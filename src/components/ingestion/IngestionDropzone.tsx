@@ -1,5 +1,6 @@
 import { useState, useCallback, useRef } from "react";
 import { invoke, convertFileSrc } from "@tauri-apps/api/core";
+import { ReviewSyncModal, type ProposedMapping } from "./ReviewSyncModal";
 import { open } from "@tauri-apps/plugin-dialog";
 import { toast } from "sonner";
 import { UploadCloud, FileText, Loader2 } from "lucide-react";
@@ -12,7 +13,14 @@ pdfjsLib.GlobalWorkerOptions.workerSrc = pdfWorker;
 
 // ── IngestionDropzone ─────────────────────────────────────────────────────────
 
-export function IngestionDropzone() {
+interface IngestionDropzoneProps {
+  onSuccess?: () => void;
+}
+
+export function IngestionDropzone({ onSuccess }: IngestionDropzoneProps) {
+  const [importMode, setImportMode] = useState<"questions" | "mark_scheme">("questions");
+  const [subject, setSubject] = useState("Mathematics");
+  const [pendingMappings, setPendingMappings] = useState<ProposedMapping[] | null>(null);
   const [isDraggingOver, setIsDraggingOver] = useState(false);
   const [isProcessing, setIsProcessing] = useState(false);
   const [lastFile, setLastFile] = useState<string | null>(null);
@@ -43,7 +51,7 @@ export function IngestionDropzone() {
         
         const pdf = await pdfjsLib.getDocument({ data: arrayBuffer }).promise;
         const pages: string[] = [];
-        const numPages = Math.min(pdf.numPages, 20); // Limit to 20 pages for performance/tokens
+        const numPages = pdf.numPages; // Process the entire document
         
         for (let i = 1; i <= numPages; i++) {
           const page = await pdf.getPage(i);
@@ -61,22 +69,31 @@ export function IngestionDropzone() {
         pdfBase64Pages = pages;
       }
 
-      const count = await invoke<number>("parse_pdf_vision", { 
-        filePath, 
-        apiKey,
-        pdfBase64Pages,
-        baseUrl,
-        modelName
-      });
-      toast.success(
-        count === 1
-          ? "1 question extracted!"
-          : `${count} questions extracted!`,
-        {
-          description: filePath,
-          duration: 6000,
-        }
-      );
+      if (importMode === "mark_scheme") {
+        const mappings = await invoke<ProposedMapping[]>("parse_mark_scheme_vision", {
+          filePath,
+          apiKey,
+          pdfBase64Pages,
+          baseUrl,
+          modelName
+        });
+        setPendingMappings(mappings);
+      } else {
+        const questions = await invoke<any[]>("parse_pdf_vision", { 
+          filePath, 
+          apiKey,
+          pdfBase64Pages,
+          baseUrl,
+          modelName,
+          subject
+        });
+        const count = questions.length;
+        toast.success(
+          count === 1 ? "1 question extracted!" : `${count} questions extracted!`,
+          { description: filePath, duration: 6000 }
+        );
+        if (onSuccess) onSuccess();
+      }
     } catch (err) {
       toast.error("Ingestion failed", {
         description: String(err),
@@ -156,12 +173,58 @@ export function IngestionDropzone() {
       {/* Page heading */}
       <div className="mb-8 text-center space-y-1 select-none">
         <h1 className="text-2xl font-bold tracking-tight text-foreground">
-          Import a Past Paper
+          Import Document
         </h1>
         <p className="text-sm text-muted-foreground max-w-md">
-          Drop a PDF, image, or plain-text past paper below and MergeMark will
-          automatically extract the questions into your repository.
+          Drop a PDF, image, or plain-text document below and MergeMark will
+          automatically process it into your repository.
         </p>
+      </div>
+
+      {/* ── Controls (Mode & Subject) ── */}
+      <div className="flex flex-col items-center gap-4 mb-6">
+        <div className="flex items-center justify-center bg-muted/30 p-1 rounded-lg border border-border/50">
+          <button
+            onClick={() => setImportMode("questions")}
+            className={cn(
+              "px-4 py-2 text-sm font-medium rounded-md transition-all duration-200",
+              importMode === "questions" 
+                ? "bg-background text-foreground shadow-sm ring-1 ring-border/50" 
+                : "text-muted-foreground hover:text-foreground hover:bg-muted/50"
+            )}
+          >
+            Import Question Paper
+          </button>
+          <button
+            onClick={() => setImportMode("mark_scheme")}
+            className={cn(
+              "px-4 py-2 text-sm font-medium rounded-md transition-all duration-200",
+              importMode === "mark_scheme" 
+                ? "bg-background text-foreground shadow-sm ring-1 ring-border/50" 
+                : "text-muted-foreground hover:text-foreground hover:bg-muted/50"
+            )}
+          >
+            Import Mark Scheme
+          </button>
+        </div>
+
+        <div className="flex items-center gap-3">
+          <label htmlFor="subject-select" className="text-sm font-medium text-foreground">
+            Paper Subject:
+          </label>
+          <select
+            id="subject-select"
+            value={subject}
+            onChange={(e) => setSubject(e.target.value)}
+            disabled={isProcessing}
+            className="h-9 w-48 rounded-md border border-input bg-background px-3 py-1 text-sm shadow-sm transition-colors focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring disabled:cursor-not-allowed disabled:opacity-50"
+          >
+            <option value="Mathematics">Mathematics</option>
+            <option value="Further Mathematics">Further Mathematics</option>
+            <option value="Physics">Physics</option>
+            <option value="Computer Science">Computer Science</option>
+          </select>
+        </div>
       </div>
 
       {/* ── Dropzone card ── */}
@@ -239,7 +302,7 @@ export function IngestionDropzone() {
               <p className="text-base font-semibold text-foreground">
                 {isDraggingOver
                   ? "Release to import"
-                  : "Drag & Drop a Past Paper PDF or Image here"}
+                  : `Drag & Drop a ${importMode === "questions" ? "Past Paper" : "Mark Scheme"} here`}
               </p>
               <p className="text-xs text-muted-foreground">
                 or{" "}
@@ -266,6 +329,15 @@ export function IngestionDropzone() {
         <FileText className="size-3.5 opacity-60" aria-hidden />
         <span>Accepted: .pdf, .png, .jpg, .txt</span>
       </div>
+
+      <ReviewSyncModal
+        mappings={pendingMappings}
+        onClose={() => setPendingMappings(null)}
+        onSuccess={() => {
+          setPendingMappings(null);
+          if (onSuccess) onSuccess();
+        }}
+      />
     </section>
   );
 }

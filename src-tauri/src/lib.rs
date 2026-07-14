@@ -53,8 +53,10 @@ pub fn run() {
             commands::compile_worksheet,
             commands::parse_pdf,
             commands::parse_pdf_vision,
+            commands::parse_mark_scheme_vision,
             commands::fetch_models,
-            commands::update_question
+            commands::update_question,
+            commands::commit_mark_schemes
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

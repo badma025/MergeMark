@@ -181,6 +181,8 @@
   text-align: center !important;
   margin: 1em 0 !important;
   padding: 0.5em 0 !important;
+  overflow-x: auto !important;
+  overflow-y: hidden !important;
 }
 
 /* ─── KaTeX inline math ────────────────────────────────────────────────────── */

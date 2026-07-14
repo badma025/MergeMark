@@ -82,10 +82,10 @@ export function WorksheetBuilder({ selectedQuestions, onRemove, onReorder }: Wor
     const ids = selectedQuestions.map((q) => q.id);
     setIsCompiling(true);
     try {
-      const filePath = await invoke<string>("compile_worksheet", { questionIds: ids });
-      toast.success("Worksheet compiled!", {
-        description: filePath,
-        duration: 6000,
+      const filePaths = await invoke<string[]>("compile_worksheet", { questionIds: ids });
+      toast.success("Worksheet & Answer Key compiled!", {
+        description: filePaths.join("\n"),
+        duration: 8000,
       });
     } catch (err) {
       toast.error("Compilation failed", {

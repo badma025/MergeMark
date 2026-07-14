@@ -83,7 +83,7 @@ function App() {
           {activeTab === "repository" && (
             <RepositoryFeed onAddToWorksheet={handleAddQuestion} />
           )}
-          {activeTab === "ingestion" && <IngestionDropzone />}
+          {activeTab === "ingestion" && <IngestionDropzone onSuccess={() => setActiveTab("repository")} />}
           {activeTab === "settings" && <Settings />}
         </div>
       </div>

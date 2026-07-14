@@ -4,7 +4,18 @@ import { invoke } from "@tauri-apps/api/core";
 import { toast } from "sonner";
 import { Input } from "@/components/ui/input";
 import { Button } from "@/components/ui/button";
+import { Badge } from "@/components/ui/badge";
+import { cn } from "@/lib/utils";
 import { QuestionCard, type QuestionCardProps } from "./QuestionCard";
+
+const EDEXCEL_MATHS_TOPICS = [
+  "Proof", "Algebra and functions", "Coordinate geometry in the (x, y) plane", 
+  "Sequences and series", "Trigonometry", "Exponentials and logarithms", 
+  "Differentiation", "Integration", "Numerical methods", "Vectors", 
+  "Statistical sampling", "Data presentation and interpretation", "Probability", 
+  "Statistical distributions", "Statistical hypothesis testing", 
+  "Quantities and units in mechanics", "Kinematics", "Forces and Newton's laws", "Moments"
+];
 
 // ── Component ─────────────────────────────────────────────────────────────────
 
@@ -14,6 +25,7 @@ export interface RepositoryFeedProps {
 
 export function RepositoryFeed({ onAddToWorksheet }: RepositoryFeedProps) {
   const [search, setSearch] = useState("");
+  const [selectedTopics, setSelectedTopics] = useState<string[]>([]);
   const [questions, setQuestions] = useState<Omit<QuestionCardProps, "onAddToWorksheet" | "onDelete">[]>([]);
   const [loading, setLoading] = useState(true);
 
@@ -47,11 +59,11 @@ export function RepositoryFeed({ onAddToWorksheet }: RepositoryFeedProps) {
     }
   }
 
-  async function handleUpdate(id: string, newContent: string, newMarks: number) {
+  async function handleUpdate(id: string, newContent: string, newMarks: number, newAnswerContent?: string) {
     try {
-      await invoke("update_question", { id, newContent, newMarks });
+      await invoke("update_question", { id, newContent, newMarks, newAnswerContent });
       setQuestions((prev) => 
-        prev.map(q => q.id === id ? { ...q, content: newContent, marks: newMarks } : q)
+        prev.map(q => q.id === id ? { ...q, content: newContent, marks: newMarks, answerContent: newAnswerContent } : q)
       );
       toast.success("Question updated successfully");
     } catch (err) {
@@ -72,13 +84,27 @@ export function RepositoryFeed({ onAddToWorksheet }: RepositoryFeedProps) {
 
   const filtered = questions.filter((q) => {
     const term = search.toLowerCase();
-    return (
-      term === "" ||
+    const matchesSearch = term === "" ||
       q.subject.toLowerCase().includes(term) ||
       q.subtopic.toLowerCase().includes(term) ||
       q.content.toLowerCase().includes(term) ||
-      q.mathSnippet.toLowerCase().includes(term)
-    );
+      q.mathSnippet.toLowerCase().includes(term);
+
+    let matchesTopicFilter = true;
+    if (selectedTopics.length > 0) {
+      let qTopics: string[] = [];
+      try {
+        if (q.topics) {
+          qTopics = JSON.parse(q.topics);
+          if (!Array.isArray(qTopics)) qTopics = [];
+        }
+      } catch (e) {
+        // ignore
+      }
+      matchesTopicFilter = qTopics.some((t) => selectedTopics.includes(t));
+    }
+
+    return matchesSearch && matchesTopicFilter;
   });
 
   function handleAdd(id: string) {
@@ -123,6 +149,30 @@ export function RepositoryFeed({ onAddToWorksheet }: RepositoryFeedProps) {
               Clear Repository
             </Button>
           </div>
+        </div>
+        <div className="mt-3 flex flex-wrap gap-1.5 max-h-[4.5rem] overflow-y-auto">
+          {EDEXCEL_MATHS_TOPICS.map((topic) => {
+            const isSelected = selectedTopics.includes(topic);
+            return (
+              <Badge
+                key={topic}
+                variant={isSelected ? "default" : "outline"}
+                className={cn(
+                  "cursor-pointer transition-colors text-xs font-medium py-0.5",
+                  isSelected ? "bg-blue-600 hover:bg-blue-700 text-white border-blue-600" : "hover:bg-accent border-border"
+                )}
+                onClick={() => {
+                  setSelectedTopics(prev => 
+                    prev.includes(topic) 
+                      ? prev.filter(t => t !== topic)
+                      : [...prev, topic]
+                  );
+                }}
+              >
+                {topic}
+              </Badge>
+            );
+          })}
         </div>
       </div>
 
