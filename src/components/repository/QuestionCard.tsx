@@ -1,0 +1,289 @@
+import { useState } from "react";
+import "katex/dist/katex.min.css";
+import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
+import { Plus, Trash2, Pencil } from "lucide-react";
+import {
+  Dialog,
+  DialogContent,
+  DialogHeader,
+  DialogTitle,
+  DialogFooter,
+} from "@/components/ui/dialog";
+import ReactMarkdown from "react-markdown";
+import remarkMath from "remark-math";
+import rehypeKatex from "rehype-katex";
+import { cn } from "@/lib/utils";
+import { convertFileSrc } from "@tauri-apps/api/core";
+
+/**
+ * Regex that matches display-worthy LaTeX operators.
+ * \\{1,2} handles both \int (1 backslash) and \\int (AI double-escaping in JSON).
+ * (?![a-z]) prevents matching longer names like \integer but allows \int_2, \int^n etc.
+ */
+const DISPLAY_OP_RE =
+  /\\{1,2}(?:int|iint|iiint|oint|sum|prod|coprod|lim|bigcup|bigcap|bigsqcup|bigvee|bigwedge)(?![a-z])/;
+
+/** Convert \\cmd → \cmd (AI sometimes double-escapes backslashes from JSON) */
+function fixSlashes(s: string): string {
+  return s.replace(/\\{2}([a-zA-Z])/g, "\\$1");
+}
+
+/**
+ * Normalise content so every display-worthy equation is wrapped in $$...$$
+ * before ReactMarkdown + rehype-katex see it.
+ *
+ * Uses global multiline regex passes (not line-by-line) so patterns that span
+ * multiple lines are handled correctly in a single replacement call.
+ *
+ * Patterns handled (all AI inconsistencies we have observed):
+ *   A) $$ expr $$           — already correct, left alone
+ *   B) $              ← AI using $ on its own line as a "block" delimiter
+ *      \int expr
+ *      $
+ *   C) $\int expr$          — single-line inline wrapping a display expr
+ *   D) \int expr            — raw LaTeX with no delimiters at all
+ *   E) text $\int expr$ text — display expr embedded mid-sentence
+ */
+function preprocessMath(raw: string): string {
+  if (!raw) return "";
+
+  let s = raw;
+
+  // ── A: protect already-correct $$ blocks from further processing ──────────
+  // We mark them with a placeholder, restore at end.
+  const blocks: string[] = [];
+  s = s.replace(/\$\$([\s\S]*?)\$\$/g, (_m, inner) => {
+    const idx = blocks.length;
+    blocks.push(`$$${inner}$$`);
+    return `\x00BLOCK${idx}\x00`;
+  });
+
+  // ── B: $ on its own line used as block delimiter ──────────────────────────
+  // Matches: (newline or start) $ (optional spaces) newline ... newline $ (optional spaces) (newline or end)
+  s = s.replace(
+    /(?:^|\n)[ \t]*\$[ \t]*\n([\s\S]*?)\n[ \t]*\$[ \t]*(?=\n|$)/gm,
+    (_m, inner) => `\n\n$$${fixSlashes(inner.trim())}$$\n\n`
+  );
+
+  // ── C+E: inline $...$ (single-line) containing a display operator ─────────
+  s = s.replace(/\$([^$\n]+)\$/g, (match, expr) => {
+    if (DISPLAY_OP_RE.test(expr)) {
+      return `\n\n$$${fixSlashes(expr.trim())}$$\n\n`;
+    }
+    return match;
+  });
+
+  // ── D: raw LaTeX line (no $ at all) with a display operator ──────────────
+  // Multiline flag `m` makes ^ and $ match line boundaries.
+  // IMPORTANT: use \n\n (blank line) on both sides so remark-math treats $$ as
+  // a block-level paragraph, not inline.
+  s = s.replace(
+    /^(?!\s*\$\$)([^\n$]*(?:\\{1,2}(?:int|iint|iiint|oint|sum|prod|coprod|lim|bigcup|bigcap|bigsqcup|bigvee|bigwedge)(?![a-z]))[^\n$]*)$/gm,
+    (_m, line) => `\n\n$$${fixSlashes(line.trim())}$$\n\n`
+  );
+
+  // ── Restore protected $$ blocks ───────────────────────────────────────────
+  s = s.replace(/\x00BLOCK(\d+)\x00/g, (_m, idx) => blocks[Number(idx)]);
+
+  // Collapse 3+ blank lines to 2
+  return s.replace(/\n{3,}/g, "\n\n").trim();
+}
+
+
+
+export interface QuestionCardProps {
+  id: string;
+  subject: string;
+  subtopic: string;
+  marks: number;
+  content: string;
+  mathSnippet: string;
+  /** Whether the snippet is a code block (true) or math formula (false) */
+  isCode?: boolean;
+  className?: string;
+  onAddToWorksheet?: (id: string) => void;
+  onDelete?: (id: string) => void;
+  onUpdate?: (id: string, newContent: string, newMarks: number) => void;
+}
+
+export function QuestionCard({
+  id,
+  subject,
+  subtopic,
+  marks,
+  content,
+  className,
+  onAddToWorksheet,
+  onDelete,
+  onUpdate,
+}: QuestionCardProps) {
+  const [isEditing, setIsEditing] = useState(false);
+  const [editContent, setEditContent] = useState(content);
+  const [editMarks, setEditMarks] = useState(marks);
+
+  function handleSave() {
+    onUpdate?.(id, editContent, editMarks);
+    setIsEditing(false);
+  }
+
+  function handleCancel() {
+    setEditContent(content);
+    setEditMarks(marks);
+    setIsEditing(false);
+  }
+  return (
+    <article
+      onClick={() => setIsEditing(true)}
+      className={cn(
+        "group relative flex flex-col gap-3 rounded-xl border border-border bg-card p-4 shadow-sm",
+        "transition-all duration-200 hover:border-primary/40 hover:shadow-md hover:shadow-primary/5 cursor-pointer",
+        className
+      )}
+    >
+      {/* ── Action buttons — top-right corner, visible on hover ── */}
+      <div className="absolute top-3 right-3 flex gap-1 opacity-0 group-hover:opacity-100 focus-within:opacity-100 transition-all duration-150 z-10">
+        {!isEditing && (
+          <button
+            type="button"
+            onClick={(e) => {
+              e.stopPropagation();
+              setIsEditing(true);
+            }}
+            aria-label={`Edit question ${id}`}
+            className={cn(
+              "flex items-center justify-center rounded-md p-1.5",
+              "text-muted-foreground/40 transition-all duration-150",
+              "hover:bg-primary/10 hover:text-primary hover:opacity-100",
+              "focus-visible:opacity-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/60"
+            )}
+          >
+            <Pencil className="size-3.5" />
+          </button>
+        )}
+        <button
+          id={`delete-question-${id}`}
+          type="button"
+          onClick={(e) => {
+            e.stopPropagation();
+            onDelete?.(id);
+          }}
+          aria-label={`Delete question ${id}`}
+          className={cn(
+            "flex items-center justify-center rounded-md p-1.5",
+            "text-muted-foreground/40 transition-all duration-150",
+            "hover:bg-destructive/10 hover:text-destructive hover:opacity-100",
+            "focus-visible:opacity-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-destructive/60"
+          )}
+        >
+          <Trash2 className="size-3.5" />
+        </button>
+      </div>
+
+      {/* ── Badge row ── */}
+      <div className="flex flex-wrap items-center gap-2 pr-7">
+        <Badge
+          variant="secondary"
+          className="text-xs font-medium tracking-wide"
+        >
+          {subject}
+        </Badge>
+        <Badge
+          variant="outline"
+          className="text-xs text-muted-foreground"
+        >
+          {subtopic}
+        </Badge>
+        <Badge className="ml-auto bg-primary/15 text-primary hover:bg-primary/20 border-primary/20 text-xs font-semibold">
+          {marks} {marks === 1 ? "mark" : "marks"}
+        </Badge>
+      </div>
+
+      {/* ── Question content ── */}
+      <div className="text-sm leading-relaxed text-foreground prose prose-sm dark:prose-invert max-w-none prose-p:my-1 prose-pre:my-1">
+        <ReactMarkdown 
+          remarkPlugins={[remarkMath]} 
+          rehypePlugins={[rehypeKatex]}
+          urlTransform={(value) => value}
+          components={{
+            img: ({ node, ...props }) => {
+              if (props.src && (props.src.match(/^[a-zA-Z]:[\\/]/) || props.src.startsWith("/"))) {
+                try {
+                  const assetUrl = convertFileSrc(props.src);
+                  return (
+                    <img
+                        {...props}
+                        src={assetUrl}
+                        alt={props.alt || "Diagram"}
+                        className="max-w-full rounded-md my-4"
+                        onError={() => console.error("Failed to load image via asset protocol:", props.src)}
+                      />
+                    );
+                  } catch (e) {
+                    return <div className="text-sm text-destructive border border-destructive/20 p-2 rounded-md bg-destructive/10 text-center">Failed to convert diagram URL: {props.alt || "Image"}</div>;
+                  }
+                }
+                return <img {...props} alt={props.alt || "Diagram"} className="max-w-full rounded-md my-4" />;
+              }
+            }}
+          >
+            {preprocessMath(content ?? "")}
+          </ReactMarkdown>
+        </div>
+      {/* ── Edit Modal ── */}
+      <Dialog open={isEditing} onOpenChange={setIsEditing}>
+        <DialogContent className="max-w-3xl w-full max-h-[90vh] overflow-y-auto">
+          <DialogHeader>
+            <DialogTitle>Edit Question</DialogTitle>
+          </DialogHeader>
+          <div className="flex flex-col gap-4 py-4">
+            <div className="flex items-center gap-4">
+              <label className="text-sm font-semibold text-foreground whitespace-nowrap">Marks:</label>
+              <input
+                type="number"
+                min={1}
+                max={100}
+                value={editMarks}
+                onChange={(e) => setEditMarks(parseInt(e.target.value) || 1)}
+                className="w-24 p-2 text-sm bg-background border border-input rounded-md focus:outline-none focus:ring-2 focus:ring-primary/50"
+              />
+            </div>
+            <div className="flex flex-col gap-2">
+              <label className="text-sm font-semibold text-foreground">Markdown Content:</label>
+              <textarea 
+                value={editContent}
+                onChange={(e) => setEditContent(e.target.value)}
+                className="w-full min-h-[400px] p-3 text-sm bg-background border border-input rounded-md font-mono resize-y focus:outline-none focus:ring-2 focus:ring-primary/50"
+              />
+            </div>
+          </div>
+          <DialogFooter>
+            <Button variant="outline" onClick={handleCancel}>Cancel</Button>
+            <Button onClick={handleSave}>Save Changes</Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+      {/* ── Footer: Add to Worksheet ── */}
+      <div className="flex items-center justify-end pt-1">
+        <Button
+          id={`add-to-worksheet-${id}`}
+          size="sm"
+          className={cn(
+            "gap-1.5 text-xs font-semibold",
+            "bg-primary text-primary-foreground",
+            "opacity-0 translate-y-1 transition-all duration-200",
+            "group-hover:opacity-100 group-hover:translate-y-0"
+          )}
+          onClick={(e) => {
+            e.stopPropagation();
+            onAddToWorksheet?.(id);
+          }}
+          aria-label={`Add question ${id} to worksheet`}
+        >
+          <Plus className="size-3.5" />
+          Add to Worksheet
+        </Button>
+      </div>
+    </article>
+  );
+}
