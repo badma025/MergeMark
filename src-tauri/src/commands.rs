@@ -2,6 +2,8 @@ use crate::AppState;
 use image::GenericImageView;
 use serde::{Deserialize, Serialize};
 use tauri::{Manager, State};
+use std::thread;
+use std::time::Duration;
 
 // ── Shared data model ─────────────────────────────────────────────────────────
 
@@ -15,6 +17,53 @@ pub struct Question {
     pub content: String,
     pub math_snippet: String,
     pub is_code: bool,
+    pub answer_content: Option<String>,
+    pub topics: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProposedMapping {
+    pub question_id: String,
+    pub raw_content: String,
+    pub proposed_answer: String,
+}
+
+fn auto_close_json(s: &str) -> String {
+    let mut in_string = false;
+    let mut escaped = false;
+    let mut stack = Vec::new();
+
+    for c in s.chars() {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if c == '\\' {
+                escaped = true;
+            } else if c == '"' {
+                in_string = false;
+            }
+        } else {
+            match c {
+                '"' => in_string = true,
+                '{' => stack.push('}'),
+                '[' => stack.push(']'),
+                '}' | ']' => {
+                    stack.pop();
+                }
+                _ => {}
+            }
+        }
+    }
+
+    let mut closed = s.to_string();
+    if in_string {
+        closed.push('"');
+    }
+    while let Some(c) = stack.pop() {
+        closed.push(c);
+    }
+    closed
 }
 
 // ── Helper: shared question-classification + DB-insert logic ──────────────────
@@ -217,13 +266,14 @@ async fn insert_questions_from_text(
 
         sqlx::query(
             r#"
-            INSERT INTO questions (id, subject, subtopic, marks, content, math_snippet, is_code)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO questions (id, subject, subtopic, topics, marks, content, math_snippet, is_code)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             "#,
         )
         .bind(&id)
         .bind(subject)
         .bind(subtopic)
+        .bind("[]")
         .bind(marks)
         .bind(&content)
         .bind(&math_snippet)
@@ -256,13 +306,14 @@ pub async fn add_question(question: Question, state: State<'_, AppState>) -> Res
     let pool = state.db.lock().await;
     sqlx::query(
         r#"
-        INSERT INTO questions (id, subject, subtopic, marks, content, math_snippet, is_code)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO questions (id, subject, subtopic, topics, marks, content, math_snippet, is_code)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
         "#,
     )
     .bind(question.id)
     .bind(question.subject)
     .bind(question.subtopic)
+    .bind(question.topics.unwrap_or_else(|| "[]".to_string()))
     .bind(question.marks)
     .bind(question.content)
     .bind(question.math_snippet)
@@ -362,7 +413,7 @@ pub async fn parse_pdf(
 pub async fn compile_worksheet(
     app: tauri::AppHandle,
     question_ids: Vec<String>,
-) -> Result<String, String> {
+) -> Result<Vec<String>, String> {
     let state: State<'_, AppState> = app.state();
     let pool = state.db.lock().await;
 
@@ -371,10 +422,24 @@ pub async fn compile_worksheet(
     latex.push_str("\\usepackage{amsmath}\n");
     latex.push_str("\\usepackage{amssymb}\n");
     latex.push_str("\\usepackage{graphicx}\n");
+    latex.push_str("\\usepackage{xcolor}\n");
+    latex.push_str("\\usepackage{mdframed}\n");
     latex.push_str("\\begin{document}\n\n");
     latex.push_str("\\title{Mergemark Practice Paper}\n");
     latex.push_str("\\maketitle\n\n");
     latex.push_str("\\begin{enumerate}\n");
+
+    let mut answer_latex = String::new();
+    answer_latex.push_str("\\documentclass{article}\n");
+    answer_latex.push_str("\\usepackage{amsmath}\n");
+    answer_latex.push_str("\\usepackage{amssymb}\n");
+    answer_latex.push_str("\\usepackage{graphicx}\n");
+    answer_latex.push_str("\\usepackage{xcolor}\n");
+    answer_latex.push_str("\\usepackage{mdframed}\n");
+    answer_latex.push_str("\\begin{document}\n\n");
+    answer_latex.push_str("\\title{Mergemark Practice Paper -- Answer Key}\n");
+    answer_latex.push_str("\\maketitle\n\n");
+    answer_latex.push_str("\\begin{enumerate}\n");
 
     for id in question_ids {
         let q: Option<Question> = sqlx::query_as("SELECT * FROM questions WHERE id = ?")
@@ -400,8 +465,6 @@ pub async fn compile_worksheet(
             }
 
             // 3. Fix missing inline math wrapping on bare Greek variables
-            // Matches prefix (space/punct), the greek letter, and suffix (space/punct)
-            // Replacement uses $$ to output a literal $ in the regex replacement string.
             let greek_re = regex::Regex::new(r"(?x)
                 (^|[\s,.\-\(])
                 \\(theta|alpha|beta|gamma|pi|mu|lambda|phi|omega|sigma|delta)
@@ -409,7 +472,7 @@ pub async fn compile_worksheet(
             ").unwrap();
             content = greek_re.replace_all(&content, r"${1}$$\${2}$$${3}").to_string();
 
-            // 4. Clean up markdown lists (replace bullets with paragraph breaks)
+            // 4. Clean up markdown lists
             let list_re = regex::Regex::new(r"(?m)^[\*\-]\s+").unwrap();
             content = list_re.replace_all(&content, "\n\n").to_string();
 
@@ -436,20 +499,56 @@ pub async fn compile_worksheet(
                 }
             }
             latex.push_str(&format!("  \\hfill [{} marks]\n\n", question.marks));
+
+            answer_latex.push_str(&format!("  \\item {}\n", content));
+            if !question.math_snippet.is_empty() {
+                if question.is_code {
+                    answer_latex.push_str(&format!(
+                        "  \\begin{{verbatim}}\n{}\n  \\end{{verbatim}}\n",
+                        question.math_snippet
+                    ));
+                } else {
+                    answer_latex.push_str(&format!("  \\[ {} \\]\n", question.math_snippet));
+                }
+            }
+            answer_latex.push_str(&format!("  \\hfill [{} marks]\n\n", question.marks));
+
+            if let Some(mut ans_content) = question.answer_content {
+                ans_content = greek_re.replace_all(&ans_content, r"${1}$$\${2}$$${3}").to_string();
+                ans_content = list_re.replace_all(&ans_content, "\n\n").to_string();
+
+                while let Some(start_idx) = ans_content.find("![Diagram](") {
+                    if let Some(end_idx) = ans_content[start_idx..].find(')') {
+                        let path = &ans_content[start_idx + 11..start_idx + end_idx];
+                        let latex_img = format!("\\begin{{center}}\\includegraphics[width=0.8\\linewidth]{{{}}}\\end{{center}}", path);
+                        ans_content.replace_range(start_idx..start_idx + end_idx + 1, &latex_img);
+                    } else {
+                        break;
+                    }
+                }
+
+                answer_latex.push_str("  \\vspace{0.5em}\n  \\begin{mdframed}[backgroundcolor=gray!10, linewidth=0.5pt, roundcorner=4pt]\n");
+                answer_latex.push_str("  \\textbf{Mark Scheme:}\\\\[0.5em]\n");
+                answer_latex.push_str(&format!("  {}\n", ans_content));
+                answer_latex.push_str("  \\end{mdframed}\n\n");
+            }
         }
     }
 
     latex.push_str("\\end{enumerate}\n");
     latex.push_str("\\end{document}\n");
 
+    answer_latex.push_str("\\end{enumerate}\n");
+    answer_latex.push_str("\\end{document}\n");
+
     let download_dir = app.path().download_dir().map_err(|e| e.to_string())?;
-    let file_path = download_dir.join("worksheet.tex");
+    
+    let worksheet_tex = download_dir.join("worksheet.tex");
+    let answer_key_tex = download_dir.join("answer_key.tex");
 
-    std::fs::write(&file_path, &latex).map_err(|e| format!("Failed to write file: {}", e))?;
+    std::fs::write(&worksheet_tex, &latex).map_err(|e| format!("Failed to write worksheet file: {}", e))?;
+    std::fs::write(&answer_key_tex, &answer_latex).map_err(|e| format!("Failed to write answer key file: {}", e))?;
 
-    // Execute pdflatex
-    // It might not be in PATH if the IDE hasn't been restarted since installation.
-    // We check the standard MiKTeX installation path on Windows as a fallback.
     let pdflatex_cmd = if std::process::Command::new("pdflatex").arg("--version").output().is_ok() {
         "pdflatex".to_string()
     } else if let Some(local_app_data) = std::env::var_os("LOCALAPPDATA") {
@@ -464,32 +563,47 @@ pub async fn compile_worksheet(
         "pdflatex".to_string()
     };
 
-    let output = std::process::Command::new(&pdflatex_cmd)
+    let output_worksheet = std::process::Command::new(&pdflatex_cmd)
         .current_dir(&download_dir)
         .arg("-interaction=nonstopmode")
         .arg("-output-directory")
         .arg(&download_dir)
-        .arg(&file_path)
+        .arg(&worksheet_tex)
         .output()
-        .map_err(|e| format!("Failed to execute pdflatex at {}: {}", pdflatex_cmd, e))?;
+        .map_err(|e| format!("Failed to execute pdflatex for worksheet: {}", e))?;
 
-    // pdflatex in nonstopmode will often exit with a non-zero status code if there are LaTeX syntax errors
-    // (e.g. missing '$', mismatched braces) but will STILL successfully generate a viewable PDF.
-    // Instead of failing the entire process, we simply check if the PDF was generated.
-    let pdf_path = download_dir.join("worksheet.pdf");
-    
-    if !pdf_path.exists() {
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!("pdflatex failed to generate PDF:\n{}\n{}", stdout, stderr));
+    let worksheet_pdf = download_dir.join("worksheet.pdf");
+    if !worksheet_pdf.exists() {
+        let stdout = String::from_utf8_lossy(&output_worksheet.stdout);
+        let stderr = String::from_utf8_lossy(&output_worksheet.stderr);
+        return Err(format!("pdflatex failed to generate worksheet PDF:\n{}\n{}", stdout, stderr));
     }
 
-    // Clean up auxiliary files generated by pdflatex
+    let output_answer_key = std::process::Command::new(&pdflatex_cmd)
+        .current_dir(&download_dir)
+        .arg("-interaction=nonstopmode")
+        .arg("-output-directory")
+        .arg(&download_dir)
+        .arg(&answer_key_tex)
+        .output()
+        .map_err(|e| format!("Failed to execute pdflatex for answer key: {}", e))?;
+
+    let answer_key_pdf = download_dir.join("answer_key.pdf");
+    if !answer_key_pdf.exists() {
+        let stdout = String::from_utf8_lossy(&output_answer_key.stdout);
+        let stderr = String::from_utf8_lossy(&output_answer_key.stderr);
+        return Err(format!("pdflatex failed to generate answer key PDF:\n{}\n{}", stdout, stderr));
+    }
+
     let _ = std::fs::remove_file(download_dir.join("worksheet.aux"));
     let _ = std::fs::remove_file(download_dir.join("worksheet.log"));
+    let _ = std::fs::remove_file(download_dir.join("answer_key.aux"));
+    let _ = std::fs::remove_file(download_dir.join("answer_key.log"));
 
-    // Return the generated PDF path
-    Ok(pdf_path.to_string_lossy().to_string())
+    Ok(vec![
+        worksheet_pdf.to_string_lossy().to_string(),
+        answer_key_pdf.to_string_lossy().to_string()
+    ])
 }
 
 #[tauri::command]
@@ -500,8 +614,9 @@ pub async fn parse_pdf_vision(
     pdf_base64_pages: Option<Vec<String>>,
     base_url: String,
     model_name: String,
+    subject: String,
     state: State<'_, AppState>,
-) -> Result<usize, String> {
+) -> Result<Vec<Question>, String> {
     // Clean up inputs to prevent copy-paste errors
     let base_url = base_url.trim().to_string();
     let api_key = api_key.trim().to_string();
@@ -537,29 +652,44 @@ pub async fn parse_pdf_vision(
     }
 
     // 2. Build the OpenAI prompt for structured extraction
-    let system_prompt = "You are an expert exam parser. Your job is to extract EVERY question from the provided exam paper pages and return them as structured JSON. You have a generous output token budget — use it fully.
+    const EDEXCEL_MATHS_TOPICS: &[&str] = &["Proof", "Algebra and functions", "Coordinate geometry in the (x, y) plane", "Sequences and series", "Trigonometry", "Exponentials and logarithms", "Differentiation", "Integration", "Numerical methods", "Vectors", "Statistical sampling", "Data presentation and interpretation", "Probability", "Statistical distributions", "Statistical hypothesis testing", "Quantities and units in mechanics", "Kinematics", "Forces and Newton's laws", "Moments"];
+    
+    let system_prompt_string = format!("You are an expert exam parser. Your job is to extract EVERY question from the provided exam paper pages and return them as structured JSON. You have a generous output token budget — use it fully.
 
 Return a JSON object with a single key 'questions' containing an array of objects. Schema for each object:
-{ \"subject\": string (e.g. \"Mathematics\"), \"subtopic\": string (e.g. \"Integration\"), \"marks\": integer (sum all parts; default 1 if unknown), \"content\": string (full question text with all sub-parts), \"math_snippet\": string (extract any key LaTeX/math expression, else empty string), \"is_code\": boolean }
+{{ \"subtopic\": string (e.g. \"Integration\"), \"topics\": [string] (1 to 3 exact matches from the list below), \"marks\": integer (sum all parts; default 1 if unknown), \"content\": string (full question text with all sub-parts), \"math_snippet\": string (extract any key LaTeX/math expression, else empty string), \"is_code\": boolean }}
+
+You are extracting questions from a {} exam paper. Your ONLY classification task is to return a `topics` array containing 1 to 3 exact matches from this list: {:?}.
+Do not invent any new tags. If a topic spans multiple areas, pick the most relevant ones.
 
 CRITICAL — ACCURACY & GREEK LETTERS: Pay extreme attention to Greek letters (especially theta). Ensure they are properly translated to LaTeX (e.g., `$\\theta$`) and never dropped or mistakenly transcribed as a zero or the letter 'O'.
 CRITICAL — NO SUMMARIES: DO NOT summarize, repeat, or list equations at the bottom of the text. You must only extract the text exactly as it flows in the document.
 
 CRITICAL — COMPLETENESS: You MUST extract every single question. A typical A-level paper has 10–15+ questions. Do NOT stop early. Continue until 'END OF PAPER' or the last blank page. Count every numbered question. If you are running low on space, emit shorter content fields rather than omitting questions entirely.
+CRITICAL: You are extracting from a high-stakes exam paper. You MUST NOT skip, summarize, or omit ANY questions.
+You MUST extract EVERY SINGLE QUESTION visible in the provided pages.
+Do not stop generating the array until you have perfectly transcribed every question present in the images.
+If a question spans across multiple pages, ensure you capture the entirety of it into a single object.
 
 CRITICAL — MULTI-PART QUESTIONS: Group all parts of one question (e.g. 3a, 3b, 3c) into a single JSON object. Sum their marks. Insert \\n\\n before each sub-part label like (a), (b), (i).
 
 CRITICAL — MATH FORMATTING RULES (follow exactly):
 1. Use $$ ... $$ (with a blank line before and after) for any equation that appears large, on its own line, or contains \\int, \\sum, \\prod, \\frac (as main expression), \\lim, or similar.
-   BAD:  \"Show that $\\int_0^1 x^2\\,dx = \\frac{1}{3}$\"
-   GOOD: \"Show that\\n\\n$$\\int_0^1 x^2\\,dx = \\frac{1}{3}$$\\n\\n\"
+   BAD:  \"Show that $\\int_0^1 x^2\\,dx = \\frac{{1}}{{3}}$\"
+   GOOD: \"Show that\\n\\n$$\\int_0^1 x^2\\,dx = \\frac{{1}}{{3}}$$\\n\\n\"
 2. Use $ ... $ ONLY for small inline variables like $x$, $n$, $A$, $f(x)$.
-   BAD:  \"The function $f(x) = 3x^2 - 2$ where $x \\in \\mathbb{R}$\" (if f(x)=... is a definition)
-   GOOD: \"The function\\n\\n$$f(x) = 3x^2 - 2, \\quad x \\in \\mathbb{R}$$\\n\\n\"
+   BAD:  \"The function $f(x) = 3x^2 - 2$ where $x \\in \\mathbb{{R}}$\" (if f(x)=... is a definition)
+   GOOD: \"The function\\n\\n$$f(x) = 3x^2 - 2, \\quad x \\in \\mathbb{{R}}$$\\n\\n\"
 3. NEVER put $ on its own line. NEVER use triple backticks for math.
 4. NEVER append equation summaries at the end of questions.
 
-CRITICAL — DIAGRAMS: If a question references a diagram/graph/figure, return diagram_bbox as [x, y, width, height] in relative 0.0–1.0 page coordinates. Also return diagram_page (0-indexed page number). Set diagram_bbox to null if there is no diagram. Do NOT flag ruled answer lines or blank spaces as diagrams.";
+CRITICAL — DIAGRAMS: If a question references a diagram/graph/figure, return diagram_bbox as [x, y, width, height] in relative 0.0–1.0 page coordinates. Also return diagram_page (0-indexed page number). Set diagram_bbox to null if there is no diagram. Do NOT flag ruled answer lines or blank spaces as diagrams.
+CRITICAL: When calculating the `[x, y, width, height]` bounding box for a diagram, you MUST capture the absolute full extent of the figure.
+You MUST explicitly include the 'Figure X' label (usually at the bottom) within the bounding box.
+You MUST explicitly include any 'Diagram NOT accurately drawn' or 'Not to scale' warnings (usually floating in the top right corner) within the bounding box.
+Ensure the bounding box stretches far enough to the edges to include all axis labels (e.g., x, y, O), curve extremes, and full geometric shapes without slicing them in half.", subject, EDEXCEL_MATHS_TOPICS);
+    
+    let system_prompt = system_prompt_string.as_str();
 
     let mut requests_to_make = Vec::new();
 
@@ -569,8 +699,8 @@ CRITICAL — DIAGRAMS: If a question references a diagram/graph/figure, return d
         // This ensures every question is fully visible in at least one batch,
         // even if it straddles a page boundary.
         // Each call only needs to output ~2-4 questions, well within any token limit.
-        let window_size: usize = 3;  // 2 "new" pages + 1 overlap page shown as context
-        let step: usize = 2;         // advance 2 pages between batches
+        let window_size: usize = 5;  // 4 "new" pages + 1 overlap page shown as context
+        let step: usize = 4;         // advance 4 pages between batches
         let mut start: usize = 0;
         while start < pages.len() {
             let end = (start + window_size).min(pages.len());
@@ -605,7 +735,7 @@ CRITICAL — DIAGRAMS: If a question references a diagram/graph/figure, return d
                     { "role": "user", "content": content_array }
                 ],
                 "temperature": 0.1,
-                "max_tokens": 16000,
+                "max_tokens": 16384,
                 "response_format": { "type": "json_object" }
             });
             requests_to_make.push((req_body, start));
@@ -631,7 +761,7 @@ CRITICAL — DIAGRAMS: If a question references a diagram/graph/figure, return d
                 }
             ],
             "temperature": 0.1,
-            "max_tokens": 16000,
+            "max_tokens": 16384,
             "response_format": { "type": "json_object" }
         });
         requests_to_make.push((req_body, 0));
@@ -643,7 +773,7 @@ CRITICAL — DIAGRAMS: If a question references a diagram/graph/figure, return d
                 { "role": "user", "content": text }
             ],
             "temperature": 0.1,
-            "max_tokens": 16000,
+            "max_tokens": 16384,
             "response_format": { "type": "json_object" }
         });
         requests_to_make.push((req_body, 0));
@@ -651,22 +781,25 @@ CRITICAL — DIAGRAMS: If a question references a diagram/graph/figure, return d
 
     let client = reqwest::Client::new();
     let pool = state.db.lock().await;
-    let mut total_inserted = 0;
+    let classifier = SubjectClassifier::new();
+    let mut final_questions = Vec::new();
 
     #[derive(serde::Deserialize)]
     struct ExtractedQuestion {
-        subject: String,
-        subtopic: String,
-        marks: i32,
-        content: String,
-        math_snippet: String,
-        is_code: bool,
+        subject: Option<String>,
+        subtopic: Option<String>,
+        topics: Option<Vec<String>>,
+        marks: Option<i32>,
+        content: Option<String>,
+        math_snippet: Option<String>,
+        is_code: Option<bool>,
         diagram_bbox: Option<Vec<f32>>,
         diagram_page: Option<usize>,
     }
 
     #[derive(serde::Deserialize)]
     struct OpenAIResult {
+        #[serde(default)]
         questions: Vec<ExtractedQuestion>,
     }
 
@@ -726,10 +859,11 @@ CRITICAL — DIAGRAMS: If a question references a diagram/graph/figure, return d
         // Non-OpenAI models (Claude, Gemini) often ignore the JSON mode instruction
         // and include conversational text (e.g. "Here is the JSON: ```json ... ```").
         // We find the first '{' and last '}' to extract only the JSON object.
-        if let (Some(start), Some(end)) = (content_str.find('{'), content_str.rfind('}')) {
-            if start <= end {
-                content_str = &content_str[start..=end];
-            }
+        if let Some(start) = content_str.find('{') {
+            content_str = &content_str[start..];
+        }
+        if content_str.ends_with("```") {
+            content_str = &content_str[..content_str.len() - 3].trim_end();
         }
 
         // Sanitize invalid JSON escapes. Non-OpenAI models often output literal single
@@ -794,13 +928,52 @@ CRITICAL — DIAGRAMS: If a question references a diagram/graph/figure, return d
             i += 1;
         }
 
-        let parsed: OpenAIResult = serde_json::from_str(&sanitized)
-            .map_err(|e| format!("Failed to parse OpenAI JSON: {}\nContent starts with: {}...", e, sanitized.chars().take(50).collect::<String>()))?;
+        let parsed: OpenAIResult = match serde_json::from_str(&sanitized) {
+            Ok(p) => p,
+            Err(e) => {
+                let err_str = e.to_string();
+                if err_str.contains("trailing characters") {
+                    if let Some(end) = sanitized.rfind('}') {
+                        let chopped = &sanitized[..=end];
+                        serde_json::from_str(chopped).map_err(|e2| format!("Failed to parse OpenAI JSON after trailing chop: {}", e2))?
+                    } else {
+                        return Err(format!("Failed to parse OpenAI JSON: {}\nContent starts with: {}...", err_str, sanitized.chars().take(50).collect::<String>()));
+                    }
+                } else {
+                    let mut current = sanitized.clone();
+                    let mut attempts = 0;
+                    let mut recovered: Option<OpenAIResult> = None;
+                    
+                    while attempts < 2000 && !current.is_empty() {
+                        let closed = auto_close_json(&current);
+                        if let Ok(p) = serde_json::from_str::<OpenAIResult>(&closed) {
+                            recovered = Some(p);
+                            break;
+                        }
+                        current.pop();
+                        attempts += 1;
+                    }
+                    
+                    if let Some(p) = recovered {
+                        p
+                    } else {
+                        let auto_closed = auto_close_json(&sanitized);
+                        let final_err = serde_json::from_str::<OpenAIResult>(&auto_closed).err().map(|e| e.to_string()).unwrap_or_else(|| "Unknown".to_string());
+                        return Err(format!("The AI model truncated the response. Attempted robust recovery failed: {}\nContent starts with: {}...", final_err, auto_closed.chars().take(50).collect::<String>()));
+                    }
+                }
+            }
+        };
 
         for mut q in parsed.questions {
+            let mut q_content = match q.content.clone() {
+                Some(c) if !c.trim().is_empty() => c,
+                _ => continue, // Skip questions without content
+            };
+
             // Deduplicate: build a fingerprint from the first ~20 words of the content.
             // Questions seen in a previous overlapping batch will have the same fingerprint.
-            let fingerprint: String = q.content
+            let fingerprint: String = q_content
                 .split_whitespace()
                 .take(20)
                 .collect::<Vec<_>>()
@@ -870,7 +1043,7 @@ CRITICAL — DIAGRAMS: If a question references a diagram/graph/figure, return d
                                     // On Windows, absolute paths need special handling in markdown/browsers
                                     // However, requirements specifically asked for absolute local path:
                                     let link = format!("\n\n![Diagram]({})\n\n", img_path.to_string_lossy().replace('\\', "/"));
-                                    q.content.push_str(&link);
+                                    q_content.push_str(&link);
                                 }
                             }
                         }
@@ -878,28 +1051,51 @@ CRITICAL — DIAGRAMS: If a question references a diagram/graph/figure, return d
                 }
             }
 
+            let (_, sys_subtopic, sys_is_code) = classifier.classify(&q_content);
+            let final_subject = subject.clone();
+            let final_subtopic = if sys_subtopic == "Unknown" { q.subtopic.unwrap_or_else(|| "Unknown".to_string()) } else { sys_subtopic.to_string() };
+            let final_is_code = if sys_is_code { true } else { q.is_code.unwrap_or(false) };
+
+            let final_topics = serde_json::to_string(&q.topics.unwrap_or_default()).unwrap_or_else(|_| "[]".to_string());
+
+            let marks_val = q.marks.unwrap_or(1);
+            let snippet_val = q.math_snippet.unwrap_or_default();
+
             sqlx::query(
                 r#"
-                INSERT INTO questions (id, subject, subtopic, marks, content, math_snippet, is_code)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO questions (id, subject, subtopic, topics, marks, content, math_snippet, is_code)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 "#,
             )
-            .bind(&id)
-            .bind(q.subject)
-            .bind(q.subtopic)
-            .bind(q.marks)
-            .bind(&q.content)
-            .bind(q.math_snippet)
-            .bind(q.is_code)
+            .bind(id.clone())
+            .bind(final_subject.clone())
+            .bind(final_subtopic.clone())
+            .bind(final_topics.clone())
+            .bind(marks_val)
+            .bind(q_content.clone())
+            .bind(snippet_val.clone())
+            .bind(final_is_code)
             .execute(&*pool)
             .await
             .map_err(|e| format!("DB error: {}", e))?;
 
-            total_inserted += 1;
+            final_questions.push(Question {
+                id,
+                subject: final_subject,
+                subtopic: final_subtopic,
+                marks: marks_val,
+                content: q_content,
+                math_snippet: snippet_val,
+                is_code: final_is_code,
+                answer_content: None,
+                topics: Some(final_topics),
+            });
         }
+
+        thread::sleep(Duration::from_millis(1500));
     }
 
-    Ok(total_inserted)
+    Ok(final_questions)
 }
 
 #[tauri::command]
@@ -953,16 +1149,436 @@ pub async fn update_question(
     id: String,
     new_content: String,
     new_marks: i32,
+    new_answer_content: Option<String>,
 ) -> Result<(), String> {
     use tauri::Manager;
     let state = app.state::<AppState>();
     let pool = state.db.lock().await;
-    sqlx::query("UPDATE questions SET content = ?, marks = ? WHERE id = ?")
+    sqlx::query("UPDATE questions SET content = ?, marks = ?, answer_content = ? WHERE id = ?")
         .bind(new_content)
         .bind(new_marks)
+        .bind(new_answer_content)
         .bind(id)
         .execute(&*pool)
         .await
         .map_err(|e| format!("Failed to update question: {}", e))?;
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn parse_mark_scheme_vision(
+    _app: tauri::AppHandle,
+    api_key: String,
+    file_path: String,
+    pdf_base64_pages: Option<Vec<String>>,
+    base_url: String,
+    model_name: String,
+    state: State<'_, AppState>,
+) -> Result<Vec<ProposedMapping>, String> {
+    let base_url = base_url.trim().to_string();
+    let api_key = api_key.trim().to_string();
+    let model_name = model_name.trim().to_string();
+
+    let ext = std::path::Path::new(&file_path).extension().and_then(|s| s.to_str()).unwrap_or("").to_lowercase();
+    let is_image = ext == "png" || ext == "jpg" || ext == "jpeg";
+    let has_pdf_pages = pdf_base64_pages.as_ref().map(|p| !p.is_empty()).unwrap_or(false);
+
+    let text = if !is_image && !has_pdf_pages {
+        match ext.as_str() {
+            "txt" => tokio::fs::read_to_string(&file_path).await.map_err(|e| e.to_string())?,
+            _ => {
+                let file_path_clone = file_path.clone();
+                tokio::task::spawn_blocking(move || {
+                    pdf_extract::extract_text(&file_path_clone).map_err(|e| format!("PDF extraction failed: {}", e))
+                }).await.map_err(|e| e.to_string())??
+            }
+        }
+    } else {
+        String::new()
+    };
+
+    if !is_image && !has_pdf_pages && text.trim().is_empty() {
+        return Err("File is empty or contains only unextractable images.".to_string());
+    }
+
+    let system_prompt = r#"You are an expert examiner. Extract the final answers and grading logic from this mark scheme. Return a JSON array containing `question_number` (String, e.g., '1' or '2') and `answer_content` (String, formatted perfectly in Markdown and LaTeX). Return a JSON object with a single key 'answers' containing this array.
+
+CRITICAL FORMATTING RULES:
+1. CRITICAL: NEVER use markdown code blocks (triple backticks) like ```latex. Return the raw text directly.
+2. CRITICAL - MULTI-PART QUESTIONS: Group all parts of one question (e.g., 1a, 1b, 1c) into a SINGLE JSON object in the array. Do NOT create separate array items for each sub-part. Use the main question number (e.g., '1', '2') as the `question_number`.
+3. CRITICAL FORMATTING RULE: You must structure the answer step-by-step with massive spacing. NEVER cram working out into a single line or a single inline math block.
+4. Part labels MUST be bolded on their own line (e.g., **(a)**).
+5. EVERY single distinct marking point, step, or line of working MUST be separated by a double newline (`\n\n`).
+6. Extract the textual description of the step (e.g., 'Finds the area of $R_1$') as standard text. Only use inline math (`$`) for small variables within these sentences.
+7. The main equations, substitutions, and final answers MUST be formatted as display/block math (`$$ equation $$`) so they render centered on their own distinct line.
+
+TEMPLATE TO FOLLOW FOR EACH PART:
+**(a)** Finds the area of $R_1$
+\n\n
+$$ R_1 = \frac{1}{2}r^2(\theta - \sin\theta) $$
+\n\n
+Uses the ratio $R_1 = 2R_2$
+\n\n
+$$ \frac{1}{2}r^2(\theta - \sin\theta) = 2 \cdot \frac{1}{2}r^2((\pi - \theta) - \sin\theta) $$"#;
+
+    let mut requests_to_make = Vec::new();
+
+    if has_pdf_pages {
+        let pages = pdf_base64_pages.as_ref().unwrap();
+        let window_size: usize = 3;
+        let step: usize = 2;
+        let mut start: usize = 0;
+        while start < pages.len() {
+            let end = (start + window_size).min(pages.len());
+            let chunk = &pages[start..end];
+            let primary_start = start + 1;
+            let primary_end = (start + step).min(pages.len());
+            let context_note = if start == 0 {
+                format!("These are pages 1\u{2013}{} of the mark scheme. Extract every answer that begins on any of these pages.", end)
+            } else {
+                format!(
+                    "Page {} is shown for context (already processed in the previous batch). \
+                     Extract ONLY answers that begin on page{} {}{}.",
+                    start,
+                    if primary_end > primary_start { "s" } else { "" },
+                    primary_start,
+                    if primary_end > primary_start { format!("\u{2013}{}", primary_end) } else { String::new() }
+                )
+            };
+            let mut content_array = vec![serde_json::json!({ "type": "text", "text": context_note })];
+            for page_b64 in chunk {
+                content_array.push(serde_json::json!({
+                    "type": "image_url",
+                    "image_url": { "url": format!("data:image/jpeg;base64,{}", page_b64) }
+                }));
+            }
+            let req_body = serde_json::json!({
+                "model": &model_name,
+                "messages": [
+                    { "role": "system", "content": system_prompt },
+                    { "role": "user", "content": content_array }
+                ],
+                "temperature": 0.1,
+                "max_tokens": 16384,
+                "response_format": { "type": "json_object" }
+            });
+            requests_to_make.push((req_body, start));
+            if end >= pages.len() { break; }
+            start += step;
+        }
+    } else if is_image {
+        use base64::Engine;
+        let image_bytes = tokio::fs::read(&file_path).await.map_err(|e| format!("Failed to read image: {}", e))?;
+        let base64_image = base64::engine::general_purpose::STANDARD.encode(&image_bytes);
+        let mime_type = if ext == "png" { "image/png" } else { "image/jpeg" };
+        let req_body = serde_json::json!({
+            "model": &model_name,
+            "messages": [
+                { "role": "system", "content": system_prompt },
+                { 
+                    "role": "user", 
+                    "content": [
+                        { "type": "text", "text": "Extract all answers from this mark scheme image." },
+                        { "type": "image_url", "image_url": { "url": format!("data:{};base64,{}", mime_type, base64_image) } }
+                    ]
+                }
+            ],
+            "temperature": 0.1,
+            "max_tokens": 4096,
+            "response_format": { "type": "json_object" }
+        });
+        requests_to_make.push((req_body, 0));
+    } else {
+        let req_body = serde_json::json!({
+            "model": &model_name,
+            "messages": [
+                { "role": "system", "content": system_prompt },
+                { "role": "user", "content": text }
+            ],
+            "temperature": 0.1,
+            "max_tokens": 4096,
+            "response_format": { "type": "json_object" }
+        });
+        requests_to_make.push((req_body, 0));
+    }
+
+    let client = reqwest::Client::new();
+    let pool = state.db.lock().await;
+
+    #[derive(serde::Deserialize)]
+    #[allow(dead_code)]
+    struct ExtractedAnswer {
+        question_number: Option<String>,
+        answer_content: Option<String>,
+    }
+
+    #[derive(serde::Deserialize)]
+    struct OpenAIAnswerResult {
+        #[serde(default)]
+        answers: Vec<ExtractedAnswer>,
+    }
+
+    let mut all_answers = Vec::new();
+    let mut seen_fingerprints = std::collections::HashSet::new();
+
+    for (req_body, _) in requests_to_make {
+        let mut retry_count = 0;
+        let mut response_json: Option<serde_json::Value> = None;
+
+        while retry_count < 3 {
+            let url = format!("{}/chat/completions", base_url.trim_end_matches('/'));
+            let res = client
+                .post(&url)
+                .header("Authorization", format!("Bearer {}", api_key))
+                .json(&req_body)
+                .send()
+                .await
+                .map_err(|e| format!("OpenAI network error: {}", e))?;
+
+            if res.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
+                retry_count += 1;
+                tokio::time::sleep(tokio::time::Duration::from_secs(20 * retry_count)).await;
+                continue;
+            }
+
+            if !res.status().is_success() {
+                let err_text = res.text().await.unwrap_or_default();
+                return Err(format!("OpenAI API error: {}", err_text));
+            }
+
+            response_json = Some(res.json().await.map_err(|e| e.to_string())?);
+            break;
+        }
+
+        let response_json = response_json.ok_or_else(|| "Failed to get response from OpenAI after retries (Rate Limited).".to_string())?;
+
+        let mut content_str = response_json["choices"][0]["message"]["content"]
+            .as_str()
+            .ok_or("Invalid OpenAI response format")?
+            .trim();
+
+        if let Some(start) = content_str.find('{') {
+            content_str = &content_str[start..];
+        }
+        if content_str.ends_with("```") {
+            content_str = &content_str[..content_str.len() - 3].trim_end();
+        }
+
+        let chars_vec: Vec<char> = content_str.chars().collect();
+        let mut sanitized = String::with_capacity(content_str.len() + 100);
+        let mut i = 0;
+        while i < chars_vec.len() {
+            let c = chars_vec[i];
+            if c == '\\' {
+                if i + 1 < chars_vec.len() {
+                    let next_c = chars_vec[i + 1];
+                    let mut is_latex = false;
+                    
+                    let remaining: String = chars_vec[i+1..].iter().take(6).collect();
+                    if remaining.starts_with("text") ||
+                       remaining.starts_with("frac") ||
+                       remaining.starts_with("theta") ||
+                       remaining.starts_with("tan") ||
+                       remaining.starts_with("times") ||
+                       remaining.starts_with("rho") ||
+                       remaining.starts_with("right") ||
+                       remaining.starts_with("beta") ||
+                       remaining.starts_with("binom") ||
+                       remaining.starts_with("nabla") ||
+                       remaining.starts_with("nu") ||
+                       remaining.starts_with("notin") ||
+                       remaining.starts_with("ne") {
+                           is_latex = true;
+                    }
+
+                    match next_c {
+                        '"' | '\\' | '/' | 'u' => {
+                            if next_c == '\\' {
+                                sanitized.push_str("\\\\");
+                                i += 1;
+                            } else {
+                                sanitized.push('\\');
+                            }
+                        }
+                        'n' | 'r' | 't' | 'b' | 'f' => {
+                            if is_latex {
+                                sanitized.push_str("\\\\");
+                            } else {
+                                sanitized.push('\\');
+                            }
+                        }
+                        _ => {
+                            sanitized.push_str("\\\\");
+                        }
+                    }
+                } else {
+                    sanitized.push('\\');
+                }
+            } else {
+                sanitized.push(c);
+            }
+            i += 1;
+        }
+
+        let parsed: OpenAIAnswerResult = match serde_json::from_str(&sanitized) {
+            Ok(p) => p,
+            Err(e) => {
+                let err_str = e.to_string();
+                if err_str.contains("trailing characters") {
+                    if let Some(end) = sanitized.rfind('}') {
+                        let chopped = &sanitized[..=end];
+                        serde_json::from_str(chopped).map_err(|e2| format!("Failed to parse OpenAI JSON after trailing chop: {}", e2))?
+                    } else {
+                        return Err(format!("Failed to parse OpenAI JSON: {}\nContent starts with: {}...", err_str, sanitized.chars().take(50).collect::<String>()));
+                    }
+                } else {
+                    let mut current = sanitized.clone();
+                    let mut attempts = 0;
+                    let mut recovered: Option<OpenAIAnswerResult> = None;
+                    
+                    while attempts < 2000 && !current.is_empty() {
+                        let closed = auto_close_json(&current);
+                        if let Ok(p) = serde_json::from_str::<OpenAIAnswerResult>(&closed) {
+                            recovered = Some(p);
+                            break;
+                        }
+                        current.pop();
+                        attempts += 1;
+                    }
+                    
+                    if let Some(p) = recovered {
+                        p
+                    } else {
+                        let auto_closed = auto_close_json(&sanitized);
+                        let final_err = serde_json::from_str::<OpenAIAnswerResult>(&auto_closed).err().map(|e| e.to_string()).unwrap_or_else(|| "Unknown".to_string());
+                        return Err(format!("The AI model truncated the response. Attempted robust recovery failed: {}\nContent starts with: {}...", final_err, auto_closed.chars().take(50).collect::<String>()));
+                    }
+                }
+            }
+        };
+
+        // We do not return an error here if answers is empty, as it could just be a blank page or title page.
+
+
+        for ans in parsed.answers {
+            let ans_content = match ans.answer_content {
+                Some(ref c) if !c.trim().is_empty() => c.clone(),
+                _ => continue, // Skip answers without content
+            };
+
+            let fingerprint: String = ans_content
+                .split_whitespace()
+                .take(20)
+                .collect::<Vec<_>>()
+                .join(" ")
+                .to_lowercase();
+            if !seen_fingerprints.insert(fingerprint) {
+                continue;
+            }
+            
+            // For now, if the question_number isn't present, we'll assign a placeholder or skip it.
+            // But currently the code just uses the order of answers.
+            all_answers.push(ExtractedAnswer {
+                question_number: ans.question_number,
+                answer_content: Some(ans_content),
+            });
+        }
+
+        thread::sleep(Duration::from_millis(1500));
+    }
+
+    if all_answers.is_empty() {
+        return Err("The AI model failed to return any answers from the entire document. It may have hit a safety filter, timed out, or encountered an unreadable document.".to_string());
+    }
+
+    let questions: Vec<Question> = sqlx::query_as("SELECT * FROM questions WHERE answer_content IS NULL OR trim(answer_content) = '' ORDER BY rowid ASC")
+        .fetch_all(&*pool)
+        .await
+        .map_err(|e| format!("DB error: {}", e))?;
+
+    let mut proposed_mappings = Vec::new();
+    let mut used_q_indices = std::collections::HashSet::new();
+
+    for (i, ans) in all_answers.into_iter().enumerate() {
+        let ans_content = ans.answer_content.unwrap_or_default();
+        if ans_content.trim().is_empty() {
+            continue;
+        }
+
+        let mut matched_q_idx = None;
+
+        if let Some(ref q_num) = ans.question_number {
+            let q_num_clean = q_num.trim().to_lowercase();
+            for (q_idx, q) in questions.iter().enumerate() {
+                if used_q_indices.contains(&q_idx) {
+                    continue;
+                }
+                
+                let content_clean = q.content.trim().to_lowercase();
+                
+                // Strip common prefix "question " if present
+                let mut content_test = content_clean.as_str();
+                if content_test.starts_with("question ") {
+                    content_test = &content_test["question ".len()..];
+                }
+                content_test = content_test.trim_start();
+                
+                let mut q_num_test = q_num_clean.as_str();
+                if q_num_test.starts_with("question ") {
+                    q_num_test = &q_num_test["question ".len()..];
+                }
+                q_num_test = q_num_test.trim_start();
+
+                if content_test.starts_with(q_num_test) {
+                    matched_q_idx = Some(q_idx);
+                    break;
+                }
+            }
+        }
+
+        if matched_q_idx.is_none() {
+            // Fallback to array index order
+            if i < questions.len() && !used_q_indices.contains(&i) {
+                matched_q_idx = Some(i);
+            } else {
+                for (q_idx, _) in questions.iter().enumerate() {
+                    if !used_q_indices.contains(&q_idx) {
+                        matched_q_idx = Some(q_idx);
+                        break;
+                    }
+                }
+            }
+        }
+
+        if let Some(q_idx) = matched_q_idx {
+            used_q_indices.insert(q_idx);
+            let q = &questions[q_idx];
+            proposed_mappings.push(ProposedMapping {
+                question_id: q.id.clone(),
+                raw_content: q.content.clone(),
+                proposed_answer: ans_content,
+            });
+        }
+    }
+
+    Ok(proposed_mappings)
+}
+
+#[tauri::command]
+pub async fn commit_mark_schemes(
+    mappings: Vec<ProposedMapping>,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    let pool = state.db.lock().await;
+
+    for mapping in mappings {
+        sqlx::query("UPDATE questions SET answer_content = ? WHERE id = ?")
+            .bind(mapping.proposed_answer)
+            .bind(mapping.question_id)
+            .execute(&*pool)
+            .await
+            .map_err(|e| format!("DB update error: {}", e))?;
+    }
+
     Ok(())
 }
