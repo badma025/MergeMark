@@ -15,6 +15,7 @@ import remarkMath from "remark-math";
 import rehypeKatex from "rehype-katex";
 import { cn } from "@/lib/utils";
 import { convertFileSrc } from "@tauri-apps/api/core";
+import { TOPICS_BY_SUBJECT } from "@/lib/taxonomy";
 
 /**
  * Regex that matches display-worthy LaTeX operators.
@@ -136,7 +137,7 @@ export interface QuestionCardProps {
   className?: string;
   onAddToWorksheet?: (id: string) => void;
   onDelete?: (id: string) => void;
-  onUpdate?: (id: string, newContent: string, newMarks: number, newAnswerContent?: string) => void;
+  onUpdate?: (id: string, newContent: string, newMarks: number, newAnswerContent?: string, newTopics?: string[]) => void;
 }
 
 export function QuestionCard({
@@ -155,10 +156,6 @@ export function QuestionCard({
 }: QuestionCardProps) {
   const [isEditing, setIsEditing] = useState(false);
   const [isShowingAnswer, setIsShowingAnswer] = useState(false);
-  const [editContent, setEditContent] = useState(content);
-  const [editMarks, setEditMarks] = useState(marks);
-  const [editAnswerContent, setEditAnswerContent] = useState(answerContent || "");
-
   let parsedTopics: string[] = [];
   try {
     if (topics) {
@@ -169,20 +166,34 @@ export function QuestionCard({
     console.error("Failed to parse topics:", e);
   }
 
-  function handleSave() {
-    onUpdate?.(id, editContent, editMarks, editAnswerContent || undefined);
+  const [editContent, setEditContent] = useState(content);
+  const [editMarks, setEditMarks] = useState(marks);
+  const [editAnswerContent, setEditAnswerContent] = useState(answerContent || "");
+  const [editTopics, setEditTopics] = useState<string[]>(parsedTopics);
+
+  function handleSave(e?: React.MouseEvent) {
+    e?.stopPropagation();
+    onUpdate?.(id, editContent, editMarks, editAnswerContent || undefined, editTopics);
     setIsEditing(false);
   }
 
-  function handleCancel() {
+  function handleCancel(e?: React.MouseEvent) {
+    e?.stopPropagation();
     setEditContent(content);
     setEditMarks(marks);
     setEditAnswerContent(answerContent || "");
+    setEditTopics(parsedTopics);
     setIsEditing(false);
   }
   return (
     <article
-      onClick={() => setIsEditing(true)}
+      onClick={() => {
+        setEditContent(content);
+        setEditMarks(marks);
+        setEditAnswerContent(answerContent || "");
+        setEditTopics(parsedTopics);
+        setIsEditing(true);
+      }}
       className={cn(
         "group relative flex flex-col gap-3 rounded-xl border border-border bg-card p-4 shadow-sm",
         "transition-all duration-200 hover:border-primary/40 hover:shadow-md hover:shadow-primary/5 cursor-pointer",
@@ -196,6 +207,10 @@ export function QuestionCard({
             type="button"
             onClick={(e) => {
               e.stopPropagation();
+              setEditContent(content);
+              setEditMarks(marks);
+              setEditAnswerContent(answerContent || "");
+              setEditTopics(parsedTopics);
               setIsEditing(true);
             }}
             aria-label={`Edit question ${id}`}
@@ -329,44 +344,83 @@ export function QuestionCard({
         </div>
       </div>
       {/* ── Edit Modal ── */}
-      <Dialog open={isEditing} onOpenChange={setIsEditing}>
-        <DialogContent className="max-w-3xl w-full max-h-[90vh] overflow-y-auto">
+      <Dialog open={isEditing} onOpenChange={(open) => {
+        if (!open) handleCancel();
+        else {
+          setEditContent(content);
+          setEditMarks(marks);
+          setEditAnswerContent(answerContent || "");
+          setEditTopics(parsedTopics);
+          setIsEditing(true);
+        }
+      }}>
+        <DialogContent 
+          className="max-w-[95vw] sm:max-w-[95vw] h-[95vh] w-full flex flex-col"
+          onClick={(e) => e.stopPropagation()}
+        >
           <DialogHeader>
             <DialogTitle>Edit Question</DialogTitle>
           </DialogHeader>
-          <div className="flex flex-col gap-4 py-4">
-            <div className="flex items-center gap-4">
-              <label className="text-sm font-semibold text-foreground whitespace-nowrap">Marks:</label>
-              <input
-                type="number"
-                min={1}
-                max={100}
-                value={editMarks}
-                onChange={(e) => setEditMarks(parseInt(e.target.value) || 1)}
-                className="w-24 p-2 text-sm bg-background border border-input rounded-md focus:outline-none focus:ring-2 focus:ring-primary/50"
-              />
+          <div className="flex flex-col gap-4 py-2 flex-1 min-h-0">
+            <div className="flex items-center gap-4 flex-wrap">
+              <div className="flex items-center gap-4">
+                <label className="text-sm font-semibold text-foreground whitespace-nowrap">Marks:</label>
+                <input
+                  type="number"
+                  min={1}
+                  max={100}
+                  value={editMarks}
+                  onChange={(e) => setEditMarks(parseInt(e.target.value) || 1)}
+                  className="w-24 p-2 text-sm bg-background border border-input rounded-md focus:outline-none focus:ring-2 focus:ring-primary/50"
+                />
+              </div>
+              <div className="flex flex-wrap items-center gap-1.5 flex-1 ml-4 border-l pl-4 border-border">
+                {(TOPICS_BY_SUBJECT[subject] || []).map((topic) => {
+                  const isSelected = editTopics.includes(topic);
+                  return (
+                    <Badge
+                      key={topic}
+                      variant={isSelected ? "default" : "outline"}
+                      className={cn(
+                        "cursor-pointer transition-colors text-xs font-medium py-0.5",
+                        isSelected ? "bg-blue-600 hover:bg-blue-700 text-white border-blue-600" : "hover:bg-accent border-border"
+                      )}
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        setEditTopics(prev =>
+                          prev.includes(topic)
+                            ? prev.filter(t => t !== topic)
+                            : [...prev, topic]
+                        );
+                      }}
+                    >
+                      {topic}
+                    </Badge>
+                  );
+                })}
+              </div>
             </div>
-            <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-              <div className="flex flex-col gap-2">
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-4 flex-1 min-h-0">
+              <div className="flex flex-col gap-2 flex-1 min-h-0">
                 <label className="text-sm font-semibold text-foreground">Question Content (Markdown):</label>
                 <textarea 
                   value={editContent}
                   onChange={(e) => setEditContent(e.target.value)}
-                  className="w-full h-[400px] p-3 text-sm bg-background border border-input rounded-md font-mono resize-none focus:outline-none focus:ring-2 focus:ring-primary/50"
+                  className="w-full h-full p-3 text-sm bg-background border border-input rounded-md font-mono resize-none focus:outline-none focus:ring-2 focus:ring-primary/50"
                 />
               </div>
-              <div className="flex flex-col gap-2">
+              <div className="flex flex-col gap-2 flex-1 min-h-0">
                 <label className="text-sm font-semibold text-foreground">Answer Content (Mark Scheme):</label>
                 <textarea 
                   value={editAnswerContent}
                   onChange={(e) => setEditAnswerContent(e.target.value)}
                   placeholder="Paste or edit the mark scheme answer here..."
-                  className="w-full h-[400px] p-3 text-sm bg-background border border-input rounded-md font-mono resize-none focus:outline-none focus:ring-2 focus:ring-primary/50"
+                  className="w-full h-full p-3 text-sm bg-background border border-input rounded-md font-mono resize-none focus:outline-none focus:ring-2 focus:ring-primary/50"
                 />
               </div>
             </div>
           </div>
-          <DialogFooter>
+          <DialogFooter className="mt-auto">
             <Button variant="outline" onClick={handleCancel}>Cancel</Button>
             <Button onClick={handleSave}>Save Changes</Button>
           </DialogFooter>

@@ -14,12 +14,23 @@ export interface ProposedMapping {
   questionId: string;
   rawContent: string;
   proposedAnswer: string;
+  paperName: string;
 }
 
 interface ReviewSyncModalProps {
   mappings: ProposedMapping[] | null;
   onClose: () => void;
   onSuccess: () => void;
+}
+
+/**
+ * Extract the leading integer question number from the raw question content.
+ * Handles formats like: "1. Find...", "Question 1\n...", "1) Find...", "Q1 ..."
+ * Falls back to `fallback` (the array index) if no number is found.
+ */
+function extractQuestionNumber(rawContent: string, fallback: number): number {
+  const match = rawContent.trim().match(/^(?:Question\s+|Q\.?\s*)?(\d+)/i);
+  return match ? parseInt(match[1], 10) : fallback;
 }
 
 export function ReviewSyncModal({ mappings, onClose, onSuccess }: ReviewSyncModalProps) {
@@ -32,23 +43,32 @@ export function ReviewSyncModal({ mappings, onClose, onSuccess }: ReviewSyncModa
     }
   }, [mappings]);
 
-  function handleSwap(currentIndex: number, targetIndex: number) {
-    if (currentIndex === targetIndex) return;
+  /**
+   * Swap the proposedAnswer of the mapping at `currentIndex` with the mapping
+   * whose extracted question number equals `targetQNum` AND whose paperName
+   * matches the current mapping's paperName (prevents cross-paper swaps).
+   */
+  function handleSwap(currentIndex: number, targetQNum: number) {
+    const currentPaperName = localMappings[currentIndex].paperName;
+    const targetIndex = localMappings.findIndex(
+      (m, idx) =>
+        extractQuestionNumber(m.rawContent, idx + 1) === targetQNum &&
+        m.paperName === currentPaperName
+    );
+    if (targetIndex === -1 || currentIndex === targetIndex) return;
+
     setLocalMappings((prev) => {
       const next = [...prev];
-      
-      // Create fresh objects to ensure React detects the update!
       const currentItem = { ...next[currentIndex] };
       const targetItem = { ...next[targetIndex] };
-      
-      // Swap ONLY the proposedAnswer fields
+
+      // Swap ONLY the proposedAnswer fields; questionId stays anchored to rawContent.
       const tempAnswer = currentItem.proposedAnswer;
       currentItem.proposedAnswer = targetItem.proposedAnswer;
       targetItem.proposedAnswer = tempAnswer;
-      
+
       next[currentIndex] = currentItem;
       next[targetIndex] = targetItem;
-      
       return next;
     });
   }
@@ -74,7 +94,9 @@ export function ReviewSyncModal({ mappings, onClose, onSuccess }: ReviewSyncModa
         <DialogHeader>
           <DialogTitle>Review Mappings</DialogTitle>
           <DialogDescription>
-            Review the extracted answers below. If any answers are misaligned with their questions, you can swap them using the dropdown.
+            Review the extracted answers below. Each row is matched by the question number parsed
+            directly from the mark scheme — not by position. If any answers are misaligned, use the
+            dropdown to re-assign them.
           </DialogDescription>
         </DialogHeader>
 
@@ -85,46 +107,60 @@ export function ReviewSyncModal({ mappings, onClose, onSuccess }: ReviewSyncModa
             </div>
           ) : (
             <div className="flex flex-col gap-4">
-              {localMappings.map((m, currentIndex) => (
-                <div key={m.questionId} className="flex gap-4 border-b pb-4 last:border-0 last:pb-0">
-                  <div className="flex-1 prose prose-sm dark:prose-invert border rounded bg-background/50 p-3 opacity-90 overflow-x-auto whitespace-normal break-words">
-                    <div className="text-xs font-semibold text-muted-foreground mb-2 uppercase tracking-wider">
-                      Question {currentIndex + 1}
-                    </div>
-                    <ReactMarkdown remarkPlugins={[remarkMath]} rehypePlugins={[rehypeKatex]}>
-                      {preprocessMath(m.rawContent)}
-                    </ReactMarkdown>
-                  </div>
+              {localMappings.map((m, currentIndex) => {
+                // Derive the display number from the content itself, not the array index.
+                const qNum = extractQuestionNumber(m.rawContent, currentIndex + 1);
 
-                  <div className="flex-1 flex flex-col prose prose-sm dark:prose-invert border rounded bg-background p-3 relative overflow-x-auto whitespace-normal break-words">
-                    <div className="flex items-center justify-between gap-2 mb-2">
-                      <div className="text-xs font-semibold text-muted-foreground uppercase tracking-wider">
-                        Proposed Answer
+                return (
+                  <div key={m.questionId} className="flex gap-4 border-b pb-4 last:border-0 last:pb-0">
+                    {/* ── Question column ─────────────────────────────────── */}
+                    <div className="flex-1 prose prose-sm dark:prose-invert border rounded bg-background/50 p-3 opacity-90 overflow-x-auto whitespace-normal break-words">
+                      <div className="text-xs font-semibold text-muted-foreground mb-2 uppercase tracking-wider">
+                        Question {qNum}
                       </div>
-                      <div className="flex items-center gap-2">
-                        <label htmlFor={`swap-${currentIndex}`} className="text-xs font-medium text-muted-foreground">
-                          Match to:
-                        </label>
-                        <select
-                          id={`swap-${currentIndex}`}
-                          value={currentIndex}
-                          onChange={(e) => handleSwap(currentIndex, parseInt(e.target.value))}
-                          className="text-xs bg-background border border-border rounded px-2 py-1 focus:ring-1 focus:ring-primary focus:outline-none"
-                        >
-                          {localMappings.map((_, i) => (
-                            <option key={i} value={i}>
-                              Question {i + 1}
-                            </option>
-                          ))}
-                        </select>
-                      </div>
+                      <ReactMarkdown remarkPlugins={[remarkMath]} rehypePlugins={[rehypeKatex]}>
+                        {preprocessMath(m.rawContent)}
+                      </ReactMarkdown>
                     </div>
-                    <ReactMarkdown remarkPlugins={[remarkMath]} rehypePlugins={[rehypeKatex]}>
-                      {preprocessMath(m.proposedAnswer)}
-                    </ReactMarkdown>
+
+                    {/* ── Proposed answer column ───────────────────────────── */}
+                    <div className="flex-1 flex flex-col prose prose-sm dark:prose-invert border rounded bg-background p-3 relative overflow-x-auto whitespace-normal break-words">
+                      <div className="flex items-center justify-between gap-2 mb-2">
+                        <div className="text-xs font-semibold text-muted-foreground uppercase tracking-wider">
+                          Proposed Answer
+                        </div>
+                        <div className="flex items-center gap-2">
+                          <label
+                            htmlFor={`swap-${m.questionId}`}
+                            className="text-xs font-medium text-muted-foreground"
+                          >
+                            Match to:
+                          </label>
+                          <select
+                            id={`swap-${m.questionId}`}
+                            // The selected value is the current question's own number.
+                            value={qNum}
+                            onChange={(e) => handleSwap(currentIndex, parseInt(e.target.value, 10))}
+                            className="text-xs bg-background border border-border rounded px-2 py-1 focus:ring-1 focus:ring-primary focus:outline-none"
+                          >
+                            {localMappings.map((opt, optIdx) => {
+                              const optQNum = extractQuestionNumber(opt.rawContent, optIdx + 1);
+                              return (
+                                <option key={opt.questionId} value={optQNum}>
+                                  Question {optQNum}
+                                </option>
+                              );
+                            })}
+                          </select>
+                        </div>
+                      </div>
+                      <ReactMarkdown remarkPlugins={[remarkMath]} rehypePlugins={[rehypeKatex]}>
+                        {preprocessMath(m.proposedAnswer)}
+                      </ReactMarkdown>
+                    </div>
                   </div>
-                </div>
-              ))}
+                );
+              })}
             </div>
           )}
         </div>

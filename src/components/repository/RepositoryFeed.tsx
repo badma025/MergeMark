@@ -7,15 +7,7 @@ import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { cn } from "@/lib/utils";
 import { QuestionCard, type QuestionCardProps } from "./QuestionCard";
-
-const EDEXCEL_MATHS_TOPICS = [
-  "Proof", "Algebra and functions", "Coordinate geometry in the (x, y) plane", 
-  "Sequences and series", "Trigonometry", "Exponentials and logarithms", 
-  "Differentiation", "Integration", "Numerical methods", "Vectors", 
-  "Statistical sampling", "Data presentation and interpretation", "Probability", 
-  "Statistical distributions", "Statistical hypothesis testing", 
-  "Quantities and units in mechanics", "Kinematics", "Forces and Newton's laws", "Moments"
-];
+import { SUBJECTS, TOPICS_BY_SUBJECT, ALL_TOPICS } from "@/lib/taxonomy";
 
 // ── Component ─────────────────────────────────────────────────────────────────
 
@@ -25,6 +17,7 @@ export interface RepositoryFeedProps {
 
 export function RepositoryFeed({ onAddToWorksheet }: RepositoryFeedProps) {
   const [search, setSearch] = useState("");
+  const [selectedSubject, setSelectedSubject] = useState<string>("All");
   const [selectedTopics, setSelectedTopics] = useState<string[]>([]);
   const [questions, setQuestions] = useState<Omit<QuestionCardProps, "onAddToWorksheet" | "onDelete">[]>([]);
   const [loading, setLoading] = useState(true);
@@ -59,11 +52,12 @@ export function RepositoryFeed({ onAddToWorksheet }: RepositoryFeedProps) {
     }
   }
 
-  async function handleUpdate(id: string, newContent: string, newMarks: number, newAnswerContent?: string) {
+  async function handleUpdate(id: string, newContent: string, newMarks: number, newAnswerContent?: string, newTopics?: string[]) {
     try {
-      await invoke("update_question", { id, newContent, newMarks, newAnswerContent });
+      const newTopicsStr = newTopics ? JSON.stringify(newTopics) : undefined;
+      await invoke("update_question", { id, newContent, newMarks, newAnswerContent, newTopics: newTopicsStr });
       setQuestions((prev) => 
-        prev.map(q => q.id === id ? { ...q, content: newContent, marks: newMarks, answerContent: newAnswerContent } : q)
+        prev.map(q => q.id === id ? { ...q, content: newContent, marks: newMarks, answerContent: newAnswerContent, topics: newTopicsStr ?? q.topics } : q)
       );
       toast.success("Question updated successfully");
     } catch (err) {
@@ -90,6 +84,8 @@ export function RepositoryFeed({ onAddToWorksheet }: RepositoryFeedProps) {
       q.content.toLowerCase().includes(term) ||
       q.mathSnippet.toLowerCase().includes(term);
 
+    const matchesSubject = selectedSubject === "All" || q.subject === selectedSubject;
+
     let matchesTopicFilter = true;
     if (selectedTopics.length > 0) {
       let qTopics: string[] = [];
@@ -104,7 +100,7 @@ export function RepositoryFeed({ onAddToWorksheet }: RepositoryFeedProps) {
       matchesTopicFilter = qTopics.some((t) => selectedTopics.includes(t));
     }
 
-    return matchesSearch && matchesTopicFilter;
+    return matchesSearch && matchesTopicFilter && matchesSubject;
   });
 
   function handleAdd(id: string) {
@@ -150,8 +146,35 @@ export function RepositoryFeed({ onAddToWorksheet }: RepositoryFeedProps) {
             </Button>
           </div>
         </div>
+        
+        {/* Subject Filter */}
+        <div className="mt-3 flex flex-wrap gap-1.5 border-b border-border/50 pb-3">
+          {["All", ...SUBJECTS].map((subject) => {
+            const isSelected = selectedSubject === subject;
+            return (
+              <Badge
+                key={subject}
+                variant={isSelected ? "default" : "secondary"}
+                className={cn(
+                  "cursor-pointer transition-colors text-xs font-semibold py-1 px-3 rounded-md",
+                  isSelected ? "bg-primary text-primary-foreground hover:bg-primary/90" : "hover:bg-accent hover:text-accent-foreground border border-border/50"
+                )}
+                onClick={() => {
+                  if (selectedSubject !== subject) {
+                    setSelectedSubject(subject);
+                    setSelectedTopics([]);
+                  }
+                }}
+              >
+                {subject}
+              </Badge>
+            );
+          })}
+        </div>
+
+        {/* Topics Filter */}
         <div className="mt-3 flex flex-wrap gap-1.5 max-h-[4.5rem] overflow-y-auto">
-          {EDEXCEL_MATHS_TOPICS.map((topic) => {
+          {(selectedSubject === "All" ? ALL_TOPICS : TOPICS_BY_SUBJECT[selectedSubject] || []).map((topic) => {
             const isSelected = selectedTopics.includes(topic);
             return (
               <Badge

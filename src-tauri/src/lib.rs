@@ -56,7 +56,8 @@ pub fn run() {
             commands::parse_mark_scheme_vision,
             commands::fetch_models,
             commands::update_question,
-            commands::commit_mark_schemes
+            commands::commit_mark_schemes,
+            commands::get_paper_names
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

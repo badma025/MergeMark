@@ -32,18 +32,26 @@ pub async fn init_db(app_data_dir: PathBuf) -> Result<SqlitePool, sqlx::Error> {
             math_snippet TEXT NOT NULL,
             is_code BOOLEAN NOT NULL,
             answer_content TEXT,
-            topics TEXT
+            topics TEXT,
+            paper_name TEXT DEFAULT '',
+            question_number INTEGER
         );
         "#
     )
     .execute(&pool)
     .await?;
 
-    // Migrate existing table by adding the new column. Ignore error if it already exists.
+    // Migrate existing table by adding new columns. Ignore error if the column already exists.
     let _ = sqlx::query("ALTER TABLE questions ADD COLUMN answer_content TEXT")
         .execute(&pool)
         .await;
     let _ = sqlx::query("ALTER TABLE questions ADD COLUMN topics TEXT")
+        .execute(&pool)
+        .await;
+    let _ = sqlx::query("ALTER TABLE questions ADD COLUMN paper_name TEXT DEFAULT ''")
+        .execute(&pool)
+        .await;
+    let _ = sqlx::query("ALTER TABLE questions ADD COLUMN question_number INTEGER")
         .execute(&pool)
         .await;
 

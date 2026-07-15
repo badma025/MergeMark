@@ -19,6 +19,10 @@ pub struct Question {
     pub is_code: bool,
     pub answer_content: Option<String>,
     pub topics: Option<String>,
+    #[sqlx(default)]
+    pub paper_name: String,
+    #[sqlx(default)]
+    pub question_number: Option<i64>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -27,6 +31,7 @@ pub struct ProposedMapping {
     pub question_id: String,
     pub raw_content: String,
     pub proposed_answer: String,
+    pub paper_name: String,
 }
 
 fn auto_close_json(s: &str) -> String {
@@ -615,6 +620,7 @@ pub async fn parse_pdf_vision(
     base_url: String,
     model_name: String,
     subject: String,
+    paper_name: String,
     state: State<'_, AppState>,
 ) -> Result<Vec<Question>, String> {
     // Clean up inputs to prevent copy-paste errors
@@ -651,17 +657,33 @@ pub async fn parse_pdf_vision(
         return Err("File is empty or contains only unextractable images.".to_string());
     }
 
-    // 2. Build the OpenAI prompt for structured extraction
     const EDEXCEL_MATHS_TOPICS: &[&str] = &["Proof", "Algebra and functions", "Coordinate geometry in the (x, y) plane", "Sequences and series", "Trigonometry", "Exponentials and logarithms", "Differentiation", "Integration", "Numerical methods", "Vectors", "Statistical sampling", "Data presentation and interpretation", "Probability", "Statistical distributions", "Statistical hypothesis testing", "Quantities and units in mechanics", "Kinematics", "Forces and Newton's laws", "Moments"];
+    const FURTHER_MATHS_TOPICS: &[&str] = &["Complex numbers", "Argand diagrams", "Series", "Roots of polynomials", "Volumes of revolution", "Matrices", "Linear transformations", "Proof by induction", "Vectors", "Differential equations", "Polar coordinates", "Hyperbolic functions", "Maclaurin series", "Methods in calculus", "Momentum and impulse", "Work, energy and power", "Elastic strings and springs", "Elastic collisions in one dimension", "Elastic collisions in two dimensions", "Discrete probability distributions", "Poisson distribution", "Geometric and negative binomial", "Hypothesis testing", "Central Limit Theorem", "Chi-squared tests", "Probability generating functions", "Quality of tests", "Vectors (Cross product & planes)", "Conic sections", "Inequalities", "t-formulae", "Taylor series", "Numerical methods (Further)", "Reducible differential equations", "Algorithms", "Graphs and networks", "Algorithms on graphs", "Route inspection", "Travelling Salesperson Problem", "Linear programming", "Simplex algorithm"];
+    const PHYSICS_TOPICS: &[&str] = &["Measurements and their errors", "Particles and radiation", "Waves", "Mechanics and materials", "Electricity", "Further mechanics", "Thermal physics", "Fields and their consequences", "Nuclear physics", "Telescopes", "Classification of stars", "Cosmology"];
+    const CS_TOPICS: &[&str] = &["Fundamentals of programming", "Fundamentals of data structures", "Fundamentals of algorithms", "Theory of computation", "Fundamentals of data representation", "Fundamentals of computer systems", "Computer organisation and architecture", "Consequences of uses of computing", "Communication and networking", "Fundamentals of databases", "Big Data", "Fundamentals of functional programming"];
+
+    let allowed_topics: &[&str] = match subject.as_str() {
+        "Mathematics" => EDEXCEL_MATHS_TOPICS,
+        "Further Mathematics" => FURTHER_MATHS_TOPICS,
+        "Physics" => PHYSICS_TOPICS,
+        "Computer Science" => CS_TOPICS,
+        _ => &[],
+    };
     
-    let system_prompt_string = format!("You are an expert exam parser. Your job is to extract EVERY question from the provided exam paper pages and return them as structured JSON. You have a generous output token budget — use it fully.
+    let system_prompt_string = format!("STEP 1: Look at the page headers. If you see 'General Instructions for Marking', 'General Marking Guidance', 'General Principles for Mechanics Marking', or 'Abbreviations', you MUST immediately return an empty array `[]`. DO NOT invent math. DO NOT extract numbered lists from these pages.
+ESCAPE HATCH: Exams contain front covers, formula booklets, and 'General Marking Guidance' pages. If the provided images DO NOT contain any actual exam questions or mark scheme answers, you MUST return a completely empty JSON array: `[]`.
+CRITICAL: Do NOT hallucinate, invent, or generate example math questions to fill the array. If the page is just instructions, return `[]`.
+TRANSCRIBE ONLY VISIBLE INK: You must ONLY extract text, letters, and questions that are physically printed on the current page. NEVER invent, predict, or generate sub-questions (e.g., generating parts (d) through (z)) from your own knowledge. If the text ends at part (c), you stop at part (c).
 
-Return a JSON object with a single key 'questions' containing an array of objects. Schema for each object:
-{{ \"subtopic\": string (e.g. \"Integration\"), \"topics\": [string] (1 to 3 exact matches from the list below), \"marks\": integer (sum all parts; default 1 if unknown), \"content\": string (full question text with all sub-parts), \"math_snippet\": string (extract any key LaTeX/math expression, else empty string), \"is_code\": boolean }}
+You are an expert exam parser. Your job is to extract EVERY question from the provided exam paper pages and return them as structured JSON. You have a generous output token budget — use it fully.
 
-You are extracting questions from a {} exam paper. Your ONLY classification task is to return a `topics` array containing 1 to 3 exact matches from this list: {:?}.
-Do not invent any new tags. If a topic spans multiple areas, pick the most relevant ones.
+Return a JSON object with a single key 'questions' containing an array of objects. Do NOT rely on array indices. Each object MUST contain a `question_number` (Integer) read directly from the page, and `content` (String).
+Schema for each object:
+{{ \"question_number\": integer (the main question number, e.g. 1, 2), \"subtopic\": string (e.g. \"Integration\"), \"topics\": [string] (1 to 3 exact matches from the list below), \"marks\": integer (sum all parts; default 1 if unknown), \"content\": string (full question text with all sub-parts), \"math_snippet\": string (extract any key LaTeX/math expression, else empty string), \"is_code\": boolean }}
 
+You are extracting from a {} exam. You MUST return a `topics` array containing 1 to 3 exact matches from this list: {:?}. Do not invent any new tags.
+
+QAB RULE: Preserve sub-question letters exactly as printed (e.g., (g), (h)). Do not reset them to (a) on a new page.
 CRITICAL — ACCURACY & GREEK LETTERS: Pay extreme attention to Greek letters (especially theta). Ensure they are properly translated to LaTeX (e.g., `$\\theta$`) and never dropped or mistakenly transcribed as a zero or the letter 'O'.
 CRITICAL — NO SUMMARIES: DO NOT summarize, repeat, or list equations at the bottom of the text. You must only extract the text exactly as it flows in the document.
 
@@ -671,15 +693,11 @@ You MUST extract EVERY SINGLE QUESTION visible in the provided pages.
 Do not stop generating the array until you have perfectly transcribed every question present in the images.
 If a question spans across multiple pages, ensure you capture the entirety of it into a single object.
 
-CRITICAL — MULTI-PART QUESTIONS: Group all parts of one question (e.g. 3a, 3b, 3c) into a single JSON object. Sum their marks. Insert \\n\\n before each sub-part label like (a), (b), (i).
+CRITICAL — MULTI-PART QUESTIONS: Group all parts of one question (e.g. 3a, 3b, 3c) into a single JSON object. Ensure they all share the exact same `question_number`. Sum their marks. Insert \\n\\n before each sub-part label like (a), (b), (i).
 
 CRITICAL — MATH FORMATTING RULES (follow exactly):
 1. Use $$ ... $$ (with a blank line before and after) for any equation that appears large, on its own line, or contains \\int, \\sum, \\prod, \\frac (as main expression), \\lim, or similar.
-   BAD:  \"Show that $\\int_0^1 x^2\\,dx = \\frac{{1}}{{3}}$\"
-   GOOD: \"Show that\\n\\n$$\\int_0^1 x^2\\,dx = \\frac{{1}}{{3}}$$\\n\\n\"
 2. Use $ ... $ ONLY for small inline variables like $x$, $n$, $A$, $f(x)$.
-   BAD:  \"The function $f(x) = 3x^2 - 2$ where $x \\in \\mathbb{{R}}$\" (if f(x)=... is a definition)
-   GOOD: \"The function\\n\\n$$f(x) = 3x^2 - 2, \\quad x \\in \\mathbb{{R}}$$\\n\\n\"
 3. NEVER put $ on its own line. NEVER use triple backticks for math.
 4. NEVER append equation summaries at the end of questions.
 
@@ -687,7 +705,13 @@ CRITICAL — DIAGRAMS: If a question references a diagram/graph/figure, return d
 CRITICAL: When calculating the `[x, y, width, height]` bounding box for a diagram, you MUST capture the absolute full extent of the figure.
 You MUST explicitly include the 'Figure X' label (usually at the bottom) within the bounding box.
 You MUST explicitly include any 'Diagram NOT accurately drawn' or 'Not to scale' warnings (usually floating in the top right corner) within the bounding box.
-Ensure the bounding box stretches far enough to the edges to include all axis labels (e.g., x, y, O), curve extremes, and full geometric shapes without slicing them in half.", subject, EDEXCEL_MATHS_TOPICS);
+Ensure the bounding box stretches far enough to the edges to include all axis labels (e.g., x, y, O), curve extremes, and full geometric shapes without slicing them in half.
+
+DECISION MATHS QAB PROTOCOL:
+
+THE REPRINT BAN: If a page reprints a previous question's text or initial tableau for convenience, IGNORE the reprinted text and only extract the new sub-questions.
+DATA TABLES VS WORKING GRIDS: You MUST extract populated tables (e.g., Precedence tables containing activities, Distance matrices containing weights, or partially filled Simplex tableaus) using LaTeX `array` blocks. ONLY ignore tables if they are completely blank grids intended for the student to write their answers in (e.g., empty Dijkstra tracing tables or blank Route Inspection tables).
+GRAPHICAL DIAGRAMS: Activity networks, Gantt charts, and trees MUST be captured via image bounding box coordinates. Do NOT try to build them with LaTeX.", subject, allowed_topics);
     
     let system_prompt = system_prompt_string.as_str();
 
@@ -786,6 +810,7 @@ Ensure the bounding box stretches far enough to the edges to include all axis la
 
     #[derive(serde::Deserialize)]
     struct ExtractedQuestion {
+        question_number: Option<i64>,
         subject: Option<String>,
         subtopic: Option<String>,
         topics: Option<Vec<String>>,
@@ -858,8 +883,8 @@ Ensure the bounding box stretches far enough to the edges to include all axis la
 
         // Non-OpenAI models (Claude, Gemini) often ignore the JSON mode instruction
         // and include conversational text (e.g. "Here is the JSON: ```json ... ```").
-        // We find the first '{' and last '}' to extract only the JSON object.
-        if let Some(start) = content_str.find('{') {
+        // We find the first '{' or '[' to extract only the JSON object/array.
+        if let Some(start) = content_str.find(|c| c == '{' || c == '[') {
             content_str = &content_str[start..];
         }
         if content_str.ends_with("```") {
@@ -931,39 +956,91 @@ Ensure the bounding box stretches far enough to the edges to include all axis la
         let parsed: OpenAIResult = match serde_json::from_str(&sanitized) {
             Ok(p) => p,
             Err(e) => {
-                let err_str = e.to_string();
-                if err_str.contains("trailing characters") {
-                    if let Some(end) = sanitized.rfind('}') {
-                        let chopped = &sanitized[..=end];
-                        serde_json::from_str(chopped).map_err(|e2| format!("Failed to parse OpenAI JSON after trailing chop: {}", e2))?
+                // ── Case 1: model used the escape hatch and returned `[]` ──
+                if let Ok(serde_json::Value::Array(ref arr)) = serde_json::from_str(&sanitized) {
+                    if arr.is_empty() {
+                        continue;
+                    }
+                }
+
+                // ── Case 2: model returned a bare array `[{...}]` instead of
+                //            the expected `{"questions": [{...}]}` wrapper.
+                //            Parse directly as Vec<ExtractedQuestion> and wrap it.
+                if sanitized.trim_start().starts_with('[') {
+                    if let Ok(questions) = serde_json::from_str::<Vec<ExtractedQuestion>>(&sanitized) {
+                        OpenAIResult { questions }
                     } else {
-                        return Err(format!("Failed to parse OpenAI JSON: {}\nContent starts with: {}...", err_str, sanitized.chars().take(50).collect::<String>()));
+                        // Try auto-close on the truncated bare array.
+                        let mut current = sanitized.clone();
+                        let mut attempts = 0;
+                        let mut recovered: Option<OpenAIResult> = None;
+                        while attempts < 2000 && !current.is_empty() {
+                            let closed = auto_close_json(&current);
+                            if let Ok(questions) = serde_json::from_str::<Vec<ExtractedQuestion>>(&closed) {
+                                recovered = Some(OpenAIResult { questions });
+                                break;
+                            }
+                            current.pop();
+                            attempts += 1;
+                        }
+                        if let Some(p) = recovered {
+                            p
+                        } else {
+                            let auto_closed = auto_close_json(&sanitized);
+                            let final_err = serde_json::from_str::<OpenAIResult>(&auto_closed)
+                                .err()
+                                .map(|e| e.to_string())
+                                .unwrap_or_else(|| "Unknown".to_string());
+                            return Err(format!(
+                                "The AI model truncated the response. Attempted robust recovery failed: {}\nContent starts with: {}...",
+                                final_err,
+                                auto_closed.chars().take(50).collect::<String>()
+                            ));
+                        }
                     }
                 } else {
-                    let mut current = sanitized.clone();
-                    let mut attempts = 0;
-                    let mut recovered: Option<OpenAIResult> = None;
-                    
-                    while attempts < 2000 && !current.is_empty() {
-                        let closed = auto_close_json(&current);
-                        if let Ok(p) = serde_json::from_str::<OpenAIResult>(&closed) {
-                            recovered = Some(p);
-                            break;
+                    // ── Case 3: standard {"questions":[...]} object, but truncated/malformed ──
+                    let err_str = e.to_string();
+                    if err_str.contains("trailing characters") {
+                        if let Some(end) = sanitized.rfind('}') {
+                            let chopped = &sanitized[..=end];
+                            serde_json::from_str(chopped).map_err(|e2| format!("Failed to parse OpenAI JSON after trailing chop: {}", e2))?
+                        } else {
+                            return Err(format!("Failed to parse OpenAI JSON: {}\nContent starts with: {}...", err_str, sanitized.chars().take(50).collect::<String>()));
                         }
-                        current.pop();
-                        attempts += 1;
-                    }
-                    
-                    if let Some(p) = recovered {
-                        p
                     } else {
-                        let auto_closed = auto_close_json(&sanitized);
-                        let final_err = serde_json::from_str::<OpenAIResult>(&auto_closed).err().map(|e| e.to_string()).unwrap_or_else(|| "Unknown".to_string());
-                        return Err(format!("The AI model truncated the response. Attempted robust recovery failed: {}\nContent starts with: {}...", final_err, auto_closed.chars().take(50).collect::<String>()));
+                        let mut current = sanitized.clone();
+                        let mut attempts = 0;
+                        let mut recovered: Option<OpenAIResult> = None;
+
+                        while attempts < 2000 && !current.is_empty() {
+                            let closed = auto_close_json(&current);
+                            if let Ok(p) = serde_json::from_str::<OpenAIResult>(&closed) {
+                                recovered = Some(p);
+                                break;
+                            }
+                            current.pop();
+                            attempts += 1;
+                        }
+
+                        if let Some(p) = recovered {
+                            p
+                        } else {
+                            let auto_closed = auto_close_json(&sanitized);
+                            let final_err = serde_json::from_str::<OpenAIResult>(&auto_closed).err().map(|e| e.to_string()).unwrap_or_else(|| "Unknown".to_string());
+                            return Err(format!("The AI model truncated the response. Attempted robust recovery failed: {}\nContent starts with: {}...", final_err, auto_closed.chars().take(50).collect::<String>()));
+                        }
                     }
                 }
             }
         };
+
+        // If the model returned an empty questions array (e.g. a blank/cover page
+        // that did not trigger the literal `[]` escape hatch path above), skip
+        // this batch and continue to the next one — do NOT break or return early.
+        if parsed.questions.is_empty() {
+            continue;
+        }
 
         for mut q in parsed.questions {
             let mut q_content = match q.content.clone() {
@@ -1008,28 +1085,24 @@ Ensure the bounding box stretches far enough to the edges to include all axis la
                     if let Ok(mut img) = img_result {
                         let (width, height) = img.dimensions();
                         
-                        const PADDING_PERCENT: f32 = 0.05;
                         let x_rel = bbox[0];
                         let y_rel = bbox[1];
                         let w_rel = bbox[2];
                         let h_rel = bbox[3];
 
-                        let padded_x = (x_rel - PADDING_PERCENT).max(0.0);
-                        let padded_y = (y_rel - PADDING_PERCENT).max(0.0);
-                        let padded_w = (w_rel + (PADDING_PERCENT * 2.0)).min(1.0 - padded_x);
-                        let padded_h = (h_rel + (PADDING_PERCENT * 2.0)).min(1.0 - padded_y);
+                        let x = (x_rel * width as f32) as u32;
+                        let y = (y_rel * height as f32) as u32;
+                        let w = (w_rel * width as f32) as u32;
+                        let h = (h_rel * height as f32) as u32;
 
-                        let x = (padded_x * width as f32).round() as u32;
-                        let y = (padded_y * height as f32).round() as u32;
-                        let w = (padded_w * width as f32).max(1.0).round() as u32;
-                        let h = (padded_h * height as f32).max(1.0).round() as u32;
+                        let padding: u32 = 40;
+                        let safe_x = x.saturating_sub(padding);
+                        let safe_y = y.saturating_sub(padding);
+                        let safe_width = (w + (x - safe_x) + padding).min(width - safe_x);
+                        let safe_height = (h + (y - safe_y) + padding).min(height - safe_y);
 
-                        // Ensure we don't crop outside image bounds
-                        let crop_w = w.min(width.saturating_sub(x));
-                        let crop_h = h.min(height.saturating_sub(y));
-
-                        if crop_w > 0 && crop_h > 0 {
-                            let cropped = image::imageops::crop(&mut img, x, y, crop_w, crop_h).to_image();
+                        if safe_width > 0 && safe_height > 0 {
+                            let cropped = image::imageops::crop(&mut img, safe_x, safe_y, safe_width, safe_height).to_image();
                             
                             if let Ok(app_data_dir) = app.path().app_data_dir() {
                                 let diagrams_dir = app_data_dir.join("diagrams");
@@ -1061,34 +1134,76 @@ Ensure the bounding box stretches far enough to the edges to include all axis la
             let marks_val = q.marks.unwrap_or(1);
             let snippet_val = q.math_snippet.unwrap_or_default();
 
-            sqlx::query(
-                r#"
-                INSERT INTO questions (id, subject, subtopic, topics, marks, content, math_snippet, is_code)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                "#,
-            )
-            .bind(id.clone())
-            .bind(final_subject.clone())
-            .bind(final_subtopic.clone())
-            .bind(final_topics.clone())
-            .bind(marks_val)
-            .bind(q_content.clone())
-            .bind(snippet_val.clone())
-            .bind(final_is_code)
-            .execute(&*pool)
-            .await
-            .map_err(|e| format!("DB error: {}", e))?;
+            let paper_name_val = paper_name.trim().to_string();
+            let q_num_val = q.question_number;
+            let mut final_id = id.clone();
+            let mut final_content = q_content.clone();
+            let mut was_updated = false;
+
+            if let Some(q_num) = q_num_val {
+                if !paper_name_val.is_empty() {
+                    let existing: Option<(String, String)> = sqlx::query_as(
+                        "SELECT id, content FROM questions WHERE paper_name = ? AND question_number = ? LIMIT 1"
+                    )
+                    .bind(&paper_name_val)
+                    .bind(q_num)
+                    .fetch_optional(&*pool)
+                    .await
+                    .unwrap_or(None);
+
+                    if let Some((existing_id, existing_content)) = existing {
+                        final_id = existing_id.clone();
+                        final_content = format!("{}\n\n{}", existing_content, q_content);
+                        sqlx::query("UPDATE questions SET content = ? WHERE id = ?")
+                            .bind(&final_content)
+                            .bind(&existing_id)
+                            .execute(&*pool)
+                            .await
+                            .map_err(|e| format!("DB error updating existing question: {}", e))?;
+                        was_updated = true;
+                    }
+                }
+            }
+
+            if !was_updated {
+                sqlx::query(
+                    r#"
+                    INSERT INTO questions (id, subject, subtopic, topics, marks, content, math_snippet, is_code, paper_name, question_number)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    "#,
+                )
+                .bind(&final_id)
+                .bind(&final_subject)
+                .bind(&final_subtopic)
+                .bind(&final_topics)
+                .bind(marks_val)
+                .bind(&final_content)
+                .bind(&snippet_val)
+                .bind(final_is_code)
+                .bind(&paper_name_val)
+                .bind(q_num_val)
+                .execute(&*pool)
+                .await
+                .map_err(|e| format!("DB error inserting new question: {}", e))?;
+            }
+
+            // If we updated an existing question, remove the old version from final_questions before pushing the updated one
+            if was_updated {
+                final_questions.retain(|existing_q: &Question| existing_q.id != final_id);
+            }
 
             final_questions.push(Question {
-                id,
+                id: final_id,
                 subject: final_subject,
                 subtopic: final_subtopic,
                 marks: marks_val,
-                content: q_content,
+                content: final_content,
                 math_snippet: snippet_val,
                 is_code: final_is_code,
                 answer_content: None,
                 topics: Some(final_topics),
+                paper_name: paper_name_val,
+                question_number: q_num_val,
             });
         }
 
@@ -1096,6 +1211,18 @@ Ensure the bounding box stretches far enough to the edges to include all axis la
     }
 
     Ok(final_questions)
+}
+
+#[tauri::command]
+pub async fn get_paper_names(state: State<'_, AppState>) -> Result<Vec<String>, String> {
+    let pool = state.db.lock().await;
+    let rows: Vec<(String,)> = sqlx::query_as(
+        "SELECT DISTINCT paper_name FROM questions WHERE paper_name IS NOT NULL AND trim(paper_name) != '' ORDER BY paper_name ASC"
+    )
+    .fetch_all(&*pool)
+    .await
+    .map_err(|e| e.to_string())?;
+    Ok(rows.into_iter().map(|(name,)| name).collect())
 }
 
 #[tauri::command]
@@ -1150,14 +1277,16 @@ pub async fn update_question(
     new_content: String,
     new_marks: i32,
     new_answer_content: Option<String>,
+    new_topics: Option<String>,
 ) -> Result<(), String> {
     use tauri::Manager;
     let state = app.state::<AppState>();
     let pool = state.db.lock().await;
-    sqlx::query("UPDATE questions SET content = ?, marks = ?, answer_content = ? WHERE id = ?")
+    sqlx::query("UPDATE questions SET content = ?, marks = ?, answer_content = ?, topics = COALESCE(?, topics) WHERE id = ?")
         .bind(new_content)
         .bind(new_marks)
         .bind(new_answer_content)
+        .bind(new_topics)
         .bind(id)
         .execute(&*pool)
         .await
@@ -1173,6 +1302,7 @@ pub async fn parse_mark_scheme_vision(
     pdf_base64_pages: Option<Vec<String>>,
     base_url: String,
     model_name: String,
+    paper_name: String,
     state: State<'_, AppState>,
 ) -> Result<Vec<ProposedMapping>, String> {
     let base_url = base_url.trim().to_string();
@@ -1201,23 +1331,55 @@ pub async fn parse_mark_scheme_vision(
         return Err("File is empty or contains only unextractable images.".to_string());
     }
 
-    let system_prompt = r#"You are an expert examiner. Extract the final answers and grading logic from this mark scheme. Return a JSON array containing `question_number` (String, e.g., '1' or '2') and `answer_content` (String, formatted perfectly in Markdown and LaTeX). Return a JSON object with a single key 'answers' containing this array.
+    let system_prompt = r#"STEP 1: Look at the page headers. If you see 'General Instructions for Marking', 'General Marking Guidance', 'General Principles for Mechanics Marking', or 'Abbreviations', you MUST immediately return an empty array `[]`. DO NOT invent math. DO NOT extract numbered lists from these pages.
+
+ESCAPE HATCH: Exams contain front covers, formula booklets, and 'General Marking Guidance' pages. If the provided images DO NOT contain any actual exam questions or mark scheme answers, you MUST return a completely empty JSON array: `[]`.
+CRITICAL: Do NOT hallucinate, invent, or generate example math questions to fill the array. If the page is just instructions, return `[]`.
+
+STRICT ANTI-HALLUCINATION: You are a transcriber, not a solver. Do NOT invent, solve, or hallucinate generic physics problems (e.g., resolving forces for a block) just because you see physics keywords on a page. If you do not see a clear question number header (e.g., '1(a)') next to mathematical steps, return `[]`.
+
+EXTRACTION GUARDRAIL — MARK SCHEME STRUCTURE REQUIRED: Before extracting any content from a page, confirm it contains explicit mark-scheme structure. Valid indicators are: a question number header in the form '1', '1(a)', '2(b)(i)', etc. appearing in a dedicated question-number column, AND at least one mark label such as 'M1', 'A1', 'B1', 'dM1', or 'ft' in the adjacent marks column. If you do NOT see this structure on the page, do NOT extract anything from it — return `[]`. Numbered bullet points, grammar rules, or abbreviation lists that happen to resemble math are NOT valid mark scheme entries.
+
+IGNORE EXAMINER NOTES: Discard any text explaining mark allocations (e.g., M1, A1, B1, dM1). Extract pure mathematics only.
+LIMIT ALTERNATIVES: If a question has multiple alternative methods, extract the main scheme and a MAXIMUM of ONE Alternative Method. Discard the rest.
+
+You are an expert examiner. Extract the final answers and grading logic from this mark scheme.
+Return a JSON object with a single key 'answers' containing an array of objects. Do NOT rely on array indices. Each object MUST contain a `question_number` (Integer) read directly from the page, and `answer_markdown` (String).
+
+QAB RULE: Preserve sub-question letters exactly as printed (e.g., (g), (h)). Do not reset them to (a) on a new page.
+
+CRITICAL — QUESTION NUMBER RULE: Look at the main question number column printed in the mark scheme. Use only that explicit number. If a question spans multiple pages or contains alternative methods, group them all under the SAME `question_number` object — do not create a second object with the same number.
 
 CRITICAL FORMATTING RULES:
-1. CRITICAL: NEVER use markdown code blocks (triple backticks) like ```latex. Return the raw text directly.
-2. CRITICAL - MULTI-PART QUESTIONS: Group all parts of one question (e.g., 1a, 1b, 1c) into a SINGLE JSON object in the array. Do NOT create separate array items for each sub-part. Use the main question number (e.g., '1', '2') as the `question_number`.
-3. CRITICAL FORMATTING RULE: You must structure the answer step-by-step with massive spacing. NEVER cram working out into a single line or a single inline math block.
-4. Part labels MUST be bolded on their own line (e.g., **(a)**).
-5. EVERY single distinct marking point, step, or line of working MUST be separated by a double newline (`\n\n`).
-6. Extract the textual description of the step (e.g., 'Finds the area of $R_1$') as standard text. Only use inline math (`$`) for small variables within these sentences.
-7. The main equations, substitutions, and final answers MUST be formatted as display/block math (`$$ equation $$`) so they render centered on their own distinct line.
+1. CRITICAL: Your output array length must perfectly match the number of unique main question numbers on the page. All 'Alternative Methods' for a single question MUST be merged into that ONE question's `answer_markdown` string, separated by a Markdown divider (`---`).
+2. CRITICAL: NEVER use markdown code blocks (triple backticks) like ```latex. Return the raw text directly.
+3. CRITICAL - MULTI-PART QUESTIONS: Group all parts of one question (e.g., 1a, 1b, 1c) into a SINGLE JSON object. Do NOT create separate array items for each sub-part. The `question_number` must be the main integer (e.g., 1, 2) from the exam paper — not a sub-part letter.
+4. CRITICAL ANCHORING RULE: Parse the mark scheme by its official printed question numbers. One array item corresponds to exactly ONE unique main question number.
+5. HANDLING ALTERNATIVE METHODS — LIMIT TO ONE: If a question or subquestion contains 'Alternative Method', 'Alt 1', 'Alternative Scheme', or similar, you MUST NOT create a new JSON object for it. Instead, append it inside the single `answer_markdown` for that `question_number`, separated by a Markdown horizontal rule (`---`) and a bold header.
+   STRICT LIMIT: You MUST extract at most ONE alternative method per question or subquestion. If the mark scheme provides multiple alternatives (e.g., 'Alt 1', 'Alt 2', 'Alternative Method 2'), extract ONLY the FIRST one. Completely ignore and discard any second, third, or subsequent alternative methods — do not include them in the Markdown output at all.
+   The goal is a concise solution: the main scheme, and at most ONE alternative. If there is only a main scheme, extract only that.
+6. CRITICAL FORMATTING RULE: Structure the answer step-by-step with generous spacing. NEVER cram working out into a single line or a single inline math block.
+7. Part labels MUST be bolded on their own line (e.g., **(a)**).
+8. EVERY single distinct marking point, step, or line of working MUST be separated by a double newline (`\n\n`).
+9. Extract the textual description of the step (e.g., 'Finds the area of $R_1$') as standard text. Only use inline math (`$`) for small variables within these sentences.
+10. The main equations, substitutions, and final answers MUST be formatted as display/block math (`$$ equation $$`) so they render centered on their own distinct line.
+
+DECISION MATHS QAB PROTOCOL:
+THE REPRINT BAN: If a page reprints a previous question's text or initial tableau for convenience, IGNORE the reprinted text and only extract the new sub-questions.
+MATH TABLES: Simplex tableaus and data tables MUST be formatted as LaTeX block math using the `array` environment. Do NOT draw image bounding boxes around them.
+GRAPHICAL DIAGRAMS: Activity networks, Gantt charts, and trees MUST be captured via image bounding box coordinates. Do NOT try to build them with LaTeX.
+THE EMPTY GRID BAN: NEVER capture empty working grids, blank lines, or unpopulated tracing tables. Return nothing for these.
 
 TEMPLATE TO FOLLOW FOR EACH PART:
-**(a)** Finds the area of $R_1$
+**(a)** Main Method working...
 \n\n
 $$ R_1 = \frac{1}{2}r^2(\theta - \sin\theta) $$
 \n\n
-Uses the ratio $R_1 = 2R_2$
+---
+\n\n
+**ALTERNATIVE METHOD 1** (include this block only if the mark scheme provides an alternative — and only this one, never a second)
+\n\n
+**(a)** Alternative step-by-step working...
 \n\n
 $$ \frac{1}{2}r^2(\theta - \sin\theta) = 2 \cdot \frac{1}{2}r^2((\pi - \theta) - \sin\theta) $$"#;
 
@@ -1306,10 +1468,11 @@ $$ \frac{1}{2}r^2(\theta - \sin\theta) = 2 \cdot \frac{1}{2}r^2((\pi - \theta) -
     let pool = state.db.lock().await;
 
     #[derive(serde::Deserialize)]
-    #[allow(dead_code)]
     struct ExtractedAnswer {
-        question_number: Option<String>,
-        answer_content: Option<String>,
+        /// Integer question number parsed directly from the mark scheme page (e.g., 1, 2, 3).
+        question_number: Option<i64>,
+        /// Formatted LaTeX/Markdown solution steps for this question.
+        answer_markdown: Option<String>,
     }
 
     #[derive(serde::Deserialize)]
@@ -1357,7 +1520,7 @@ $$ \frac{1}{2}r^2(\theta - \sin\theta) = 2 \cdot \frac{1}{2}r^2((\pi - \theta) -
             .ok_or("Invalid OpenAI response format")?
             .trim();
 
-        if let Some(start) = content_str.find('{') {
+        if let Some(start) = content_str.find(|c| c == '{' || c == '[') {
             content_str = &content_str[start..];
         }
         if content_str.ends_with("```") {
@@ -1423,49 +1586,105 @@ $$ \frac{1}{2}r^2(\theta - \sin\theta) = 2 \cdot \frac{1}{2}r^2((\pi - \theta) -
         let parsed: OpenAIAnswerResult = match serde_json::from_str(&sanitized) {
             Ok(p) => p,
             Err(e) => {
-                let err_str = e.to_string();
-                if err_str.contains("trailing characters") {
-                    if let Some(end) = sanitized.rfind('}') {
-                        let chopped = &sanitized[..=end];
-                        serde_json::from_str(chopped).map_err(|e2| format!("Failed to parse OpenAI JSON after trailing chop: {}", e2))?
+                // ── Case 1: model used the escape hatch and returned `[]` ──
+                if let Ok(serde_json::Value::Array(ref arr)) = serde_json::from_str(&sanitized) {
+                    if arr.is_empty() {
+                        continue;
+                    }
+                }
+
+                // ── Case 2: model returned a bare array `[{...}]` instead
+                //            of the expected `{"answers": [{...}]}` wrapper.
+                //            Parse directly as Vec<ExtractedAnswer> and wrap it.
+                if sanitized.trim_start().starts_with('[') {
+                    if let Ok(answers) = serde_json::from_str::<Vec<ExtractedAnswer>>(&sanitized) {
+                        OpenAIAnswerResult { answers }
                     } else {
-                        return Err(format!("Failed to parse OpenAI JSON: {}\nContent starts with: {}...", err_str, sanitized.chars().take(50).collect::<String>()));
+                        // Try auto-close on the bare array (truncated case)
+                        let mut current = sanitized.clone();
+                        let mut attempts = 0;
+                        let mut recovered: Option<OpenAIAnswerResult> = None;
+                        while attempts < 2000 && !current.is_empty() {
+                            let closed = auto_close_json(&current);
+                            if let Ok(answers) = serde_json::from_str::<Vec<ExtractedAnswer>>(&closed) {
+                                recovered = Some(OpenAIAnswerResult { answers });
+                                break;
+                            }
+                            current.pop();
+                            attempts += 1;
+                        }
+                        if let Some(p) = recovered {
+                            p
+                        } else {
+                            let auto_closed = auto_close_json(&sanitized);
+                            let final_err = serde_json::from_str::<OpenAIAnswerResult>(&auto_closed)
+                                .err()
+                                .map(|e| e.to_string())
+                                .unwrap_or_else(|| "Unknown".to_string());
+                            return Err(format!(
+                                "The AI model truncated the response. Attempted robust recovery failed: {}\nContent starts with: {}...",
+                                final_err,
+                                auto_closed.chars().take(50).collect::<String>()
+                            ));
+                        }
                     }
                 } else {
-                    let mut current = sanitized.clone();
-                    let mut attempts = 0;
-                    let mut recovered: Option<OpenAIAnswerResult> = None;
-                    
-                    while attempts < 2000 && !current.is_empty() {
-                        let closed = auto_close_json(&current);
-                        if let Ok(p) = serde_json::from_str::<OpenAIAnswerResult>(&closed) {
-                            recovered = Some(p);
-                            break;
+                    // ── Case 3: standard {"answers": [...]} object, but truncated/malformed ──
+                    let err_str = e.to_string();
+                    if err_str.contains("trailing characters") {
+                        if let Some(end) = sanitized.rfind('}') {
+                            let chopped = &sanitized[..=end];
+                            serde_json::from_str(chopped)
+                                .map_err(|e2| format!("Failed to parse OpenAI JSON after trailing chop: {}", e2))?
+                        } else {
+                            return Err(format!(
+                                "Failed to parse OpenAI JSON: {}\nContent starts with: {}...",
+                                err_str,
+                                sanitized.chars().take(50).collect::<String>()
+                            ));
                         }
-                        current.pop();
-                        attempts += 1;
-                    }
-                    
-                    if let Some(p) = recovered {
-                        p
                     } else {
-                        let auto_closed = auto_close_json(&sanitized);
-                        let final_err = serde_json::from_str::<OpenAIAnswerResult>(&auto_closed).err().map(|e| e.to_string()).unwrap_or_else(|| "Unknown".to_string());
-                        return Err(format!("The AI model truncated the response. Attempted robust recovery failed: {}\nContent starts with: {}...", final_err, auto_closed.chars().take(50).collect::<String>()));
+                        let mut current = sanitized.clone();
+                        let mut attempts = 0;
+                        let mut recovered: Option<OpenAIAnswerResult> = None;
+                        while attempts < 2000 && !current.is_empty() {
+                            let closed = auto_close_json(&current);
+                            if let Ok(p) = serde_json::from_str::<OpenAIAnswerResult>(&closed) {
+                                recovered = Some(p);
+                                break;
+                            }
+                            current.pop();
+                            attempts += 1;
+                        }
+                        if let Some(p) = recovered {
+                            p
+                        } else {
+                            let auto_closed = auto_close_json(&sanitized);
+                            let final_err = serde_json::from_str::<OpenAIAnswerResult>(&auto_closed)
+                                .err()
+                                .map(|e| e.to_string())
+                                .unwrap_or_else(|| "Unknown".to_string());
+                            return Err(format!(
+                                "The AI model truncated the response. Attempted robust recovery failed: {}\nContent starts with: {}...",
+                                final_err,
+                                auto_closed.chars().take(50).collect::<String>()
+                            ));
+                        }
                     }
                 }
             }
         };
 
-        // We do not return an error here if answers is empty, as it could just be a blank page or title page.
 
+        // We do not return an error here if answers is empty — it could be a blank/title page.
 
         for ans in parsed.answers {
-            let ans_content = match ans.answer_content {
+            let ans_content = match ans.answer_markdown {
                 Some(ref c) if !c.trim().is_empty() => c.clone(),
                 _ => continue, // Skip answers without content
             };
 
+            // Deduplicate across overlapping batches using a content fingerprint.
             let fingerprint: String = ans_content
                 .split_whitespace()
                 .take(20)
@@ -1475,13 +1694,16 @@ $$ \frac{1}{2}r^2(\theta - \sin\theta) = 2 \cdot \frac{1}{2}r^2((\pi - \theta) -
             if !seen_fingerprints.insert(fingerprint) {
                 continue;
             }
-            
-            // For now, if the question_number isn't present, we'll assign a placeholder or skip it.
-            // But currently the code just uses the order of answers.
-            all_answers.push(ExtractedAnswer {
-                question_number: ans.question_number,
-                answer_content: Some(ans_content),
-            });
+
+            // Only accept entries that carry an explicit question_number; skip otherwise.
+            if let Some(q_num) = ans.question_number {
+                all_answers.push(ExtractedAnswer {
+                    question_number: Some(q_num),
+                    answer_markdown: Some(ans_content),
+                });
+            } else {
+                eprintln!("[MergeMark] WARNING: AI returned an answer without a question_number — skipping.");
+            }
         }
 
         thread::sleep(Duration::from_millis(1500));
@@ -1491,73 +1713,85 @@ $$ \frac{1}{2}r^2(\theta - \sin\theta) = 2 \cdot \frac{1}{2}r^2((\pi - \theta) -
         return Err("The AI model failed to return any answers from the entire document. It may have hit a safety filter, timed out, or encountered an unreadable document.".to_string());
     }
 
-    let questions: Vec<Question> = sqlx::query_as("SELECT * FROM questions WHERE answer_content IS NULL OR trim(answer_content) = '' ORDER BY rowid ASC")
-        .fetch_all(&*pool)
-        .await
-        .map_err(|e| format!("DB error: {}", e))?;
+    // Fetch all questions belonging to this paper that still need a mark-scheme answer.
+    // Matching on paper_name prevents answers from one paper polluting another paper's questions.
+    let paper_name_filter = paper_name.trim().to_string();
+    // Fetch ALL questions for this paper, not just unanswered ones.
+    // This ensures that if a hallucinated answer was written for an instruction page,
+    // the real answer extracted from actual question pages will overwrite it.
+    let questions: Vec<Question> = sqlx::query_as(
+        "SELECT * FROM questions WHERE paper_name = ? ORDER BY rowid ASC"
+    )
+    .bind(&paper_name_filter)
+    .fetch_all(&*pool)
+    .await
+    .map_err(|e| format!("DB error: {}", e))?;
 
-    let mut proposed_mappings = Vec::new();
-    let mut used_q_indices = std::collections::HashSet::new();
-
-    for (i, ans) in all_answers.into_iter().enumerate() {
-        let ans_content = ans.answer_content.unwrap_or_default();
-        if ans_content.trim().is_empty() {
-            continue;
-        }
-
-        let mut matched_q_idx = None;
-
-        if let Some(ref q_num) = ans.question_number {
-            let q_num_clean = q_num.trim().to_lowercase();
-            for (q_idx, q) in questions.iter().enumerate() {
-                if used_q_indices.contains(&q_idx) {
-                    continue;
-                }
-                
-                let content_clean = q.content.trim().to_lowercase();
-                
-                // Strip common prefix "question " if present
-                let mut content_test = content_clean.as_str();
-                if content_test.starts_with("question ") {
-                    content_test = &content_test["question ".len()..];
-                }
-                content_test = content_test.trim_start();
-                
-                let mut q_num_test = q_num_clean.as_str();
-                if q_num_test.starts_with("question ") {
-                    q_num_test = &q_num_test["question ".len()..];
-                }
-                q_num_test = q_num_test.trim_start();
-
-                if content_test.starts_with(q_num_test) {
-                    matched_q_idx = Some(q_idx);
-                    break;
+    // Build a lookup map: extracted leading integer from question content → Question.
+    // For example, content starting with "1. Find..." or "Question 1\n..." → key 1.
+    let leading_num_re = regex::Regex::new(r"^(?:Question\s+)?(\d+)").unwrap();
+    let mut q_by_number: std::collections::HashMap<i64, &Question> =
+        std::collections::HashMap::new();
+    for q in &questions {
+        if let Some(n) = q.question_number {
+            q_by_number.entry(n).or_insert(q);
+        } else {
+            let trimmed = q.content.trim();
+            if let Some(cap) = leading_num_re.captures(trimmed) {
+                if let Ok(n) = cap[1].parse::<i64>() {
+                    // Only insert the first question for each number to avoid overwriting.
+                    q_by_number.entry(n).or_insert(q);
                 }
             }
         }
+    }
 
-        if matched_q_idx.is_none() {
-            // Fallback to array index order
-            if i < questions.len() && !used_q_indices.contains(&i) {
-                matched_q_idx = Some(i);
+    let mut proposed_mappings: Vec<ProposedMapping> = Vec::new();
+    let mut q_id_to_mapping_index: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+
+    for ans in all_answers {
+        let ans_content = match ans.answer_markdown {
+            Some(c) if !c.trim().is_empty() => c,
+            _ => continue,
+        };
+        let q_num = match ans.question_number {
+            Some(n) => n,
+            None => continue,
+        };
+
+        if let Some(q) = q_by_number.get(&q_num) {
+            // STITCHING LOGIC: If a mapping for this exact question_number and paper_name already exists,
+            // fetch its current proposed_answer, append a double newline \n\n, and append the new markdown.
+            if let Some(&idx) = q_id_to_mapping_index.get(&q.id) {
+                let existing = &proposed_mappings[idx].proposed_answer;
+                proposed_mappings[idx].proposed_answer = format!("{}\n\n{}", existing, ans_content);
             } else {
-                for (q_idx, _) in questions.iter().enumerate() {
-                    if !used_q_indices.contains(&q_idx) {
-                        matched_q_idx = Some(q_idx);
-                        break;
+                let idx = proposed_mappings.len();
+                q_id_to_mapping_index.insert(q.id.clone(), idx);
+                
+                // If there's already an answer in the DB from a previous run, stitch it too
+                let initial_answer = if let Some(ref db_ans) = q.answer_content {
+                    if !db_ans.trim().is_empty() {
+                        format!("{}\n\n{}", db_ans, ans_content)
+                    } else {
+                        ans_content.clone()
                     }
-                }
-            }
-        }
+                } else {
+                    ans_content.clone()
+                };
 
-        if let Some(q_idx) = matched_q_idx {
-            used_q_indices.insert(q_idx);
-            let q = &questions[q_idx];
-            proposed_mappings.push(ProposedMapping {
-                question_id: q.id.clone(),
-                raw_content: q.content.clone(),
-                proposed_answer: ans_content,
-            });
+                proposed_mappings.push(ProposedMapping {
+                    question_id: q.id.clone(),
+                    raw_content: q.content.clone(),
+                    proposed_answer: initial_answer,
+                    paper_name: q.paper_name.clone(),
+                });
+            }
+        } else {
+            eprintln!(
+                "[MergeMark] WARNING: No DB question found matching question_number {} — skipping.",
+                q_num
+            );
         }
     }
 

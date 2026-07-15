@@ -1,10 +1,11 @@
-import { useState, useCallback, useRef } from "react";
+import { useState, useCallback, useRef, useEffect } from "react";
 import { invoke, convertFileSrc } from "@tauri-apps/api/core";
 import { ReviewSyncModal, type ProposedMapping } from "./ReviewSyncModal";
 import { open } from "@tauri-apps/plugin-dialog";
 import { toast } from "sonner";
 import { UploadCloud, FileText, Loader2 } from "lucide-react";
 import { cn } from "@/lib/utils";
+import { SUBJECTS } from "@/lib/taxonomy";
 
 import * as pdfjsLib from "pdfjs-dist";
 import pdfWorker from "pdfjs-dist/build/pdf.worker.mjs?url";
@@ -20,11 +21,29 @@ interface IngestionDropzoneProps {
 export function IngestionDropzone({ onSuccess }: IngestionDropzoneProps) {
   const [importMode, setImportMode] = useState<"questions" | "mark_scheme">("questions");
   const [subject, setSubject] = useState("Mathematics");
+  // Paper names already in the DB — populated when the user switches to mark_scheme mode.
+  const [availablePaperNames, setAvailablePaperNames] = useState<string[]>([]);
+  // The paper name the user has selected to match the mark scheme against.
+  const [msPaperName, setMsPaperName] = useState("");
   const [pendingMappings, setPendingMappings] = useState<ProposedMapping[] | null>(null);
   const [isDraggingOver, setIsDraggingOver] = useState(false);
   const [isProcessing, setIsProcessing] = useState(false);
   const [lastFile, setLastFile] = useState<string | null>(null);
   const dragCounter = useRef(0); // tracks nested enter/leave events
+
+  // Fetch distinct paper names from the DB whenever the user enters mark_scheme mode.
+  useEffect(() => {
+    if (importMode !== "mark_scheme") return;
+    invoke<string[]>("get_paper_names")
+      .then((names) => {
+        setAvailablePaperNames(names);
+        // Auto-select the first one if nothing is selected yet.
+        if (msPaperName === "" && names.length > 0) {
+          setMsPaperName(names[0]);
+        }
+      })
+      .catch(() => setAvailablePaperNames([]));
+  }, [importMode]);
 
   // ── Core processing logic ──────────────────────────────────────────────────
 
@@ -38,6 +57,12 @@ export function IngestionDropzone({ onSuccess }: IngestionDropzoneProps) {
     if (!apiKey || apiKey.trim() === "") {
       apiKey = "dummy";
     }
+
+    // Derive the paper name from the file's basename (minus extension).
+    // e.g. "C:\\exams\\2024_June_P1.pdf" → "2024_June_P1"
+    const paperName =
+      filePath.replace(/\\/g, "/").split("/").pop()?.replace(/\.[^.]+$/, "") ||
+      filePath;
 
     setLastFile(filePath);
     setIsProcessing(true);
@@ -70,12 +95,18 @@ export function IngestionDropzone({ onSuccess }: IngestionDropzoneProps) {
       }
 
       if (importMode === "mark_scheme") {
+        // Use the DB-selected paper name so MS questions match the QP that was already imported.
+        const effectivePaperName = msPaperName;
+        if (!effectivePaperName) {
+          throw new Error("Please select which question paper this mark scheme belongs to before importing.");
+        }
         const mappings = await invoke<ProposedMapping[]>("parse_mark_scheme_vision", {
           filePath,
           apiKey,
           pdfBase64Pages,
           baseUrl,
-          modelName
+          modelName,
+          paperName: effectivePaperName,
         });
         setPendingMappings(mappings);
       } else {
@@ -85,12 +116,13 @@ export function IngestionDropzone({ onSuccess }: IngestionDropzoneProps) {
           pdfBase64Pages,
           baseUrl,
           modelName,
-          subject
+          subject,
+          paperName,
         });
         const count = questions.length;
         toast.success(
           count === 1 ? "1 question extracted!" : `${count} questions extracted!`,
-          { description: filePath, duration: 6000 }
+          { description: `Paper: ${paperName}`, duration: 6000 }
         );
         if (onSuccess) onSuccess();
       }
@@ -219,12 +251,39 @@ export function IngestionDropzone({ onSuccess }: IngestionDropzoneProps) {
             disabled={isProcessing}
             className="h-9 w-48 rounded-md border border-input bg-background px-3 py-1 text-sm shadow-sm transition-colors focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring disabled:cursor-not-allowed disabled:opacity-50"
           >
-            <option value="Mathematics">Mathematics</option>
-            <option value="Further Mathematics">Further Mathematics</option>
-            <option value="Physics">Physics</option>
-            <option value="Computer Science">Computer Science</option>
+            {SUBJECTS.map((s) => (
+              <option key={s} value={s}>{s}</option>
+            ))}
           </select>
         </div>
+
+        {/* Match-to-paper selector — only shown when importing a mark scheme */}
+        {importMode === "mark_scheme" && (
+          <div className="flex items-center gap-3">
+            <label htmlFor="ms-paper-select" className="text-sm font-medium text-foreground">
+              Match to Paper:
+            </label>
+            {availablePaperNames.length === 0 ? (
+              <p className="text-sm text-muted-foreground italic">
+                No question papers imported yet.
+              </p>
+            ) : (
+              <select
+                id="ms-paper-select"
+                value={msPaperName}
+                onChange={(e) => setMsPaperName(e.target.value)}
+                disabled={isProcessing}
+                className="h-9 w-64 rounded-md border border-input bg-background px-3 py-1 text-sm shadow-sm transition-colors focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring disabled:cursor-not-allowed disabled:opacity-50"
+              >
+                {availablePaperNames.map((name) => (
+                  <option key={name} value={name}>{name}</option>
+                ))}
+              </select>
+            )}
+          </div>
+        )}
+
+
       </div>
 
       {/* ── Dropzone card ── */}
