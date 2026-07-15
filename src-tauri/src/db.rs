@@ -34,7 +34,8 @@ pub async fn init_db(app_data_dir: PathBuf) -> Result<SqlitePool, sqlx::Error> {
             answer_content TEXT,
             topics TEXT,
             paper_name TEXT DEFAULT '',
-            question_number INTEGER
+            question_number INTEGER,
+            module TEXT
         );
         "#
     )
@@ -54,6 +55,9 @@ pub async fn init_db(app_data_dir: PathBuf) -> Result<SqlitePool, sqlx::Error> {
     let _ = sqlx::query("ALTER TABLE questions ADD COLUMN question_number INTEGER")
         .execute(&pool)
         .await;
+    let _ = sqlx::query("ALTER TABLE questions ADD COLUMN module TEXT")
+        .execute(&pool)
+        .await;
 
     // 5. Seed the database with mock data if it's empty
     seed_database_if_empty(&pool).await?;
@@ -68,19 +72,19 @@ async fn seed_database_if_empty(pool: &SqlitePool) -> Result<(), sqlx::Error> {
 
     if count.0 == 0 {
         let mock_data = vec![
-            ("q1", "Mathematics", "Calculus", "[\"Differentiation\"]", 4, "Find the derivative of f(x) with respect to x, and determine all critical points in the interval [0, 2π].", "f(x) = 3x³ - 2sin(x) + e^(2x)", false),
-            ("q2", "Physics", "Mechanics", "[]", 6, "A particle of mass m moves under a conservative force. Show that the total mechanical energy is conserved and find the equilibrium positions.", "F(x) = -dV/dx,   V(x) = ½kx² - mgx", false),
-            ("q3", "Computer Science", "Algorithms", "[]", 3, "Analyse the time complexity of the following recursive function and express your answer using Big-O notation.", "def fib(n):\n    if n <= 1:\n        return n\n    return fib(n-1) + fib(n-2)", true),
-            ("q4", "Mathematics", "Statistics", "[\"Statistical distributions\"]", 5, "Given a normal distribution X ~ N(μ, σ²), find the probability P(X > 72) given that μ = 65 and σ = 8.", "P(X > 72) = P(Z > (72 - μ) / σ)", false),
-            ("q5", "Chemistry", "Thermodynamics", "[]", 4, "Calculate the Gibbs free energy change for the reaction at 298 K. State whether the reaction is spontaneous.", "ΔG° = ΔH° - TΔS°\n     = -120 kJ - (298)(0.250 kJ/K)", false),
-            ("q6", "Computer Science", "Data Structures", "[]", 3, "Write a function that reverses a singly linked list in-place and returns the new head node. Analyse its space complexity.", "def reverse(head):\n    prev = None\n    curr = head\n    while curr:\n        nxt = curr.next\n        curr.next = prev\n        prev, curr = curr, nxt\n    return prev", true),
+            ("q1", "Mathematics", "Calculus", "[\"Differentiation\"]", 4, "Find the derivative of f(x) with respect to x, and determine all critical points in the interval [0, 2π].", "f(x) = 3x³ - 2sin(x) + e^(2x)", false, Some("Pure".to_string())),
+            ("q2", "Physics", "Mechanics", "[]", 6, "A particle of mass m moves under a conservative force. Show that the total mechanical energy is conserved and find the equilibrium positions.", "F(x) = -dV/dx,   V(x) = ½kx² - mgx", false, Some("General".to_string())),
+            ("q3", "Computer Science", "Algorithms", "[]", 3, "Analyse the time complexity of the following recursive function and express your answer using Big-O notation.", "def fib(n):\n    if n <= 1:\n        return n\n    return fib(n-1) + fib(n-2)", true, Some("General".to_string())),
+            ("q4", "Mathematics", "Statistics", "[\"Statistical distributions\"]", 5, "Given a normal distribution X ~ N(μ, σ²), find the probability P(X > 72) given that μ = 65 and σ = 8.", "P(X > 72) = P(Z > (72 - μ) / σ)", false, Some("Statistics".to_string())),
+            ("q5", "Chemistry", "Thermodynamics", "[]", 4, "Calculate the Gibbs free energy change for the reaction at 298 K. State whether the reaction is spontaneous.", "ΔG° = ΔH° - TΔS°\n     = -120 kJ - (298)(0.250 kJ/K)", false, Some("General".to_string())),
+            ("q6", "Computer Science", "Data Structures", "[]", 3, "Write a function that reverses a singly linked list in-place and returns the new head node. Analyse its space complexity.", "def reverse(head):\n    prev = None\n    curr = head\n    while curr:\n        nxt = curr.next\n        curr.next = prev\n        prev, curr = curr, nxt\n    return prev", true, Some("General".to_string())),
         ];
 
-        for (id, subject, subtopic, topics, marks, content, math_snippet, is_code) in mock_data {
+        for (id, subject, subtopic, topics, marks, content, math_snippet, is_code, module) in mock_data {
             sqlx::query(
                 r#"
-                INSERT INTO questions (id, subject, subtopic, topics, marks, content, math_snippet, is_code)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO questions (id, subject, subtopic, topics, marks, content, math_snippet, is_code, module)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 "#,
             )
             .bind(id)
@@ -91,6 +95,7 @@ async fn seed_database_if_empty(pool: &SqlitePool) -> Result<(), sqlx::Error> {
             .bind(content)
             .bind(math_snippet)
             .bind(is_code)
+            .bind(module)
             .execute(pool)
             .await?;
         }

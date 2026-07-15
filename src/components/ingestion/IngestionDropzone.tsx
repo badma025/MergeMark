@@ -1,5 +1,6 @@
 import { useState, useCallback, useRef, useEffect } from "react";
 import { invoke, convertFileSrc } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import { ReviewSyncModal, type ProposedMapping } from "./ReviewSyncModal";
 import { open } from "@tauri-apps/plugin-dialog";
 import { toast } from "sonner";
@@ -139,6 +140,44 @@ export function IngestionDropzone({ onSuccess }: IngestionDropzoneProps) {
     }
   }
 
+  // ── Native Tauri Drag-and-Drop ─────────────────────────────────────────────
+
+  const processFileRef = useRef(processFile);
+  useEffect(() => {
+    processFileRef.current = processFile;
+  }, [processFile]);
+
+  const isProcessingRef = useRef(isProcessing);
+  useEffect(() => {
+    isProcessingRef.current = isProcessing;
+  }, [isProcessing]);
+
+  useEffect(() => {
+    const unlistenDrop = listen<{ paths: string[] }>('tauri://drop', (event) => {
+      setIsDraggingOver(false);
+      dragCounter.current = 0;
+      const paths = event.payload.paths;
+      if (paths && paths.length > 0 && !isProcessingRef.current) {
+        processFileRef.current(paths[0]);
+      }
+    });
+
+    const unlistenEnter = listen('tauri://drag-enter', () => {
+      setIsDraggingOver(true);
+    });
+
+    const unlistenLeave = listen('tauri://drag-leave', () => {
+      setIsDraggingOver(false);
+      dragCounter.current = 0;
+    });
+
+    return () => {
+      unlistenDrop.then(unlisten => unlisten());
+      unlistenEnter.then(unlisten => unlisten());
+      unlistenLeave.then(unlisten => unlisten());
+    };
+  }, []);
+
   // ── Native file picker ─────────────────────────────────────────────────────
 
   async function handleBrowse() {
@@ -177,25 +216,14 @@ export function IngestionDropzone({ onSuccess }: IngestionDropzoneProps) {
   }, []);
 
   const handleDrop = useCallback(
-    async (e: React.DragEvent) => {
+    (e: React.DragEvent) => {
       e.preventDefault();
       e.stopPropagation();
       dragCounter.current = 0;
       setIsDraggingOver(false);
-      if (isProcessing) return;
-
-      const file = e.dataTransfer.files[0];
-      if (!file) return;
-
-      // On Tauri v2 the drag-and-drop event exposes the real FS path via
-      // the non-standard `path` property on the File object.
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      const filePath: string | undefined = (file as any).path ?? file.name;
-      if (filePath) {
-        await processFile(filePath);
-      }
+      // The Tauri native 'tauri://drop' event will handle the actual file processing with absolute paths.
     },
-    [isProcessing]
+    []
   );
 
   // ── Render ─────────────────────────────────────────────────────────────────

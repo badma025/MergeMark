@@ -18,6 +18,7 @@ export interface RepositoryFeedProps {
 export function RepositoryFeed({ onAddToWorksheet }: RepositoryFeedProps) {
   const [search, setSearch] = useState("");
   const [selectedSubject, setSelectedSubject] = useState<string>("All");
+  const [selectedModule, setSelectedModule] = useState<string>("All");
   const [selectedTopics, setSelectedTopics] = useState<string[]>([]);
   const [questions, setQuestions] = useState<Omit<QuestionCardProps, "onAddToWorksheet" | "onDelete">[]>([]);
   const [loading, setLoading] = useState(true);
@@ -100,7 +101,34 @@ export function RepositoryFeed({ onAddToWorksheet }: RepositoryFeedProps) {
       matchesTopicFilter = qTopics.some((t) => selectedTopics.includes(t));
     }
 
-    return matchesSearch && matchesTopicFilter && matchesSubject;
+    let matchesModuleFilter = true;
+    if (selectedModule !== "All") {
+      // Check if the question's topics belong to the selected module
+      const moduleTopics = (TOPICS_BY_SUBJECT[q.subject] || {})[selectedModule] || [];
+      if (selectedTopics.length > 0) {
+        // If topics are explicitly selected, we'll just let the topic filter handle it.
+      } else {
+        // If no topics are selected, check if the question has any topic in this module.
+        let qTopics: string[] = [];
+        try {
+          if (q.topics) {
+            qTopics = JSON.parse(q.topics);
+            if (!Array.isArray(qTopics)) qTopics = [];
+          }
+        } catch (e) {}
+        
+        if (qTopics.length > 0) {
+          matchesModuleFilter = qTopics.some((t) => moduleTopics.includes(t));
+        } else {
+          // If the question has no topics but has a module explicitly set (we'll assume q.module is added)
+          if ((q as any).module) {
+            matchesModuleFilter = (q as any).module === selectedModule;
+          }
+        }
+      }
+    }
+
+    return matchesSearch && matchesTopicFilter && matchesSubject && matchesModuleFilter;
   });
 
   function handleAdd(id: string) {
@@ -162,6 +190,7 @@ export function RepositoryFeed({ onAddToWorksheet }: RepositoryFeedProps) {
                 onClick={() => {
                   if (selectedSubject !== subject) {
                     setSelectedSubject(subject);
+                    setSelectedModule("All");
                     setSelectedTopics([]);
                   }
                 }}
@@ -172,9 +201,43 @@ export function RepositoryFeed({ onAddToWorksheet }: RepositoryFeedProps) {
           })}
         </div>
 
+        {/* Module Filter */}
+        {selectedSubject !== "All" && (
+          <div className="mt-3 flex flex-wrap gap-1.5 border-b border-border/50 pb-3">
+            {["All", ...Object.keys(TOPICS_BY_SUBJECT[selectedSubject] || {})].map((mod) => {
+              const isSelected = selectedModule === mod;
+              return (
+                <Badge
+                  key={mod}
+                  variant={isSelected ? "default" : "secondary"}
+                  className={cn(
+                    "cursor-pointer transition-colors text-xs font-semibold py-1 px-3 rounded-md",
+                    isSelected ? "bg-purple-600 text-white hover:bg-purple-700" : "hover:bg-accent hover:text-accent-foreground border border-border/50"
+                  )}
+                  onClick={() => {
+                    if (selectedModule !== mod) {
+                      setSelectedModule(mod);
+                      setSelectedTopics([]);
+                    }
+                  }}
+                >
+                  {mod}
+                </Badge>
+              );
+            })}
+          </div>
+        )}
+
         {/* Topics Filter */}
         <div className="mt-3 flex flex-wrap gap-1.5 max-h-[4.5rem] overflow-y-auto">
-          {(selectedSubject === "All" ? ALL_TOPICS : TOPICS_BY_SUBJECT[selectedSubject] || []).map((topic) => {
+          {(() => {
+            if (selectedSubject === "All") return ALL_TOPICS;
+            const subjectMods = TOPICS_BY_SUBJECT[selectedSubject] || {};
+            if (selectedModule === "All") {
+              return Object.values(subjectMods).flat();
+            }
+            return subjectMods[selectedModule] || [];
+          })().map((topic) => {
             const isSelected = selectedTopics.includes(topic);
             return (
               <Badge

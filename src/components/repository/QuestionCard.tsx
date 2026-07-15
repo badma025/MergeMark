@@ -135,9 +135,10 @@ export interface QuestionCardProps {
   isCode?: boolean;
   answerContent?: string;
   className?: string;
+  module?: string;
   onAddToWorksheet?: (id: string) => void;
   onDelete?: (id: string) => void;
-  onUpdate?: (id: string, newContent: string, newMarks: number, newAnswerContent?: string, newTopics?: string[]) => void;
+  onUpdate?: (id: string, newContent: string, newMarks: number, newAnswerContent?: string, newTopics?: string[], newModule?: string) => void;
 }
 
 export function QuestionCard({
@@ -150,6 +151,7 @@ export function QuestionCard({
   answerContent,
   isCode,
   className,
+  module,
   onAddToWorksheet,
   onDelete,
   onUpdate,
@@ -193,7 +195,7 @@ export function QuestionCard({
 
   function handleSave(e?: React.MouseEvent) {
     e?.stopPropagation();
-    onUpdate?.(id, editContent, editMarks, editAnswerContent || undefined, editTopics);
+    onUpdate?.(id, editContent, editMarks, editAnswerContent || undefined, editTopics, module);
     setIsEditing(false);
   }
 
@@ -271,6 +273,13 @@ export function QuestionCard({
         >
           {subject}
         </Badge>
+        {module && module !== "General" && module !== "Unknown" && (
+          <Badge
+            className="text-xs font-medium tracking-wide bg-purple-900/50 text-purple-200 border-purple-800 hover:bg-purple-900/60"
+          >
+            {module}
+          </Badge>
+        )}
         {parsedTopics.map((topic, i) => (
           <Badge
             key={i}
@@ -302,22 +311,32 @@ export function QuestionCard({
             urlTransform={(value) => value}
             components={{
               img: ({ node, ...props }) => {
-                if (props.src && (props.src.match(/^[a-zA-Z]:[\\/]/) || props.src.startsWith("/"))) {
-                  try {
-                    const assetUrl = convertFileSrc(props.src);
-                    return (
-                      <img
-                          {...props}
-                          src={assetUrl}
-                          alt={props.alt || "Diagram"}
-                          className="max-w-full rounded-md my-4"
-                          onError={() => console.error("Failed to load image via asset protocol:", props.src)}
-                        />
-                      );
-                    } catch (e) {
-                      return <div className="text-sm text-destructive border border-destructive/20 p-2 rounded-md bg-destructive/10 text-center">Failed to convert diagram URL: {props.alt || "Image"}</div>;
-                    }
-                  }
+                            if (props.src && (props.src.match(/^[a-zA-Z]:[\\/]/) || props.src.startsWith("/"))) {
+                              try {
+                                const assetUrl = convertFileSrc(props.src);
+                                return (
+                                  <div className="relative group">
+                                    <img
+                                        {...props}
+                                        src={assetUrl}
+                                        alt={props.alt || "Diagram"}
+                                        className="max-w-full rounded-md my-4"
+                                        onError={(e) => {
+                                          console.error("Failed to load image via asset protocol:", props.src, assetUrl);
+                                          const target = e.target as HTMLImageElement;
+                                          target.style.opacity = '0.5';
+                                          target.title = `Failed to load: ${props.src} -> ${assetUrl}`;
+                                        }}
+                                      />
+                                    <div className="hidden group-hover:block absolute bottom-0 left-0 bg-black/80 text-white text-[10px] p-1 truncate max-w-full">
+                                      {props.src}
+                                    </div>
+                                  </div>
+                                  );
+                                } catch (e) {
+                                  return <div className="text-sm text-destructive border border-destructive/20 p-2 rounded-md bg-destructive/10 text-center">Failed to convert diagram URL: {props.alt || "Image"}</div>;
+                                }
+                              }
                   return <img {...props} alt={props.alt || "Diagram"} className="max-w-full rounded-md my-4" />;
                 }
               }}
@@ -340,22 +359,32 @@ export function QuestionCard({
             urlTransform={(value) => value}
             components={{
               img: ({ node, ...props }) => {
-                if (props.src && (props.src.match(/^[a-zA-Z]:[\\/]/) || props.src.startsWith("/"))) {
-                  try {
-                    const assetUrl = convertFileSrc(props.src);
-                    return (
-                      <img
-                          {...props}
-                          src={assetUrl}
-                          alt={props.alt || "Diagram"}
-                          className="max-w-full rounded-md my-4"
-                          onError={() => console.error("Failed to load image via asset protocol:", props.src)}
-                        />
-                      );
-                    } catch (e) {
-                      return <div className="text-sm text-destructive border border-destructive/20 p-2 rounded-md bg-destructive/10 text-center">Failed to convert diagram URL: {props.alt || "Image"}</div>;
-                    }
-                  }
+                            if (props.src && (props.src.match(/^[a-zA-Z]:[\\/]/) || props.src.startsWith("/"))) {
+                              try {
+                                const assetUrl = convertFileSrc(props.src);
+                                return (
+                                  <div className="relative group">
+                                    <img
+                                        {...props}
+                                        src={assetUrl}
+                                        alt={props.alt || "Diagram"}
+                                        className="max-w-full rounded-md my-4"
+                                        onError={(e) => {
+                                          console.error("Failed to load image via asset protocol:", props.src, assetUrl);
+                                          const target = e.target as HTMLImageElement;
+                                          target.style.opacity = '0.5';
+                                          target.title = `Failed to load: ${props.src} -> ${assetUrl}`;
+                                        }}
+                                      />
+                                    <div className="hidden group-hover:block absolute bottom-0 left-0 bg-black/80 text-white text-[10px] p-1 truncate max-w-full">
+                                      {props.src}
+                                    </div>
+                                  </div>
+                                  );
+                                } catch (e) {
+                                  return <div className="text-sm text-destructive border border-destructive/20 p-2 rounded-md bg-destructive/10 text-center">Failed to convert diagram URL: {props.alt || "Image"}</div>;
+                                }
+                              }
                   return <img {...props} alt={props.alt || "Diagram"} className="max-w-full rounded-md my-4" />;
                 }
               }}
@@ -396,7 +425,11 @@ export function QuestionCard({
                 />
               </div>
               <div className="flex flex-wrap items-center gap-1.5 flex-1 ml-4 border-l pl-4 border-border">
-                {(TOPICS_BY_SUBJECT[subject] || []).map((topic) => {
+                {(() => {
+                  if (subject === "All") return [];
+                  const subjectMods = TOPICS_BY_SUBJECT[subject] || {};
+                  return Object.values(subjectMods).flat();
+                })().map((topic) => {
                   const isSelected = editTopics.includes(topic);
                   return (
                     <Badge

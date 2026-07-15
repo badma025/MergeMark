@@ -23,6 +23,8 @@ pub struct Question {
     pub paper_name: String,
     #[sqlx(default)]
     pub question_number: Option<i64>,
+    #[sqlx(default)]
+    pub module: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -69,6 +71,46 @@ fn auto_close_json(s: &str) -> String {
         closed.push(c);
     }
     closed
+}
+
+fn is_blank_or_grid(img: &image::DynamicImage) -> bool {
+    use image::GenericImageView;
+    let (width, height) = img.dimensions();
+    if width == 0 || height == 0 {
+        return true;
+    }
+    
+    let mut sum = 0.0;
+    let mut sum_sq = 0.0;
+    let mut count = 0.0;
+    let mut non_white_count = 0.0;
+    
+    for (_, _, pixel) in img.pixels() {
+        // Luma coefficients: 0.299 R + 0.587 G + 0.114 B
+        let luma = pixel[0] as f64 * 0.299 + pixel[1] as f64 * 0.587 + pixel[2] as f64 * 0.114;
+        sum += luma;
+        sum_sq += luma * luma;
+        count += 1.0;
+        
+        // Count pixels that are not practically white
+        if luma < 180.0 {
+            non_white_count += 1.0;
+        }
+    }
+    
+    if count == 0.0 { return true; }
+    
+    let mean = sum / count;
+    let variance = (sum_sq / count) - (mean * mean);
+    let non_white_ratio = non_white_count / count;
+    
+    // Variance < 10.0 catches perfectly blank/solid color boxes.
+    // Non-white ratio < 0.005 (0.5%) catches empty student working grids which are mostly white space with a few faint lines.
+    if variance < 10.0 || non_white_ratio < 0.005 {
+        return true;
+    }
+    
+    false
 }
 
 // ── Helper: shared question-classification + DB-insert logic ──────────────────
@@ -271,8 +313,8 @@ async fn insert_questions_from_text(
 
         sqlx::query(
             r#"
-            INSERT INTO questions (id, subject, subtopic, topics, marks, content, math_snippet, is_code)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO questions (id, subject, subtopic, topics, marks, content, math_snippet, is_code, module)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             "#,
         )
         .bind(&id)
@@ -283,6 +325,7 @@ async fn insert_questions_from_text(
         .bind(&content)
         .bind(&math_snippet)
         .bind(is_code)
+        .bind(Option::<String>::None)
         .execute(pool)
         .await
         .map_err(|e| format!("Failed to insert question: {}", e))?;
@@ -311,8 +354,8 @@ pub async fn add_question(question: Question, state: State<'_, AppState>) -> Res
     let pool = state.db.lock().await;
     sqlx::query(
         r#"
-        INSERT INTO questions (id, subject, subtopic, topics, marks, content, math_snippet, is_code)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO questions (id, subject, subtopic, topics, marks, content, math_snippet, is_code, module)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
         "#,
     )
     .bind(question.id)
@@ -323,6 +366,7 @@ pub async fn add_question(question: Question, state: State<'_, AppState>) -> Res
     .bind(question.content)
     .bind(question.math_snippet)
     .bind(question.is_code)
+    .bind(question.module)
     .execute(&*pool)
     .await
     .map_err(|e| e.to_string())?;
@@ -611,6 +655,40 @@ pub async fn compile_worksheet(
     ])
 }
 
+fn fix_json_escapes(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 100);
+    let chars: Vec<char> = s.chars().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] == '\\' {
+            if i + 1 < chars.len() {
+                let next = chars[i + 1];
+                if next == '"' || next == '\\' || next == '/' || next == 'b' || next == 'f' || next == 'n' || next == 'r' || next == 't' || next == 'u' {
+                    out.push('\\');
+                    out.push(next);
+                    i += 2;
+                    continue;
+                } else {
+                    out.push('\\');
+                    out.push('\\');
+                    out.push(next);
+                    i += 2;
+                    continue;
+                }
+            } else {
+                out.push('\\');
+                out.push('\\');
+                i += 1;
+                continue;
+            }
+        } else {
+            out.push(chars[i]);
+            i += 1;
+        }
+    }
+    out
+}
+
 #[tauri::command]
 pub async fn parse_pdf_vision(
     app: tauri::AppHandle,
@@ -710,6 +788,16 @@ pub async fn parse_pdf_vision(
         }
     }
 
+    let mut pdf_page_texts: Vec<String> = Vec::new();
+    if file_path.to_lowercase().ends_with(".pdf") {
+        if let Ok(pages) = pdf_extract::extract_text_by_pages(&file_path) {
+            let re_lines = regex::Regex::new(r"_+|-+").unwrap();
+            pdf_page_texts = pages.into_iter().map(|s| {
+                re_lines.replace_all(&s, "").to_string()
+            }).collect();
+        }
+    }
+
     let classifier = SubjectClassifier::new();
     let mut aggregated_questions: std::collections::BTreeMap<String, Question> = std::collections::BTreeMap::new();
     
@@ -738,8 +826,9 @@ pub async fn parse_pdf_vision(
         content: Option<String>,
         math_snippet: Option<String>,
         is_code: Option<bool>,
-        diagram_bbox: Option<Vec<f32>>,
+        diagram_bboxes: Option<Vec<Vec<f32>>>,
         is_continuation: Option<bool>,
+        module: Option<String>,
     }
 
     #[derive(serde::Deserialize)]
@@ -749,6 +838,12 @@ pub async fn parse_pdf_vision(
     }
 
     for page_idx in 0..effective_num_pages {
+        let page_text = if page_idx < pdf_page_texts.len() {
+            &pdf_page_texts[page_idx]
+        } else {
+            ""
+        };
+        
         let system_prompt = format!(r#"You are a mathematical OCR engine. You MUST output a valid JSON object starting with {{ and ending with }}. Do NOT output a bare array.
 
 RULE 1 (JSON SCHEMA):
@@ -759,30 +854,52 @@ The root object MUST be: {{ "extracted_questions": [ ... ] }}. Every question ob
 - "math_snippet": string (LEAVE THIS EMPTY. Put all math directly inside the "content" string where it belongs chronologically).
 - "is_code": boolean
 - "topics": array of strings (Select relevant topics from the provided list below)
-- "diagram_bbox": [x, y, w, h] normalized floats between 0.0 and 1.0 (e.g., 0.12, 0.45). If you return pixel integers (e.g., 86, 229), the code will crash. You must calculate these as a fraction of the total image width/height.
+- "module": string (Select the correct module based on topics: e.g., 'Pure', 'Mechanics', 'Core Pure', 'Decision Mathematics 1', etc., or 'General'/'Unknown' if not applicable)
+- "diagram_bboxes": Array of bounding boxes [[x, y, w, h], ...]. CRITICAL: This MUST be a 2D array of arrays, even if there is only one diagram. Example: [[0.1, 0.2, 0.4, 0.4]]. Calculate these as a fraction of the total image width/height.
 - "is_continuation": boolean
 
-RULE 2 (SUBJECT TAGS):
-You are STRICTLY FORBIDDEN from inventing topics. You MUST only use the provided topics list: {:?}.
+RULE 2 (SUBJECT TAGS & MODULES):
+You are STRICTLY FORBIDDEN from inventing topics. You MUST select at least one relevant topic from the provided list below for every question. Do not leave the topics array empty.
+You MUST select the correct "module" based on the topics:
+- Mathematics Modules: Pure, Statistics, Mechanics.
+- Further Mathematics Modules: Core Pure, Further Mechanics 1, Further Statistics 1, Decision Mathematics 1, Further Pure 1.
+For Physics or Computer Science, set module to 'General'.
+You MUST only use the provided topics list: {:?}.
 
 RULE 3 (PUNCTUATION & FORMATTING):
 - Preserve ALL original punctuation (commas, periods, colons). Do not strip them.
+- DO NOT TRUNCATE: You must transcribe the ENTIRE question text on the page exactly as it appears in the RAW TEXT. Do not stop halfway through a sentence or equation.
 - Preserve spatial formatting: If there is a list or lines of working (e.g., Bin 1: ..., Bin 2: ...), separate them with double newlines (\n\n) so they do not become a wall of text.
 - Use double newlines (\n\n) to separate sub-parts like (a), (b), (i). 
 - If a question has multiple parts, include all parts in ONE JSON object for that question number.
-- WRAP ALL MATH: You MUST wrap all numbers, variables, expressions, and mathematical operators in single `$` for inline math or `$$` for display math.
+- WRAP ALL MATH: You MUST wrap all numbers, variables, expressions, and mathematical operators in single `$` for inline math.
+- STRICT DISPLAY MATH RULE: ONLY use `$$` for display math if the equation is naturally on its own line and visually separated from the text block. DO NOT use `$$` for variables embedded within a sentence (e.g., use `$P$`, `$i$`, `$j$`, not `$$P$$`).
 - STRICT LaTeX RULE: NEVER put `$` or `$$` delimiters INSIDE a LaTeX environment like `\begin{{array}}` or `\begin{{aligned}}`. Environments must stand alone inside `$$...$$`.
 
 RULE 4 (TABLES & DIAGRAMS):
 - TABLES: ONLY true data tables, matrices, or Simplex tableaus should be formatted as LaTeX block math using the `array` environment. Do NOT draw image bounding boxes around pure data tables.
-- DIAGRAMS: You MUST use `diagram_bbox` for all visual and scheduling elements including Gantt charts, scheduling diagrams, timelines, graphs, plots, charts, illustrations, networks, and trees. Do NOT attempt to recreate scheduling diagrams or timelines using LaTeX arrays. Provide the bounding box [x, y, w, h] as relative coordinates (0.0 to 1.0).
+- DIAGRAMS: You MUST use `diagram_bboxes` for all visual and scheduling elements including Gantt charts, scheduling diagrams, timelines, graphs, plots, charts, illustrations, networks, and trees. Do NOT attempt to recreate scheduling diagrams or timelines using LaTeX arrays. Provide the bounding box [[x, y, w, h]] as relative coordinates (0.0 to 1.0). If there are multiple diagrams, provide multiple bounding boxes in the array.
+  CRITICAL: Draw ONE single large bounding box that captures the ENTIRE diagram (including all axis labels, nodes, and headers). DO NOT split a single graph or network into multiple separate bounding boxes.
+  CRITICAL DIAGRAM BAN: You are STRICTLY FORBIDDEN from drawing bounding boxes around standard paragraphs of text, mathematical working out, equations, or empty student working grids. Bounding boxes are ONLY for visual graphics. If it's text or math, you MUST transcribe it into Markdown/LaTeX.
 - Example: If the image is 1000px wide and the diagram starts at 100px, x should be 0.1.
 - If you cannot calculate the relative coordinate, return null.
 RULE 5 (EXCLUSIONS & CLEANUP):
 - EXCLUDE MARKS: Do NOT extract the mark counts that appear next to question parts (e.g., "(4)", "[3]"). Do NOT extract the footer text that says "Total for Question X is Y marks". Just sum the marks mentally and put the total integer in the "marks" JSON field.
+- EXCLUDE HEADERS/FOOTERS: Do NOT extract page headers or footers like "Question X continued", "Turn over", or "TOTAL FOR PAPER IS X MARKS".
 - EXCLUDE BLANK PAGES: If a page just says "BLANK PAGE" or "Turn over", completely ignore it. Do NOT include this text in the content. If the entire page is blank or just says "BLANK PAGE", return an empty array `[]`.
+- EXCLUDE STUDENT GRIDS: Do NOT transcribe horizontal lines, dots, or grids (e.g. `_____` or `......`) that are intended for students to write their answers on. Ignore them completely.
 
-CONTEXT: The previous page was processing Question {}. If the current image does not explicitly start with a new question number, you MUST assume it is a continuation of Question {}, use that number in JSON, and set 'is_continuation': true."#, allowed_topics, current_question_num, current_question_num);
+RULE 6 (CRITICAL JSON ESCAPING):
+You are outputting a JSON string. You MUST properly escape all backslashes in LaTeX commands. For example, write `\\frac` instead of `\frac`, and `\\mathbf` instead of `\mathbf`. If you output raw backslashes, the JSON parser will crash and the question will be completely lost!
+
+RULE 7 (HYBRID TEXT FORMATTING):
+Rust has already extracted the raw text from this document for you. Your job is ONLY to act as a Markdown formatter for this provided raw text.
+You MUST transcribe EVERY SINGLE WORD of the raw text provided. DO NOT summarize, skip, or truncate.
+The image is provided ONLY so you can correct OCR errors, properly format mathematical formulas using LaTeX, and identify bounding boxes for diagrams. Do not transcribe blank lines `___` from the raw text.
+RAW TEXT:
+{}
+
+CONTEXT: The previous page was processing Question {}. If the current image does not explicitly start with a new question number, you MUST assume it is a continuation of Question {}, use that number in JSON, and set 'is_continuation': true."#, allowed_topics, current_question_num, current_question_num, page_text);
 
         let b64_data_str = &pdf_pages[page_idx];
         let b64_data = if b64_data_str.starts_with("data:image") {
@@ -837,20 +954,20 @@ CONTEXT: The previous page was processing Question {}. If the current image does
             .trim()
             .to_string();
             
-        let cleaned_json = if content_str.starts_with("```json") {
+        let fixed_json = fix_json_escapes(if content_str.starts_with("```json") {
             content_str.trim_start_matches("```json").trim_end_matches("```").trim()
         } else if content_str.starts_with("```") {
             content_str.trim_start_matches("```").trim_end_matches("```").trim()
         } else {
             &content_str
-        };
+        });
         
-        let parsed_page: OpenAIResult = match serde_json::from_str(cleaned_json) {
+        let parsed_page: OpenAIResult = match serde_json::from_str(&fixed_json) {
             Ok(v) => v,
             Err(e) => {
                 let err_str = e.to_string();
                 if err_str.contains("EOF") || err_str.contains("expected value") || err_str.contains("trailing characters") {
-                    let mut current = cleaned_json.to_string();
+                    let mut current = fixed_json.to_string();
                     let mut attempts = 0;
                     let mut recovered: Option<OpenAIResult> = None;
                     while attempts < 2000 && !current.is_empty() {
@@ -865,11 +982,11 @@ CONTEXT: The previous page was processing Question {}. If the current image does
                     if let Some(v) = recovered {
                         v
                     } else {
-                        println!("Failed to parse JSON on page {}: {} - Raw: {}", page_idx, e, cleaned_json);
+                        println!("Failed to parse JSON on page {}: {} - Raw: {}", page_idx, e, fixed_json);
                         continue;
                     }
                 } else {
-                    println!("Failed to parse JSON on page {}: {} - Raw: {}", page_idx, e, cleaned_json);
+                    println!("Failed to parse JSON on page {}: {} - Raw: {}", page_idx, e, fixed_json);
                     continue;
                 }
             }
@@ -905,37 +1022,60 @@ CONTEXT: The previous page was processing Question {}. If the current image does
             };
 
             // Diagram cropping logic
-            if let Some(bbox) = &q.diagram_bbox {
-                if bbox.len() == 4 {
-                    use base64::Engine;
-                    if let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(b64_data) {
-                        if let Ok(mut img) = image::load_from_memory(&bytes) {
-                            let (width, height) = img.dimensions();
-                            let x = (bbox[0] * width as f32) as u32;
-                            let y = (bbox[1] * height as f32) as u32;
-                            let w = (bbox[2] * width as f32) as u32;
-                            let h = (bbox[3] * height as f32) as u32;
+            if let Some(bboxes) = &q.diagram_bboxes {
+                use base64::Engine;
+                if let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(b64_data) {
+                    if let Ok(mut img) = image::load_from_memory(&bytes) {
+                        if !bboxes.is_empty() {
+                            let mut min_x = 1.0_f32;
+                            let mut min_y = 1.0_f32;
+                            let mut max_x = 0.0_f32;
+                            let mut max_y = 0.0_f32;
+                            
+                            for bbox in bboxes {
+                                if bbox.len() == 4 {
+                                    min_x = min_x.min(bbox[0]);
+                                    min_y = min_y.min(bbox[1]);
+                                    max_x = max_x.max(bbox[0] + bbox[2]);
+                                    max_y = max_y.max(bbox[1] + bbox[3]);
+                                }
+                            }
+                            
+                            if min_x <= max_x && min_y <= max_y {
+                                let merged_w = max_x - min_x;
+                                let merged_h = max_y - min_y;
+                                
+                                let (width, height) = img.dimensions();
+                                let x = (min_x * width as f32) as u32;
+                                let y = (min_y * height as f32) as u32;
+                                let w = (merged_w * width as f32) as u32;
+                                let h = (merged_h * height as f32) as u32;
 
-                            let padding: u32 = 40;
-                            let safe_x = x.saturating_sub(padding);
-                            let safe_y = y.saturating_sub(padding);
-                            let safe_width = (w + (x - safe_x) + padding).min(width - safe_x);
-                            let safe_height = (h + (y - safe_y) + padding).min(height - safe_y);
+                                let padding: u32 = 40;
+                                let safe_x = x.saturating_sub(padding);
+                                let safe_y = y.saturating_sub(padding);
+                                let safe_width = (w + (x - safe_x) + padding).min(width - safe_x);
+                                let safe_height = (h + (y - safe_y) + padding).min(height - safe_y);
 
-                            if safe_width > 0 && safe_height > 0 {
-                                let cropped = image::imageops::crop(&mut img, safe_x, safe_y, safe_width, safe_height).to_image();
-                                if let Ok(app_data_dir) = app.path().app_data_dir() {
-                                    let diagrams_dir = app_data_dir.join("diagrams");
-                                    let _ = std::fs::create_dir_all(&diagrams_dir);
-                                    let img_uuid = uuid::Uuid::new_v4().to_string();
-                                    let img_path = diagrams_dir.join(format!("{}.png", img_uuid));
+                                if safe_width > 0 && safe_height > 0 {
+                                    let cropped = image::imageops::crop(&mut img, safe_x, safe_y, safe_width, safe_height).to_image();
                                     
-                                    if cropped.save(&img_path).is_ok() {
-                                        let link = format!("\n\n![Diagram]({})\n\n", img_path.to_string_lossy().replace('\\', "/"));
-                                        if q_content.contains("[DIAGRAM_PLACEHOLDER]") {
-                                            q_content = q_content.replace("[DIAGRAM_PLACEHOLDER]", &link);
-                                        } else {
-                                            q_content.push_str(&link);
+                                    // Anti-blank guardrail
+                                    if !is_blank_or_grid(&image::DynamicImage::ImageRgba8(cropped.clone())) {
+                                        if let Ok(app_data_dir) = app.path().app_data_dir() {
+                                            let diagrams_dir = app_data_dir.join("diagrams");
+                                            let _ = std::fs::create_dir_all(&diagrams_dir);
+                                            let img_uuid = uuid::Uuid::new_v4().to_string();
+                                            let img_path = diagrams_dir.join(format!("{}.png", img_uuid));
+                                            
+                                            if cropped.save(&img_path).is_ok() {
+                                                let link = format!("\n\n![Diagram]({})\n\n", img_path.to_string_lossy().replace('\\', "/"));
+                                                if q_content.contains("[DIAGRAM_PLACEHOLDER]") {
+                                                    q_content = q_content.replacen("[DIAGRAM_PLACEHOLDER]", &link, 1);
+                                                } else {
+                                                    q_content.push_str(&link);
+                                                }
+                                            }
                                         }
                                     }
                                 }
@@ -943,6 +1083,10 @@ CONTEXT: The previous page was processing Question {}. If the current image does
                         }
                     }
                 }
+            }
+
+            if q_content.contains("[DIAGRAM_PLACEHOLDER]") {
+                q_content = q_content.replace("[DIAGRAM_PLACEHOLDER]", "");
             }
 
             let existing = aggregated_questions.entry(target_q_num.clone()).or_insert_with(|| {
@@ -959,6 +1103,7 @@ CONTEXT: The previous page was processing Question {}. If the current image does
                     topics: Some(serde_json::to_string(&q.topics.clone().unwrap_or_default()).unwrap_or_else(|_| "[]".to_string())),
                     paper_name: paper_name.clone(),
                     question_number: q_num_val.as_i64().or_else(|| target_q_num.parse::<i64>().ok()),
+                    module: Some(q.module.clone().unwrap_or_else(|| "Unknown".to_string())),
                 }
             });
 
@@ -968,11 +1113,66 @@ CONTEXT: The previous page was processing Question {}. If the current image does
             existing.content.push_str(&q_content);
         }
     }
-
     let pool = state.db.lock().await;
     let mut final_questions = Vec::new();
     
     for (q_num_str, mut question_obj) in aggregated_questions {
+        let re_q_cont = regex::Regex::new(r"(?i)Question\s+\d+\s+continued").unwrap();
+        let re_total_q = regex::Regex::new(r"(?i)\(Total\s+for\s+Question\s+\d+\s+is\s+\d+\s+marks\)").unwrap();
+        let re_total_q2 = regex::Regex::new(r"(?i)Total\s+for\s+Question\s+\d+\s+is\s+\d+\s+marks").unwrap();
+        let re_total_paper = regex::Regex::new(r"(?i)TOTAL\s+FOR\s+PAPER\s+IS\s+\d+\s+MARKS").unwrap();
+        let re_turn_over = regex::Regex::new(r"(?i)Turn\s+over").unwrap();
+        let re_blank_page = regex::Regex::new(r"(?i)BLANK\s+PAGE").unwrap();
+
+        let mut cleaned = question_obj.content.clone();
+        cleaned = re_q_cont.replace_all(&cleaned, "").into_owned();
+        cleaned = re_total_q.replace_all(&cleaned, "").into_owned();
+        cleaned = re_total_q2.replace_all(&cleaned, "").into_owned();
+        cleaned = re_total_paper.replace_all(&cleaned, "").into_owned();
+        cleaned = re_turn_over.replace_all(&cleaned, "").into_owned();
+        cleaned = re_blank_page.replace_all(&cleaned, "").into_owned();
+        question_obj.content = cleaned.trim().to_string();
+
+        let mut final_topics_str = question_obj.topics.clone().unwrap_or_else(|| "[]".to_string());
+
+        if final_topics_str == "[]" || final_topics_str == "null" {
+            let allowed_topics_for_tagging: &[&str] = match question_obj.subject.as_str() {
+                "Mathematics" => EDEXCEL_MATHS_TOPICS,
+                "Further Mathematics" => FURTHER_MATHS_TOPICS,
+                "Physics" => PHYSICS_TOPICS,
+                "Computer Science" => CS_TOPICS,
+                _ => &[],
+            };
+            if !allowed_topics_for_tagging.is_empty() {
+                let tag_prompt = format!(
+                    "Analyze the following question and select ALL relevant topics from this exact list: {:?}.\n\nReturn ONLY a valid JSON array of strings, e.g. [\"Topic 1\", \"Topic 2\"]. Do not return anything else.\n\nQuestion text: {}",
+                    allowed_topics_for_tagging, cleaned
+                );
+                
+                let tag_req = serde_json::json!({
+                    "model": "gpt-4o-mini",
+                    "messages": [
+                        { "role": "user", "content": tag_prompt }
+                    ],
+                    "temperature": 0.1
+                });
+                
+                let url = format!("{}/chat/completions", base_url.trim_end_matches('/'));
+                if let Ok(res) = client.post(&url).header("Authorization", format!("Bearer {}", api_key)).json(&tag_req).send().await {
+                    if let Ok(resp_json) = res.json::<serde_json::Value>().await {
+                        if let Some(content) = resp_json["choices"][0]["message"]["content"].as_str() {
+                            let raw_json = content.trim().trim_start_matches("```json").trim_start_matches("```").trim_end_matches("```").trim();
+                            if let Ok(topics_arr) = serde_json::from_str::<Vec<String>>(raw_json) {
+                                if !topics_arr.is_empty() {
+                                    final_topics_str = serde_json::to_string(&topics_arr).unwrap_or_else(|_| "[]".to_string());
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         let q_num_val = q_num_str.parse::<i64>().unwrap_or(0);
         let mut final_id = question_obj.id.clone();
         let mut final_content = question_obj.content.clone();
@@ -992,13 +1192,13 @@ CONTEXT: The previous page was processing Question {}. If the current image does
                 final_id = existing_id.clone();
                 final_content = format!("{}\n\n{}", existing_content, final_content);
                 
-                let new_topics_str = question_obj.topics.clone().unwrap_or_else(|| "[]".to_string());
                 let new_marks = question_obj.marks;
                 
-                sqlx::query("UPDATE questions SET content = ?, topics = CASE WHEN ? != '[]' THEN ? ELSE topics END, marks = CASE WHEN ? > 1 THEN ? ELSE marks END WHERE id = ?")
+                sqlx::query("UPDATE questions SET content = ?, topics = CASE WHEN ? != '[]' THEN ? ELSE topics END, module = COALESCE(?, module), marks = CASE WHEN ? > 1 THEN ? ELSE marks END WHERE id = ?")
                     .bind(&final_content)
-                    .bind(&new_topics_str)
-                    .bind(&new_topics_str)
+                    .bind(&final_topics_str)
+                    .bind(&final_topics_str)
+                    .bind(&question_obj.module)
                     .bind(new_marks)
                     .bind(new_marks)
                     .bind(&existing_id)
@@ -1012,20 +1212,21 @@ CONTEXT: The previous page was processing Question {}. If the current image does
         if !was_updated {
             sqlx::query(
                 r#"
-                INSERT INTO questions (id, subject, subtopic, topics, marks, content, math_snippet, is_code, paper_name, question_number)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO questions (id, subject, subtopic, topics, marks, content, math_snippet, is_code, paper_name, question_number, module)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 "#,
             )
             .bind(&final_id)
             .bind(&question_obj.subject)
             .bind(&question_obj.subtopic)
-            .bind(&question_obj.topics.clone().unwrap_or_else(|| "[]".to_string()))
+            .bind(&final_topics_str)
             .bind(question_obj.marks)
             .bind(&final_content)
             .bind(&question_obj.math_snippet)
             .bind(question_obj.is_code)
             .bind(&paper_name)
             .bind(q_num_val)
+            .bind(&question_obj.module)
             .execute(&*pool)
             .await
             .map_err(|e| format!("DB error inserting new question: {}", e))?;
@@ -1106,15 +1307,17 @@ pub async fn update_question(
     new_marks: i32,
     new_answer_content: Option<String>,
     new_topics: Option<String>,
+    new_module: Option<String>,
 ) -> Result<(), String> {
     use tauri::Manager;
     let state = app.state::<AppState>();
     let pool = state.db.lock().await;
-    sqlx::query("UPDATE questions SET content = ?, marks = ?, answer_content = ?, topics = COALESCE(?, topics), math_snippet = '' WHERE id = ?")
+    sqlx::query("UPDATE questions SET content = ?, marks = ?, answer_content = ?, topics = COALESCE(?, topics), module = COALESCE(?, module), math_snippet = '' WHERE id = ?")
         .bind(new_content)
         .bind(new_marks)
         .bind(new_answer_content)
         .bind(new_topics)
+        .bind(new_module)
         .bind(id)
         .execute(&*pool)
         .await
@@ -1124,7 +1327,7 @@ pub async fn update_question(
 
 #[tauri::command]
 pub async fn parse_mark_scheme_vision(
-    _app: tauri::AppHandle,
+    app: tauri::AppHandle,
     api_key: String,
     file_path: String,
     pdf_base64_pages: Option<Vec<String>>,
@@ -1159,6 +1362,21 @@ pub async fn parse_mark_scheme_vision(
         return Err("File is empty or contains only unextractable images.".to_string());
     }
 
+    let mut pdf_page_texts: Vec<String> = Vec::new();
+    if has_pdf_pages && file_path.to_lowercase().ends_with(".pdf") {
+        let file_path_clone = file_path.clone();
+        pdf_page_texts = tokio::task::spawn_blocking(move || {
+            if let Ok(pages) = pdf_extract::extract_text_by_pages(&file_path_clone) {
+                let re_lines = regex::Regex::new(r"_+|-+").unwrap();
+                pages.into_iter().map(|s| {
+                    re_lines.replace_all(&s, "").to_string()
+                }).collect()
+            } else {
+                Vec::new()
+            }
+        }).await.unwrap_or_default();
+    }
+
     let system_prompt = r#"STEP 1: Look at the page headers. If you see 'General Instructions for Marking', 'General Marking Guidance', 'General Principles for Mechanics Marking', or 'Abbreviations', you MUST immediately return an empty array `[]`. DO NOT invent math. DO NOT extract numbered lists from these pages.
 
 ESCAPE HATCH: Exams contain front covers, formula booklets, and 'General Marking Guidance' pages. If the provided images DO NOT contain any actual exam questions or mark scheme answers, you MUST return a completely empty JSON array: `[]`.
@@ -1172,7 +1390,9 @@ IGNORE EXAMINER NOTES: Discard any text explaining mark allocations (e.g., M1, A
 LIMIT ALTERNATIVES: If a question has multiple alternative methods, extract the main scheme and a MAXIMUM of ONE Alternative Method. Discard the rest.
 
 You are an expert examiner. Extract the final answers and grading logic from this mark scheme.
-Return a JSON object with a single key 'answers' containing an array of objects. Do NOT rely on array indices. Each object MUST contain a `question_number` (Integer) read directly from the page, and `answer_markdown` (String).
+Return a JSON object with a single key 'answers' containing an array of objects. Do NOT rely on array indices. Each object MUST contain a `question_number` (Integer) read directly from the page, `answer_markdown` (String), and `module` (String, e.g. 'Pure', 'Mechanics', 'Core Pure', 'Decision Mathematics 1', etc., or 'General'/'Unknown' if not applicable).
+- "diagram_bboxes": Array of bounding boxes [[x, y, w, h], ...]. CRITICAL: This MUST be a 2D array of arrays, even if there is only one diagram. Example: [[0.1, 0.2, 0.4, 0.4]]. Calculate these as a fraction of the total image width/height.
+- "diagram_page_indexes": Array of integers [0, 1, 2, ...]. This indicates WHICH of the provided images EACH diagram belongs to (0 for the first image, 1 for the second, etc). The length MUST match diagram_bboxes.
 
 QAB RULE: Preserve sub-question letters exactly as printed (e.g., (g), (h)). Do not reset them to (a) on a new page.
 
@@ -1195,7 +1415,8 @@ CRITICAL FORMATTING RULES:
 DECISION MATHS QAB PROTOCOL:
 THE REPRINT BAN: If a page reprints a previous question's text or initial tableau for convenience, IGNORE the reprinted text and only extract the new sub-questions.
 MATH TABLES: Simplex tableaus and data tables MUST be formatted as LaTeX block math using the `array` environment. Do NOT draw image bounding boxes around them.
-GRAPHICAL DIAGRAMS: Activity networks, Gantt charts, and trees MUST be captured via image bounding box coordinates. Do NOT try to build them with LaTeX.
+GRAPHICAL DIAGRAMS: Activity networks, Gantt charts, and trees MUST be captured via image bounding box coordinates using `diagram_bboxes` and `diagram_page_indexes`. Do NOT try to build them with LaTeX. In `answer_markdown`, insert the exact string "[DIAGRAM_PLACEHOLDER]" exactly where the diagram appears.
+CRITICAL DIAGRAM BAN: You are STRICTLY FORBIDDEN from drawing bounding boxes around standard paragraphs of text, mathematical working out, examiner notes, equations, or empty student working grids. Bounding boxes are ONLY for visual graphics. If it's text or math, you MUST transcribe it into Markdown/LaTeX. If you use a diagram bounding box to avoid typing out long mathematical working, you have failed.
 THE EMPTY GRID BAN: NEVER capture empty working grids, blank lines, or unpopulated tracing tables. Return nothing for these.
 
 TEMPLATE TO FOLLOW FOR EACH PART:
@@ -1209,7 +1430,12 @@ $$ R_1 = \frac{1}{2}r^2(\theta - \sin\theta) $$
 \n\n
 **(a)** Alternative step-by-step working...
 \n\n
-$$ \frac{1}{2}r^2(\theta - \sin\theta) = 2 \cdot \frac{1}{2}r^2((\pi - \theta) - \sin\theta) $$"#;
+$$ \frac{1}{2}r^2(\theta - \sin\theta) = 2 \cdot \frac{1}{2}r^2((\pi - \theta) - \sin\theta) $$
+
+RULE (HYBRID TEXT FORMATTING):
+Rust has already extracted the raw text from this document for you. Your job is ONLY to act as a Markdown formatter for this provided raw text.
+You MUST transcribe EVERY SINGLE WORD of the raw text provided. DO NOT summarize, skip, or truncate.
+The image is provided ONLY so you can correct OCR errors, properly format mathematical formulas using LaTeX, and identify bounding boxes for diagrams."#;
 
     let mut requests_to_make = Vec::new();
 
@@ -1235,7 +1461,17 @@ $$ \frac{1}{2}r^2(\theta - \sin\theta) = 2 \cdot \frac{1}{2}r^2((\pi - \theta) -
                     if primary_end > primary_start { format!("\u{2013}{}", primary_end) } else { String::new() }
                 )
             };
-            let mut content_array = vec![serde_json::json!({ "type": "text", "text": context_note })];
+            
+            let mut chunk_text = String::new();
+            for i in start..end {
+                if i < pdf_page_texts.len() {
+                    chunk_text.push_str(&format!("RAW TEXT PAGE {}:\n{}\n\n---\n\n", i + 1, pdf_page_texts[i]));
+                }
+            }
+            
+            let final_prompt_text = format!("{}\n\nBELOW IS THE EXTRACTED RAW TEXT FOR THESE PAGES. You MUST format this text completely without skipping any words or steps.\n\n{}", context_note, chunk_text);
+            
+            let mut content_array = vec![serde_json::json!({ "type": "text", "text": final_prompt_text })];
             for page_b64 in chunk {
                 content_array.push(serde_json::json!({
                     "type": "image_url",
@@ -1301,6 +1537,8 @@ $$ \frac{1}{2}r^2(\theta - \sin\theta) = 2 \cdot \frac{1}{2}r^2((\pi - \theta) -
         question_number: Option<i64>,
         /// Formatted LaTeX/Markdown solution steps for this question.
         answer_markdown: Option<String>,
+        diagram_bboxes: Option<Vec<Vec<f32>>>,
+        diagram_page_indexes: Option<Vec<usize>>,
     }
 
     #[derive(serde::Deserialize)]
@@ -1312,7 +1550,7 @@ $$ \frac{1}{2}r^2(\theta - \sin\theta) = 2 \cdot \frac{1}{2}r^2((\pi - \theta) -
     let mut all_answers = Vec::new();
     let mut seen_fingerprints = std::collections::HashSet::new();
 
-    for (req_body, _) in requests_to_make {
+    for (req_body, start) in requests_to_make {
         let mut retry_count = 0;
         let mut response_json: Option<serde_json::Value> = None;
 
@@ -1507,10 +1745,102 @@ $$ \frac{1}{2}r^2(\theta - \sin\theta) = 2 \cdot \frac{1}{2}r^2((\pi - \theta) -
         // We do not return an error here if answers is empty — it could be a blank/title page.
 
         for ans in parsed.answers {
-            let ans_content = match ans.answer_markdown {
+            let mut ans_content = match ans.answer_markdown {
                 Some(ref c) if !c.trim().is_empty() => c.clone(),
                 _ => continue, // Skip answers without content
             };
+
+            // Diagram crop logic
+            if let Some(bboxes) = &ans.diagram_bboxes {
+                let page_indexes = ans.diagram_page_indexes.clone().unwrap_or_default();
+                
+                // Group by page index
+                let mut page_to_bboxes: std::collections::HashMap<usize, Vec<Vec<f32>>> = std::collections::HashMap::new();
+                for (i, bbox) in bboxes.iter().enumerate() {
+                    if bbox.len() == 4 {
+                        let page_idx_in_chunk = page_indexes.get(i).copied().unwrap_or(0);
+                        page_to_bboxes.entry(page_idx_in_chunk).or_default().push(bbox.clone());
+                    }
+                }
+                
+                if let Some(pages) = &pdf_base64_pages {
+                    for (page_idx_in_chunk, page_bboxes) in page_to_bboxes {
+                        let target_idx = start + page_idx_in_chunk;
+                        if target_idx < pages.len() {
+                            let b64_data_str = &pages[target_idx];
+                            let b64_data = if b64_data_str.starts_with("data:image") {
+                                b64_data_str.split(',').nth(1).unwrap_or(b64_data_str)
+                            } else {
+                                b64_data_str
+                            };
+                            
+                            use base64::Engine;
+                            if let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(b64_data) {
+                                if let Ok(mut img) = image::load_from_memory(&bytes) {
+                                    if !page_bboxes.is_empty() {
+                                        let mut min_x = 1.0_f32;
+                                        let mut min_y = 1.0_f32;
+                                        let mut max_x = 0.0_f32;
+                                        let mut max_y = 0.0_f32;
+                                        
+                                        for bbox in &page_bboxes {
+                                            min_x = min_x.min(bbox[0]);
+                                            min_y = min_y.min(bbox[1]);
+                                            max_x = max_x.max(bbox[0] + bbox[2]);
+                                            max_y = max_y.max(bbox[1] + bbox[3]);
+                                        }
+                                        
+                                        if min_x <= max_x && min_y <= max_y {
+                                            let merged_w = max_x - min_x;
+                                            let merged_h = max_y - min_y;
+                                            
+                                            let (width, height) = img.dimensions();
+                                            let x = (min_x * width as f32) as u32;
+                                            let y = (min_y * height as f32) as u32;
+                                            let w = (merged_w * width as f32) as u32;
+                                            let h = (merged_h * height as f32) as u32;
+
+                                            let padding: u32 = 40;
+                                            let safe_x = x.saturating_sub(padding);
+                                            let safe_y = y.saturating_sub(padding);
+                                            let safe_width = (w + (x - safe_x) + padding).min(width - safe_x);
+                                            let safe_height = (h + (y - safe_y) + padding).min(height - safe_y);
+
+                                            if safe_width > 0 && safe_height > 0 {
+                                                let cropped = image::imageops::crop(&mut img, safe_x, safe_y, safe_width, safe_height).to_image();
+                                                
+                                                // Anti-blank guardrail
+                                                if !is_blank_or_grid(&image::DynamicImage::ImageRgba8(cropped.clone())) {
+                                                    use tauri::Manager;
+                                                    if let Ok(app_data_dir) = app.path().app_data_dir() {
+                                                        let diagrams_dir = app_data_dir.join("diagrams");
+                                                        let _ = std::fs::create_dir_all(&diagrams_dir);
+                                                        let img_uuid = uuid::Uuid::new_v4().to_string();
+                                                        let img_path = diagrams_dir.join(format!("{}.png", img_uuid));
+                                                        
+                                                        if cropped.save(&img_path).is_ok() {
+                                                            let link = format!("\n\n![Diagram]({})\n\n", img_path.to_string_lossy().replace('\\', "/"));
+                                                            if ans_content.contains("[DIAGRAM_PLACEHOLDER]") {
+                                                                ans_content = ans_content.replacen("[DIAGRAM_PLACEHOLDER]", &link, 1);
+                                                            } else {
+                                                                ans_content.push_str(&link);
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            if ans_content.contains("[DIAGRAM_PLACEHOLDER]") {
+                ans_content = ans_content.replace("[DIAGRAM_PLACEHOLDER]", "");
+            }
 
             // Deduplicate across overlapping batches using a content fingerprint.
             let fingerprint: String = ans_content
@@ -1528,6 +1858,8 @@ $$ \frac{1}{2}r^2(\theta - \sin\theta) = 2 \cdot \frac{1}{2}r^2((\pi - \theta) -
                 all_answers.push(ExtractedAnswer {
                     question_number: Some(q_num),
                     answer_markdown: Some(ans_content),
+                    diagram_bboxes: ans.diagram_bboxes.clone(),
+                    diagram_page_indexes: ans.diagram_page_indexes.clone(),
                 });
             } else {
                 eprintln!("[MergeMark] WARNING: AI returned an answer without a question_number — skipping.");
