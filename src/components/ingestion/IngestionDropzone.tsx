@@ -8,9 +8,12 @@ import { cn } from "@/lib/utils";
 import { SUBJECTS } from "@/lib/taxonomy";
 
 import * as pdfjsLib from "pdfjs-dist";
-import pdfWorker from "pdfjs-dist/build/pdf.worker.mjs?url";
 
-pdfjsLib.GlobalWorkerOptions.workerSrc = pdfWorker;
+pdfjsLib.GlobalWorkerOptions.workerSrc = new URL(
+  "pdfjs-dist/build/pdf.worker.mjs",
+  import.meta.url
+).toString();
+
 
 // ── IngestionDropzone ─────────────────────────────────────────────────────────
 

@@ -1816,3 +1816,338 @@ pub async fn commit_mark_schemes(
 
     Ok(())
 }
+
+// ── Hybrid Pipeline ──────────────────────────────────────────────────────────
+
+struct BBoxOutput {
+    pub text_data: Vec<(String, f64, f64)>,
+    pub pdf_page_height: f64,
+}
+
+impl pdf_extract::OutputDev for BBoxOutput {
+    fn begin_page(&mut self, _page_num: u32, media_box: &pdf_extract::MediaBox, _art_box: Option<(f64, f64, f64, f64)>) -> Result<(), pdf_extract::OutputError> {
+        self.pdf_page_height = media_box.ury - media_box.lly;
+        Ok(())
+    }
+    fn end_page(&mut self) -> Result<(), pdf_extract::OutputError> {
+        Ok(())
+    }
+    fn output_character(&mut self, trm: &pdf_extract::Transform, _width: f64, _spacing: f64, _font_size: f64, char: &str) -> Result<(), pdf_extract::OutputError> {
+        self.text_data.push((char.to_string(), trm.m31, trm.m32));
+        Ok(())
+    }
+    fn begin_word(&mut self) -> Result<(), pdf_extract::OutputError> { Ok(()) }
+    fn end_word(&mut self) -> Result<(), pdf_extract::OutputError> { Ok(()) }
+    fn end_line(&mut self) -> Result<(), pdf_extract::OutputError> { Ok(()) }
+}
+
+#[derive(Debug, serde::Serialize)]
+pub struct QuestionSlice {
+    pub question_number: u32,
+    pub y_start: f64,
+    pub y_end: f64,
+}
+
+#[tauri::command]
+pub async fn parse_pdf_hybrid(
+    app: tauri::AppHandle,
+    api_key: String,
+    base_url: String,
+    model_name: String,
+    paper_name: String,
+    file_path: String,
+    pdf_base64_pages: Option<Vec<String>>,
+    state: State<'_, AppState>,
+) -> Result<Vec<Question>, String> {
+    // 1. Decode rasterized image of the first page from frontend
+    let has_pdf_pages = pdf_base64_pages.as_ref().map(|p| !p.is_empty()).unwrap_or(false);
+    if !has_pdf_pages {
+        return Err("No rasterized PDF pages provided for hybrid pipeline.".into());
+    }
+
+    let pdf_pages = pdf_base64_pages.unwrap();
+    let num_pages = pdf_pages.len();
+    
+    // --- DUAL-VERIFICATION FIREWALL (ASYNC) ---
+    let mut effective_num_pages = num_pages;
+    let mut is_answer_booklet = false;
+    let client = reqwest::Client::new();
+    
+    for page_idx in 0..num_pages {
+        let file_path_clone = file_path.clone();
+        
+        let raw_text = tokio::task::spawn_blocking(move || {
+            let doc = match pdf_extract::Document::load(&file_path_clone) {
+                Ok(d) => d,
+                Err(_) => return String::new(),
+            };
+            let mut output = BBoxOutput { text_data: Vec::new(), pdf_page_height: 0.0 };
+            if pdf_extract::output_doc_page(&doc, &mut output, (page_idx + 1) as u32).is_ok() {
+                output.text_data.iter().map(|(c, _, _)| c.as_str()).collect::<String>()
+            } else {
+                String::new()
+            }
+        }).await.unwrap_or_default();
+        
+        // CHECK 1: The Deterministic Crusher
+        let norm_text = raw_text.to_lowercase().replace(|c: char| c.is_whitespace(), "");
+        if norm_text.contains("totalforpaper") || 
+           norm_text.contains("endofquestionpaper") || 
+           (norm_text.contains("answerbooklet") && norm_text.contains("centrenumber")) {
+            is_answer_booklet = true;
+            effective_num_pages = page_idx;
+            break;
+        }
+        
+        // CHECK 1.5: Suspicious Page Heuristic
+        let text_len = raw_text.trim().len();
+        if text_len > 250 {
+            continue; // Likely a valid question page, skip Check 2
+        }
+        
+        // CHECK 2: Semantic Failsafe (Vision AI)
+        let b64_data_str = &pdf_pages[page_idx];
+        let b64_data = if b64_data_str.starts_with("data:image") {
+            b64_data_str.split(',').nth(1).unwrap_or(b64_data_str)
+        } else {
+            b64_data_str
+        };
+        
+        let prompt = "Classify this page layout. If it is an Edexcel Answer Booklet or an empty grid/blank page, return exactly `ANSWER_BOOKLET`. Otherwise, return `QUESTION_PAPER`.";
+        let req_body = serde_json::json!({
+            "model": &model_name,
+            "messages": [
+                { "role": "user", "content": [
+                    { "type": "text", "text": prompt },
+                    { "type": "image_url", "image_url": { "url": format!("data:image/jpeg;base64,{}", b64_data) } }
+                ]}
+            ],
+            "temperature": 0.1,
+            "max_tokens": 10
+        });
+        
+        let url = format!("{}/chat/completions", base_url.trim_end_matches('/'));
+        let res = client.post(&url)
+            .header("Authorization", format!("Bearer {}", api_key))
+            .timeout(std::time::Duration::from_secs(30))
+            .json(&req_body)
+            .send()
+            .await;
+            
+        if let Ok(response) = res {
+            if response.status().is_success() {
+                if let Ok(json) = response.json::<serde_json::Value>().await {
+                    let ai_resp = json["choices"][0]["message"]["content"].as_str().unwrap_or_default().trim();
+                    if ai_resp.contains("ANSWER_BOOKLET") {
+                        is_answer_booklet = true;
+                        effective_num_pages = page_idx;
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    // ------------------------------------------
+    
+    // ------------------------------------------
+    
+    let mut aggregated_questions: std::collections::BTreeMap<String, String> = std::collections::BTreeMap::new();
+    let mut current_question_num = String::from("Unknown");
+
+    for page_idx in 0..effective_num_pages {
+        let system_prompt = format!(r#"You are a mathematical OCR engine. Extract the contents of this exam page into the following strict JSON schema:
+{{
+  "extracted_questions": [
+    {{
+      "question_number": "integer or string",
+      "content_markdown": "Complete markdown and LaTeX transcription of the question",
+      "is_continuation": boolean (true if this continues a previous question)
+    }}
+  ]
+}}
+
+CONTEXT: The previous page was processing Question {}. If the current image does not explicitly start with a new question number, you MUST assume it is a continuation of Question {}, use that exact number in your JSON, and set 'is_continuation' to true.
+
+Format data tables and Simplex tableaus using the LaTeX `array` environment.
+Do NOT invent, add, or infer any information. Transcribe exactly what is in the image.
+
+MATH TABLES ARE NOT IMAGES: You MUST NEVER output image bounding box coordinates for data tables, distance matrices, precedence tables, or Simplex tableaus. You MUST transcribe these exclusively using LaTeX block math with the `array` environment.
+
+When drawing bounding boxes around valid graphical diagrams (like networks, graphs, or geometric shapes), you MUST include the figure captions (e.g., 'Figure 2') and ensure no peripheral text or nodes are cut off.
+
+TRANSCRIBE ONLY VISIBLE INK: You are operating on a sliced chunk of a page. You must ONLY transcribe the exact text visible in this specific image slice.
+DO NOT predict, generate, or hallucinate sub-questions (like 'Explain what is meant by critical path'). If the slice only contains a preamble or trails off, output exactly what is there and STOP."#, current_question_num, current_question_num);
+
+        let b64_data_str = &pdf_pages[page_idx];
+        let b64_data = if b64_data_str.starts_with("data:image") {
+            b64_data_str.split(',').nth(1).unwrap_or(b64_data_str)
+        } else {
+            b64_data_str
+        };
+        
+        let req_body = serde_json::json!({
+            "model": &model_name,
+            "messages": [
+                { "role": "system", "content": system_prompt },
+                { "role": "user", "content": [
+                    { "type": "image_url", "image_url": { "url": format!("data:image/png;base64,{}", b64_data) } }
+                ]}
+            ],
+            "temperature": 0.1,
+            "max_tokens": 16384,
+            "response_format": { "type": "json_object" }
+        });
+        
+        let url = format!("{}/chat/completions", base_url.trim_end_matches('/'));
+        let mut res = client.post(&url)
+            .header("Authorization", format!("Bearer {}", api_key))
+            .timeout(std::time::Duration::from_secs(300))
+            .json(&req_body)
+            .send()
+            .await
+            .map_err(|e| format!("Network error: {}", e))?;
+            
+        // Basic retry logic for rate limits
+        if res.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
+            tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
+            res = client.post(&url)
+                .header("Authorization", format!("Bearer {}", api_key))
+                .timeout(std::time::Duration::from_secs(300))
+                .json(&req_body)
+                .send()
+                .await
+                .map_err(|e| format!("Network error: {}", e))?;
+        }
+            
+        if !res.status().is_success() {
+            let err_text = res.text().await.unwrap_or_default();
+            println!("API Error on page {}: {}", page_idx, err_text);
+            continue; // Skip this page instead of failing the whole document
+        }
+        
+        let response_json: serde_json::Value = res.json().await.map_err(|e| e.to_string())?;
+        let content_str = response_json["choices"][0]["message"]["content"]
+            .as_str()
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+            
+        let cleaned_json = if content_str.starts_with("```json") {
+            content_str.trim_start_matches("```json").trim_end_matches("```").trim()
+        } else if content_str.starts_with("```") {
+            content_str.trim_start_matches("```").trim_end_matches("```").trim()
+        } else {
+            &content_str
+        };
+        
+        let parsed_page: serde_json::Value = match serde_json::from_str(cleaned_json) {
+            Ok(v) => v,
+            Err(e) => {
+                println!("Failed to parse JSON on page {}: {} - Raw: {}", page_idx, e, cleaned_json);
+                continue;
+            }
+        };
+        
+        if let Some(questions) = parsed_page.get("extracted_questions").and_then(|q| q.as_array()) {
+            for q in questions {
+                let q_num_val = q.get("question_number").unwrap_or(&serde_json::json!("")).clone();
+                let q_num_str = if q_num_val.is_number() {
+                    q_num_val.as_i64().unwrap_or(0).to_string()
+                } else {
+                    q_num_val.as_str().unwrap_or("").to_string()
+                };
+                
+                let content_md = q.get("content_markdown").and_then(|c| c.as_str()).unwrap_or("").to_string();
+                let is_cont = q.get("is_continuation").and_then(|c| c.as_bool()).unwrap_or(false);
+                
+                if !q_num_str.is_empty() && q_num_str != "Unknown" {
+                    current_question_num = q_num_str.clone();
+                }
+                
+                let target_q_num = if is_cont {
+                    current_question_num.clone()
+                } else if !q_num_str.is_empty() {
+                    q_num_str.clone()
+                } else {
+                    current_question_num.clone()
+                };
+                
+                let existing = aggregated_questions.entry(target_q_num).or_insert(String::new());
+                if !existing.is_empty() {
+                    existing.push_str("\n\n");
+                }
+                existing.push_str(&content_md);
+            }
+        }
+    }
+
+    let pool = state.db.lock().await;
+    let mut final_questions = Vec::new();
+    
+    for (q_num_str, mut final_content) in aggregated_questions {
+        let q_num_val = q_num_str.parse::<i64>().unwrap_or(0);
+        let mut final_id = uuid::Uuid::new_v4().to_string();
+        let mut was_updated = false;
+
+        if !paper_name.trim().is_empty() {
+            let existing: Option<(String, String)> = sqlx::query_as(
+                "SELECT id, content FROM questions WHERE paper_name = ? AND question_number = ? LIMIT 1"
+            )
+            .bind(&paper_name)
+            .bind(q_num_val)
+            .fetch_optional(&*pool)
+            .await
+            .unwrap_or(None);
+
+            if let Some((existing_id, existing_content)) = existing {
+                final_id = existing_id.clone();
+                final_content = format!("{}\n\n{}", existing_content, final_content);
+                sqlx::query("UPDATE questions SET content = ? WHERE id = ?")
+                    .bind(&final_content)
+                    .bind(&existing_id)
+                    .execute(&*pool)
+                    .await
+                    .map_err(|e| format!("DB error updating existing question: {}", e))?;
+                was_updated = true;
+            }
+        }
+
+        if !was_updated {
+            sqlx::query(
+                r#"
+                INSERT INTO questions (id, subject, subtopic, topics, marks, content, math_snippet, is_code, paper_name, question_number)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                "#,
+            )
+            .bind(&final_id)
+            .bind("Unknown")
+            .bind("Unknown")
+            .bind("[]")
+            .bind(1)
+            .bind(&final_content)
+            .bind("")
+            .bind(false)
+            .bind(&paper_name)
+            .bind(q_num_val)
+            .execute(&*pool)
+            .await
+            .map_err(|e| format!("DB error inserting new question: {}", e))?;
+        }
+        
+        final_questions.push(Question {
+            id: final_id,
+            subject: "Unknown".to_string(),
+            subtopic: "Unknown".to_string(),
+            marks: 1,
+            content: final_content,
+            math_snippet: String::new(),
+            is_code: false,
+            answer_content: None,
+            topics: Some("[]".to_string()),
+            paper_name: paper_name.clone(),
+            question_number: Some(q_num_val),
+        });
+    }
+
+    Ok(final_questions)
+}
