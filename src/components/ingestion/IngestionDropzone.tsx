@@ -131,10 +131,18 @@ export function IngestionDropzone({ onSuccess }: IngestionDropzoneProps) {
         if (onSuccess) onSuccess();
       }
     } catch (err) {
-      toast.error("Ingestion failed", {
-        description: String(err),
-        duration: 8000,
-      });
+      const errMsg = String(err);
+      if (errMsg.includes("Import cancelled by user")) {
+        toast.info("Import Cancelled", {
+          description: `Stopped processing ${paperName}`,
+          duration: 4000,
+        });
+      } else {
+        toast.error("Ingestion failed", {
+          description: errMsg,
+          duration: 8000,
+        });
+      }
     } finally {
       setIsProcessing(false);
     }
@@ -383,9 +391,19 @@ export function IngestionDropzone({ onSuccess }: IngestionDropzoneProps) {
               <p className="text-base font-semibold text-foreground">
                 Processing…
               </p>
-              <p className="text-xs text-muted-foreground truncate max-w-xs">
+              <p className="text-xs text-muted-foreground truncate max-w-xs pb-2">
                 {lastFile ?? ""}
               </p>
+              <button
+                type="button"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  invoke("cancel_import").catch(console.error);
+                }}
+                className="pointer-events-auto px-4 py-1.5 text-xs font-semibold text-destructive-foreground bg-destructive hover:bg-destructive/90 rounded-md transition-colors shadow-sm"
+              >
+                Cancel Import
+              </button>
             </>
           ) : (
             <>

@@ -11,6 +11,7 @@ mod commands;
 
 pub struct AppState {
     pub db: Arc<Mutex<SqlitePool>>,
+    pub cancel_flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 // ---------------------------------------------------------------------------
@@ -40,6 +41,7 @@ pub fn run() {
 
             app.manage(AppState {
                 db: Arc::new(Mutex::new(pool)),
+                cancel_flag: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             });
 
             Ok(())
@@ -57,7 +59,8 @@ pub fn run() {
             commands::fetch_models,
             commands::update_question,
             commands::commit_mark_schemes,
-            commands::get_paper_names
+            commands::get_paper_names,
+            commands::cancel_import
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

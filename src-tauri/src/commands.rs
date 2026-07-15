@@ -104,9 +104,9 @@ fn is_blank_or_grid(img: &image::DynamicImage) -> bool {
     let variance = (sum_sq / count) - (mean * mean);
     let non_white_ratio = non_white_count / count;
     
-    // Variance < 10.0 catches perfectly blank/solid color boxes.
-    // Non-white ratio < 0.005 (0.5%) catches empty student working grids which are mostly white space with a few faint lines.
-    if variance < 10.0 || non_white_ratio < 0.005 {
+    // Variance < 5.0 catches perfectly blank/solid color boxes.
+    // Non-white ratio < 0.0001 (0.01%) catches empty student working grids which are mostly white space with a few faint lines.
+    if variance < 5.0 || non_white_ratio < 0.0001 {
         return true;
     }
     
@@ -705,6 +705,8 @@ pub async fn parse_pdf_vision(
     let api_key = api_key.trim().to_string();
     let model_name = model_name.trim().to_string();
     
+    state.cancel_flag.store(false, std::sync::atomic::Ordering::Relaxed);
+    
     // Check if we have pages
     let has_pdf_pages = pdf_base64_pages.as_ref().map(|p| !p.is_empty()).unwrap_or(false);
     if !has_pdf_pages {
@@ -792,14 +794,19 @@ pub async fn parse_pdf_vision(
     if file_path.to_lowercase().ends_with(".pdf") {
         if let Ok(pages) = pdf_extract::extract_text_by_pages(&file_path) {
             let re_lines = regex::Regex::new(r"_+|-+").unwrap();
+            let re_ans_lines = regex::Regex::new(r"(?m)^\s*[1-6]\s*$").unwrap();
+            let re_aqa_num = regex::Regex::new(r"[0O]\s*(\d)\s*\.\s*(\d)").unwrap();
             pdf_page_texts = pages.into_iter().map(|s| {
-                re_lines.replace_all(&s, "").to_string()
+                let mut text = re_lines.replace_all(&s, "").to_string();
+                text = re_ans_lines.replace_all(&text, "").to_string();
+                text = re_aqa_num.replace_all(&text, "${1}.${2}").to_string();
+                text
             }).collect();
         }
     }
 
     let classifier = SubjectClassifier::new();
-    let mut aggregated_questions: std::collections::BTreeMap<String, Question> = std::collections::BTreeMap::new();
+    let mut aggregated_questions: Vec<Question> = Vec::new();
     
     const EDEXCEL_MATHS_TOPICS: &[&str] = &["Proof", "Algebra and functions", "Coordinate geometry in the (x, y) plane", "Sequences and series", "Trigonometry", "Exponentials and logarithms", "Differentiation", "Integration", "Numerical methods", "Vectors", "Statistical sampling", "Data presentation and interpretation", "Probability", "Statistical distributions", "Statistical hypothesis testing", "Quantities and units in mechanics", "Kinematics", "Forces and Newton's laws", "Moments"];
     const FURTHER_MATHS_TOPICS: &[&str] = &["Complex numbers", "Argand diagrams", "Series", "Roots of polynomials", "Volumes of revolution", "Matrices", "Linear transformations", "Proof by induction", "Vectors", "Differential equations", "Polar coordinates", "Hyperbolic functions", "Maclaurin series", "Methods in calculus", "Momentum and impulse", "Work, energy and power", "Elastic strings and springs", "Elastic collisions in one dimension", "Elastic collisions in two dimensions", "Discrete probability distributions", "Poisson distribution", "Geometric and negative binomial", "Hypothesis testing", "Central Limit Theorem", "Chi-squared tests", "Probability generating functions", "Quality of tests", "Vectors (Cross product & planes)", "Conic sections", "Inequalities", "t-formulae", "Taylor series", "Numerical methods (Further)", "Reducible differential equations", "Algorithms", "Graphs and networks", "Algorithms on graphs", "Route inspection", "Travelling Salesperson Problem", "Linear programming", "Simplex algorithm"];
@@ -838,6 +845,9 @@ pub async fn parse_pdf_vision(
     }
 
     for page_idx in 0..effective_num_pages {
+        if state.cancel_flag.load(std::sync::atomic::Ordering::Relaxed) {
+            return Err("Import cancelled by user".to_string());
+        }
         let page_text = if page_idx < pdf_page_texts.len() {
             &pdf_page_texts[page_idx]
         } else {
@@ -848,9 +858,9 @@ pub async fn parse_pdf_vision(
 
 RULE 1 (JSON SCHEMA):
 The root object MUST be: {{ "extracted_questions": [ ... ] }}. Every question object inside the array MUST include:
-- "question_number": integer
-- "marks": integer (Find the marks for this specific part, e.g., (4). If the question is multi-part, sum the marks for all parts (a)+(b)+(c). Never return 0.)
-- "content": string (Put ALL text, math, and tables here chronologically. If there is a graphical diagram, insert the exact string "[DIAGRAM_PLACEHOLDER]" exactly where the diagram appears in the text).
+- "question_number": integer (The MAIN question number only. For AQA style "03.1", the main number is 3. Do not include sub-parts here.)
+- "marks": integer (CRITICAL: You MUST look for the mark allocation printed on the page, usually in brackets like '[3 marks]' or '(4)'. Sum them up. If you cannot find any, estimate based on the length, but NEVER return 0 or null.)
+- "content": string. CRITICAL: For long-answer questions (e.g., 6-mark explainers), you MUST maintain the paragraph structure. Insert a double newline (\n\n) between every distinct sentence or logical point. Do not merge them into one block. If the text on the page is long, YOU ARE FORBIDDEN FROM SUMMARIZING OR TRUNCATING. You must transcribe the full text until the question ends. If the raw text is cut off, read from the image! CRITICAL: You MUST include the sub-part labels (e.g., '1.1', '1.2', '(a)', '(b)') at the start of their respective paragraphs in the Markdown. If there is a graphical diagram, insert the exact string "[DIAGRAM_PLACEHOLDER]" exactly where the diagram appears in the text.
 - "math_snippet": string (LEAVE THIS EMPTY. Put all math directly inside the "content" string where it belongs chronologically).
 - "is_code": boolean
 - "topics": array of strings (Select relevant topics from the provided list below)
@@ -875,10 +885,20 @@ RULE 3 (PUNCTUATION & FORMATTING):
 - WRAP ALL MATH: You MUST wrap all numbers, variables, expressions, and mathematical operators in single `$` for inline math.
 - STRICT DISPLAY MATH RULE: ONLY use `$$` for display math if the equation is naturally on its own line and visually separated from the text block. DO NOT use `$$` for variables embedded within a sentence (e.g., use `$P$`, `$i$`, `$j$`, not `$$P$$`).
 - STRICT LaTeX RULE: NEVER put `$` or `$$` delimiters INSIDE a LaTeX environment like `\begin{{array}}` or `\begin{{aligned}}`. Environments must stand alone inside `$$...$$`.
+- AQA NUMBERING CONVERSION: Convert AQA decimal sub-parts (e.g., '1.1', '1.2') to exactly '**(a)**' and '**(b)**' with NO main question number attached. You MUST place a double newline (\n\n) before it. CRITICAL: There must be ZERO spaces between the asterisks and the bracket (e.g., use `**(a)**`, NOT `** (a)**`).
+- MULTIPLE CHOICE WARNING: Whole numbers like '11', '12', '13' are completely independent multiple-choice questions. DO NOT confuse them with sub-parts and do NOT convert '11' into '1.1' or '1 (a)'. Question 11 MUST receive `"question_number": 11`. ONE QUESTION PER OBJECT: You are strictly forbidden from placing multiple independent questions inside the same JSON object's content. Every single numbered question MUST be a completely separate JSON object in the array.
+- AQA PHYSICS LISTS: If a question asks you to 'State the names of...' or similar, you MUST use Markdown bullet points (e.g., '- ...'). Do not use numbered lists (1, 2, 3) unless they are part of the original question text. This prevents the UI from confusing your transcription with its own numbering.
+
+RULE 9 (HYBRID QUESTION BOUNDARIES):
+You must intelligently group or split questions based on their context:
+1. OVERARCHING CONTEXT (Merge): If a set of sub-parts (e.g., 1.1, 1.2, 1.3) all share a single overarching scenario, preamble, or diagram at the top, you MUST merge them into ONE single JSON object.
+2. INDEPENDENT QUESTIONS (Split): If the page contains a sequence of completely independent Multiple Choice Questions or short-answer questions that do NOT share any overarching context (even if they are numbered 1.1, 1.2, 1.3), you MUST split them into SEPARATE JSON objects in the array. This prevents unrelated questions from being mashed together. (Set `is_continuation`: false for each).
 
 RULE 4 (TABLES & DIAGRAMS):
 - TABLES: ONLY true data tables, matrices, or Simplex tableaus should be formatted as LaTeX block math using the `array` environment. Do NOT draw image bounding boxes around pure data tables.
-- DIAGRAMS: You MUST use `diagram_bboxes` for all visual and scheduling elements including Gantt charts, scheduling diagrams, timelines, graphs, plots, charts, illustrations, networks, and trees. Do NOT attempt to recreate scheduling diagrams or timelines using LaTeX arrays. Provide the bounding box [[x, y, w, h]] as relative coordinates (0.0 to 1.0). If there are multiple diagrams, provide multiple bounding boxes in the array.
+- MULTIPLE CHOICE: You MUST format A, B, C, D options as a Markdown bulleted list (e.g., `- A) [option]`, `- B) [option]`) or separate them with DOUBLE newlines (\n\n). Do NOT put them on single lines, or Markdown will collapse them into a single unreadable paragraph.
+- DIAGRAMS: You MUST use `diagram_bboxes` for all visual and scheduling elements including Gantt charts, scheduling diagrams, timelines, graphs, plots, charts, illustrations, networks, trees, force diagrams, circuits, and simple line drawings. Do NOT attempt to recreate scheduling diagrams or timelines using LaTeX arrays. You MUST draw bounding boxes for ALL line drawings. Do not miss simple line diagrams. Provide the bounding box [[x, y, w, h]] as relative coordinates (0.0 to 1.0). If there are multiple diagrams, provide multiple bounding boxes in the array.
+  FIGURE KEYWORD CRITICAL: If you see the word 'Figure' followed by a number (e.g., 'Figure 6', 'Figure 8'), the actual diagram/graph is usually located DIRECTLY BELOW OR ABOVE that text. You MUST draw a massive bounding box that captures BOTH the 'Figure X' text AND the entire faint graph/grid/drawing next to it. Do not just draw a tiny box around the word 'Figure'.
   CRITICAL: Draw ONE single large bounding box that captures the ENTIRE diagram (including all axis labels, nodes, and headers). DO NOT split a single graph or network into multiple separate bounding boxes.
   CRITICAL DIAGRAM BAN: You are STRICTLY FORBIDDEN from drawing bounding boxes around standard paragraphs of text, mathematical working out, equations, or empty student working grids. Bounding boxes are ONLY for visual graphics. If it's text or math, you MUST transcribe it into Markdown/LaTeX.
 - Example: If the image is 1000px wide and the diagram starts at 100px, x should be 0.1.
@@ -888,13 +908,20 @@ RULE 5 (EXCLUSIONS & CLEANUP):
 - EXCLUDE HEADERS/FOOTERS: Do NOT extract page headers or footers like "Question X continued", "Turn over", or "TOTAL FOR PAPER IS X MARKS".
 - EXCLUDE BLANK PAGES: If a page just says "BLANK PAGE" or "Turn over", completely ignore it. Do NOT include this text in the content. If the entire page is blank or just says "BLANK PAGE", return an empty array `[]`.
 - EXCLUDE STUDENT GRIDS: Do NOT transcribe horizontal lines, dots, or grids (e.g. `_____` or `......`) that are intended for students to write their answers on. Ignore them completely.
+- EXCLUDE AQA MARGINS: Ignore the isolated 2-digit margin numbers (e.g., "01", "02") that AQA prints next to questions.
+- ANSWER LINES BAN: You are STRICTLY FORBIDDEN from transcribing isolated, sequential numbers (e.g., 1, 2, 3, 4) that appear vertically on the page. These are blank answer lines. Delete them from your output entirely.
+
+RULE 8 (NO SUMMARIES):
+You are an expert OCR engine. Your task is to extract the FULL text of the exam question. If you produce a summary instead of a full transcription, you have failed. If you truncate a long sentence, you have failed.
 
 RULE 6 (CRITICAL JSON ESCAPING):
 You are outputting a JSON string. You MUST properly escape all backslashes in LaTeX commands. For example, write `\\frac` instead of `\frac`, and `\\mathbf` instead of `\mathbf`. If you output raw backslashes, the JSON parser will crash and the question will be completely lost!
 
-RULE 7 (HYBRID TEXT FORMATTING):
-Rust has already extracted the raw text from this document for you. Your job is ONLY to act as a Markdown formatter for this provided raw text.
-You MUST transcribe EVERY SINGLE WORD of the raw text provided. DO NOT summarize, skip, or truncate.
+RULE 7 (HYBRID TEXT FORMATTING & CORRECTION):
+You are provided with RAW TEXT extracted via OCR, but it may be incomplete, out of order, or missing words.
+Your primary source of truth is the visual IMAGE.
+You MUST transcribe the ENTIRE question exactly as it appears in the IMAGE. Use the RAW TEXT only as a helpful baseline to save time. If the RAW TEXT cuts off mid-sentence, misses a paragraph, or is out of order, you MUST seamlessly continue transcribing directly from the IMAGE. Never leave a sentence unfinished!
+IGNORE repetitive margin numbers, blank answer line numbers, and boilerplate.
 The image is provided ONLY so you can correct OCR errors, properly format mathematical formulas using LaTeX, and identify bounding boxes for diagrams. Do not transcribe blank lines `___` from the raw text.
 RAW TEXT:
 {}
@@ -917,7 +944,7 @@ CONTEXT: The previous page was processing Question {}. If the current image does
                 ]}
             ],
             "temperature": 0.1,
-            "max_tokens": 16384,
+            "max_tokens": 32768,
             "response_format": { "type": "json_object" }
         });
         
@@ -962,7 +989,7 @@ CONTEXT: The previous page was processing Question {}. If the current image does
             &content_str
         });
         
-        let parsed_page: OpenAIResult = match serde_json::from_str(&fixed_json) {
+        let mut parsed_page: OpenAIResult = match serde_json::from_str(&fixed_json) {
             Ok(v) => v,
             Err(e) => {
                 let err_str = e.to_string();
@@ -992,6 +1019,88 @@ CONTEXT: The previous page was processing Question {}. If the current image does
             }
         };
 
+        // --- ADD RECOVERY FOR OMITTED CONTENT ---
+        let mut needs_recovery = false;
+        let mut recovery_q_num = String::new();
+        for q in &parsed_page.extracted_questions {
+            if q.marks.unwrap_or(0) > 1 {
+                let content = q.content.as_deref().unwrap_or("");
+                if content.trim().len() < 5 {
+                    needs_recovery = true;
+                    let default_val = serde_json::json!("");
+                    let q_num_val = q.question_number.as_ref().unwrap_or(&default_val);
+                    recovery_q_num = if q_num_val.is_number() {
+                        q_num_val.as_i64().unwrap_or(0).to_string()
+                    } else {
+                        q_num_val.as_str().unwrap_or("").to_string()
+                    };
+                    break;
+                }
+            }
+        }
+
+        if needs_recovery {
+            println!("Detected truncated content for Q{} on page {}, re-extracting with recovery prompt...", recovery_q_num, page_idx);
+            let recovery_prompt = format!(r#"You previously omitted the full text for Question {} on this page. YOU MUST RE-EXTRACT IT.
+{}
+CRITICAL: DO NOT SUMMARIZE. Transcribe the ENTIRE long-answer text, sentence by sentence, using double newlines between points. If you output a short summary, you have failed."#, recovery_q_num, system_prompt);
+            
+            let req_body_rec = serde_json::json!({
+                "model": &model_name,
+                "messages": [
+                    { "role": "system", "content": recovery_prompt },
+                    { "role": "user", "content": [
+                        { "type": "image_url", "image_url": { "url": format!("data:image/jpeg;base64,{}", b64_data) } }
+                    ]}
+                ],
+                "temperature": 0.1,
+                "max_tokens": 32768,
+                "response_format": { "type": "json_object" }
+            });
+            
+            let mut res_rec = client.post(&url)
+                .header("Authorization", format!("Bearer {}", api_key))
+                .timeout(std::time::Duration::from_secs(300))
+                .json(&req_body_rec)
+                .send()
+                .await
+                .map_err(|e| format!("Network error: {}", e))?;
+                
+            if res_rec.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
+                tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
+                res_rec = client.post(&url)
+                    .header("Authorization", format!("Bearer {}", api_key))
+                    .timeout(std::time::Duration::from_secs(300))
+                    .json(&req_body_rec)
+                    .send()
+                    .await
+                    .map_err(|e| format!("Network error: {}", e))?;
+            }
+            
+            if res_rec.status().is_success() {
+                if let Ok(rec_json) = res_rec.json::<serde_json::Value>().await {
+                    let rec_content_str = rec_json["choices"][0]["message"]["content"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .trim()
+                        .to_string();
+                    
+                    let rec_fixed = fix_json_escapes(if rec_content_str.starts_with("```json") {
+                        rec_content_str.trim_start_matches("```json").trim_end_matches("```").trim()
+                    } else if rec_content_str.starts_with("```") {
+                        rec_content_str.trim_start_matches("```").trim_end_matches("```").trim()
+                    } else {
+                        &rec_content_str
+                    });
+                    
+                    if let Ok(rec_parsed) = serde_json::from_str::<OpenAIResult>(&rec_fixed) {
+                        parsed_page = rec_parsed; // overwrite with recovered page
+                    }
+                }
+            }
+        }
+        // --- END RECOVERY ---
+
         for q in parsed_page.extracted_questions {
             let q_num_val = q.question_number.unwrap_or(serde_json::json!(""));
             let mut q_num_str = if q_num_val.is_number() {
@@ -1013,13 +1122,7 @@ CONTEXT: The previous page was processing Question {}. If the current image does
                 current_question_num = q_num_str.clone();
             }
             
-            let target_q_num = if is_cont {
-                current_question_num.clone()
-            } else if !q_num_str.is_empty() {
-                q_num_str.clone()
-            } else {
-                current_question_num.clone()
-            };
+            let parsed_q_num_i64 = q_num_val.as_i64().or_else(|| q_num_str.parse::<i64>().ok());
 
             // Diagram cropping logic
             if let Some(bboxes) = &q.diagram_bboxes {
@@ -1089,34 +1192,58 @@ CONTEXT: The previous page was processing Question {}. If the current image does
                 q_content = q_content.replace("[DIAGRAM_PLACEHOLDER]", "");
             }
 
-            let existing = aggregated_questions.entry(target_q_num.clone()).or_insert_with(|| {
+            let mut should_merge = false;
+            if let Some(last_q) = aggregated_questions.last() {
+                let last_num = last_q.question_number.unwrap_or(-1);
+                let current_num = parsed_q_num_i64.unwrap_or(-1);
+
+                // HYBRID OVERRIDE: If the AI explicitly parsed a distinct new question number, 
+                // NEVER merge it, even if the AI hallucinated the is_continuation flag to true.
+                if current_num > 0 && last_num > 0 && current_num != last_num {
+                    should_merge = false; 
+                } else if is_cont {
+                    should_merge = true;
+                } else if last_num > 0 && last_num == current_num {
+                    should_merge = true;
+                }
+            }
+
+            if should_merge {
+                if let Some(existing) = aggregated_questions.last_mut() {
+                    if !existing.content.is_empty() {
+                        existing.content.push_str("\n\n");
+                    }
+                    existing.content.push_str(&q_content);
+                    if let Some(m) = q.marks {
+                        let to_add = if m == 0 { 1 } else { m };
+                        existing.marks += to_add;
+                    }
+                }
+            } else {
                 let (_, sys_subtopic, sys_is_code) = classifier.classify(&q_content);
-                Question {
+                let parsed_marks = q.marks.unwrap_or(1);
+                let final_marks = if parsed_marks == 0 { 1 } else { parsed_marks };
+                aggregated_questions.push(Question {
                     id: uuid::Uuid::new_v4().to_string(),
                     subject: subject.clone(),
                     subtopic: if sys_subtopic == "Unknown" { q.subtopic.clone().unwrap_or_else(|| "Unknown".to_string()) } else { sys_subtopic.to_string() },
-                    marks: q.marks.unwrap_or(1),
-                    content: String::new(),
+                    marks: final_marks,
+                    content: q_content.clone(),
                     math_snippet: q.math_snippet.clone().unwrap_or_default(),
                     is_code: if subject == "Computer Science" { q.is_code.unwrap_or(sys_is_code) } else { false },
                     answer_content: None,
                     topics: Some(serde_json::to_string(&q.topics.clone().unwrap_or_default()).unwrap_or_else(|_| "[]".to_string())),
                     paper_name: paper_name.clone(),
-                    question_number: q_num_val.as_i64().or_else(|| target_q_num.parse::<i64>().ok()),
+                    question_number: parsed_q_num_i64,
                     module: Some(q.module.clone().unwrap_or_else(|| "Unknown".to_string())),
-                }
-            });
-
-            if !existing.content.is_empty() {
-                existing.content.push_str("\n\n");
+                });
             }
-            existing.content.push_str(&q_content);
         }
     }
     let pool = state.db.lock().await;
     let mut final_questions = Vec::new();
     
-    for (q_num_str, mut question_obj) in aggregated_questions {
+    for mut question_obj in aggregated_questions {
         let re_q_cont = regex::Regex::new(r"(?i)Question\s+\d+\s+continued").unwrap();
         let re_total_q = regex::Regex::new(r"(?i)\(Total\s+for\s+Question\s+\d+\s+is\s+\d+\s+marks\)").unwrap();
         let re_total_q2 = regex::Regex::new(r"(?i)Total\s+for\s+Question\s+\d+\s+is\s+\d+\s+marks").unwrap();
@@ -1173,7 +1300,7 @@ CONTEXT: The previous page was processing Question {}. If the current image does
             }
         }
 
-        let q_num_val = q_num_str.parse::<i64>().unwrap_or(0);
+        let q_num_val = question_obj.question_number.unwrap_or(0);
         let mut final_id = question_obj.id.clone();
         let mut final_content = question_obj.content.clone();
         let mut was_updated = false;
@@ -1290,6 +1417,12 @@ pub async fn fetch_models(base_url: String, api_key: String) -> Result<Vec<Strin
 }
 
 #[tauri::command]
+pub async fn cancel_import(state: State<'_, AppState>) -> Result<(), String> {
+    state.cancel_flag.store(true, std::sync::atomic::Ordering::Relaxed);
+    Ok(())
+}
+
+#[tauri::command]
 pub async fn delete_all_questions(state: State<'_, AppState>) -> Result<bool, String> {
     let pool = state.db.lock().await;
     sqlx::query("DELETE FROM questions")
@@ -1339,6 +1472,8 @@ pub async fn parse_mark_scheme_vision(
     let base_url = base_url.trim().to_string();
     let api_key = api_key.trim().to_string();
     let model_name = model_name.trim().to_string();
+
+    state.cancel_flag.store(false, std::sync::atomic::Ordering::Relaxed);
 
     let ext = std::path::Path::new(&file_path).extension().and_then(|s| s.to_str()).unwrap_or("").to_lowercase();
     let is_image = ext == "png" || ext == "jpg" || ext == "jpeg";
@@ -1390,11 +1525,15 @@ IGNORE EXAMINER NOTES: Discard any text explaining mark allocations (e.g., M1, A
 LIMIT ALTERNATIVES: If a question has multiple alternative methods, extract the main scheme and a MAXIMUM of ONE Alternative Method. Discard the rest.
 
 You are an expert examiner. Extract the final answers and grading logic from this mark scheme.
-Return a JSON object with a single key 'answers' containing an array of objects. Do NOT rely on array indices. Each object MUST contain a `question_number` (Integer) read directly from the page, `answer_markdown` (String), and `module` (String, e.g. 'Pure', 'Mechanics', 'Core Pure', 'Decision Mathematics 1', etc., or 'General'/'Unknown' if not applicable).
+Return a JSON object with a single key 'answers' containing an array of objects. Do NOT rely on array indices. Each object MUST contain a `question_number` (Integer, the MAIN question number only. For AQA style "03.1", the main number is 3. Do not include sub-parts here.), `answer_markdown` (String), and `module` (String, e.g. 'Pure', 'Mechanics', 'Core Pure', 'Decision Mathematics 1', etc., or 'General'/'Unknown' if not applicable).
 - "diagram_bboxes": Array of bounding boxes [[x, y, w, h], ...]. CRITICAL: This MUST be a 2D array of arrays, even if there is only one diagram. Example: [[0.1, 0.2, 0.4, 0.4]]. Calculate these as a fraction of the total image width/height.
 - "diagram_page_indexes": Array of integers [0, 1, 2, ...]. This indicates WHICH of the provided images EACH diagram belongs to (0 for the first image, 1 for the second, etc). The length MUST match diagram_bboxes.
 
 QAB RULE: Preserve sub-question letters exactly as printed (e.g., (g), (h)). Do not reset them to (a) on a new page.
+AQA NUMBERING CONVERSION: AQA uses decimal sub-parts (e.g., '1.1', '1.2', '3.4'). You MUST completely remove this decimal numbering system and replace it with standard alphabetical brackets. For example, convert '1.1' to '**1 (a)**', convert '1.2' to '**(b)**', and convert '3.4' to '**(d)**'. NEVER output decimals like '1.1' or '1.2' in the content.
+MULTIPLE CHOICE WARNING: Whole numbers like '11', '12', '13' are completely independent multiple-choice questions. DO NOT confuse them with sub-parts and do NOT convert '11' into '1.1' or '1 (a)'. Question 11 MUST receive `"question_number": 11`.
+EXCLUDE AQA MARGINS: Ignore the isolated 2-digit margin numbers (e.g., "01", "02") that AQA prints next to questions.
+EXCLUDE ANSWER LINES: Completely ignore vertical sequential numbers (e.g., "1", "2", "3") that are printed as placeholders for students to write answers.
 
 CRITICAL — QUESTION NUMBER RULE: Look at the main question number column printed in the mark scheme. Use only that explicit number. If a question spans multiple pages or contains alternative methods, group them all under the SAME `question_number` object — do not create a second object with the same number.
 
@@ -1485,7 +1624,7 @@ The image is provided ONLY so you can correct OCR errors, properly format mathem
                     { "role": "user", "content": content_array }
                 ],
                 "temperature": 0.1,
-                "max_tokens": 16384,
+                "max_tokens": 32768,
                 "response_format": { "type": "json_object" }
             });
             requests_to_make.push((req_body, start));
@@ -1551,6 +1690,9 @@ The image is provided ONLY so you can correct OCR errors, properly format mathem
     let mut seen_fingerprints = std::collections::HashSet::new();
 
     for (req_body, start) in requests_to_make {
+        if state.cancel_flag.load(std::sync::atomic::Ordering::Relaxed) {
+            return Err("Import cancelled by user".to_string());
+        }
         let mut retry_count = 0;
         let mut response_json: Option<serde_json::Value> = None;
 
