@@ -143,10 +143,10 @@ export interface QuestionCardProps {
 export function QuestionCard({
   id,
   subject,
-  subtopic,
   topics,
   marks,
   content,
+  mathSnippet,
   answerContent,
   isCode,
   className,
@@ -166,7 +166,27 @@ export function QuestionCard({
     console.error("Failed to parse topics:", e);
   }
 
-  const [editContent, setEditContent] = useState(content);
+  let displayContent = content ?? "";
+  const snippet = (mathSnippet || "").trim();
+  if (snippet !== "") {
+    const contentTrim = displayContent.trimEnd();
+    if (contentTrim.endsWith(snippet)) {
+      displayContent = contentTrim.substring(0, contentTrim.length - snippet.length).trimEnd();
+    }
+    if (isCode) {
+      displayContent += `\n\n\`\`\`\n${snippet}\n\`\`\``;
+    } else {
+      if (snippet.startsWith("$$") && snippet.endsWith("$$")) {
+        displayContent += `\n\n${snippet}`;
+      } else if (snippet.startsWith("$") && snippet.endsWith("$") && !snippet.includes("\n")) {
+        displayContent += `\n\n${snippet}`;
+      } else {
+        displayContent += `\n\n$$\n${snippet}\n$$`;
+      }
+    }
+  }
+
+  const [editContent, setEditContent] = useState(displayContent);
   const [editMarks, setEditMarks] = useState(marks);
   const [editAnswerContent, setEditAnswerContent] = useState(answerContent || "");
   const [editTopics, setEditTopics] = useState<string[]>(parsedTopics);
@@ -179,16 +199,17 @@ export function QuestionCard({
 
   function handleCancel(e?: React.MouseEvent) {
     e?.stopPropagation();
-    setEditContent(content);
+    setEditContent(displayContent);
     setEditMarks(marks);
     setEditAnswerContent(answerContent || "");
     setEditTopics(parsedTopics);
     setIsEditing(false);
   }
+
   return (
     <article
       onClick={() => {
-        setEditContent(content);
+        setEditContent(displayContent);
         setEditMarks(marks);
         setEditAnswerContent(answerContent || "");
         setEditTopics(parsedTopics);
@@ -207,7 +228,7 @@ export function QuestionCard({
             type="button"
             onClick={(e) => {
               e.stopPropagation();
-              setEditContent(content);
+              setEditContent(displayContent);
               setEditMarks(marks);
               setEditAnswerContent(answerContent || "");
               setEditTopics(parsedTopics);
@@ -301,7 +322,7 @@ export function QuestionCard({
                 }
               }}
             >
-              {preprocessMath(content ?? "", isCode)}
+              {preprocessMath(displayContent, isCode)}
           </ReactMarkdown>
         </div>
 
@@ -347,7 +368,7 @@ export function QuestionCard({
       <Dialog open={isEditing} onOpenChange={(open) => {
         if (!open) handleCancel();
         else {
-          setEditContent(content);
+          setEditContent(displayContent);
           setEditMarks(marks);
           setEditAnswerContent(answerContent || "");
           setEditTopics(parsedTopics);
