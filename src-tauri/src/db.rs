@@ -59,6 +59,38 @@ pub async fn init_db(app_data_dir: PathBuf) -> Result<SqlitePool, sqlx::Error> {
         .execute(&pool)
         .await;
 
+    // ── Idempotency migration ────────────────────────────────────────────────
+    // Before the unique index can exist, collapse any duplicate
+    // (paper_name, question_number) rows produced by older builds, keeping
+    // the most recently written row.
+    let _ = sqlx::query(
+        r#"
+        DELETE FROM questions
+        WHERE trim(COALESCE(paper_name, '')) != ''
+          AND question_number IS NOT NULL
+          AND rowid NOT IN (
+              SELECT MAX(rowid) FROM questions
+              WHERE trim(COALESCE(paper_name, '')) != ''
+                AND question_number IS NOT NULL
+              GROUP BY paper_name, question_number
+          );
+        "#,
+    )
+    .execute(&pool)
+    .await;
+
+    // Composite-key uniqueness — the old architecture's invariant, now
+    // enforced by the database itself so re-imports upsert instead of
+    // duplicating (NULL question_numbers stay insertable for legacy rows).
+    let _ = sqlx::query(
+        r#"
+        CREATE UNIQUE INDEX IF NOT EXISTS ux_questions_paper_qnum
+        ON questions(paper_name, question_number);
+        "#,
+    )
+    .execute(&pool)
+    .await;
+
     // 5. Seed the database with mock data if it's empty
     seed_database_if_empty(&pool).await?;
 

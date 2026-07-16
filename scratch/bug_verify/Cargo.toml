@@ -1,0 +1,8 @@
+[package]
+name = "bug_verify"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+serde_json = "1"
+regex = "1.13.0"

@@ -8,6 +8,12 @@ use tokio::sync::Mutex;
 mod db;
 
 mod commands;
+mod doc_map;
+mod geometry;
+mod json_salvage;
+mod llm;
+mod pipeline;
+mod validate;
 
 pub struct AppState {
     pub db: Arc<Mutex<SqlitePool>>,
