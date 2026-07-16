@@ -237,7 +237,7 @@ pub fn validate_structure_proposal(
             let q = crate::validate::value_to_question_number(&pair[0]);
             let m = crate::validate::value_to_marks(&pair[1]);
             if let (Some(q), Some(m)) = (q, m) {
-                return Some((q, m));
+                return Some((q, m.max(0) as u32));
             }
         }
         violations.push(format!("page {}: malformed total_marks_footer ignored", page + 1));

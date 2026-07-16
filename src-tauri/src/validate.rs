@@ -55,7 +55,7 @@ pub fn value_to_marks(v: &serde_json::Value) -> Option<i32> {
 /// whole question number. Rejects: missing, zero, > 60, and multi-part
 /// decimals like "03.1" (which digit-mashing used to turn into "31").
 pub fn value_to_question_number(v: &serde_json::Value) -> Option<u32> {
-    let raw: Option<u32> = match v {
+    let raw: Option<u64> = match v {
         serde_json::Value::Number(n) => n
             .as_u64()
             .or_else(|| n.as_i64().and_then(|x| u64::try_from(x).ok()))
@@ -74,13 +74,13 @@ pub fn value_to_question_number(v: &serde_json::Value) -> Option<u32> {
                 // "03.1" or "1,2" are sub-part styles — refuse to guess.
                 None
             } else {
-                t.parse::<u32>().ok()
+                t.parse::<u64>().ok()
             }
         }
         _ => None,
     }?;
     match raw {
-        Some(n) if (1..=60).contains(&n) => Some(n),
+        Some(n) if (1..=60).contains(&n) => Some(n as u32),
         _ => None,
     }
 }

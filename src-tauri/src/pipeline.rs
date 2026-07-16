@@ -588,7 +588,7 @@ async fn extract_span<C: LlmClient>(
         let raw_text: String = chunk
             .iter()
             .enumerate()
-            .map(|(k, (pi, p))| {
+            .map(|(_k, (pi, p))| {
                 if p.text.trim().is_empty() {
                     String::new()
                 } else {
