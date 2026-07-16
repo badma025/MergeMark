@@ -1,7 +1,7 @@
 use crate::AppState;
 use image::GenericImageView;
 use serde::{Deserialize, Serialize};
-use tauri::{Manager, State};
+use tauri::{Manager, State, Emitter};
 use std::thread;
 use std::time::Duration;
 
@@ -717,10 +717,14 @@ pub async fn parse_pdf_vision(
     let num_pages = pdf_pages.len();
     
     // --- DUAL-VERIFICATION FIREWALL (ASYNC) ---
-    let mut effective_num_pages = num_pages;
+    let _ = app.emit("import-progress", serde_json::json!({ "page": 1, "total": 1, "message": "Scanning document structure..." }));
+    let mut valid_pages = vec![true; num_pages];
     let client = reqwest::Client::new();
     
     for page_idx in 0..num_pages {
+        if state.cancel_flag.load(std::sync::atomic::Ordering::Relaxed) {
+            return Err("Import cancelled by user".to_string());
+        }
         let file_path_clone = file_path.clone();
         
         let raw_text = tokio::task::spawn_blocking(move || {
@@ -739,9 +743,9 @@ pub async fn parse_pdf_vision(
         let norm_text = raw_text.to_lowercase().replace(|c: char| c.is_whitespace(), "");
         if norm_text.contains("totalforpaper") || 
            norm_text.contains("endofquestionpaper") || 
-           (norm_text.contains("answerbooklet") && norm_text.contains("centrenumber")) {
-            effective_num_pages = page_idx + 1;
-            break;
+           norm_text.contains("endofquestions") {
+            // We no longer brutally break the loop here. We just mark this page and let the AI handle subsequent pages.
+            // If it's truly the end, the following pages will be blank or answer booklets and get filtered naturally!
         }
         
         let text_len = raw_text.trim().len();
@@ -756,7 +760,7 @@ pub async fn parse_pdf_vision(
             b64_data_str
         };
         
-        let prompt = "You are an exam document classifier. If this page is explicitly an 'Answer Booklet' (e.g., contains lined paper for answers, 'Do not write in this area' margins, or a secondary cover page with 'Candidate Number'), return EXACTLY 'ANSWER_BOOKLET'. If it is a normal question, or just a page that says 'BLANK PAGE', return EXACTLY 'QUESTION_PAPER'.";
+        let prompt = "You are an exam page classifier. ONLY return 'ANSWER_BOOKLET' if this page is a dedicated, empty student writing response booklet (lined blank paper with no printed exam questions) or an explicitly blank page. If the page contains ANY exam question, pseudo-code, diagram, or instructions for a question, you MUST return 'QUESTION_PAPER'.";
         let req_body = serde_json::json!({
             "model": &model_name,
             "messages": [
@@ -782,36 +786,78 @@ pub async fn parse_pdf_vision(
                 if let Ok(json) = response.json::<serde_json::Value>().await {
                     let ai_resp = json["choices"][0]["message"]["content"].as_str().unwrap_or_default().trim();
                     if ai_resp.contains("ANSWER_BOOKLET") {
-                        effective_num_pages = page_idx + 1;
-                        break;
+                        valid_pages[page_idx] = false;
                     }
                 }
             }
         }
     }
 
-    let mut pdf_page_texts: Vec<String> = Vec::new();
+    let mut pdf_page_texts: Vec<String> = vec![String::new(); num_pages];
     if file_path.to_lowercase().ends_with(".pdf") {
-        if let Ok(pages) = pdf_extract::extract_text_by_pages(&file_path) {
+        if let Ok(doc) = pdf_extract::Document::load(&file_path) {
+            for page_idx in 0..num_pages {
+                if !valid_pages[page_idx] { continue; }
+                if state.cancel_flag.load(std::sync::atomic::Ordering::Relaxed) {
+                    return Err("Import cancelled by user".to_string());
+                }
+                let mut output = HybridTextOutput::new();
+                if pdf_extract::output_doc_page(&doc, &mut output, (page_idx + 1) as u32).is_ok() {
+                    pdf_page_texts[page_idx] = output.text;
+                }
+            }
+
             let re_lines = regex::Regex::new(r"_+|-+").unwrap();
             let re_ans_lines = regex::Regex::new(r"(?m)^\s*[1-6]\s*$").unwrap();
             let re_aqa_num = regex::Regex::new(r"[0O]\s*(\d)\s*\.\s*(\d)").unwrap();
-            pdf_page_texts = pages.into_iter().map(|s| {
-                let mut text = re_lines.replace_all(&s, "").to_string();
-                text = re_ans_lines.replace_all(&text, "").to_string();
-                text = re_aqa_num.replace_all(&text, "${1}.${2}").to_string();
-                text
-            }).collect();
+            for text in pdf_page_texts.iter_mut() {
+                if !text.is_empty() {
+                    *text = re_lines.replace_all(text, "").to_string();
+                    *text = re_ans_lines.replace_all(text, "").to_string();
+                    *text = re_aqa_num.replace_all(text, "${1}.${2}").to_string();
+                }
+            }
         }
     }
 
     let classifier = SubjectClassifier::new();
-    let mut aggregated_questions: Vec<Question> = Vec::new();
+    let mut aggregated_questions: Vec<(Question, bool)> = Vec::new();
     
+    const EDEXCEL_MATHS_PURE: &[&str] = &["Proof", "Algebra and functions", "Coordinate geometry in the (x, y) plane", "Sequences and series", "Trigonometry", "Exponentials and logarithms", "Differentiation", "Integration", "Numerical methods", "Vectors"];
+    const EDEXCEL_MATHS_STATS: &[&str] = &["Statistical sampling", "Data presentation and interpretation", "Probability", "Statistical distributions", "Statistical hypothesis testing"];
+    const EDEXCEL_MATHS_MECH: &[&str] = &["Quantities and units in mechanics", "Kinematics", "Forces and Newton's laws", "Moments"];
     const EDEXCEL_MATHS_TOPICS: &[&str] = &["Proof", "Algebra and functions", "Coordinate geometry in the (x, y) plane", "Sequences and series", "Trigonometry", "Exponentials and logarithms", "Differentiation", "Integration", "Numerical methods", "Vectors", "Statistical sampling", "Data presentation and interpretation", "Probability", "Statistical distributions", "Statistical hypothesis testing", "Quantities and units in mechanics", "Kinematics", "Forces and Newton's laws", "Moments"];
+
+    const FM_CORE_PURE: &[&str] = &["Complex numbers", "Argand diagrams", "Series", "Roots of polynomials", "Volumes of revolution", "Matrices", "Linear transformations", "Proof by induction", "Vectors", "Differential equations", "Polar coordinates", "Hyperbolic functions", "Maclaurin series", "Methods in calculus"];
+    const FM_FM1: &[&str] = &["Momentum and impulse", "Work, energy and power", "Elastic strings and springs", "Elastic collisions in one dimension", "Elastic collisions in two dimensions"];
+    const FM_FS1: &[&str] = &["Discrete probability distributions", "Poisson distribution", "Geometric and negative binomial", "Hypothesis testing", "Central Limit Theorem", "Chi-squared tests", "Probability generating functions", "Quality of tests"];
+    const FM_FP1: &[&str] = &["Vectors (Cross product & planes)", "Conic sections", "Inequalities", "t-formulae", "Taylor series", "Numerical methods (Further)", "Reducible differential equations"];
+    const FM_D1: &[&str] = &["Algorithms", "Graphs and networks", "Algorithms on graphs", "Route inspection", "Travelling Salesperson Problem", "Linear programming", "Simplex algorithm"];
     const FURTHER_MATHS_TOPICS: &[&str] = &["Complex numbers", "Argand diagrams", "Series", "Roots of polynomials", "Volumes of revolution", "Matrices", "Linear transformations", "Proof by induction", "Vectors", "Differential equations", "Polar coordinates", "Hyperbolic functions", "Maclaurin series", "Methods in calculus", "Momentum and impulse", "Work, energy and power", "Elastic strings and springs", "Elastic collisions in one dimension", "Elastic collisions in two dimensions", "Discrete probability distributions", "Poisson distribution", "Geometric and negative binomial", "Hypothesis testing", "Central Limit Theorem", "Chi-squared tests", "Probability generating functions", "Quality of tests", "Vectors (Cross product & planes)", "Conic sections", "Inequalities", "t-formulae", "Taylor series", "Numerical methods (Further)", "Reducible differential equations", "Algorithms", "Graphs and networks", "Algorithms on graphs", "Route inspection", "Travelling Salesperson Problem", "Linear programming", "Simplex algorithm"];
     const PHYSICS_TOPICS: &[&str] = &["Measurements and their errors", "Particles and radiation", "Waves", "Mechanics and materials", "Electricity", "Further mechanics", "Thermal physics", "Fields and their consequences", "Nuclear physics", "Telescopes", "Classification of stars", "Cosmology"];
     const CS_TOPICS: &[&str] = &["Fundamentals of programming", "Fundamentals of data structures", "Fundamentals of algorithms", "Theory of computation", "Fundamentals of data representation", "Fundamentals of computer systems", "Computer organisation and architecture", "Consequences of uses of computing", "Communication and networking", "Fundamentals of databases", "Big Data", "Fundamentals of functional programming"];
+
+    let get_allowed_topics = |subj: &str, module: Option<&str>| -> &[&str] {
+        match subj {
+            "Mathematics" => match module.unwrap_or("") {
+                "Pure" | "Core Pure" => EDEXCEL_MATHS_PURE,
+                "Statistics" => EDEXCEL_MATHS_STATS,
+                "Mechanics" => EDEXCEL_MATHS_MECH,
+                _ => EDEXCEL_MATHS_TOPICS,
+            },
+            "Further Mathematics" => match module.unwrap_or("") {
+                "Core Pure" | "Pure" => FM_CORE_PURE,
+                "Further Mechanics 1" | "Further Mechanics 2" | "Mechanics" => FM_FM1,
+                "Further Statistics 1" | "Further Statistics 2" | "Statistics" => FM_FS1,
+                "Further Pure 1" => FM_FP1,
+                "Decision Mathematics 1" | "Decision 1" | "Decision 2" => FM_D1,
+                _ => FURTHER_MATHS_TOPICS,
+            },
+            "Physics" => PHYSICS_TOPICS,
+            "Computer Science" => CS_TOPICS,
+            _ => &[],
+        }
+    };
 
     let allowed_topics: &[&str] = match subject.as_str() {
         "Mathematics" => EDEXCEL_MATHS_TOPICS,
@@ -844,7 +890,14 @@ pub async fn parse_pdf_vision(
         extracted_questions: Vec<ExtractedQuestion>,
     }
 
-    for page_idx in 0..effective_num_pages {
+    let valid_count = valid_pages.iter().filter(|&&v| v).count();
+    let mut current_valid_idx = 0;
+
+    for page_idx in 0..num_pages {
+        if !valid_pages[page_idx] { continue; }
+        current_valid_idx += 1;
+        
+        let _ = app.emit("import-progress", serde_json::json!({ "page": current_valid_idx, "total": valid_count, "message": format!("Analyzing page {} of {}...", current_valid_idx, valid_count) }));
         if state.cancel_flag.load(std::sync::atomic::Ordering::Relaxed) {
             return Err("Import cancelled by user".to_string());
         }
@@ -860,7 +913,7 @@ RULE 1 (JSON SCHEMA):
 The root object MUST be: {{ "extracted_questions": [ ... ] }}. Every question object inside the array MUST include:
 - "question_number": integer (The MAIN question number only. For AQA style "03.1", the main number is 3. Do not include sub-parts here.)
 - "marks": integer (CRITICAL: You MUST look for the mark allocation printed on the page, usually in brackets like '[3 marks]' or '(4)'. Sum them up. If you cannot find any, estimate based on the length, but NEVER return 0 or null.)
-- "content": string. CRITICAL: For long-answer questions (e.g., 6-mark explainers), you MUST maintain the paragraph structure. Insert a double newline (\n\n) between every distinct sentence or logical point. Do not merge them into one block. If the text on the page is long, YOU ARE FORBIDDEN FROM SUMMARIZING OR TRUNCATING. You must transcribe the full text until the question ends. If the raw text is cut off, read from the image! CRITICAL: You MUST include the sub-part labels (e.g., '1.1', '1.2', '(a)', '(b)') at the start of their respective paragraphs in the Markdown. If there is a graphical diagram, insert the exact string "[DIAGRAM_PLACEHOLDER]" exactly where the diagram appears in the text.
+- "content": string. CRITICAL: For long-answer questions, maintain paragraph structure using double newlines (\n\n). You MUST transcribe the FULL text, including instructions like 'Shade one lozenge...'. Do NOT drop introductory sentences. CRITICAL: You MUST append `**[X marks]**` to EVERY distinct sub-part. Do not miss any.
 - "math_snippet": string (LEAVE THIS EMPTY. Put all math directly inside the "content" string where it belongs chronologically).
 - "is_code": boolean
 - "topics": array of strings (Select relevant topics from the provided list below)
@@ -869,12 +922,13 @@ The root object MUST be: {{ "extracted_questions": [ ... ] }}. Every question ob
 - "is_continuation": boolean
 
 RULE 2 (SUBJECT TAGS & MODULES):
+PAPER CONTEXT: This document is from the paper '{paper_name}'. If this paper name implies a specific module (e.g., 'Core Pure 1', 'Further Mechanics 1', 'Physics Paper 1'), you MUST strictly assign that exact module to EVERY question. Do not hallucinate different modules for different questions if they all belong to this paper.
 You are STRICTLY FORBIDDEN from inventing topics. You MUST select at least one relevant topic from the provided list below for every question. Do not leave the topics array empty.
 You MUST select the correct "module" based on the topics:
 - Mathematics Modules: Pure, Statistics, Mechanics.
 - Further Mathematics Modules: Core Pure, Further Mechanics 1, Further Statistics 1, Decision Mathematics 1, Further Pure 1.
-For Physics or Computer Science, set module to 'General'.
-You MUST only use the provided topics list: {:?}.
+For Physics, set module to 'Physics'. For Computer Science, set module to 'Computer Science'.
+You MUST only use the provided topics list: {allowed_topics:?}.
 
 RULE 3 (PUNCTUATION & FORMATTING):
 - Preserve ALL original punctuation (commas, periods, colons). Do not strip them.
@@ -885,7 +939,8 @@ RULE 3 (PUNCTUATION & FORMATTING):
 - WRAP ALL MATH: You MUST wrap all numbers, variables, expressions, and mathematical operators in single `$` for inline math.
 - STRICT DISPLAY MATH RULE: ONLY use `$$` for display math if the equation is naturally on its own line and visually separated from the text block. DO NOT use `$$` for variables embedded within a sentence (e.g., use `$P$`, `$i$`, `$j$`, not `$$P$$`).
 - STRICT LaTeX RULE: NEVER put `$` or `$$` delimiters INSIDE a LaTeX environment like `\begin{{array}}` or `\begin{{aligned}}`. Environments must stand alone inside `$$...$$`.
-- AQA NUMBERING CONVERSION: Convert AQA decimal sub-parts (e.g., '1.1', '1.2') to exactly '**(a)**' and '**(b)**' with NO main question number attached. You MUST place a double newline (\n\n) before it. CRITICAL: There must be ZERO spaces between the asterisks and the bracket (e.g., use `**(a)**`, NOT `** (a)**`).
+- COMPUTER SCIENCE & CODE: For Computer Science questions, you MUST format all pseudocode, class names, method names, variable names, SQL queries, and code snippets using standard Markdown code formatting (inline backticks for identifiers like `MyClass`, and triple backticks for multi-line code blocks). NEVER use LaTeX math mode (`$` or `$$`) for code or pseudocode, because LaTeX math mode destroys spaces!
+- AQA NUMBERING CONVERSION: Convert AQA decimal sub-parts (e.g., '1.1', '1.2', '04.2') to exactly '(a)' and '(b)' with NO main question number attached. CRITICAL: When you do this, you MUST also update any inline references within the prose. For example, change 'referred to in Question 02.1' to 'referred to in part (a)'. Ensure every distinct sub-task gets its bold alphabetical heading, even if AQA grouped them lazily.
 - MULTIPLE CHOICE WARNING: Whole numbers like '11', '12', '13' are completely independent multiple-choice questions. DO NOT confuse them with sub-parts and do NOT convert '11' into '1.1' or '1 (a)'. Question 11 MUST receive `"question_number": 11`. ONE QUESTION PER OBJECT: You are strictly forbidden from placing multiple independent questions inside the same JSON object's content. Every single numbered question MUST be a completely separate JSON object in the array.
 - AQA PHYSICS LISTS: If a question asks you to 'State the names of...' or similar, you MUST use Markdown bullet points (e.g., '- ...'). Do not use numbered lists (1, 2, 3) unless they are part of the original question text. This prevents the UI from confusing your transcription with its own numbering.
 
@@ -894,22 +949,31 @@ You must intelligently group or split questions based on their context:
 1. OVERARCHING CONTEXT (Merge): If a set of sub-parts (e.g., 1.1, 1.2, 1.3) all share a single overarching scenario, preamble, or diagram at the top, you MUST merge them into ONE single JSON object.
 2. INDEPENDENT QUESTIONS (Split): If the page contains a sequence of completely independent Multiple Choice Questions or short-answer questions that do NOT share any overarching context (even if they are numbered 1.1, 1.2, 1.3), you MUST split them into SEPARATE JSON objects in the array. This prevents unrelated questions from being mashed together. (Set `is_continuation`: false for each).
 
+RULE 10 (CONTINUATIONS & DEDUPLICATION): 
+- If the page is a continuation of a previous question, you MUST continue the alphabetical sequence (e.g., if the last part was (e), the new page MUST start at **(f)**). Do NOT reset to (a).
+- If the top of a continuation page reprints the exact same introductory scenario text from the previous page, DO NOT transcribe the preamble again. Only transcribe the new sub-questions.
+
 RULE 4 (TABLES & DIAGRAMS):
-- TABLES: ONLY true data tables, matrices, or Simplex tableaus should be formatted as LaTeX block math using the `array` environment. Do NOT draw image bounding boxes around pure data tables.
-- MULTIPLE CHOICE: You MUST format A, B, C, D options as a Markdown bulleted list (e.g., `- A) [option]`, `- B) [option]`) or separate them with DOUBLE newlines (\n\n). Do NOT put them on single lines, or Markdown will collapse them into a single unreadable paragraph.
-- DIAGRAMS: You MUST use `diagram_bboxes` for all visual and scheduling elements including Gantt charts, scheduling diagrams, timelines, graphs, plots, charts, illustrations, networks, trees, force diagrams, circuits, and simple line drawings. Do NOT attempt to recreate scheduling diagrams or timelines using LaTeX arrays. You MUST draw bounding boxes for ALL line drawings. Do not miss simple line diagrams. Provide the bounding box [[x, y, w, h]] as relative coordinates (0.0 to 1.0). If there are multiple diagrams, provide multiple bounding boxes in the array.
-  FIGURE KEYWORD CRITICAL: If you see the word 'Figure' followed by a number (e.g., 'Figure 6', 'Figure 8'), the actual diagram/graph is usually located DIRECTLY BELOW OR ABOVE that text. You MUST draw a massive bounding box that captures BOTH the 'Figure X' text AND the entire faint graph/grid/drawing next to it. Do not just draw a tiny box around the word 'Figure'.
+- TEXT/DATA TABLES: You MUST use standard Markdown tables (using `|` and `-`) for any tables containing text, categories, or mixed data (e.g., age categories, probability tables). Do NOT use LaTeX arrays for text.
+- MATH MATRICES: ONLY use LaTeX `\begin{{array}}` for pure mathematical matrices or Simplex tableaus.
+- MULTIPLE CHOICE: You MUST format multiple choice options exactly with lowercase letters (e.g., `a) [option]`, `b) [option]`, `c) [option]`, `d) [option]`). DO NOT attach the main question number to the options (e.g. do NOT output `1 a)`, just `a)`). Separate them with DOUBLE newlines (\n\n).
+- DIAGRAMS: You MUST use `diagram_bboxes` for all visual and scheduling elements including Gantt charts, scheduling diagrams, timelines, graphs, plots, charts, illustrations, networks, trees, force diagrams, circuits, and simple line drawings. Do not attempt to recreate scheduling diagrams or timelines using LaTeX arrays. You MUST draw bounding boxes for ALL line drawings. Do not miss simple line diagrams. Provide the bounding box [[x, y, w, h]] as relative coordinates (0.0 to 1.0). If there are multiple diagrams, provide multiple bounding boxes in the array.
+  FIGURE KEYWORD CRITICAL: If a table, grid, or graphic is explicitly labeled with the word 'Figure' followed by a number (e.g., 'Figure 6', 'Figure 8'), you MUST treat it as a diagram and draw a bounding box around it. DO NOT attempt to transcribe it using Markdown tables or LaTeX. You MUST draw a massive bounding box that captures BOTH the 'Figure X' text AND the entire table/grid/drawing next to it. Do not just draw a tiny box around the word 'Figure'.
   CRITICAL: Draw ONE single large bounding box that captures the ENTIRE diagram (including all axis labels, nodes, and headers). DO NOT split a single graph or network into multiple separate bounding boxes.
-  CRITICAL DIAGRAM BAN: You are STRICTLY FORBIDDEN from drawing bounding boxes around standard paragraphs of text, mathematical working out, equations, or empty student working grids. Bounding boxes are ONLY for visual graphics. If it's text or math, you MUST transcribe it into Markdown/LaTeX.
+  - CRITICAL DIAGRAM BAN: NEVER draw bounding boxes around database schemas (e.g., `Product(ProductID, ...)`), text tables, or code. Transcribe them as formatted text.
+  - DIAGRAM PLACEMENT: You MUST insert `[DIAGRAM_PLACEHOLDER]` at the EXACT chronological location the diagram appears (e.g., directly after the sentence referencing it). Do NOT dump it at the top or bottom of the card.
 - Example: If the image is 1000px wide and the diagram starts at 100px, x should be 0.1.
 - If you cannot calculate the relative coordinate, return null.
 RULE 5 (EXCLUSIONS & CLEANUP):
-- EXCLUDE MARKS: Do NOT extract the mark counts that appear next to question parts (e.g., "(4)", "[3]"). Do NOT extract the footer text that says "Total for Question X is Y marks". Just sum the marks mentally and put the total integer in the "marks" JSON field.
+- TRANSCRIBE MARKS: You MUST transcribe the mark allocations into the "content" string. Whenever you see a mark allocation (e.g., "(4)", "[3]"), you MUST format it exactly as ` **[{{M}} marks]**` at the end of the respective sentence or paragraph. Example: `...solve for x. **[4 marks]**`. Do NOT extract the footer text that says "Total for Question X is Y marks". You must also sum the marks and put the total integer in the "marks" JSON field.
 - EXCLUDE HEADERS/FOOTERS: Do NOT extract page headers or footers like "Question X continued", "Turn over", or "TOTAL FOR PAPER IS X MARKS".
 - EXCLUDE BLANK PAGES: If a page just says "BLANK PAGE" or "Turn over", completely ignore it. Do NOT include this text in the content. If the entire page is blank or just says "BLANK PAGE", return an empty array `[]`.
 - EXCLUDE STUDENT GRIDS: Do NOT transcribe horizontal lines, dots, or grids (e.g. `_____` or `......`) that are intended for students to write their answers on. Ignore them completely.
 - EXCLUDE AQA MARGINS: Ignore the isolated 2-digit margin numbers (e.g., "01", "02") that AQA prints next to questions.
 - ANSWER LINES BAN: You are STRICTLY FORBIDDEN from transcribing isolated, sequential numbers (e.g., 1, 2, 3, 4) that appear vertically on the page. These are blank answer lines. Delete them from your output entirely.
+- ANTI-TRUNCATION: The content string MUST end with terminal punctuation (a period, question mark, or bracket). If you stop transcribing mid-sentence, you fail.
+- EXCLUDE STUDENT LABELS: Completely ignore prompt headers that sit immediately next to or above blank answer lines. This includes isolated words like 'Answer', 'Advantage 1', 'Advantage 2', 'Problem 1', etc.
+- IGNORE REFERENCE TABLES: If a page consists entirely of standard reference material (e.g., 'Table 1 - Standard AQA assembly language instruction set' or a generic formula sheet), you MUST return an empty array [].
 
 RULE 8 (NO SUMMARIES):
 You are an expert OCR engine. Your task is to extract the FULL text of the exam question. If you produce a summary instead of a full transcription, you have failed. If you truncate a long sentence, you have failed.
@@ -924,9 +988,9 @@ You MUST transcribe the ENTIRE question exactly as it appears in the IMAGE. Use 
 IGNORE repetitive margin numbers, blank answer line numbers, and boilerplate.
 The image is provided ONLY so you can correct OCR errors, properly format mathematical formulas using LaTeX, and identify bounding boxes for diagrams. Do not transcribe blank lines `___` from the raw text.
 RAW TEXT:
-{}
+{page_text}
 
-CONTEXT: The previous page was processing Question {}. If the current image does not explicitly start with a new question number, you MUST assume it is a continuation of Question {}, use that number in JSON, and set 'is_continuation': true."#, allowed_topics, current_question_num, current_question_num, page_text);
+CONTEXT: The previous page was processing Question {current_num}. If the current image does not explicitly start with a new question number, you MUST assume it is a continuation of Question {current_num}, use that number in JSON, and set 'is_continuation': true."#, paper_name = paper_name, allowed_topics = allowed_topics, current_num = current_question_num, page_text = page_text);
 
         let b64_data_str = &pdf_pages[page_idx];
         let b64_data = if b64_data_str.starts_with("data:image") {
@@ -1129,6 +1193,14 @@ CRITICAL: DO NOT SUMMARIZE. Transcribe the ENTIRE long-answer text, sentence by 
                 use base64::Engine;
                 if let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(b64_data) {
                     if let Ok(mut img) = image::load_from_memory(&bytes) {
+                        // DEBUG: Save the full image to disk to verify if the diagram exists before cropping
+                        if let Ok(app_data_dir) = app.path().app_data_dir() {
+                            let debug_dir = app_data_dir.join("debug_images");
+                            let _ = std::fs::create_dir_all(&debug_dir);
+                            let debug_path = debug_dir.join(format!("full_page_{}.jpg", page_idx));
+                            let _ = img.save(&debug_path);
+                        }
+
                         if !bboxes.is_empty() {
                             let mut min_x = 1.0_f32;
                             let mut min_y = 1.0_f32;
@@ -1193,8 +1265,8 @@ CRITICAL: DO NOT SUMMARIZE. Transcribe the ENTIRE long-answer text, sentence by 
             }
 
             let mut should_merge = false;
-            if let Some(last_q) = aggregated_questions.last() {
-                let last_num = last_q.question_number.unwrap_or(-1);
+            if let Some(last_q_tuple) = aggregated_questions.last() {
+                let last_num = last_q_tuple.0.question_number.unwrap_or(-1);
                 let current_num = parsed_q_num_i64.unwrap_or(-1);
 
                 // HYBRID OVERRIDE: If the AI explicitly parsed a distinct new question number, 
@@ -1209,21 +1281,56 @@ CRITICAL: DO NOT SUMMARIZE. Transcribe the ENTIRE long-answer text, sentence by 
             }
 
             if should_merge {
-                if let Some(existing) = aggregated_questions.last_mut() {
+                if let Some(existing_tuple) = aggregated_questions.last_mut() {
+                    let existing = &mut existing_tuple.0;
                     if !existing.content.is_empty() {
                         existing.content.push_str("\n\n");
                     }
                     existing.content.push_str(&q_content);
-                    if let Some(m) = q.marks {
-                        let to_add = if m == 0 { 1 } else { m };
-                        existing.marks += to_add;
+                    
+                    let mut extracted_sum = 0;
+                    let re_marks_tagged = regex::Regex::new(r"(?i)(?:\[|\()\s*(\d+)\s*marks?\s*(?:\]|\))").unwrap();
+                    for cap in re_marks_tagged.captures_iter(&existing.content) {
+                        if let Ok(m) = cap[1].parse::<i32>() {
+                            extracted_sum += m;
+                        }
+                    }
+
+                    if extracted_sum > 0 {
+                        existing.marks = extracted_sum;
+                    } else if let Some(m) = q.marks {
+                        existing.marks = existing.marks.max(m);
                     }
                 }
             } else {
                 let (_, sys_subtopic, sys_is_code) = classifier.classify(&q_content);
-                let parsed_marks = q.marks.unwrap_or(1);
+                
+                let mut extracted_marks = 0;
+                let re_marks_tagged = regex::Regex::new(r"(?i)(?:\[|\()\s*(\d+)\s*marks?\s*(?:\]|\))").unwrap();
+                for cap in re_marks_tagged.captures_iter(&q_content) {
+                    if let Ok(m) = cap[1].parse::<i32>() {
+                        extracted_marks += m;
+                    }
+                }
+                let parsed_marks = if extracted_marks > 0 { extracted_marks } else { q.marks.unwrap_or(1) };
                 let final_marks = if parsed_marks == 0 { 1 } else { parsed_marks };
-                aggregated_questions.push(Question {
+
+                let mut valid_topics: Vec<String> = Vec::new();
+                let allowed_topics_for_tagging = get_allowed_topics(&subject, q.module.as_deref());
+                if let Some(topics) = &q.topics {
+                    for t in topics {
+                        if allowed_topics_for_tagging.contains(&t.as_str()) {
+                            valid_topics.push(t.clone());
+                        }
+                    }
+                }
+                let topics_json = if valid_topics.is_empty() {
+                    "[]".to_string()
+                } else {
+                    serde_json::to_string(&valid_topics).unwrap_or_else(|_| "[]".to_string())
+                };
+
+                aggregated_questions.push((Question {
                     id: uuid::Uuid::new_v4().to_string(),
                     subject: subject.clone(),
                     subtopic: if sys_subtopic == "Unknown" { q.subtopic.clone().unwrap_or_else(|| "Unknown".to_string()) } else { sys_subtopic.to_string() },
@@ -1232,24 +1339,37 @@ CRITICAL: DO NOT SUMMARIZE. Transcribe the ENTIRE long-answer text, sentence by 
                     math_snippet: q.math_snippet.clone().unwrap_or_default(),
                     is_code: if subject == "Computer Science" { q.is_code.unwrap_or(sys_is_code) } else { false },
                     answer_content: None,
-                    topics: Some(serde_json::to_string(&q.topics.clone().unwrap_or_default()).unwrap_or_else(|_| "[]".to_string())),
+                    topics: Some(topics_json),
                     paper_name: paper_name.clone(),
                     question_number: parsed_q_num_i64,
-                    module: Some(q.module.clone().unwrap_or_else(|| "Unknown".to_string())),
-                });
+                    module: Some(
+                        if subject == "Physics" {
+                            "Physics".to_string()
+                        } else if subject == "Computer Science" {
+                            "Computer Science".to_string()
+                        } else {
+                            q.module.clone().unwrap_or_else(|| "Unknown".to_string())
+                        }
+                    ),
+                }, is_cont));
             }
         }
     }
     let pool = state.db.lock().await;
     let mut final_questions = Vec::new();
     
-    for mut question_obj in aggregated_questions {
+    for (mut question_obj, is_cont) in aggregated_questions {
         let re_q_cont = regex::Regex::new(r"(?i)Question\s+\d+\s+continued").unwrap();
         let re_total_q = regex::Regex::new(r"(?i)\(Total\s+for\s+Question\s+\d+\s+is\s+\d+\s+marks\)").unwrap();
         let re_total_q2 = regex::Regex::new(r"(?i)Total\s+for\s+Question\s+\d+\s+is\s+\d+\s+marks").unwrap();
         let re_total_paper = regex::Regex::new(r"(?i)TOTAL\s+FOR\s+PAPER\s+IS\s+\d+\s+MARKS").unwrap();
-        let re_turn_over = regex::Regex::new(r"(?i)Turn\s+over").unwrap();
         let re_blank_page = regex::Regex::new(r"(?i)BLANK\s+PAGE").unwrap();
+        
+        // NEW: Aggressive artifact scrubbers
+        let re_turn_over = regex::Regex::new(r"(?i)Turn\s+over(\s+for\s+the\s+next\s+question)?").unwrap();
+        let re_shade_loz = regex::Regex::new(r"(?i)Shade\s+the\s+lozenges\s+next(\s+to.*)?").unwrap();
+        let re_answer_lines = regex::Regex::new(r"(?i)^Answer\s*(_+)?$|Answer\s*_+.*").unwrap();
+        let re_advantage = regex::Regex::new(r"(?im)^Advantage\s*\d*\s*$|^Disadvantage\s*\d*\s*$|^Problem\s*\d+\s*$").unwrap();
 
         let mut cleaned = question_obj.content.clone();
         cleaned = re_q_cont.replace_all(&cleaned, "").into_owned();
@@ -1258,18 +1378,16 @@ CRITICAL: DO NOT SUMMARIZE. Transcribe the ENTIRE long-answer text, sentence by 
         cleaned = re_total_paper.replace_all(&cleaned, "").into_owned();
         cleaned = re_turn_over.replace_all(&cleaned, "").into_owned();
         cleaned = re_blank_page.replace_all(&cleaned, "").into_owned();
+        cleaned = re_shade_loz.replace_all(&cleaned, "").into_owned();
+        cleaned = re_answer_lines.replace_all(&cleaned, "").into_owned();
+        cleaned = re_advantage.replace_all(&cleaned, "").into_owned();
+
         question_obj.content = cleaned.trim().to_string();
 
         let mut final_topics_str = question_obj.topics.clone().unwrap_or_else(|| "[]".to_string());
 
         if final_topics_str == "[]" || final_topics_str == "null" {
-            let allowed_topics_for_tagging: &[&str] = match question_obj.subject.as_str() {
-                "Mathematics" => EDEXCEL_MATHS_TOPICS,
-                "Further Mathematics" => FURTHER_MATHS_TOPICS,
-                "Physics" => PHYSICS_TOPICS,
-                "Computer Science" => CS_TOPICS,
-                _ => &[],
-            };
+            let allowed_topics_for_tagging = get_allowed_topics(&question_obj.subject, question_obj.module.as_deref());
             if !allowed_topics_for_tagging.is_empty() {
                 let tag_prompt = format!(
                     "Analyze the following question and select ALL relevant topics from this exact list: {:?}.\n\nReturn ONLY a valid JSON array of strings, e.g. [\"Topic 1\", \"Topic 2\"]. Do not return anything else.\n\nQuestion text: {}",
@@ -1290,8 +1408,11 @@ CRITICAL: DO NOT SUMMARIZE. Transcribe the ENTIRE long-answer text, sentence by 
                         if let Some(content) = resp_json["choices"][0]["message"]["content"].as_str() {
                             let raw_json = content.trim().trim_start_matches("```json").trim_start_matches("```").trim_end_matches("```").trim();
                             if let Ok(topics_arr) = serde_json::from_str::<Vec<String>>(raw_json) {
-                                if !topics_arr.is_empty() {
-                                    final_topics_str = serde_json::to_string(&topics_arr).unwrap_or_else(|_| "[]".to_string());
+                                let valid_tagging_topics: Vec<String> = topics_arr.into_iter()
+                                    .filter(|t| allowed_topics_for_tagging.contains(&t.as_str()))
+                                    .collect();
+                                if !valid_tagging_topics.is_empty() {
+                                    final_topics_str = serde_json::to_string(&valid_tagging_topics).unwrap_or_else(|_| "[]".to_string());
                                 }
                             }
                         }
@@ -1303,11 +1424,23 @@ CRITICAL: DO NOT SUMMARIZE. Transcribe the ENTIRE long-answer text, sentence by 
         let q_num_val = question_obj.question_number.unwrap_or(0);
         let mut final_id = question_obj.id.clone();
         let mut final_content = question_obj.content.clone();
+        
+        let mut extracted_sum = 0;
+        let re_marks_tagged = regex::Regex::new(r"(?i)(?:\[|\()\s*(\d+)\s*marks?\s*(?:\]|\))").unwrap();
+        for cap in re_marks_tagged.captures_iter(&final_content) {
+            if let Ok(m) = cap[1].parse::<i32>() {
+                extracted_sum += m;
+            }
+        }
+        if extracted_sum > 0 {
+            question_obj.marks = extracted_sum;
+        }
+
         let mut was_updated = false;
 
-        if q_num_val > 0 && !paper_name.trim().is_empty() {
+        if q_num_val > 0 && !paper_name.trim().is_empty() && is_cont {
             let existing: Option<(String, String)> = sqlx::query_as(
-                "SELECT id, content FROM questions WHERE paper_name = ? AND question_number = ? LIMIT 1"
+                "SELECT id, content FROM questions WHERE paper_name = ? AND question_number = ? ORDER BY rowid DESC LIMIT 1"
             )
             .bind(&paper_name)
             .bind(q_num_val)
@@ -1319,7 +1452,14 @@ CRITICAL: DO NOT SUMMARIZE. Transcribe the ENTIRE long-answer text, sentence by 
                 final_id = existing_id.clone();
                 final_content = format!("{}\n\n{}", existing_content, final_content);
                 
-                let new_marks = question_obj.marks;
+                let mut extracted_sum = 0;
+                let re_marks_tagged = regex::Regex::new(r"(?i)(?:\[|\()\s*(\d+)\s*marks?\s*(?:\]|\))").unwrap();
+                for cap in re_marks_tagged.captures_iter(&final_content) {
+                    if let Ok(m) = cap[1].parse::<i32>() {
+                        extracted_sum += m;
+                    }
+                }
+                let new_marks = if extracted_sum > 0 { extracted_sum } else { question_obj.marks };
                 
                 sqlx::query("UPDATE questions SET content = ?, topics = CASE WHEN ? != '[]' THEN ? ELSE topics END, module = COALESCE(?, module), marks = CASE WHEN ? > 1 THEN ? ELSE marks END WHERE id = ?")
                     .bind(&final_content)
@@ -1551,9 +1691,10 @@ CRITICAL FORMATTING RULES:
 9. Extract the textual description of the step (e.g., 'Finds the area of $R_1$') as standard text. Only use inline math (`$`) for small variables within these sentences.
 10. The main equations, substitutions, and final answers MUST be formatted as display/block math (`$$ equation $$`) so they render centered on their own distinct line.
 
-DECISION MATHS QAB PROTOCOL:
+DECISION MATHS & CS PROTOCOL:
 THE REPRINT BAN: If a page reprints a previous question's text or initial tableau for convenience, IGNORE the reprinted text and only extract the new sub-questions.
-MATH TABLES: Simplex tableaus and data tables MUST be formatted as LaTeX block math using the `array` environment. Do NOT draw image bounding boxes around them.
+CS CODE & PSEUDOCODE: You MUST format all code, pseudocode, and code identifiers using Markdown code blocks (backticks). NEVER use LaTeX math mode (`$` or `$$`) for code.
+MATH TABLES: Format data tables (e.g. trace tables) using standard Markdown tables. ONLY use LaTeX block math (`\begin{{array}}`) for true mathematical matrices or Simplex tableaus. Do NOT draw image bounding boxes around them.
 GRAPHICAL DIAGRAMS: Activity networks, Gantt charts, and trees MUST be captured via image bounding box coordinates using `diagram_bboxes` and `diagram_page_indexes`. Do NOT try to build them with LaTeX. In `answer_markdown`, insert the exact string "[DIAGRAM_PLACEHOLDER]" exactly where the diagram appears.
 CRITICAL DIAGRAM BAN: You are STRICTLY FORBIDDEN from drawing bounding boxes around standard paragraphs of text, mathematical working out, examiner notes, equations, or empty student working grids. Bounding boxes are ONLY for visual graphics. If it's text or math, you MUST transcribe it into Markdown/LaTeX. If you use a diagram bounding box to avoid typing out long mathematical working, you have failed.
 THE EMPTY GRID BAN: NEVER capture empty working grids, blank lines, or unpopulated tracing tables. Return nothing for these.
@@ -2136,6 +2277,95 @@ impl pdf_extract::OutputDev for BBoxOutput {
     }
     fn output_character(&mut self, trm: &pdf_extract::Transform, _width: f64, _spacing: f64, _font_size: f64, char: &str) -> Result<(), pdf_extract::OutputError> {
         self.text_data.push((char.to_string(), trm.m31, trm.m32));
+        Ok(())
+    }
+    fn begin_word(&mut self) -> Result<(), pdf_extract::OutputError> { Ok(()) }
+    fn end_word(&mut self) -> Result<(), pdf_extract::OutputError> { Ok(()) }
+    fn end_line(&mut self) -> Result<(), pdf_extract::OutputError> { Ok(()) }
+}
+
+struct HybridTextOutput {
+    pub text: String,
+    word_buf: String,
+    is_monospace_word: bool,
+    last_end: f64,
+    last_y: f64,
+    first_char: bool,
+    flip_ctm: Option<pdf_extract::Transform>,
+}
+
+impl HybridTextOutput {
+    pub fn new() -> Self {
+        HybridTextOutput {
+            text: String::new(),
+            word_buf: String::new(),
+            is_monospace_word: true,
+            last_end: 100000.,
+            last_y: 0.,
+            first_char: true,
+            flip_ctm: None,
+        }
+    }
+
+    fn flush_word(&mut self) {
+        if !self.word_buf.is_empty() {
+            if self.is_monospace_word && self.word_buf.chars().any(|c| c.is_alphanumeric()) {
+                self.text.push('`');
+                self.text.push_str(&self.word_buf);
+                self.text.push('`');
+            } else {
+                self.text.push_str(&self.word_buf);
+            }
+            self.word_buf.clear();
+        }
+        self.is_monospace_word = true; // reset for next word
+    }
+}
+
+impl pdf_extract::OutputDev for HybridTextOutput {
+    fn begin_page(&mut self, _page_num: u32, media_box: &pdf_extract::MediaBox, _art_box: Option<(f64, f64, f64, f64)>) -> Result<(), pdf_extract::OutputError> {
+        self.flip_ctm = Some(pdf_extract::Transform::row_major(1., 0., 0., -1., 0., media_box.ury - media_box.lly));
+        Ok(())
+    }
+    fn end_page(&mut self) -> Result<(), pdf_extract::OutputError> {
+        self.flush_word();
+        Ok(())
+    }
+    fn output_character(&mut self, trm: &pdf_extract::Transform, width: f64, _spacing: f64, font_size: f64, char: &str) -> Result<(), pdf_extract::OutputError> {
+        let flip_ctm = self.flip_ctm.unwrap();
+        // Fallback for euclid vector math
+        let m31 = trm.m31 * flip_ctm.m11 + trm.m32 * flip_ctm.m21 + flip_ctm.m31;
+        let m32 = trm.m31 * flip_ctm.m12 + trm.m32 * flip_ctm.m22 + flip_ctm.m32;
+        let transformed_font_size = (trm.m11.abs() * font_size + trm.m22.abs() * font_size) / 2.0;
+        let (x, y) = (m31, m32);
+
+        if !self.first_char {
+            if (y - self.last_y).abs() > transformed_font_size * 1.5 {
+                self.flush_word();
+                self.text.push('\n');
+            } else if x < self.last_end && (y - self.last_y).abs() > transformed_font_size * 0.5 {
+                self.flush_word();
+                self.text.push('\n');
+            } else if x > self.last_end + transformed_font_size * 0.1 {
+                self.flush_word();
+                self.text.push(' ');
+            }
+        }
+        
+        let char_is_space = char.trim().is_empty();
+        if !char_is_space {
+            if !(width > 0.59 && width < 0.61) {
+                self.is_monospace_word = false;
+            }
+            self.word_buf.push_str(char);
+        } else {
+            self.flush_word();
+            self.text.push_str(char);
+        }
+        
+        self.first_char = false;
+        self.last_y = y;
+        self.last_end = x + width * transformed_font_size;
         Ok(())
     }
     fn begin_word(&mut self) -> Result<(), pdf_extract::OutputError> { Ok(()) }

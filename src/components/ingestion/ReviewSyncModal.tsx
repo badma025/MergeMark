@@ -6,6 +6,7 @@ import { Button } from "@/components/ui/button";
 import ReactMarkdown from "react-markdown";
 import remarkMath from "remark-math";
 import rehypeKatex from "rehype-katex";
+import remarkGfm from "remark-gfm";
 import "katex/dist/katex.min.css";
 import { preprocessMath } from "@/components/repository/QuestionCard";
 import { Loader2 } from "lucide-react";
@@ -119,7 +120,7 @@ export function ReviewSyncModal({ mappings, onClose, onSuccess }: ReviewSyncModa
                         Question {qNum}
                       </div>
                       <ReactMarkdown 
-                        remarkPlugins={[remarkMath]} 
+                        remarkPlugins={[remarkMath, remarkGfm]} 
                         rehypePlugins={[rehypeKatex]}
                         urlTransform={(value) => value}
                         components={{
@@ -190,7 +191,7 @@ export function ReviewSyncModal({ mappings, onClose, onSuccess }: ReviewSyncModa
                         </div>
                       </div>
                       <ReactMarkdown 
-                        remarkPlugins={[remarkMath]} 
+                        remarkPlugins={[remarkMath, remarkGfm]} 
                         rehypePlugins={[rehypeKatex]}
                         urlTransform={(value) => value}
                         components={{

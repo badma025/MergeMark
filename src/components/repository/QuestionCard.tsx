@@ -13,6 +13,7 @@ import {
 import ReactMarkdown from "react-markdown";
 import remarkMath from "remark-math";
 import rehypeKatex from "rehype-katex";
+import remarkGfm from "remark-gfm";
 import { cn } from "@/lib/utils";
 import { convertFileSrc } from "@tauri-apps/api/core";
 import { TOPICS_BY_SUBJECT } from "@/lib/taxonomy";
@@ -46,7 +47,7 @@ function fixSlashes(s: string): string {
  *   D) \int expr            — raw LaTeX with no delimiters at all
  *   E) text $\int expr$ text — display expr embedded mid-sentence
  */
-export function preprocessMath(raw: string, isCode?: boolean): string {
+export function preprocessMath(raw: string, isCode?: boolean, subject?: string): string {
   if (!raw) return "";
 
   let s = raw.trim();
@@ -54,7 +55,7 @@ export function preprocessMath(raw: string, isCode?: boolean): string {
   // ── 0: Convert Markdown Code Blocks to LaTeX Math Blocks ───────────────
   // If the AI outputs ```latex ... ```, ReactMarkdown treats it as a `<pre>` block,
   // preventing Katex from rendering it. We swap them for `$$` blocks.
-  if (!isCode) {
+  if (!isCode && subject !== "Computer Science") {
     // Match ```latex, ```math, ```tex, or just empty ``` if it's not a code question
     // We also match any stray `$` signs OUTSIDE the backticks so they get absorbed and removed!
     s = s.replace(/\$*\s*```(?:latex|math|tex)?\s*\n([\s\S]*?)\n```\s*\$*/gi, (_m, inner) => {
@@ -306,7 +307,7 @@ export function QuestionCard({
           )}
         >
           <ReactMarkdown 
-            remarkPlugins={[remarkMath]} 
+            remarkPlugins={[remarkMath, remarkGfm]} 
             rehypePlugins={[rehypeKatex]}
             urlTransform={(value) => value}
             components={{
@@ -341,7 +342,7 @@ export function QuestionCard({
                 }
               }}
             >
-              {preprocessMath(displayContent, isCode)}
+              {preprocessMath(displayContent, isCode, subject)}
           </ReactMarkdown>
         </div>
 
@@ -354,7 +355,7 @@ export function QuestionCard({
         >
           <div className="font-semibold text-xs text-muted-foreground mb-2 uppercase tracking-wider">Mark Scheme Answer</div>
           <ReactMarkdown 
-            remarkPlugins={[remarkMath]} 
+            remarkPlugins={[remarkMath, remarkGfm]} 
             rehypePlugins={[rehypeKatex]}
             urlTransform={(value) => value}
             components={{
@@ -389,7 +390,7 @@ export function QuestionCard({
                 }
               }}
             >
-              {preprocessMath(answerContent ?? "", isCode)}
+              {preprocessMath(answerContent ?? "", isCode, subject)}
           </ReactMarkdown>
         </div>
       </div>

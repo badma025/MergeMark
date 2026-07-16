@@ -50,7 +50,7 @@ export const TOPICS_BY_SUBJECT: Record<string, Record<string, string[]>> = {
     ]
   },
   "Physics": {
-    "General": [
+    "Physics": [
       "Measurements and their errors", "Particles and radiation", 
       "Waves", "Mechanics and materials", "Electricity", 
       "Further mechanics", "Thermal physics", 
@@ -59,7 +59,7 @@ export const TOPICS_BY_SUBJECT: Record<string, Record<string, string[]>> = {
     ]
   },
   "Computer Science": {
-    "General": [
+    "Computer Science": [
       "Fundamentals of programming", "Fundamentals of data structures", 
       "Fundamentals of algorithms", "Theory of computation", 
       "Fundamentals of data representation", "Fundamentals of computer systems", 

@@ -12,10 +12,11 @@ import { SUBJECTS, TOPICS_BY_SUBJECT, ALL_TOPICS } from "@/lib/taxonomy";
 // ── Component ─────────────────────────────────────────────────────────────────
 
 export interface RepositoryFeedProps {
+  isActive?: boolean;
   onAddToWorksheet: (question: Omit<QuestionCardProps, "onAddToWorksheet" | "onDelete">) => void;
 }
 
-export function RepositoryFeed({ onAddToWorksheet }: RepositoryFeedProps) {
+export function RepositoryFeed({ isActive = true, onAddToWorksheet }: RepositoryFeedProps) {
   const [search, setSearch] = useState("");
   const [selectedSubject, setSelectedSubject] = useState<string>("All");
   const [selectedModule, setSelectedModule] = useState<string>("All");
@@ -24,8 +25,10 @@ export function RepositoryFeed({ onAddToWorksheet }: RepositoryFeedProps) {
   const [loading, setLoading] = useState(true);
 
   useEffect(() => {
-    fetchQuestions();
-  }, []);
+    if (isActive) {
+      fetchQuestions();
+    }
+  }, [isActive]);
 
   async function fetchQuestions() {
     setLoading(true);
@@ -103,26 +106,23 @@ export function RepositoryFeed({ onAddToWorksheet }: RepositoryFeedProps) {
 
     let matchesModuleFilter = true;
     if (selectedModule !== "All") {
-      // Check if the question's topics belong to the selected module
-      const moduleTopics = (TOPICS_BY_SUBJECT[q.subject] || {})[selectedModule] || [];
-      if (selectedTopics.length > 0) {
-        // If topics are explicitly selected, we'll just let the topic filter handle it.
+      const qMod = (q as any).module;
+      if (qMod && qMod !== "Unknown" && qMod !== "General") {
+        matchesModuleFilter = qMod === selectedModule;
       } else {
-        // If no topics are selected, check if the question has any topic in this module.
-        let qTopics: string[] = [];
-        try {
-          if (q.topics) {
-            qTopics = JSON.parse(q.topics);
-            if (!Array.isArray(qTopics)) qTopics = [];
-          }
-        } catch (e) {}
-        
-        if (qTopics.length > 0) {
-          matchesModuleFilter = qTopics.some((t) => moduleTopics.includes(t));
-        } else {
-          // If the question has no topics but has a module explicitly set (we'll assume q.module is added)
-          if ((q as any).module) {
-            matchesModuleFilter = (q as any).module === selectedModule;
+        // Fallback to topics if no explicit module is provided
+        const moduleTopics = (TOPICS_BY_SUBJECT[q.subject] || {})[selectedModule] || [];
+        if (selectedTopics.length === 0) {
+          let qTopics: string[] = [];
+          try {
+            if (q.topics) {
+              qTopics = JSON.parse(q.topics);
+              if (!Array.isArray(qTopics)) qTopics = [];
+            }
+          } catch (e) {}
+          
+          if (qTopics.length > 0) {
+            matchesModuleFilter = qTopics.some((t) => moduleTopics.includes(t));
           }
         }
       }

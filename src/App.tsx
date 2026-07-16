@@ -79,12 +79,16 @@ function App() {
         </nav>
 
         {/* Tab panels */}
-        <div className="flex flex-col flex-1 min-h-0 overflow-hidden">
-          {activeTab === "repository" && (
-            <RepositoryFeed onAddToWorksheet={handleAddQuestion} />
-          )}
-          {activeTab === "ingestion" && <IngestionDropzone onSuccess={() => setActiveTab("repository")} />}
-          {activeTab === "settings" && <Settings />}
+        <div className="flex flex-col flex-1 min-h-0 overflow-hidden relative">
+          <div className={cn("absolute inset-0 flex flex-col min-h-0 overflow-hidden bg-background", activeTab === "repository" ? "z-10 opacity-100 pointer-events-auto" : "z-0 opacity-0 pointer-events-none")}>
+            <RepositoryFeed isActive={activeTab === "repository"} onAddToWorksheet={handleAddQuestion} />
+          </div>
+          <div className={cn("absolute inset-0 flex flex-col min-h-0 overflow-hidden bg-background", activeTab === "ingestion" ? "z-10 opacity-100 pointer-events-auto" : "z-0 opacity-0 pointer-events-none")}>
+            <IngestionDropzone onSuccess={() => setActiveTab("repository")} />
+          </div>
+          <div className={cn("absolute inset-0 flex flex-col min-h-0 overflow-hidden bg-background", activeTab === "settings" ? "z-10 opacity-100 pointer-events-auto" : "z-0 opacity-0 pointer-events-none")}>
+            <Settings />
+          </div>
         </div>
       </div>
 

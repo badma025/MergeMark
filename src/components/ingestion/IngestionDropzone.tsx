@@ -32,8 +32,16 @@ export function IngestionDropzone({ onSuccess }: IngestionDropzoneProps) {
   const [pendingMappings, setPendingMappings] = useState<ProposedMapping[] | null>(null);
   const [isDraggingOver, setIsDraggingOver] = useState(false);
   const [isProcessing, setIsProcessing] = useState(false);
+  const [progressMsg, setProgressMsg] = useState("");
   const [lastFile, setLastFile] = useState<string | null>(null);
   const dragCounter = useRef(0); // tracks nested enter/leave events
+
+  useEffect(() => {
+    const unlisten = listen('import-progress', (event: any) => {
+      setProgressMsg(event.payload.message);
+    });
+    return () => { unlisten.then(f => f()); };
+  }, []);
 
   // Fetch distinct paper names from the DB whenever the user enters mark_scheme mode.
   useEffect(() => {
@@ -70,6 +78,7 @@ export function IngestionDropzone({ onSuccess }: IngestionDropzoneProps) {
 
     setLastFile(filePath);
     setIsProcessing(true);
+    setProgressMsg("");
     try {
       let pdfBase64Pages: string[] | undefined = undefined;
       
@@ -78,21 +87,33 @@ export function IngestionDropzone({ onSuccess }: IngestionDropzoneProps) {
         const response = await fetch(assetUrl);
         const arrayBuffer = await response.arrayBuffer();
         
-        const pdf = await pdfjsLib.getDocument({ data: arrayBuffer }).promise;
+        const pdf = await pdfjsLib.getDocument({ 
+          data: arrayBuffer,
+          standardFontDataUrl: `https://unpkg.com/pdfjs-dist@${pdfjsLib.version}/standard_fonts/`,
+          cMapUrl: `https://unpkg.com/pdfjs-dist@${pdfjsLib.version}/cmaps/`,
+          cMapPacked: true,
+          wasmUrl: `https://unpkg.com/pdfjs-dist@${pdfjsLib.version}/wasm/`,
+        }).promise;
         const pages: string[] = [];
         const numPages = pdf.numPages; // Process the entire document
         
         for (let i = 1; i <= numPages; i++) {
-          const page = await pdf.getPage(i);
-          const viewport = page.getViewport({ scale: 2.0 });
-          const canvas = document.createElement("canvas");
-          const context = canvas.getContext("2d");
-          if (context) {
-            canvas.width = viewport.width;
-            canvas.height = viewport.height;
-            await page.render({ canvasContext: context, canvas, viewport }).promise;
-            const dataUrl = canvas.toDataURL("image/jpeg", 0.9);
-            pages.push(dataUrl.split(",")[1]);
+          try {
+            const page = await pdf.getPage(i);
+            const viewport = page.getViewport({ scale: 2.0 });
+            const canvas = document.createElement("canvas");
+            const context = canvas.getContext("2d");
+            if (context) {
+              canvas.width = viewport.width;
+              canvas.height = viewport.height;
+              context.fillStyle = "white";
+              context.fillRect(0, 0, canvas.width, canvas.height);
+              await page.render({ canvasContext: context, canvas, viewport, intent: "print" }).promise;
+              const dataUrl = canvas.toDataURL("image/jpeg", 0.9);
+              pages.push(dataUrl.split(",")[1]);
+            }
+          } catch (pageErr) {
+            console.error(`Error rendering page ${i}:`, pageErr);
           }
         }
         pdfBase64Pages = pages;
@@ -144,6 +165,8 @@ export function IngestionDropzone({ onSuccess }: IngestionDropzoneProps) {
         });
       }
     } finally {
+      setLastFile(null);
+      setProgressMsg("");
       setIsProcessing(false);
     }
   }
@@ -161,28 +184,32 @@ export function IngestionDropzone({ onSuccess }: IngestionDropzoneProps) {
   }, [isProcessing]);
 
   useEffect(() => {
-    const unlistenDrop = listen<{ paths: string[] }>('tauri://drop', (event) => {
-      setIsDraggingOver(false);
-      dragCounter.current = 0;
-      const paths = event.payload.paths;
-      if (paths && paths.length > 0 && !isProcessingRef.current) {
-        processFileRef.current(paths[0]);
-      }
-    });
-
-    const unlistenEnter = listen('tauri://drag-enter', () => {
-      setIsDraggingOver(true);
-    });
-
-    const unlistenLeave = listen('tauri://drag-leave', () => {
-      setIsDraggingOver(false);
-      dragCounter.current = 0;
-    });
+    let unlisten: (() => void) | undefined;
+    
+    import("@tauri-apps/api/webview").then(({ getCurrentWebview }) => {
+      getCurrentWebview().onDragDropEvent((event) => {
+        const payload = event.payload;
+        if (payload.type === 'enter') {
+          setIsDraggingOver(true);
+          dragCounter.current = 1;
+        } else if (payload.type === 'leave') {
+          setIsDraggingOver(false);
+          dragCounter.current = 0;
+        } else if (payload.type === 'drop') {
+          setIsDraggingOver(false);
+          dragCounter.current = 0;
+          const paths = payload.paths;
+          if (paths && paths.length > 0 && !isProcessingRef.current) {
+            processFileRef.current(paths[0]);
+          }
+        }
+      }).then(fn => {
+        unlisten = fn;
+      }).catch(console.error);
+    }).catch(console.error);
 
     return () => {
-      unlistenDrop.then(unlisten => unlisten());
-      unlistenEnter.then(unlisten => unlisten());
-      unlistenLeave.then(unlisten => unlisten());
+      if (unlisten) unlisten();
     };
   }, []);
 
@@ -390,6 +417,9 @@ export function IngestionDropzone({ onSuccess }: IngestionDropzoneProps) {
             <>
               <p className="text-base font-semibold text-foreground">
                 Processing…
+              </p>
+              <p className="text-xs text-primary truncate max-w-xs pb-1 font-medium">
+                {progressMsg}
               </p>
               <p className="text-xs text-muted-foreground truncate max-w-xs pb-2">
                 {lastFile ?? ""}
