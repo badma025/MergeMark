@@ -156,38 +156,185 @@ pub fn is_blank_or_grid(img: &image::DynamicImage) -> bool {
     variance < 5.0 || non_white_ratio < 0.0001
 }
 
+/// Structural empty-answer-grid detector.
+///
+/// `is_blank_or_grid` misses ruled student answer grids (AQA trace tables,
+/// working grids) because the *rules and header text* push variance and ink
+/// above its thresholds. The invariant this checks instead:
+///   * ≥ 4 long horizontal rules (> 55% of width) AND ≥ 2 long vertical
+///     rules (> 55% of height), i.e. a table skeleton;
+///   * after masking the rules themselves, ≥ 80% of the bands between
+///     consecutive rules are EMPTY of ink.
+/// Filled diagrams (Gantt figures, charts, populated tables) have ink
+/// scattered through the bands and are kept.
+pub fn looks_like_answer_grid(gray: &image::GrayImage) -> bool {
+    const INK: u8 = 150;
+    let (w, h) = gray.dimensions();
+    if w < 40 || h < 40 {
+        return false;
+    }
+
+    let w_thresh = (w as f64 * 0.55) as u32;
+    let h_thresh = (h as f64 * 0.55) as u32;
+
+    let mut line_rows: Vec<u32> = Vec::new();
+    for y in 0..h {
+        let mut row_ink = 0u32;
+        for x in 0..w {
+            if gray.get_pixel(x, y)[0] < INK {
+                row_ink += 1;
+            }
+        }
+        if row_ink > w_thresh {
+            line_rows.push(y);
+        }
+    }
+
+    let mut line_cols: Vec<u32> = Vec::new();
+    for x in 0..w {
+        let mut col_ink = 0u32;
+        for y in 0..h {
+            if gray.get_pixel(x, y)[0] < INK {
+                col_ink += 1;
+            }
+        }
+        if col_ink > h_thresh {
+            line_cols.push(x);
+        }
+    }
+
+    if line_rows.len() < 4 || line_cols.len() < 2 {
+        return false;
+    }
+
+    // Bands between consecutive horizontal rules (> 3px apart).
+    let mut bands: Vec<(u32, u32)> = Vec::new();
+    let mut prev: Option<u32> = None;
+    for &y in &line_rows {
+        if let Some(p) = prev {
+            if y - p > 3 {
+                bands.push((p, y));
+            }
+        }
+        prev = Some(y);
+    }
+    if bands.is_empty() {
+        return false;
+    }
+
+    let is_line_col = |x: u32| line_cols.binary_search(&x).is_ok();
+
+    let mut empty = 0usize;
+    for &(a, b) in &bands {
+        let mut band_ink = 0u32;
+        for y in (a + 1)..b {
+            if line_rows.binary_search(&y).is_ok() {
+                continue;
+            }
+            for x in 0..w {
+                if is_line_col(x) {
+                    continue;
+                }
+                if gray.get_pixel(x, y)[0] < INK {
+                    band_ink += 1;
+                }
+            }
+        }
+        let band_area = (b - a - 1) as u64 * w as u64;
+        if (band_ink as u64) < (band_area as f64 * 0.002) as u64 {
+            empty += 1;
+        }
+    }
+
+    (empty as f64) >= 0.8 * bands.len() as f64
+}
+
+/// 8×8 block-mean luma signature for duplicate-diagram detection.
+/// Area-averaged (not point-sampled) so sparse line art survives.
+pub fn tile_signature(crop: &image::RgbaImage) -> [u8; 64] {
+    let gray = image::DynamicImage::ImageRgba8(crop.clone()).to_luma8();
+    let (w, h) = gray.dimensions();
+    let mut out = [0u8; 64];
+    if w == 0 || h == 0 {
+        return out;
+    }
+    for ty in 0..8u32 {
+        for tx in 0..8u32 {
+            let y0 = ty * h / 8;
+            let y1 = ((ty + 1) * h / 8).max(y0 + 1).min(h);
+            let x0 = tx * w / 8;
+            let x1 = ((tx + 1) * w / 8).max(x0 + 1).min(w);
+            let mut sum = 0u64;
+            let mut n = 0u64;
+            for y in y0..y1 {
+                for x in x0..x1 {
+                    sum += gray.get_pixel(x, y)[0] as u64;
+                    n += 1;
+                }
+            }
+            out[(ty * 8 + tx) as usize] = if n > 0 { (sum / n) as u8 } else { 255 };
+        }
+    }
+    out
+}
+
+/// Mean per-tile L1 distance (0–255). Same diagram, slightly different
+/// crop extent scores very low; distinct diagrams score high.
+pub fn signature_distance(a: &[u8; 64], b: &[u8; 64]) -> u32 {
+    a.iter()
+        .zip(b.iter())
+        .map(|(x, y)| (*x as i32 - *y as i32).unsigned_abs())
+        .sum::<u32>()
+        / 64
+}
+
+/// Why a proposed crop was rejected — surfaced in the import report.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CropReject {
+    /// bbox failed the sanitizer / out of bounds / implausible
+    BadBox,
+    /// blank or near-empty crop (luma variance guard)
+    Blank,
+    /// ruled empty student answer grid (trace table, working grid)
+    AnswerGrid,
+}
+
 /// Crop a proposed diagram bbox out of a decoded page image.
-/// Applies the sanitizer, padding, and the blank-grid guard.
-/// Returns `None` (never panics) when the crop is unusable.
+/// Applies the sanitizer, padding, the blank guard, and the structural
+/// answer-grid guard. Returns `Err(CropReject)` (never panics) when the
+/// crop is unusable.
 pub fn crop_diagram(
     img: &image::DynamicImage,
     bbox: &[f32],
     padding: u32,
-) -> Option<image::RgbaImage> {
+) -> Result<image::RgbaImage, CropReject> {
     use image::GenericImageView;
     let (img_w, img_h) = img.dimensions();
-    let rect = sanitize_bbox(bbox, img_w, img_h)?;
+    let rect = sanitize_bbox(bbox, img_w, img_h).ok_or(CropReject::BadBox)?;
 
     let safe_x = rect.x.saturating_sub(padding);
     let safe_y = rect.y.saturating_sub(padding);
     // img_w - safe_x / img_h - safe_y cannot underflow: the sanitizer
-    // guarantees rect.x <= img_w - 1 and rect.y <= img_h - 1, and
-    // saturating_sub only shrinks the origin.
+    // guarantees rect.x <= img_w - 1 and rect.y <= img_h - 1.
     let x_pad_left = rect.x - safe_x;
     let y_pad_top = rect.y - safe_y;
     let safe_w = (rect.w + x_pad_left + padding).min(img_w - safe_x);
     let safe_h = (rect.h + y_pad_top + padding).min(img_h - safe_y);
 
     if safe_w < MIN_EDGE_PX || safe_h < MIN_EDGE_PX {
-        return None;
+        return Err(CropReject::BadBox);
     }
 
     let mut owned = img.clone();
     let cropped = image::imageops::crop(&mut owned, safe_x, safe_y, safe_w, safe_h).to_image();
     if is_blank_or_grid(&image::DynamicImage::ImageRgba8(cropped.clone())) {
-        return None;
+        return Err(CropReject::Blank);
     }
-    Some(cropped)
+    let gray = image::DynamicImage::ImageRgba8(cropped.clone()).to_luma8();
+    if looks_like_answer_grid(&gray) {
+        return Err(CropReject::AnswerGrid);
+    }
+    Ok(cropped)
 }
 
 /// Decode a base64 page image (with or without a data-URL prefix).
@@ -311,5 +458,123 @@ mod tests {
         ] {
             let _ = crop_diagram(&img, b, 40); // must not panic
         }
+    }
+
+    // ── Synthetic fixtures for the answer-grid guard ────────────────────────
+
+    fn blank(w: u32, h: u32) -> image::GrayImage {
+        image::GrayImage::from_pixel(w, h, image::Luma([255u8]))
+    }
+    fn hline(g: &mut image::GrayImage, y: u32) {
+        for x in 0..g.width() {
+            g.put_pixel(x, y, image::Luma([40u8]));
+        }
+    }
+    fn vline(g: &mut image::GrayImage, x: u32, y0: u32, y1: u32) {
+        for y in y0..y1 {
+            g.put_pixel(x, y, image::Luma([40u8]));
+        }
+    }
+    fn text_blob(g: &mut image::GrayImage, y: u32, x0: u32, w: u32) {
+        for x in x0..x0 + w {
+            g.put_pixel(x, y, image::Luma([60u8]));
+            g.put_pixel(x, y + 3, image::Luma([60u8]));
+        }
+    }
+
+    /// The AQA trace table from the bug report: header text, 25 ruled rows,
+    /// 6 column rules — an EMPTY answer grid.
+    fn trace_table(w: u32, h: u32) -> image::GrayImage {
+        let mut g = blank(w, h);
+        let rows: Vec<u32> = (0..25).map(|i| 20 + i * 34).collect();
+        for &r in &rows {
+            if r < h {
+                hline(&mut g, r);
+            }
+        }
+        for c in [20, 215, 420, 470, 520, 570] {
+            if c < w {
+                vline(&mut g, c, 20, (*rows.last().unwrap()).min(h - 1));
+            }
+        }
+        text_blob(&mut g, 40, 60, 220);
+        text_blob(&mut g, 44, 260, 150);
+        text_blob(&mut g, 100, 60, 120);
+        g
+    }
+
+    /// A filled Gantt figure (legit diagram): same skeleton, but bars and
+    /// marks scattered through most bands.
+    fn filled_gantt() -> image::GrayImage {
+        let mut g = blank(600, 500);
+        let rows: Vec<u32> = (0..11).map(|i| 20 + i * 40).collect();
+        for &r in &rows {
+            hline(&mut g, r);
+        }
+        for c in [20, 120] {
+            vline(&mut g, c, 20, *rows.last().unwrap());
+        }
+        vline(&mut g, 580, 0, 499);
+        for (i, _r) in rows.iter().enumerate().take(10) {
+            if i % 2 == 0 || i == 7 {
+                let band_y = rows[i] + 15;
+                for yy in band_y..band_y + 10 {
+                    for x in 180..480u32 {
+                        g.put_pixel(x, yy, image::Luma([80u8]));
+                    }
+                }
+            }
+        }
+        g
+    }
+
+    /// A simple plotted curve (legit diagram): two axes + polyline, no grid.
+    fn simple_chart() -> image::GrayImage {
+        let mut g = blank(600, 400);
+        hline(&mut g, 370);
+        vline(&mut g, 40, 0, 399);
+        for x in 40..580u32 {
+            let y = (200.0 - 120.0 * ((x as f64 - 40.0) / 90.0).sin()) as i64;
+            if y >= 0 {
+                g.put_pixel(x, y.min(399) as u32, image::Luma([30u8]));
+            }
+        }
+        g
+    }
+
+    #[test]
+    fn answer_grid_rejected_figures_kept() {
+        assert!(looks_like_answer_grid(&trace_table(602, 872)));
+        assert!(!looks_like_answer_grid(&filled_gantt()));
+        assert!(!looks_like_answer_grid(&simple_chart()));
+        assert!(!looks_like_answer_grid(&blank(400, 400)));
+    }
+
+    #[test]
+    fn crop_diagram_rejects_trace_table_keeps_chart() {
+        // Page = white background with a trace table region and a chart region.
+        let page_grid = trace_table(602, 872);
+        let img = image::DynamicImage::ImageLuma8(page_grid);
+        // Box around the whole trace table (relative coords) → AnswerGrid.
+        assert_eq!(
+            crop_diagram(&img, &[0.02, 0.02, 0.9, 0.9], 0),
+            Err(CropReject::AnswerGrid)
+        );
+
+        let chart_page = image::DynamicImage::ImageLuma8(simple_chart());
+        let r = crop_diagram(&chart_page, &[0.0, 0.1, 1.0, 0.7], 0);
+        assert!(r.is_ok());
+    }
+
+    #[test]
+    fn signature_dedupes_same_diagram_separates_distinct() {
+        let t1 = image::DynamicImage::ImageLuma8(trace_table(602, 872)).to_rgba8();
+        let t2 = image::DynamicImage::ImageLuma8(trace_table(600, 860)).to_rgba8();
+        let chart = image::DynamicImage::ImageLuma8(simple_chart()).to_rgba8();
+        let s1 = tile_signature(&t1);
+        let s2 = tile_signature(&t2);
+        let sc = tile_signature(&chart);
+        assert!(signature_distance(&s1, &s2) < 4, "same table, resized → duplicate");
+        assert!(signature_distance(&s1, &sc) >= 6, "table vs chart → distinct");
     }
 }

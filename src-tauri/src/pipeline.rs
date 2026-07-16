@@ -118,6 +118,7 @@ pub struct ImportReport {
     pub salvage_events: usize,
     pub crop_rejections: usize,
     pub diagrams_saved: usize,
+    pub diagrams_deduped: usize,
     pub anomalies: Vec<String>,
 }
 
@@ -244,12 +245,13 @@ Normally there is exactly ONE item. Return more than one ONLY if Question {numbe
 
 EVERY item MUST have:
 - "question_number": {number} (integer, exactly).
-- "content": FULL transcription (never a summary). Preserve all punctuation. Separate sub-parts (a), (b), (c) with double newlines. Append the mark tag `**[X marks]**` to every sub-part that shows a mark allocation. Transcribe every sentence, including instructions to the candidate that belong to the question. Do NOT include: page headers/footers ("Question X continued", "Turn over"), the "(Total for Question X is Y marks)" footer, blank answer lines/grids, or "BLANK PAGE".
+- "content": FULL transcription (never a summary). Preserve all punctuation. Separate sub-parts (a), (b), (c) with double newlines. Append the mark tag `**[X marks]**` to every sub-part that shows a mark allocation. Transcribe every sentence, including instructions to the candidate that belong to the question. Do NOT include: page headers/footers ("Question X continued", "Turn over"), the "(Total for Question X is Y marks)" footer, plain ruled answer lines, or "BLANK PAGE".
+- STRUCTURED TABLES WITH HEADERS — trace tables, function tables, working grids — ARE question content even when the body cells are EMPTY. Transcribe them as Markdown tables in "content" (keeping every header and any pre-filled cells), NEVER as diagram boxes.
 - "marks": integer total for this question's visible part, or null if unknown.
 - "topics": array chosen ONLY from this list: {topics:?}. At least one. Never invent topics.
 - "module": string — infer from the paper context; use "Unknown" if unclear.
 - "is_code": boolean (true only for code/pseudocode questions).
-- "diagram_bboxes": array of [x, y, w, h] boxes with RELATIVE 0.0-1.0 coordinates, one per visual diagram (graphs, networks, Gantt charts, trees, force diagrams, line drawings). One box per WHOLE diagram including labels. Do NOT box text, tables of text, code, database schemas, or empty grids.
+- "diagram_bboxes": array of [x, y, w, h] boxes with RELATIVE 0.0-1.0 coordinates, one per visual diagram (graphs, networks, Gantt charts, trees, force diagrams, line drawings). One box per WHOLE diagram including labels, and NEVER more than one box per figure. Do NOT box text, code, database schemas, or any table of text or numbers (see the STRUCTURED TABLES rule above). The parser crop-checks every box: blank boxes, empty ruled grids, and duplicate boxes are rejected and cost you a repair round.
 - "bbox_page_indexes": array with the SAME LENGTH as diagram_bboxes — the 0-based index of the page image each box refers to.
 - Insert the exact token [DIAGRAM_PLACEHOLDER] in "content" where each diagram belongs chronologically.
 
@@ -578,6 +580,9 @@ async fn extract_span<C: LlmClient>(
     let mut needs_review = false;
     let mut notes: Vec<String> = Vec::new();
     let mut ai_marks: Option<i32> = None;
+    // Diagrams already persisted for this question: (signature, link) pairs
+    // for near-duplicate reuse across chunk boundaries.
+    let mut saved_diagrams: Vec<([u8; 64], String)> = Vec::new();
 
     for chunk in chunks {
         let images: Vec<String> = chunk
@@ -673,6 +678,29 @@ async fn extract_span<C: LlmClient>(
                 report.repairs += 1;
                 continue;
             }
+
+            // ── Diagram boxes: Rust audits every crop the AI proposed ─────
+            let (bad, box_issues) = audit_diagram_boxes(chunk, &page_items.items);
+            if !box_issues.is_empty() {
+                last_error = box_issues.join("; ");
+                report.repairs += 1;
+                if attempt < max_attempts {
+                    continue;
+                }
+                // Repair budget spent: keep the transcription, drop the bad
+                // boxes — deterministically, and on the record.
+                report.anomalies.push(format!(
+                    "Question {}: dropped {} invalid diagram box(es) after repair budget spent — {}",
+                    span.number,
+                    bad.len(),
+                    box_issues.join("; ")
+                ));
+                let mut items = page_items.items;
+                prune_bad_diagram_boxes(&mut items, &bad, report);
+                accepted = Some((items, salvaged));
+                break;
+            }
+
             accepted = Some((page_items.items, salvaged));
             break;
         }
@@ -692,7 +720,7 @@ async fn extract_span<C: LlmClient>(
                         .filter(|&k| k < chunk.len())
                         .unwrap_or(0);
                     let page = chunk[page_idx].1;
-                    let link = save_diagram(page, bbox, config, report);
+                    let link = save_diagram(page, bbox, config, &mut saved_diagrams, report);
                     if let Some(link) = link {
                         if item_content.contains("[DIAGRAM_PLACEHOLDER]") {
                             item_content = item_content.replacen("[DIAGRAM_PLACEHOLDER]", &link, 1);
@@ -851,18 +879,172 @@ fn validate_span_items(page: &AiQuestionPage, span: &QuestionSpan) -> Vec<String
     errors
 }
 
+/// PVRV "Validate" for diagram proposals: every box the AI drew is pushed
+/// through the Rust guard chain (sanitizer → blank guard → empty-answer-grid
+/// guard → duplicate-signature guard) BEFORE the response is accepted.
+///
+/// Returns the indices of offending boxes `(item_idx, bbox_idx)` plus a
+/// quoted feedback message per violation for the repair loop. The AI draws
+/// boxes; Rust decides which ones may ever become files.
+fn audit_diagram_boxes(
+    chunk: &[(usize, &PageInput)],
+    items: &[AiQuestion],
+) -> (Vec<(usize, usize)>, Vec<String>) {
+    let mut bad: Vec<(usize, usize)> = Vec::new();
+    let mut issues: Vec<String> = Vec::new();
+    // Page images decode lazily so text-only items cost nothing.
+    let mut decoded: Vec<Option<Option<image::DynamicImage>>> = vec![None; chunk.len()];
+    let mut accepted_sigs: Vec<[u8; 64]> = Vec::new();
+
+    for (ii, item) in items.iter().enumerate() {
+        let Some(bboxes) = &item.diagram_bboxes else { continue };
+        let indexes = item.bbox_page_indexes.clone().unwrap_or_default();
+        for (bi, bbox) in bboxes.iter().enumerate() {
+            let label = format!("item {} diagram {}", ii + 1, bi + 1);
+            if bbox.len() != 4 {
+                bad.push((ii, bi));
+                issues.push(format!("{label}: bbox must be exactly [x, y, w, h] (4 numbers)"));
+                continue;
+            }
+            let page_idx = indexes.get(bi).and_then(value_to_usize).unwrap_or(0);
+            if page_idx >= chunk.len() {
+                bad.push((ii, bi));
+                issues.push(format!(
+                    "{label}: bbox_page_indexes entry {} is out of range ({} page image(s) were sent) — renumber or drop this box",
+                    page_idx,
+                    chunk.len()
+                ));
+                continue;
+            }
+            if decoded[page_idx].is_none() {
+                decoded[page_idx] = Some(geometry::decode_page_image(&chunk[page_idx].1.b64));
+            }
+            let img = match &decoded[page_idx] {
+                Some(Some(i)) => i,
+                // Cannot judge an undecodable page here; the save-time guard
+                // still applies, so nothing bad can reach disk.
+                _ => continue,
+            };
+            let cropped = match geometry::crop_diagram(img, bbox, 40) {
+                Ok(c) => c,
+                Err(geometry::CropReject::BadBox) => {
+                    bad.push((ii, bi));
+                    issues.push(format!(
+                        "{label}: the box is unusable (degenerate or outside the page) — redraw it tightly around the figure, or delete the box AND its [DIAGRAM_PLACEHOLDER]"
+                    ));
+                    continue;
+                }
+                Err(geometry::CropReject::Blank) => {
+                    bad.push((ii, bi));
+                    issues.push(format!(
+                        "{label}: the box covers blank paper — delete the box AND its [DIAGRAM_PLACEHOLDER]"
+                    ));
+                    continue;
+                }
+                Err(geometry::CropReject::AnswerGrid) => {
+                    bad.push((ii, bi));
+                    issues.push(format!(
+                        "{label}: the box covers an EMPTY RULED ANSWER GRID (trace table / working grid). Never box these — transcribe the grid as a Markdown table inside \"content\" (keeping any pre-filled cells) and delete the box AND its [DIAGRAM_PLACEHOLDER]"
+                    ));
+                    continue;
+                }
+            };
+            let sig = geometry::tile_signature(&cropped);
+            if let Some(dup) = accepted_sigs
+                .iter()
+                .position(|s| geometry::signature_distance(s, &sig) < 4)
+            {
+                bad.push((ii, bi));
+                issues.push(format!(
+                    "{label}: identical image to box #{} — keep only ONE box and ONE placeholder per figure",
+                    dup + 1
+                ));
+                continue;
+            }
+            accepted_sigs.push(sig);
+        }
+    }
+    (bad, issues)
+}
+
+/// Terminal deterministic repair: after the repair budget is spent, drop the
+/// offending boxes (and their page-index entries) so they can never reach
+/// disk. The placeholders they leave behind are stripped by the caller's
+/// trailing replace — nothing dangles, and every drop lands in the report.
+fn prune_bad_diagram_boxes(
+    items: &mut [AiQuestion],
+    bad: &[(usize, usize)],
+    report: &mut ImportReport,
+) {
+    for (ii, item) in items.iter_mut().enumerate() {
+        let drop: Vec<usize> = bad
+            .iter()
+            .filter(|(i, _)| *i == ii)
+            .map(|(_, b)| *b)
+            .collect();
+        if drop.is_empty() {
+            continue;
+        }
+        let old_boxes = item.diagram_bboxes.take().unwrap_or_default();
+        let old_indexes = item.bbox_page_indexes.take();
+        let mut kept_boxes = Vec::new();
+        let mut kept_indexes = Vec::new();
+        for (bi, b) in old_boxes.into_iter().enumerate() {
+            if drop.contains(&bi) {
+                report.crop_rejections += 1;
+                continue;
+            }
+            kept_boxes.push(b);
+            if let Some(ix) = &old_indexes {
+                if let Some(v) = ix.get(bi) {
+                    kept_indexes.push(v.clone());
+                }
+            }
+        }
+        if !kept_boxes.is_empty() {
+            item.diagram_bboxes = Some(kept_boxes);
+            if old_indexes.is_some() {
+                item.bbox_page_indexes = Some(kept_indexes);
+            }
+        }
+    }
+}
+
 /// Crop + persist one diagram; returns the markdown link on success.
+/// `saved` carries the (signature, link) pairs already persisted for this
+/// unit of work — a near-identical crop reuses the stored file instead of
+/// writing yet another PNG of the same figure.
 fn save_diagram(
     page: &PageInput,
     bbox: &[f32],
     config: &PipelineConfig,
+    saved: &mut Vec<([u8; 64], String)>,
     report: &mut ImportReport,
 ) -> Option<String> {
-    let img = geometry::decode_page_image(&page.b64)?;
-    let cropped = geometry::crop_diagram(&img, bbox, 40).or_else(|| {
+    if bbox.len() != 4 {
         report.crop_rejections += 1;
-        None
-    })?;
+        return None;
+    }
+    let img = geometry::decode_page_image(&page.b64)?;
+    let cropped = match geometry::crop_diagram(&img, bbox, 40) {
+        Ok(c) => c,
+        Err(reason) => {
+            report.crop_rejections += 1;
+            report.anomalies.push(format!(
+                "diagram box [{:.3}, {:.3}, {:.3}, {:.3}] rejected at save ({:?})",
+                bbox[0], bbox[1], bbox[2], bbox[3], reason
+            ));
+            return None;
+        }
+    };
+    let sig = geometry::tile_signature(&cropped);
+    if let Some((_, link)) = saved
+        .iter()
+        .find(|(s, _)| geometry::signature_distance(s, &sig) < 4)
+    {
+        report.diagrams_deduped += 1;
+        return Some(link.clone());
+    }
     let dir = config.diagrams_dir.as_ref()?;
     let _ = std::fs::create_dir_all(dir);
     let path = dir.join(format!("{}.png", uuid::Uuid::new_v4()));
@@ -871,10 +1053,12 @@ fn save_diagram(
         return None;
     }
     report.diagrams_saved += 1;
-    Some(format!(
+    let link = format!(
         "\n\n![Diagram]({})\n\n",
         path.to_string_lossy().replace('\\', "/")
-    ))
+    );
+    saved.push((sig, link.clone()));
+    Some(link)
 }
 
 enum ExtractedFallback {
@@ -903,7 +1087,8 @@ RULES:
      "diagram_bboxes": [[x,y,w,h]...] relative 0.0-1.0, "bbox_page_indexes": [0,...] }}
 - If this page is a CONTINUATION of the previous question, is blank, or contains no question, return {{"items": []}}.
 - Transcribe fully (never summarize). Preserve punctuation. `**[X marks]**` after each marked sub-part. Math in $...$/$$...$$. Markdown tables for text tables; \begin{{array}} only for matrices. Code in backticks, never math mode. Escape LaTeX backslashes (\\frac).
-- Exclude headers/footers ("Question X continued", "Turn over", totals footers), blank answer lines/grids, "BLANK PAGE".
+- STRUCTURED TABLES WITH HEADERS (trace tables, function tables, working grids) are question content even when EMPTY — transcribe them as Markdown tables, NEVER as diagram boxes. Diagram boxes are ONLY for figures that cannot be typed (graphs, circuits, line drawings), one box per figure; blank, empty-grid, and duplicate boxes are rejected by the parser and cost a repair round.
+- Exclude headers/footers ("Question X continued", "Turn over", totals footers), plain ruled answer lines, "BLANK PAGE".
 - Content must end with terminal punctuation or a mark tag."#,
         topics = config.allowed_topics,
     );
@@ -971,10 +1156,31 @@ RULES:
             }
         };
 
+        // ── Diagram boxes: same Rust audit as the mapped path ─────────────
+        let (bad, box_issues) =
+            audit_diagram_boxes(&[(page_idx, page)], std::slice::from_ref(&item));
+        if !box_issues.is_empty() {
+            last_error = box_issues.join("; ");
+            report.repairs += 1;
+            if attempt < max_attempts {
+                continue;
+            }
+            report.anomalies.push(format!(
+                "page {}: dropped {} invalid diagram box(es) after repair budget spent — {}",
+                page_idx + 1,
+                bad.len(),
+                box_issues.join("; ")
+            ));
+            let mut one = [item];
+            prune_bad_diagram_boxes(&mut one, &bad, report);
+            item = one.into_iter().next().unwrap();
+        }
+
         let mut item_content = item.content.take().unwrap_or_default();
+        let mut saved_diagrams: Vec<([u8; 64], String)> = Vec::new();
         if let Some(bboxes) = &item.diagram_bboxes {
             for bbox in bboxes {
-                if let Some(link) = save_diagram(page, bbox, config, report) {
+                if let Some(link) = save_diagram(page, bbox, config, &mut saved_diagrams, report) {
                     if item_content.contains("[DIAGRAM_PLACEHOLDER]") {
                         item_content = item_content.replacen("[DIAGRAM_PLACEHOLDER]", &link, 1);
                     } else {
@@ -1038,6 +1244,9 @@ pub async fn run_markscheme_pipeline<C: LlmClient, P: Progress>(
     };
     let mut drafts: Vec<AnswerDraft> = Vec::new();
     let mut alt_count: std::collections::HashMap<u32, u32> = std::collections::HashMap::new();
+    // Paper-global diagram dedupe: windows overlap, so the same worked
+    // table/figure is naturally re-boxed — reuse the file, don't resave it.
+    let mut saved_diagrams: Vec<([u8; 64], String)> = Vec::new();
 
     let system = markscheme_system_prompt();
     let max_attempts = 1 + config.max_repairs;
@@ -1183,7 +1392,9 @@ pub async fn run_markscheme_pipeline<C: LlmClient, P: Progress>(
                             0
                         }
                     };
-                    if let Some(link) = save_diagram(&pages[start + local], bbox, config, &mut report) {
+                    if let Some(link) =
+                        save_diagram(&pages[start + local], bbox, config, &mut saved_diagrams, &mut report)
+                    {
                         if md.contains("[DIAGRAM_PLACEHOLDER]") {
                             md = md.replacen("[DIAGRAM_PLACEHOLDER]", &link, 1);
                         } else {
@@ -1424,5 +1635,192 @@ mod tests {
             .unwrap();
         assert_eq!(report.quarantined.len(), 1);
         assert!(report.quarantined[0].scope.contains("mark-scheme"));
+    }
+
+    // ── Diagram audit: trace-table regression (AQA CS June 2024 Q30) ─────
+    // Ten near-identical PNGs of an EMPTY student trace table were saved as
+    // "diagrams" because the blank guard can't see ruled grids. These tests
+    // pin the invariant: Rust audits every box, quotes violations back to
+    // the model, prunes what never gets fixed, and dedupes what gets saved.
+
+    fn gray_blank(w: u32, h: u32) -> image::GrayImage {
+        image::GrayImage::from_pixel(w, h, image::Luma([255u8]))
+    }
+    fn g_hline(g: &mut image::GrayImage, y: u32) {
+        for x in 0..g.width() {
+            g.put_pixel(x, y, image::Luma([40u8]));
+        }
+    }
+    fn g_vline(g: &mut image::GrayImage, x: u32, y0: u32, y1: u32) {
+        for y in y0..y1 {
+            g.put_pixel(x, y, image::Luma([40u8]));
+        }
+    }
+    fn g_blob(g: &mut image::GrayImage, y: u32, x0: u32, w: u32) {
+        for x in x0..(x0 + w).min(g.width()) {
+            g.put_pixel(x, y, image::Luma([60u8]));
+            g.put_pixel(x, y + 3, image::Luma([60u8]));
+        }
+    }
+
+    /// The offending artifact: header blobs + 25 ruled rows + 6 column rules.
+    fn trace_table_img() -> image::GrayImage {
+        let mut g = gray_blank(600, 900);
+        let rows: Vec<u32> = (0..25).map(|i| 20 + i * 34).collect();
+        for &r in &rows {
+            g_hline(&mut g, r);
+        }
+        for c in [20u32, 215, 420, 470, 520, 570] {
+            g_vline(&mut g, c, 20, *rows.last().unwrap());
+        }
+        g_blob(&mut g, 40, 60, 220);
+        g_blob(&mut g, 44, 260, 150);
+        g
+    }
+
+    /// A legit figure: two axes and a plotted polyline, no ruled grid.
+    fn chart_img() -> image::GrayImage {
+        let mut g = gray_blank(600, 400);
+        g_hline(&mut g, 370);
+        g_vline(&mut g, 40, 0, 399);
+        for x in 40..580u32 {
+            let y = (200.0 - 120.0 * ((x as f64 - 40.0) / 90.0).sin()) as i64;
+            if y >= 0 {
+                g.put_pixel(x, y.min(399) as u32, image::Luma([30u8]));
+            }
+        }
+        g
+    }
+
+    fn png_b64(gray: &image::GrayImage) -> String {
+        use base64::Engine;
+        let mut buf = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageLuma8(gray.clone())
+            .write_to(&mut buf, image::ImageFormat::Png)
+            .unwrap();
+        base64::engine::general_purpose::STANDARD.encode(buf.into_inner())
+    }
+
+    fn grid_page() -> PageInput {
+        PageInput { b64: png_b64(&trace_table_img()), text: String::new() }
+    }
+    fn chart_page() -> PageInput {
+        PageInput { b64: png_b64(&chart_img()), text: String::new() }
+    }
+
+    #[test]
+    fn audit_rejects_grid_and_duplicate_keeps_chart() {
+        let grid = grid_page();
+        let chart = chart_page();
+        let chunk: Vec<(usize, &PageInput)> = vec![(0, &grid), (1, &chart)];
+        let item = AiQuestion {
+            content: Some("Complete the table. [DIAGRAM_PLACEHOLDER]".into()),
+            diagram_bboxes: Some(vec![
+                vec![0.02, 0.02, 0.93, 0.93], // whole trace table → AnswerGrid
+                vec![0.02, 0.05, 0.90, 0.82], // chart → keep
+                vec![0.03, 0.06, 0.88, 0.80], // same chart → duplicate
+            ]),
+            bbox_page_indexes: Some(vec![
+                serde_json::json!(0),
+                serde_json::json!(1),
+                serde_json::json!(1),
+            ]),
+            ..Default::default()
+        };
+        let (bad, issues) = audit_diagram_boxes(&chunk, &[item]);
+        assert!(bad.contains(&(0, 0)), "trace-table box must be rejected");
+        assert!(bad.contains(&(0, 2)), "duplicate chart box must be rejected");
+        assert!(!bad.contains(&(0, 1)), "the real chart must survive");
+        let joined = issues.join("; ");
+        assert!(joined.contains("EMPTY RULED ANSWER GRID"), "grid feedback: {joined}");
+        assert!(joined.contains("identical image"), "dedupe feedback: {joined}");
+    }
+
+    #[tokio::test]
+    async fn repair_loop_quotes_diagram_feedback_and_recovers() {
+        let pgs = vec![grid_page()];
+        let span_pages: Vec<(usize, &PageInput)> = vec![(0, &pgs[0])];
+        let span = doc_map::QuestionSpan {
+            number: 30,
+            start_page: 0,
+            end_page: 0,
+            expected_marks: Some(6),
+        };
+        let bad_response = r#"{"items":[{"question_number":30,"content":"Complete the trace table below. [DIAGRAM_PLACEHOLDER] **[6 marks]**","marks":6,"topics":["Proof"],"module":"A","diagram_bboxes":[[0.02,0.02,0.93,0.93]],"bbox_page_indexes":[0]}]}"#;
+        let good_response = r#"{"items":[{"question_number":30,"content":"Complete the trace table below.\n\n| R1 | R2 |\n| --- | --- |\n| 0 | 0 |\n\nState the final value. **[6 marks]**","marks":6,"topics":["Proof"],"module":"A"}]}"#;
+        let mock = MockLlm::new(vec![ok_chat(bad_response), ok_chat(good_response)]);
+        let mut report = ImportReport::default();
+        let built = extract_span(&mock, &config(), &span, &span_pages, &mut report)
+            .await
+            .expect("question must build after the repair round");
+
+        assert_eq!(mock.remaining(), 0, "both attempts consumed");
+        assert!(
+            mock.bodies()[1].to_string().contains("EMPTY RULED ANSWER GRID"),
+            "the audit feedback must be quoted back to the model"
+        );
+        assert!(built.content.contains("| R1 | R2 |"), "recovered Markdown table");
+        assert!(!built.content.contains("[DIAGRAM_PLACEHOLDER]"));
+        assert!(report.repairs >= 1);
+    }
+
+    #[tokio::test]
+    async fn bad_boxes_pruned_deterministically_after_budget_spent() {
+        let pgs = vec![grid_page()];
+        let span_pages: Vec<(usize, &PageInput)> = vec![(0, &pgs[0])];
+        let span = doc_map::QuestionSpan {
+            number: 30,
+            start_page: 0,
+            end_page: 0,
+            expected_marks: Some(6),
+        };
+        let heavy_boxing = r#"{"items":[{"question_number":30,"content":"Complete the trace table below. [DIAGRAM_PLACEHOLDER] **[6 marks]**","marks":6,"topics":["Proof"],"module":"A","diagram_bboxes":[[0.02,0.02,0.93,0.93]],"bbox_page_indexes":[0]}]}"#;
+        // Model never learns: every attempt comes back with the same bad box.
+        let mock = MockLlm::new(vec![
+            ok_chat(heavy_boxing),
+            ok_chat(heavy_boxing),
+            ok_chat(heavy_boxing),
+        ]);
+        let mut report = ImportReport::default();
+        let built = extract_span(&mock, &config(), &span, &span_pages, &mut report)
+            .await
+            .expect("transcription must survive even when boxes never pass");
+
+        assert!(!built.content.contains("[DIAGRAM_PLACEHOLDER]"), "no dangling tags");
+        assert!(built.content.contains("Complete the trace table below."));
+        assert!(
+            report.anomalies.iter().any(|a| a.contains("dropped 1 invalid diagram box")),
+            "the drop must be on the record: {:?}",
+            report.anomalies
+        );
+        assert!(report.crop_rejections >= 1, "every drop counted");
+    }
+
+    #[test]
+    fn save_diagram_dedupes_identical_crops() {
+        let chart = chart_page();
+        let dir = std::env::temp_dir().join(format!("mm_dedupe_{}", uuid::Uuid::new_v4()));
+        let mut cfg = config();
+        cfg.diagrams_dir = Some(dir.clone());
+        let mut report = ImportReport::default();
+        let mut saved: Vec<([u8; 64], String)> = Vec::new();
+
+        let l1 = save_diagram(&chart, &[0.02, 0.05, 0.90, 0.82], &cfg, &mut saved, &mut report)
+            .expect("first crop saves");
+        let l2 = save_diagram(&chart, &[0.03, 0.06, 0.88, 0.80], &cfg, &mut saved, &mut report)
+            .expect("duplicate crop resolves to the same link");
+
+        assert_eq!(l1, l2, "same figure → same file");
+        assert_eq!(report.diagrams_saved, 1, "exactly one PNG written");
+        assert_eq!(report.diagrams_deduped, 1, "duplicate counted");
+
+        // And an empty answer grid never reaches disk at all.
+        let grid = grid_page();
+        let g = save_diagram(&grid, &[0.02, 0.02, 0.93, 0.93], &cfg, &mut saved, &mut report);
+        assert!(g.is_none(), "answer grid rejected at save");
+        assert!(report.crop_rejections >= 1);
+        assert_eq!(report.diagrams_saved, 1, "still exactly one PNG written");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

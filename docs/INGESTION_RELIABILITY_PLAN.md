@@ -212,3 +212,47 @@ Items 1–4 are surgical and can ship independently. Items 5–7 are the structu
 - Topic allow-lists + post-hoc exact-match filtering (`get_allowed_topics` containment check) — already the right instinct: *deterministic containment, not trust*.
 - `is_blank_or_grid` crop guard — keep, run *after* the sanitizer.
 - Hybrid text layer as a *hint* to the model — keep, but let the map be the authority.
+
+---
+
+## 6. Addendum — the diagram audit (2026-07-16)
+
+**Regression observed:** AQA CS June 2024 Paper 1 Q30 (an empty student trace
+table) produced ~10 near-identical PNG crops of the *same empty ruled grid*.
+The soft prompt rule ("do not box empty grids") was ignored by the model, and
+`is_blank_or_grid` cannot see ruled grids — the rules and header text are real
+ink, so variance stays high. Nothing deduplicated the saves, and the model was
+never told its boxes were wrong.
+
+**Fix (PVRV applied to diagrams — the AI proposes boxes, Rust decides):**
+
+- `geometry::crop_diagram` now returns `Result<_, CropReject>`:
+  `BadBox` (sanitizer), `Blank` (luma guard), or `AnswerGrid`
+  (`looks_like_answer_grid`: ≥4 long horizontal rules + ≥2 long vertical
+  rules + ≥80% empty inter-rule bands — a structural test that sees through
+  header text). Filled Gantt figures, charts, and populated tables pass.
+- `pipeline::audit_diagram_boxes` runs *inside* the repair loop of both
+  question-extraction paths. Every proposed box is cropped and checked
+  (sanitizer → blank → answer-grid → duplicate-signature) **before** the
+  response is accepted; violations are quoted back to the model as repair
+  feedback ("the box covers an empty ruled answer grid — transcribe it as a
+  Markdown table, keep any pre-filled cells"). When the repair budget is
+  spent, the offending boxes are pruned deterministically, counted in
+  `crop_rejections`, and recorded in `anomalies` — nothing dangles and
+  nothing is silent.
+- `tile_signature` (8×8 block-mean luma) + `signature_distance`: identical
+  crops are detected both at audit time ("identical image to box #N") and at
+  save time (`save_diagram` reuses the existing file link instead of writing
+  yet another PNG; counted in the new `diagrams_deduped` report field).
+  Point-sample hashes were considered and rejected — sparse line art
+  collapses them to all-zeros.
+- Prompts (span extraction + fallback) now state the rule the parser
+  enforces: structured tables with headers (trace tables, function tables,
+  working grids) are question content **even when empty** — always Markdown
+  tables, never diagram boxes; one box per figure; blank/empty-grid/duplicate
+  boxes are rejected and cost a repair round.
+
+Golden tests pin the regression: audit verdicts on synthetic trace-table /
+chart / duplicate fixtures, repair-loop recovery (bad boxes → quoted feedback
+→ model returns a Markdown table), deterministic pruning after budget spent,
+and save-time dedupe (one PNG, one reused link, grid rejected).
