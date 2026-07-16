@@ -73,6 +73,41 @@ impl PipelineConfig {
     }
 }
 
+/// Resolve the module in Rust rather than trusting the model's free-form label.
+/// The paper title is authoritative (for example, "Core Pure 1" must never
+/// become "Further Pure 1"). A model value is accepted only when it is one of
+/// the known module names; otherwise we use a unique topic match or Unknown.
+fn canonical_module(config: &PipelineConfig, proposed: Option<&str>, topics: &[String]) -> String {
+    if config.subject == "Physics" { return "Physics".into(); }
+    if config.subject == "Computer Science" { return "Computer Science".into(); }
+    let name = config.paper_name.to_ascii_lowercase();
+    let paper_module = [
+        ("core pure", "Core Pure"),
+        ("further pure", "Further Pure 1"),
+        ("further mechanics", "Further Mechanics 1"),
+        ("further statistics", "Further Statistics 1"),
+        ("decision mathematics", "Decision Mathematics 1"),
+        ("decision maths", "Decision Mathematics 1"),
+    ].iter().find(|(needle, _)| name.contains(needle)).map(|(_, module)| *module);
+    if let Some(module) = paper_module { return module.into(); }
+
+    let known = ["Core Pure", "Further Pure 1", "Further Mechanics 1", "Further Statistics 1", "Decision Mathematics 1"];
+    if let Some(value) = proposed.map(str::trim).filter(|value| known.iter().any(|m| m.eq_ignore_ascii_case(value))) {
+        return known.iter().find(|m| m.eq_ignore_ascii_case(value)).unwrap().to_string();
+    }
+    let topic_modules: Vec<&str> = known.iter().copied().filter(|module| {
+        let module_topics = match *module {
+            "Core Pure" => &["Complex numbers", "Argand diagrams", "Series", "Roots of polynomials", "Matrices", "Linear transformations", "Differential equations", "Maclaurin series", "Methods in calculus"][..],
+            "Further Pure 1" => &["Conic sections", "Inequalities", "t-formulae", "Taylor series", "Numerical methods (Further)", "Reducible differential equations"][..],
+            "Further Mechanics 1" => &["Momentum and impulse", "Work, energy and power"][..],
+            "Further Statistics 1" => &["Poisson distribution", "Hypothesis testing", "Chi-squared tests"][..],
+            _ => &["Algorithms", "Graphs and networks", "Linear programming"][..],
+        };
+        topics.iter().any(|topic| module_topics.contains(&topic.as_str()))
+    }).collect();
+    if topic_modules.len() == 1 { topic_modules[0].into() } else { "Unknown".into() }
+}
+
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MarkCheck {
@@ -915,13 +950,7 @@ async fn extract_span<C: LlmClient>(
         .filter(|t| config.allowed_topics.is_empty() || config.allowed_topics.contains(t))
         .collect();
 
-    let module = if config.subject == "Physics" {
-        "Physics".to_string()
-    } else if config.subject == "Computer Science" {
-        "Computer Science".to_string()
-    } else {
-        module_acc.unwrap_or_else(|| "Unknown".to_string())
-    };
+    let module = canonical_module(config, module_acc.as_deref(), &topics_valid);
 
     (
         Some(BuiltQuestion {
@@ -1348,13 +1377,7 @@ RULES:
                 .unwrap_or(1)
                 .max(1),
             topics,
-            module: if config.subject == "Physics" {
-                "Physics".into()
-            } else if config.subject == "Computer Science" {
-                "Computer Science".into()
-            } else {
-                item.module.unwrap_or_else(|| "Unknown".into())
-            },
+            module: canonical_module(config, item.module.as_deref(), &topics),
             is_code: config.subject == "Computer Science" && item.is_code == Some(true),
             needs_review: true,
             notes: vec!["extracted without document map (fallback mode)".to_string()],
