@@ -174,6 +174,19 @@ pub fn looks_like_answer_grid(gray: &image::GrayImage) -> bool {
         return false;
     }
 
+    // Cheap early exit: an EMPTY grid is mostly white. Figures with real
+    // content (charts, photos, shaded Gantt bars) blow straight past this —
+    // one O(n) pass instead of the full structural scan below.
+    let mut ink = 0u64;
+    for px in gray.pixels() {
+        if px[0] < INK {
+            ink += 1;
+        }
+    }
+    if ink as f64 > 0.15 * (w as f64) * (h as f64) {
+        return false;
+    }
+
     let w_thresh = (w as f64 * 0.55) as u32;
     let h_thresh = (h as f64 * 0.55) as u32;
 

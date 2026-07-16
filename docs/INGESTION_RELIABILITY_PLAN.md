@@ -256,3 +256,50 @@ Golden tests pin the regression: audit verdicts on synthetic trace-table /
 chart / duplicate fixtures, repair-loop recovery (bad boxes → quoted feedback
 → model returns a Markdown table), deterministic pruning after budget spent,
 and save-time dedupe (one PNG, one reused link, grid rejected).
+
+---
+
+## 7. Addendum — uniform part labels, figure coverage, and parallel I/O (2026-07-16)
+
+**Regressions observed (AQA CS June 2024 re-import):**
+1. AQA decimal part numbers ("3 . 1") leaked into stored content — the (a),
+   (b), (c) rule existed only in the mapped prompt and wasn't enforced, so
+   labelling varied by board and by path.
+2. "Figure 6" (a printed database-schema exhibit) arrived as reflowed plain
+   text: the prompt *banned* boxing schemas, and Markdown collapsed the
+   source line breaks, mashing the relations into one wrapped paragraph.
+3. End-to-end runtime: every stage was strictly serial — one API call at a
+   time per page, per span, per window.
+
+**Fixes:**
+
+- **Uniform sub-part labelling, deterministically**
+  (`validate::normalize_decimal_parts`): AQA decimal labels at line starts
+  are rewritten positionally (.1 → (a), .2 → (b)) in Rust, for the question
+  number being assembled, in both question paths and the mark scheme.
+  Safety rails: only the owning question's integers trigger; spaced-dot
+  labels ("3 . 1", the way AQA prints) always convert; compact labels
+  ("03.1") convert only when a real parts sequence exists — so floats like
+  "3.5 V" and trace-table values are never touched. The same positional rule
+  is now stated in both extraction prompts.
+- **Figure coverage gate** (`validate::diagram_consistency_errors`): a
+  content reference to "Figure N" with no diagram box is a repair-loop
+  error (final attempt degrades to an anomaly, not a quarantine), and
+  placeholder/bbox counts must match exactly. Prompts flipped: printed
+  schemas/exhibits labelled as figures MUST be boxed images, not text.
+- **Source lines preserved** (`validate::harden_line_breaks`): outside code
+  fences, display math, and Markdown tables, single source newlines become
+  paragraph breaks — what is a separate line on the paper is a separate line
+  on the card. Schemas, algorithms, and listings stop reflowing.
+- **Bounded parallel I/O** (`PARALLEL = 4`, `futures_util::future::join_all`):
+  the structure pass, span extraction, fallback pages, and mark-scheme
+  windows now run in batches of four concurrent vision calls. This changes
+  NOTHING about PVRV — validation is per unit of work; every response still
+  passes the same Rust gates; per-429 backpressure stays per-call. Each unit
+  accumulates its own `ImportReport` (absorbed in order by the caller);
+  fallback numbering monotonicity is re-checked sequentially during
+  assembly, with backwards proposals re-extracted alone under the true
+  bound. Expected ~3-4x end-to-end speedup at identical output guarantees.
+- `geometry::looks_like_answer_grid` gained a one-pass ink-ratio early exit
+  (>15% ink can't be an empty grid), which keeps the audit cheap in debug
+  builds on figure-heavy pages.

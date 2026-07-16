@@ -122,6 +122,30 @@ pub struct ImportReport {
     pub anomalies: Vec<String>,
 }
 
+/// Concurrent vision calls in flight at once. Validation is per unit of work
+/// (page / span / window), so running units in parallel changes NOTHING about
+/// correctness — every response still passes the same Rust gates. It only
+/// stops us paying API latency serially. 429 backpressure is per-call
+/// (llm.rs), so bursts self-limit.
+const PARALLEL: usize = 4;
+
+impl ImportReport {
+    /// Fold a per-unit report (one span / page / window processed inside a
+    /// parallel batch) back into the master report.
+    pub fn absorb(&mut self, o: ImportReport) {
+        self.pages_processed += o.pages_processed;
+        self.repairs += o.repairs;
+        self.salvage_events += o.salvage_events;
+        self.crop_rejections += o.crop_rejections;
+        self.diagrams_saved += o.diagrams_saved;
+        self.diagrams_deduped += o.diagrams_deduped;
+        self.mark_checks.extend(o.mark_checks);
+        self.quarantined.extend(o.quarantined);
+        self.skipped_pages.extend(o.skipped_pages);
+        self.anomalies.extend(o.anomalies);
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct BuiltQuestion {
     pub question_number: u32,
@@ -251,7 +275,7 @@ EVERY item MUST have:
 - "topics": array chosen ONLY from this list: {topics:?}. At least one. Never invent topics.
 - "module": string — infer from the paper context; use "Unknown" if unclear.
 - "is_code": boolean (true only for code/pseudocode questions).
-- "diagram_bboxes": array of [x, y, w, h] boxes with RELATIVE 0.0-1.0 coordinates, one per visual diagram (graphs, networks, Gantt charts, trees, force diagrams, line drawings). One box per WHOLE diagram including labels, and NEVER more than one box per figure. Do NOT box text, code, database schemas, or any table of text or numbers (see the STRUCTURED TABLES rule above). The parser crop-checks every box: blank boxes, empty ruled grids, and duplicate boxes are rejected and cost you a repair round.
+- "diagram_bboxes": array of [x, y, w, h] boxes with RELATIVE 0.0-1.0 coordinates, one per visual exhibit. Box EVERY figure the paper draws — graphs, networks, trees, circuits — INCLUDING anything the paper labels as a Figure (e.g. "Figure 6"): printed relation/database schemas, algorithm screens, and grids that are part of the question exhibit are figures, return them as boxes, not as text. One box per WHOLE figure including its labels/caption, never two boxes on one figure. Do NOT box plain question text, tables you transcribed as Markdown (STRUCTURED TABLES rule above), or EMPTY student answer grids. The parser crop-checks every box: blank boxes, empty ruled grids, and duplicate boxes are rejected and cost you a repair round.
 - "bbox_page_indexes": array with the SAME LENGTH as diagram_bboxes — the 0-based index of the page image each box refers to.
 - Insert the exact token [DIAGRAM_PLACEHOLDER] in "content" where each diagram belongs chronologically.
 
@@ -260,7 +284,7 @@ FORMATTING RULES:
 - Tables of text/data: standard Markdown tables. Pure mathematical matrices or Simplex tableaus: LaTeX \begin{{array}} inside $$...$$. Never put $ inside array environments.
 - Multiple-choice options: `a) ...`, `b) ...` separated by double newlines, WITHOUT the question number prefix.
 - Code/pseudocode/SQL/identifiers: Markdown backticks, NEVER LaTeX math mode.
-- AQA decimal sub-parts: render '02.1'-style parts as (a), (b), (c) and update inline cross-references accordingly. Whole-numbered MCQs are independent questions, never decimals.
+- AQA decimal sub-parts: render '02.1'-style parts as (a), (b), (c) — positionally: .1 -> a, .2 -> b — and update inline cross-references accordingly. Whole-numbered MCQs are independent questions, never decimals.
 - JSON ESCAPING: backslashes in LaTeX MUST be escaped (\\frac, \\theta). Unescaped backslashes break the parser and your work is discarded.
 - The content MUST end with terminal punctuation or a mark tag. Never stop mid-sentence."#,
         number = span.number,
@@ -308,19 +332,49 @@ pub async fn run_question_pipeline<C: LlmClient, P: Progress>(
     };
 
     // ── 1. Structure pass ───────────────────────────────────────────────────
+    // One tiny call per page, but PARALLEL in bounded batches: the per-page
+    // validation below doesn't care when a response arrived.
     progress.stage("Scanning document structure…");
+    let system_structure = structure_system_prompt();
     let mut structures: Vec<ValidatedPageStructure> = Vec::with_capacity(pages.len());
-    for (i, page) in pages.iter().enumerate() {
+    let unknown_role = |i: usize| ValidatedPageStructure {
+        page: i,
+        questions: Vec::new(),
+        footer: None,
+        role: doc_map::PageRole::Unknown,
+    };
+    for (bi, batch) in pages.chunks(PARALLEL).enumerate() {
         cancelled(cancel)?;
-        let body = llm::chat_body(
-            &config.model,
-            &structure_system_prompt(),
-            std::slice::from_ref(&page.b64),
-            None,
-            200,
-        );
-        match client.chat(&body).await {
-            Ok(resp) => match llm::message_content(&resp) {
+        let base = bi * PARALLEL;
+        progress.stage(&format!(
+            "Scanning document structure (pages {}–{} of {})…",
+            base + 1,
+            base + batch.len(),
+            pages.len()
+        ));
+        let futs: Vec<_> = batch
+            .iter()
+            .map(|page| {
+                let body = llm::chat_body(
+                    &config.model,
+                    &system_structure,
+                    std::slice::from_ref(&page.b64),
+                    None,
+                    200,
+                );
+                async move {
+                    match client.chat(&body).await {
+                        Ok(resp) => llm::message_content(&resp)
+                            .map_err(|e| format!("bad response shape ({})", e)),
+                        Err(e) => Err(format!("API failure ({})", e)),
+                    }
+                }
+            })
+            .collect();
+        let results = futures_util::future::join_all(futs).await;
+        for (k, res) in results.into_iter().enumerate() {
+            let i = base + k;
+            match res {
                 Ok(content) => match parse_llm_json::<PageStructureProposal>(&content) {
                     ParseOutcome::Clean(p) | ParseOutcome::Salvaged { value: p, .. } => {
                         let (v, violations) =
@@ -334,40 +388,17 @@ pub async fn run_question_pipeline<C: LlmClient, P: Progress>(
                             i + 1,
                             error
                         ));
-                        structures.push(ValidatedPageStructure {
-                            page: i,
-                            questions: Vec::new(),
-                            footer: None,
-                            role: doc_map::PageRole::Unknown,
-                        });
+                        structures.push(unknown_role(i));
                     }
                 },
                 Err(e) => {
                     report.anomalies.push(format!(
-                        "structure pass page {}: bad response shape ({}), page treated as unknown role",
+                        "structure pass page {}: {}, page treated as unknown role",
                         i + 1,
                         e
                     ));
-                    structures.push(ValidatedPageStructure {
-                        page: i,
-                        questions: Vec::new(),
-                        footer: None,
-                        role: doc_map::PageRole::Unknown,
-                    });
+                    structures.push(unknown_role(i));
                 }
-            },
-            Err(e) => {
-                report.anomalies.push(format!(
-                    "structure pass page {}: API failure ({}), page treated as unknown role",
-                    i + 1,
-                    e
-                ));
-                structures.push(ValidatedPageStructure {
-                    page: i,
-                    questions: Vec::new(),
-                    footer: None,
-                    role: doc_map::PageRole::Unknown,
-                });
             }
         }
     }
@@ -449,52 +480,73 @@ pub async fn run_question_pipeline<C: LlmClient, P: Progress>(
     if map.spans.is_empty() {
         // No reliable map → per-page legacy mode with all validators still
         // on (numbers proposed by AI, but forced plausible + monotonic).
+        // Pages run in PARALLEL batches; the question-order invariant is
+        // re-checked sequentially during assembly, and any out-of-order
+        // proposal is re-extracted alone with the true bound.
+        let q_pages: Vec<usize> = (0..pages.len())
+            .filter(|&i| structures[i].role.is_question_content())
+            .collect();
         let mut next_allowed: u32 = 1;
-        for (i, page) in pages.iter().enumerate() {
+        for batch in q_pages.chunks(PARALLEL) {
             cancelled(cancel)?;
-            let role = &structures[i];
-            if !role.role.is_question_content() {
-                continue;
-            }
-            report.pages_processed += 1;
-            progress.stage(&format!("Extracting page {} of {}…", i + 1, pages.len()));
-            match extract_fallback_page(client, config, page, i, next_allowed, &mut report).await {
-                Some(ExtractedFallback::Question(q)) => {
-                    next_allowed = q.question_number + 1;
-                    // A repeated number on the next page = continuation in
-                    // disguise: stitch, don't duplicate.
-                    if let Some(prev) = built.last_mut() {
-                        if prev.question_number == q.question_number {
-                            prev.content = format!("{}\n\n{}", prev.content, q.content);
-                            prev.marks = validate::sum_inline_marks(&prev.content).max(prev.marks.max(0) as u32) as i32;
-                            continue;
-                        }
+            progress.stage(&format!(
+                "Extracting pages {}–{} of {}…",
+                batch[0] + 1,
+                batch[batch.len() - 1] + 1,
+                pages.len()
+            ));
+            let futs: Vec<_> = batch
+                .iter()
+                .map(|&i| extract_fallback_page(client, config, &pages[i], i, next_allowed))
+                .collect();
+            let results = futures_util::future::join_all(futs).await;
+            for (&i, (mut outcome, local)) in batch.iter().zip(results) {
+                report.absorb(local);
+                report.pages_processed += 1;
+                // Sequential assembly enforces monotonic numbering: a page
+                // that came back backwards under the shared batch bound is
+                // re-asked alone with the true bound.
+                if let Some(ExtractedFallback::Question(q)) = &outcome {
+                    if q.question_number + 1 < next_allowed {
+                        let (redo, redo_local) =
+                            extract_fallback_page(client, config, &pages[i], i, next_allowed).await;
+                        report.absorb(redo_local);
+                        outcome = redo;
                     }
-                    built.push(q);
                 }
-                Some(ExtractedFallback::SkipPage) => {}
-                None => {
-                    report.quarantined.push(QuarantineEvent {
-                        scope: "question-page".to_string(),
-                        page: Some(i + 1),
-                        question_number: None,
-                        reason: "page failed validation and repair attempts".to_string(),
-                    });
+                match outcome {
+                    Some(ExtractedFallback::Question(q)) => {
+                        next_allowed = q.question_number + 1;
+                        // A repeated number on the next page = continuation in
+                        // disguise: stitch, don't duplicate.
+                        if let Some(prev) = built.last_mut() {
+                            if prev.question_number == q.question_number {
+                                prev.content = format!("{}\n\n{}", prev.content, q.content);
+                                prev.marks = validate::sum_inline_marks(&prev.content).max(prev.marks.max(0) as u32) as i32;
+                                continue;
+                            }
+                        }
+                        built.push(q);
+                    }
+                    Some(ExtractedFallback::SkipPage) => {}
+                    None => {
+                        report.quarantined.push(QuarantineEvent {
+                            scope: "question-page".to_string(),
+                            page: Some(i + 1),
+                            question_number: None,
+                            reason: "page failed validation and repair attempts".to_string(),
+                        });
+                    }
                 }
             }
         }
     } else {
         report.questions_expected = map.spans.len();
         let total = map.spans.len();
+        // Pre-resolve span pages; spans with nothing extractable quarantine
+        // without ever reaching the model.
+        let mut jobs: Vec<(usize, &QuestionSpan, Vec<(usize, &PageInput)>)> = Vec::new();
         for (span_idx, span) in map.spans.iter().enumerate() {
-            cancelled(cancel)?;
-            progress.stage(&format!(
-                "Extracting question {} ({} of {})…",
-                span.number,
-                span_idx + 1,
-                total
-            ));
-            // Pages for this span, excluding role-filtered ones.
             let span_pages: Vec<(usize, &PageInput)> = (span.start_page..=span.end_page)
                 .filter(|&pi| pi < pages.len())
                 .filter(|&pi| {
@@ -504,7 +556,6 @@ pub async fn run_question_pipeline<C: LlmClient, P: Progress>(
                 })
                 .map(|pi| (pi, &pages[pi]))
                 .collect();
-
             if span_pages.is_empty() {
                 report.quarantined.push(QuarantineEvent {
                     scope: "question".to_string(),
@@ -514,20 +565,47 @@ pub async fn run_question_pipeline<C: LlmClient, P: Progress>(
                 });
                 continue;
             }
+            jobs.push((span_idx, span, span_pages));
+        }
 
-            match extract_span(client, config, span, &span_pages, &mut report).await {
-                Some(q) => {
-                    report.pages_processed += span_pages.len();
-                    push_mark_check(span, &q, &mut report);
-                    built.push(q);
-                }
-                None => {
-                    report.quarantined.push(QuarantineEvent {
-                        scope: "question".to_string(),
-                        page: Some(span.start_page + 1),
-                        question_number: Some(span.number),
-                        reason: "failed validation and all repair attempts".to_string(),
-                    });
+        // Spans are independent units: extract in PARALLEL batches. Every
+        // response still passes the full validator chain — order of arrival
+        // is irrelevant to correctness, and results are assembled in order.
+        for batch in jobs.chunks(PARALLEL) {
+            cancelled(cancel)?;
+            let first = batch[0].0 + 1;
+            let last = batch[batch.len() - 1].0 + 1;
+            progress.stage(&format!(
+                "Extracting questions {}–{} (spans {}–{} of {})…",
+                batch[0].1.number,
+                batch[batch.len() - 1].1.number,
+                first,
+                last,
+                total
+            ));
+            let futs: Vec<_> = batch
+                .iter()
+                .map(|job| extract_span(client, config, job.1, &job.2))
+                .collect();
+            let results = futures_util::future::join_all(futs).await;
+            for (job, (opt, local)) in batch.iter().zip(results) {
+                let span: &QuestionSpan = job.1;
+                let sp = &job.2;
+                report.absorb(local);
+                match opt {
+                    Some(q) => {
+                        report.pages_processed += sp.len();
+                        push_mark_check(span, &q, &mut report);
+                        built.push(q);
+                    }
+                    None => {
+                        report.quarantined.push(QuarantineEvent {
+                            scope: "question".to_string(),
+                            page: Some(span.start_page + 1),
+                            question_number: Some(span.number),
+                            reason: "failed validation and all repair attempts".to_string(),
+                        });
+                    }
                 }
             }
         }
@@ -557,15 +635,18 @@ fn push_mark_check(span: &QuestionSpan, q: &BuiltQuestion, report: &mut ImportRe
 }
 
 /// Repair-loop core: repeatedly ask → parse → validate; quote failures back.
-/// Returns Some(AiQuestionPage) on acceptance (possibly flagged), None on
-/// quarantine (reason recorded in the report by the caller).
+/// Returns (Some(question), report) on acceptance (possibly flagged),
+/// (None, report) on quarantine — the LOCAL report is absorbed by the caller
+/// (this runs inside a parallel batch).
 async fn extract_span<C: LlmClient>(
     client: &C,
     config: &PipelineConfig,
     span: &QuestionSpan,
     span_pages: &[(usize, &PageInput)],
-    report: &mut ImportReport,
-) -> Option<BuiltQuestion> {
+) -> (Option<BuiltQuestion>, ImportReport) {
+    // Own, local report: spans now run in parallel batches, so each unit
+    // accumulates its own bookkeeping and the caller absorbs it in order.
+    let mut report = ImportReport::default();
     let max_attempts = 1 + config.max_repairs;
 
     // Chunk long spans: at most 4 page images per call (your no-batching
@@ -679,6 +760,30 @@ async fn extract_span<C: LlmClient>(
                 continue;
             }
 
+            // ── Figure-reference consistency: a referenced Figure must be
+            // boxed (Figure 6 mashing into text was the regression) ────────
+            let mut cons_errors: Vec<String> = Vec::new();
+            for (ii, item) in page_items.items.iter().enumerate() {
+                for e in validate::diagram_consistency_errors(
+                    item.content.as_deref().unwrap_or(""),
+                    item.diagram_bboxes.as_ref().map(|b| b.len()).unwrap_or(0),
+                ) {
+                    cons_errors.push(format!("item {}: {}", ii + 1, e));
+                }
+            }
+            if !cons_errors.is_empty() {
+                report.repairs += 1;
+                if attempt < max_attempts {
+                    last_error = cons_errors.join("; ");
+                    continue;
+                }
+                report.anomalies.push(format!(
+                    "Question {}: figure/diagram inconsistency kept after repair budget — {}",
+                    span.number,
+                    cons_errors.join("; ")
+                ));
+            }
+
             // ── Diagram boxes: Rust audits every crop the AI proposed ─────
             let (bad, box_issues) = audit_diagram_boxes(chunk, &page_items.items);
             if !box_issues.is_empty() {
@@ -705,7 +810,10 @@ async fn extract_span<C: LlmClient>(
             break;
         }
 
-        let (items, salvaged) = accepted?;
+        let (items, salvaged) = match accepted {
+            Some(v) => v,
+            None => return (None, report),
+        };
 
         for item in items {
             let mut item_content = item.content.unwrap_or_default();
@@ -756,10 +864,12 @@ async fn extract_span<C: LlmClient>(
     // ── Assemble + content-level validation ─────────────────────────────────
     let mut content = contents.join("\n\n");
     content = validate::clean_question_content(&content);
+    // One labelling scheme forever: AQA '3 . 1'-style decimals → (a), (b), (c).
+    content = validate::normalize_decimal_parts(&content, span.number);
 
     if content.trim().is_empty() && span.expected_marks.unwrap_or(0) > 0 {
         // A marked question with no content is a hard failure.
-        return None;
+        return (None, report);
     }
     if content.trim().is_empty() {
         needs_review = true;
@@ -813,16 +923,19 @@ async fn extract_span<C: LlmClient>(
         module_acc.unwrap_or_else(|| "Unknown".to_string())
     };
 
-    Some(BuiltQuestion {
-        question_number: span.number,
-        content,
-        marks,
-        topics: topics_valid,
-        module,
-        is_code: config.subject == "Computer Science" && is_code_acc,
-        needs_review,
-        notes,
-    })
+    (
+        Some(BuiltQuestion {
+            question_number: span.number,
+            content,
+            marks,
+            topics: topics_valid,
+            module,
+            is_code: config.subject == "Computer Science" && is_code_acc,
+            needs_review,
+            notes,
+        }),
+        report,
+    )
 }
 
 /// Deterministic per-item validation for a span. Returns human-readable
@@ -1075,8 +1188,9 @@ async fn extract_fallback_page<C: LlmClient>(
     page: &PageInput,
     page_idx: usize,
     next_allowed: u32,
-    report: &mut ImportReport,
-) -> Option<ExtractedFallback> {
+) -> (Option<ExtractedFallback>, ImportReport) {
+    // Own, local report: pages now run in parallel batches.
+    let mut report = ImportReport::default();
     let max_attempts = 1 + config.max_repairs;
     let system = format!(r#"You are a precise mathematical OCR engine. Output ONLY a valid JSON object {{"items": [ ... ]}}.
 
@@ -1087,6 +1201,8 @@ RULES:
      "diagram_bboxes": [[x,y,w,h]...] relative 0.0-1.0, "bbox_page_indexes": [0,...] }}
 - If this page is a CONTINUATION of the previous question, is blank, or contains no question, return {{"items": []}}.
 - Transcribe fully (never summarize). Preserve punctuation. `**[X marks]**` after each marked sub-part. Math in $...$/$$...$$. Markdown tables for text tables; \begin{{array}} only for matrices. Code in backticks, never math mode. Escape LaTeX backslashes (\\frac).
+- AQA decimal sub-parts: render '03.1'-style part numbers as (a), (b), (c) — positional: .1 -> a, .2 -> b — and update inline cross-references. The whole decimal run on this page is ONE item with its integer question number.
+- Anything the paper labels as a Figure ("Figure 6" — printed schemas, algorithm screens, grids that are part of the question exhibit) MUST be returned as a diagram box, never as transcribed text.
 - STRUCTURED TABLES WITH HEADERS (trace tables, function tables, working grids) are question content even when EMPTY — transcribe them as Markdown tables, NEVER as diagram boxes. Diagram boxes are ONLY for figures that cannot be typed (graphs, circuits, line drawings), one box per figure; blank, empty-grid, and duplicate boxes are rejected by the parser and cost a repair round.
 - Exclude headers/footers ("Question X continued", "Turn over", totals footers), plain ruled answer lines, "BLANK PAGE".
 - Content must end with terminal punctuation or a mark tag."#,
@@ -1138,7 +1254,7 @@ RULES:
             }
         };
         if page_out.items.is_empty() {
-            return Some(ExtractedFallback::SkipPage);
+            return (Some(ExtractedFallback::SkipPage), report);
         }
         let mut item = page_out.items.into_iter().next().unwrap();
         let number = item
@@ -1155,6 +1271,25 @@ RULES:
                 continue;
             }
         };
+
+        // Figure-reference consistency (same rule as the mapped path;
+        // non-fatal on the final attempt — noted, not quarantined).
+        let fig_errors = validate::diagram_consistency_errors(
+            item.content.as_deref().unwrap_or(""),
+            item.diagram_bboxes.as_ref().map(|b| b.len()).unwrap_or(0),
+        );
+        if !fig_errors.is_empty() {
+            report.repairs += 1;
+            if attempt < max_attempts {
+                last_error = fig_errors.join("; ");
+                continue;
+            }
+            report.anomalies.push(format!(
+                "page {}: figure/diagram inconsistency kept after repair budget — {}",
+                page_idx + 1,
+                fig_errors.join("; ")
+            ));
+        }
 
         // ── Diagram boxes: same Rust audit as the mapped path ─────────────
         let (bad, box_issues) =
@@ -1200,9 +1335,12 @@ RULES:
             .filter(|t| config.allowed_topics.is_empty() || config.allowed_topics.contains(t))
             .collect();
 
-        return Some(ExtractedFallback::Question(BuiltQuestion {
+        let built = BuiltQuestion {
             question_number: number,
-            content: validate::clean_question_content(&item_content),
+            content: validate::normalize_decimal_parts(
+                &validate::clean_question_content(&item_content),
+                number,
+            ),
             marks: item
                 .marks
                 .as_ref()
@@ -1220,14 +1358,114 @@ RULES:
             is_code: config.subject == "Computer Science" && item.is_code == Some(true),
             needs_review: true,
             notes: vec!["extracted without document map (fallback mode)".to_string()],
-        }));
+        };
+        return (Some(ExtractedFallback::Question(built)), report);
     }
-    None
+    (None, report)
 }
 
 // ══════════════════════════════════════════════════════════════════════════
 // Mark-scheme pipeline
 // ══════════════════════════════════════════════════════════════════════════
+
+/// One sliding mark-scheme window: images + raw text in, validated answers
+/// out. Windows run in parallel batches, so each owns a local report;
+/// errors come back as Err(last_error) for the caller's quarantine record.
+async fn read_markscheme_window<C: LlmClient>(
+    client: &C,
+    config: &PipelineConfig,
+    pages: &[PageInput],
+    start: usize,
+    end: usize,
+    step: usize,
+    system: &str,
+) -> (Result<Vec<AiAnswer>, String>, ImportReport) {
+    let mut report = ImportReport::default();
+    let images: Vec<String> = pages[start..end]
+        .iter()
+        .map(|p| p.b64.clone())
+        .filter(|b| !b.trim().is_empty())
+        .collect();
+    let mut chunk_text = String::new();
+    for i in start..end {
+        if !pages[i].text.trim().is_empty() {
+            chunk_text.push_str(&format!("RAW TEXT PAGE {}:\n{}\n\n---\n\n", i + 1, pages[i].text));
+        }
+    }
+    let context_note = if start == 0 {
+        format!("These are pages 1–{} of the mark scheme. Extract every answer anchored on any of these pages.", end)
+    } else {
+        let prim_end = (start + step).min(pages.len());
+        format!(
+            "Page {} is context (already processed). Extract ONLY answers anchored on page{s} {}.",
+            start,
+            if prim_end > start + 1 {
+                format!("{}–{}", start + 1, prim_end)
+            } else {
+                format!("{}", start + 1)
+            },
+            s = if prim_end > start + 1 { "s" } else { "" }
+        )
+    };
+    let user_text = format!(
+        "{}\n\nRaw text is provided as a baseline (images are authoritative):\n{}",
+        context_note, chunk_text
+    );
+
+    let mut last_error = String::new();
+    let mut accepted: Option<Vec<AiAnswer>> = None;
+    let max_attempts = 1 + config.max_repairs;
+
+    for attempt in 1..=max_attempts {
+        let text = if attempt == 1 {
+            user_text.clone()
+        } else {
+            format!(
+                "{}\n\nPREVIOUS ATTEMPT FAILED VALIDATION: {}. Regenerate the complete corrected JSON.",
+                user_text, last_error
+            )
+        };
+        let body = llm::chat_body(&config.model, system, &images, Some(&text), config.max_output_tokens);
+        let resp = match client.chat(&body).await {
+            Ok(r) => r,
+            Err(e) => {
+                last_error = e.to_string();
+                continue;
+            }
+        };
+        let content = match llm::message_content(&resp) {
+            Ok(c) => c,
+            Err(e) => {
+                last_error = e.to_string();
+                continue;
+            }
+        };
+        match parse_llm_json::<AiAnswerEnvelope>(&content) {
+            ParseOutcome::Clean(AiAnswerEnvelope::Wrapped { answers })
+            | ParseOutcome::Clean(AiAnswerEnvelope::Bare(answers))
+            | ParseOutcome::Salvaged {
+                value: AiAnswerEnvelope::Wrapped { answers },
+                ..
+            }
+            | ParseOutcome::Salvaged {
+                value: AiAnswerEnvelope::Bare(answers),
+                ..
+            } => {
+                accepted = Some(answers);
+                break;
+            }
+            ParseOutcome::Malformed { error } => {
+                last_error = format!("invalid JSON: {}", error);
+                report.repairs += 1;
+            }
+        }
+    }
+
+    match accepted {
+        Some(a) => (Ok(a), report),
+        None => (Err(last_error), report),
+    }
+}
 
 pub async fn run_markscheme_pipeline<C: LlmClient, P: Progress>(
     client: &C,
@@ -1249,116 +1487,61 @@ pub async fn run_markscheme_pipeline<C: LlmClient, P: Progress>(
     let mut saved_diagrams: Vec<([u8; 64], String)> = Vec::new();
 
     let system = markscheme_system_prompt();
-    let max_attempts = 1 + config.max_repairs;
 
-    // Sliding windows of 3, step 2 (context for answers spanning pages).
+    // Sliding windows of 3, step 2 (context for answers spanning pages),
+    // read in PARALLEL bounded batches. Stitch/dedupe stays sequential and
+    // ordered, so the merge result is identical to the serial version.
     let window: usize = 3;
     let step: usize = 2;
-    let mut start = 0usize;
-    while start < pages.len() {
+    let mut windows: Vec<(usize, usize)> = Vec::new();
+    {
+        let mut start = 0usize;
+        while start < pages.len() {
+            let end = (start + window).min(pages.len());
+            windows.push((start, end));
+            if end >= pages.len() {
+                break;
+            }
+            start += step;
+        }
+    }
+
+    for batch in windows.chunks(PARALLEL) {
         cancelled(cancel)?;
-        let end = (start + window).min(pages.len());
-        progress.stage(&format!("Reading mark scheme pages {}–{} of {}…", start + 1, end, pages.len()));
-
-        let images: Vec<String> = pages[start..end]
+        progress.stage(&format!(
+            "Reading mark scheme pages {}–{} of {}…",
+            batch[0].0 + 1,
+            batch[batch.len() - 1].1,
+            pages.len()
+        ));
+        let futs: Vec<_> = batch
             .iter()
-            .map(|p| p.b64.clone())
-            .filter(|b| !b.trim().is_empty())
+            .map(|&(start, end)| read_markscheme_window(client, config, pages, start, end, step, &system))
             .collect();
-        let mut chunk_text = String::new();
-        for i in start..end {
-            if !pages[i].text.trim().is_empty() {
-                chunk_text.push_str(&format!("RAW TEXT PAGE {}:\n{}\n\n---\n\n", i + 1, pages[i].text));
-            }
-        }
-        let context_note = if start == 0 {
-            format!("These are pages 1–{} of the mark scheme. Extract every answer anchored on any of these pages.", end)
-        } else {
-            let prim_end = (start + step).min(pages.len());
-            format!(
-                "Page {} is context (already processed). Extract ONLY answers anchored on page{s} {}.",
-                start,
-                if prim_end > start + 1 {
-                    format!("{}–{}", start + 1, prim_end)
-                } else {
-                    format!("{}", start + 1)
-                },
-                s = if prim_end > start + 1 { "s" } else { "" }
-            )
-        };
-        let user_text = format!(
-            "{}\n\nRaw text is provided as a baseline (images are authoritative):\n{}",
-            context_note, chunk_text
-        );
-
-        let mut last_error = String::new();
-        let mut accepted: Option<Vec<AiAnswer>> = None;
-
-        for attempt in 1..=max_attempts {
-            let text = if attempt == 1 {
-                user_text.clone()
-            } else {
-                format!(
-                    "{}\n\nPREVIOUS ATTEMPT FAILED VALIDATION: {}. Regenerate the complete corrected JSON.",
-                    user_text, last_error
-                )
-            };
-            let body = llm::chat_body(&config.model, &system, &images, Some(&text), config.max_output_tokens);
-            let resp = match client.chat(&body).await {
-                Ok(r) => r,
-                Err(e) => {
-                    last_error = e.to_string();
+        let results = futures_util::future::join_all(futs).await;
+        for (&(start, end), (res, local)) in batch.iter().zip(results) {
+            report.absorb(local);
+            let img_count = pages[start..end]
+                .iter()
+                .filter(|p| !p.b64.trim().is_empty())
+                .count();
+            let answers = match res {
+                Ok(a) => {
+                    report.pages_processed += end - start;
+                    a
+                }
+                Err(last_error) => {
+                    report.quarantined.push(QuarantineEvent {
+                        scope: "mark-scheme-window".to_string(),
+                        page: Some(start + 1),
+                        question_number: None,
+                        reason: format!("window pages {}–{} failed validation: {}", start + 1, end, last_error),
+                    });
                     continue;
                 }
             };
-            let content = match llm::message_content(&resp) {
-                Ok(c) => c,
-                Err(e) => {
-                    last_error = e.to_string();
-                    continue;
-                }
-            };
-            match parse_llm_json::<AiAnswerEnvelope>(&content) {
-                ParseOutcome::Clean(AiAnswerEnvelope::Wrapped { answers })
-                | ParseOutcome::Clean(AiAnswerEnvelope::Bare(answers))
-                | ParseOutcome::Salvaged {
-                    value: AiAnswerEnvelope::Wrapped { answers },
-                    ..
-                }
-                | ParseOutcome::Salvaged {
-                    value: AiAnswerEnvelope::Bare(answers),
-                    ..
-                } => {
-                    accepted = Some(answers);
-                    break;
-                }
-                ParseOutcome::Malformed { error } => {
-                    last_error = format!("invalid JSON: {}", error);
-                    report.repairs += 1;
-                }
-            }
-        }
 
-        let answers = match accepted {
-            Some(a) => a,
-            None => {
-                report.quarantined.push(QuarantineEvent {
-                    scope: "mark-scheme-window".to_string(),
-                    page: Some(start + 1),
-                    question_number: None,
-                    reason: format!("window pages {}–{} failed validation: {}", start + 1, end, last_error),
-                });
-                if end >= pages.len() {
-                    break;
-                }
-                start += step;
-                continue;
-            }
-        };
-
-        report.pages_processed += end - start;
-
-        for ans in answers {
+            for ans in answers {
             let q_num = match ans.question_number.as_ref().and_then(validate::value_to_question_number) {
                 Some(n) => n,
                 None => {
@@ -1381,7 +1564,7 @@ pub async fn run_markscheme_pipeline<C: LlmClient, P: Progress>(
                     let local = indexes
                         .get(bi)
                         .and_then(value_to_usize)
-                        .filter(|&k| k < images.len());
+                        .filter(|&k| k < img_count);
                     let local = match local {
                         Some(k) => k,
                         None => {
@@ -1404,6 +1587,9 @@ pub async fn run_markscheme_pipeline<C: LlmClient, P: Progress>(
                 }
             }
             md = md.replace("[DIAGRAM_PLACEHOLDER]", "");
+            // Uniform part labels + preserved source lines in answers, too.
+            md = validate::normalize_decimal_parts(&md, q_num);
+            md = validate::harden_line_breaks(&md);
 
             // Dedupe/stitch: containment-based, not a brittle prefix fingerprint.
             if let Some(existing) = drafts.iter_mut().find(|d| d.question_number == q_num) {
@@ -1425,18 +1611,11 @@ pub async fn run_markscheme_pipeline<C: LlmClient, P: Progress>(
                 });
             }
         }
-
-        if end >= pages.len() {
-            break;
         }
-        start += step;
     }
 
     Ok((drafts, report))
-}
-
-// ══════════════════════════════════════════════════════════════════════════
-// Tests — the golden suite. Deterministic: MockLlm replays scripted model
+}// Tests — the golden suite. Deterministic: MockLlm replays scripted model
 // behaviour (valid, hallucinating, truncating, junk) so every failure class
 // stays dead forever.
 // ══════════════════════════════════════════════════════════════════════════
@@ -1749,10 +1928,8 @@ mod tests {
         let bad_response = r#"{"items":[{"question_number":30,"content":"Complete the trace table below. [DIAGRAM_PLACEHOLDER] **[6 marks]**","marks":6,"topics":["Proof"],"module":"A","diagram_bboxes":[[0.02,0.02,0.93,0.93]],"bbox_page_indexes":[0]}]}"#;
         let good_response = r#"{"items":[{"question_number":30,"content":"Complete the trace table below.\n\n| R1 | R2 |\n| --- | --- |\n| 0 | 0 |\n\nState the final value. **[6 marks]**","marks":6,"topics":["Proof"],"module":"A"}]}"#;
         let mock = MockLlm::new(vec![ok_chat(bad_response), ok_chat(good_response)]);
-        let mut report = ImportReport::default();
-        let built = extract_span(&mock, &config(), &span, &span_pages, &mut report)
-            .await
-            .expect("question must build after the repair round");
+        let (built_opt, report) = extract_span(&mock, &config(), &span, &span_pages).await;
+        let built = built_opt.expect("question must build after the repair round");
 
         assert_eq!(mock.remaining(), 0, "both attempts consumed");
         assert!(
@@ -1781,10 +1958,8 @@ mod tests {
             ok_chat(heavy_boxing),
             ok_chat(heavy_boxing),
         ]);
-        let mut report = ImportReport::default();
-        let built = extract_span(&mock, &config(), &span, &span_pages, &mut report)
-            .await
-            .expect("transcription must survive even when boxes never pass");
+        let (built_opt, report) = extract_span(&mock, &config(), &span, &span_pages).await;
+        let built = built_opt.expect("transcription must survive even when boxes never pass");
 
         assert!(!built.content.contains("[DIAGRAM_PLACEHOLDER]"), "no dangling tags");
         assert!(built.content.contains("Complete the trace table below."));
