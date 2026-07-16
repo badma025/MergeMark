@@ -78,7 +78,7 @@ pub fn value_to_question_number(v: &serde_json::Value) -> Option<u32> {
             }
         }
         _ => None,
-    }?;
+    };
     match raw {
         Some(n) if (1..=60).contains(&n) => Some(n as u32),
         _ => None,

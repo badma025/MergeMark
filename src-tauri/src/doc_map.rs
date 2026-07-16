@@ -54,7 +54,10 @@ impl DocumentMap {
 // ── Text-layer scan ─────────────────────────────────────────────────────────
 
 fn footer_regex() -> regex::Regex {
-    regex::Regex::new(r"(?i)\(?\s*Total\s+for\s+Question\s+(\d{1,2})\s+is\s+(\d{1,2})\s+marks?\s*\)?").unwrap()
+    regex::Regex::new(
+        r"(?i)\(?\s*Total\s+for\s+Question\s+(\d{1,2})\s+is\s+(\d{1,2})\s+marks?\s*\)?",
+    )
+    .unwrap()
 }
 
 fn paper_total_regex() -> regex::Regex {
@@ -78,7 +81,11 @@ pub fn scan_text_layer(page_texts: &[String]) -> TextScan {
             let q = cap[1].parse::<u32>().unwrap_or(0);
             let m = cap[2].parse::<u32>().unwrap_or(0);
             if q > 0 && m > 0 {
-                footers.push(Footer { page, question: q, marks: m });
+                footers.push(Footer {
+                    page,
+                    question: q,
+                    marks: m,
+                });
             }
         }
         if paper_total.is_none() {
@@ -87,7 +94,10 @@ pub fn scan_text_layer(page_texts: &[String]) -> TextScan {
             }
         }
     }
-    TextScan { footers, paper_total }
+    TextScan {
+        footers,
+        paper_total,
+    }
 }
 
 /// Build a map from regex footers. Requires ≥ 2 footers with strictly
@@ -152,7 +162,10 @@ fn mid_page_start(prev: &Footer, cur: &Footer) -> usize {
 /// Find where question 1 plausibly starts: scan pages before its footer for
 /// instruction/cover content; Q1 begins after the last such page.
 fn estimate_first_question_start(page_texts: &[String], first_footer_page: usize) -> usize {
-    let instr_re = regex::Regex::new(r"(?i)\binstructions\b|\binformation\b|answer all questions|formulae|\bglossary\b").unwrap();
+    let instr_re = regex::Regex::new(
+        r"(?i)\binstructions\b|\binformation\b|answer all questions|formulae|\bglossary\b",
+    )
+    .unwrap();
     let margin_re = regex::Regex::new(r"(?m)^\s*0?1\s*$").unwrap();
     let mut start = 0usize;
     for p in 0..first_footer_page {
@@ -206,7 +219,10 @@ pub enum PageRole {
 
 impl PageRole {
     pub fn is_question_content(self) -> bool {
-        matches!(self, PageRole::Question | PageRole::Blank | PageRole::Unknown)
+        matches!(
+            self,
+            PageRole::Question | PageRole::Blank | PageRole::Unknown
+        )
     }
 }
 
@@ -240,7 +256,10 @@ pub fn validate_structure_proposal(
                 return Some((q, m.max(0) as u32));
             }
         }
-        violations.push(format!("page {}: malformed total_marks_footer ignored", page + 1));
+        violations.push(format!(
+            "page {}: malformed total_marks_footer ignored",
+            page + 1
+        ));
         None
     });
 
@@ -431,7 +450,7 @@ mod tests {
             },
             5,
         );
-        assert_eq!(v.questions, vec![3]);           // "03.1" refused, not "31"
+        assert_eq!(v.questions, vec![3]); // "03.1" refused, not "31"
         assert_eq!(v.footer, Some((3, 8)));
         assert_eq!(v.role, PageRole::Question);
         assert_eq!(violations.len(), 1);
