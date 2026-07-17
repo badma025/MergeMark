@@ -488,6 +488,29 @@ pub fn crop_diagram(
     let (img_w, img_h) = img.dimensions();
     let rect = sanitize_bbox(bbox, img_w, img_h).ok_or(CropReject::BadBox)?;
 
+    // Footer / header / margin guards (AQA "1 | 1" false-positive was a
+    // tiny table fragment touching the page footer IB/G/Jun24/7517/2).
+    const FOOTER_FRAC: f32 = 0.08;
+    const HEADER_FRAC: f32 = 0.05;
+    const SIDE_FRAC: f32 = 0.05;
+    let footer_start = (img_h as f32 * (1.0 - FOOTER_FRAC)).round() as u32;
+    let header_end = (img_h as f32 * HEADER_FRAC).round() as u32;
+    let left_margin = (img_w as f32 * SIDE_FRAC).round() as u32;
+    let right_margin = img_w.saturating_sub(left_margin);
+    // Any box entering the bottom 8% (exam footer) is invalid — never a figure.
+    if rect.y + rect.h > footer_start {
+        return Err(CropReject::BadBox);
+    }
+    if rect.y < header_end {
+        return Err(CropReject::BadBox);
+    }
+    // Small boxes touching side margins are almost always barcode/QR or
+    // marginalia like "1 | 1" fragments from a ruled grid, not a figure.
+    let area_frac = (rect.w as f64 * rect.h as f64) / (img_w as f64 * img_h as f64);
+    if (rect.x < left_margin || rect.x + rect.w > right_margin) && area_frac < 0.10 {
+        return Err(CropReject::BadBox);
+    }
+
     let safe_x = rect.x.saturating_sub(padding);
     let safe_y = rect.y.saturating_sub(padding);
     // img_w - safe_x / img_h - safe_y cannot underflow: the sanitizer
