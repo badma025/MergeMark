@@ -374,12 +374,12 @@ pub async fn run_question_pipeline<C: LlmClient, P: Progress>(
     let text_map_available = doc_map::build_map_from_text(&page_texts, pages.len()).is_some();
 
     // ── 1. Structure pass ───────────────────────────────────────────────────
+    let mut structures: Vec<ValidatedPageStructure> = Vec::with_capacity(pages.len());
     if !text_map_available {
     // One tiny call per page, but PARALLEL in bounded batches: the per-page
     // validation below doesn't care when a response arrived.
     progress.stage("Scanning document structure…");
     let system_structure = structure_system_prompt();
-    let mut structures: Vec<ValidatedPageStructure> = Vec::with_capacity(pages.len());
     let unknown_role = |i: usize| ValidatedPageStructure {
         page: i,
         questions: Vec::new(),
