@@ -659,6 +659,7 @@ pub async fn parse_pdf_vision(
     base_url: String,
     model_name: String,
     subject: String,
+    module_override: Option<String>,
     paper_name: String,
     state: State<'_, AppState>,
 ) -> Result<Vec<Question>, String> {
@@ -696,6 +697,7 @@ pub async fn parse_pdf_vision(
         .ok();
 
     let mut config = PipelineConfig::new(model_name.clone(), paper_name.trim().to_string(), subject.clone());
+    config.module_override = module_override.map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
     config.allowed_topics = allowed_topics_for_subject(&subject);
     config.diagrams_dir = diagrams_dir;
     config.max_repairs = 2;

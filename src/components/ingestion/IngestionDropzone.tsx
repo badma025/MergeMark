@@ -6,7 +6,7 @@ import { open } from "@tauri-apps/plugin-dialog";
 import { toast } from "sonner";
 import { UploadCloud, FileText, Loader2, AlertTriangle, CheckCircle2 } from "lucide-react";
 import { cn } from "@/lib/utils";
-import { SUBJECTS } from "@/lib/taxonomy";
+import { SUBJECTS, TOPICS_BY_SUBJECT } from "@/lib/taxonomy";
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { Button } from "@/components/ui/button";
 
@@ -50,7 +50,12 @@ interface IngestionDropzoneProps {
 
 export function IngestionDropzone({ onSuccess }: IngestionDropzoneProps) {
   const [importMode, setImportMode] = useState<"questions" | "mark_scheme">("questions");
-  const [subject, setSubject] = useState("Mathematics");
+  const [subject, setSubject] = useState(SUBJECTS[0] || "Mathematics");
+  const [moduleOverride, setModuleOverride] = useState(
+    SUBJECTS[0] && TOPICS_BY_SUBJECT[SUBJECTS[0]] 
+      ? Object.keys(TOPICS_BY_SUBJECT[SUBJECTS[0]])[0] 
+      : ""
+  );
   // Paper names already in the DB — populated when the user switches to mark_scheme mode.
   const [availablePaperNames, setAvailablePaperNames] = useState<string[]>([]);
   // The paper name the user has selected to match the mark scheme against.
@@ -62,6 +67,19 @@ export function IngestionDropzone({ onSuccess }: IngestionDropzoneProps) {
   const [lastFile, setLastFile] = useState<string | null>(null);
   const [reports, setReports] = useState<ImportReport[]>([]);
   const [showLogs, setShowLogs] = useState(false);
+  
+  // Derive available modules for the current subject
+  const availableModules = subject && TOPICS_BY_SUBJECT[subject]
+    ? Object.keys(TOPICS_BY_SUBJECT[subject])
+    : [];
+
+  useEffect(() => {
+    const defaultModule = subject && TOPICS_BY_SUBJECT[subject]
+      ? Object.keys(TOPICS_BY_SUBJECT[subject])[0]
+      : "";
+    setModuleOverride(defaultModule);
+  }, [subject]);
+
   const dragCounter = useRef(0); // tracks nested enter/leave events
 
   useEffect(() => {
@@ -192,9 +210,9 @@ export function IngestionDropzone({ onSuccess }: IngestionDropzoneProps) {
         for (let i = 1; i <= numPages; i++) {
           try {
             const page = await pdf.getPage(i);
-            // 1.5 keeps mathematical text legible while substantially reducing GPU work
+            // 1.0 keeps mathematical text legible while substantially reducing GPU work
             // and the base64 payload sent to the vision API.
-            const viewport = page.getViewport({ scale: 1.5 });
+            const viewport = page.getViewport({ scale: 1.0 });
             const canvas = document.createElement("canvas");
             const context = canvas.getContext("2d");
             if (context) {
@@ -236,6 +254,7 @@ export function IngestionDropzone({ onSuccess }: IngestionDropzoneProps) {
           baseUrl,
           modelName,
           subject,
+          moduleOverride: moduleOverride.trim() !== "" ? moduleOverride.trim() : null,
           paperName,
         });
         const count = questions.length;
@@ -400,21 +419,42 @@ export function IngestionDropzone({ onSuccess }: IngestionDropzoneProps) {
           </button>
         </div>
 
-        <div className="flex items-center gap-3">
-          <label htmlFor="subject-select" className="text-sm font-medium text-foreground">
-            Paper Subject:
-          </label>
-          <select
-            id="subject-select"
-            value={subject}
-            onChange={(e) => setSubject(e.target.value)}
-            disabled={isProcessing}
-            className="h-9 w-[300px] rounded-md border border-input bg-background px-3 py-1 text-sm shadow-sm transition-colors focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring disabled:cursor-not-allowed disabled:opacity-50"
-          >
-            {SUBJECTS.map((s) => (
-              <option key={s} value={s}>{s}</option>
-            ))}
-          </select>
+        <div className="flex flex-col gap-3">
+          <div className="flex items-center gap-3">
+            <label htmlFor="subject-select" className="text-sm font-medium text-foreground min-w-[100px]">
+              Paper Subject:
+            </label>
+            <select
+              id="subject-select"
+              value={subject}
+              onChange={(e) => setSubject(e.target.value)}
+              disabled={isProcessing}
+              className="h-9 w-[300px] rounded-md border border-input bg-background px-3 py-1 text-sm shadow-sm transition-colors focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring disabled:cursor-not-allowed disabled:opacity-50"
+            >
+              {SUBJECTS.map((s) => (
+                <option key={s} value={s}>{s}</option>
+              ))}
+            </select>
+          </div>
+
+          {importMode === "questions" && availableModules.length > 0 && (
+            <div className="flex items-center gap-3">
+              <label htmlFor="module-override" className="text-sm font-medium text-foreground min-w-[100px]">
+                Paper Module:
+              </label>
+              <select
+                id="module-override"
+                value={moduleOverride}
+                onChange={(e) => setModuleOverride(e.target.value)}
+                disabled={isProcessing}
+                className="h-9 w-[300px] rounded-md border border-input bg-background px-3 py-1 text-sm shadow-sm transition-colors focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring disabled:cursor-not-allowed disabled:opacity-50"
+              >
+                {availableModules.map((m) => (
+                  <option key={m} value={m}>{m}</option>
+                ))}
+              </select>
+            </div>
+          )}
         </div>
 
         {/* Match-to-paper selector — only shown when importing a mark scheme */}
