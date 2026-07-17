@@ -151,7 +151,9 @@ export function IngestionDropzone({ onSuccess }: IngestionDropzoneProps) {
         for (let i = 1; i <= numPages; i++) {
           try {
             const page = await pdf.getPage(i);
-            const viewport = page.getViewport({ scale: 2.0 });
+            // 1.5 keeps mathematical text legible while substantially reducing GPU work
+            // and the base64 payload sent to the vision API.
+            const viewport = page.getViewport({ scale: 1.5 });
             const canvas = document.createElement("canvas");
             const context = canvas.getContext("2d");
             if (context) {
@@ -160,7 +162,7 @@ export function IngestionDropzone({ onSuccess }: IngestionDropzoneProps) {
               context.fillStyle = "white";
               context.fillRect(0, 0, canvas.width, canvas.height);
               await page.render({ canvasContext: context, canvas, viewport, intent: "print" }).promise;
-              const dataUrl = canvas.toDataURL("image/jpeg", 0.9);
+              const dataUrl = canvas.toDataURL("image/jpeg", 0.82);
               pages.push(dataUrl.split(",")[1]);
             }
           } catch (pageErr) {

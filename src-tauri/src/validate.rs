@@ -277,6 +277,16 @@ pub fn figure_references(content: &str) -> usize {
 }
 
 /// Count [DIAGRAM_PLACEHOLDER] tokens.
+/// Textual evidence that a ruled area is a student-completion/trace table,
+/// not a paper figure. This is intentionally conservative and is used to
+/// suppress expensive diagram repair loops.
+pub fn is_answer_grid_request(content: &str) -> bool {
+    let s = content.to_ascii_lowercase();
+    ["complete the trace table", "complete the table", "complete the grid",
+     "show the results of executing", "show your working", "contents of memory location"]
+        .iter().any(|needle| s.contains(needle))
+}
+
 pub fn diagram_placeholders(content: &str) -> usize {
     content.matches("[DIAGRAM_PLACEHOLDER]").count()
 }
