@@ -217,6 +217,9 @@ struct AiQuestion {
     module: Option<String>,
     is_code: Option<bool>,
     diagram_bboxes: Option<Vec<Vec<f32>>>,
+    /// Semantic figure metadata is separate from crop geometry.
+    diagram_captions: Option<Vec<String>>,
+    diagram_kinds: Option<Vec<String>>,
     bbox_page_indexes: Option<Vec<serde_json::Value>>,
     math_snippet: Option<String>,
 }
@@ -313,7 +316,9 @@ EVERY item MUST have:
 - "topics": array chosen ONLY from this list: {topics:?}. At least one. Never invent topics.
 - "module": string — infer from the paper context; use "Unknown" if unclear.
 - "is_code": boolean (true only for code/pseudocode questions).
-- "diagram_bboxes": array of [x, y, w, h] boxes with RELATIVE 0.0-1.0 coordinates, one per visual exhibit. Box EVERY figure the paper draws — graphs, networks, trees, circuits — INCLUDING anything the paper labels as a Figure (e.g. "Figure 6"): printed relation/database schemas, algorithm screens, and grids that are part of the question exhibit are figures, return them as boxes, not as text. One box per WHOLE figure including its labels/caption, never two boxes on one figure. Do NOT box plain question text, tables you transcribed as Markdown (STRUCTURED TABLES rule above), or EMPTY student answer grids. The parser crop-checks every box: blank boxes, empty ruled grids, and duplicate boxes are rejected and cost you a repair round.
+- "diagram_captions": array of captions, one per figure box, or empty string; "diagram_kinds": array of semantic kinds such as graph, schema, flowchart, circuit, or multi-panel, one per box. Decide whether each exhibit is a figure before proposing geometry.
+- "diagram_bboxes": array of [x, y, w, h] boxes with RELATIVE 0.0-1.0 coordinates, one per visual exhibit. Box EVERY figure the paper draws — graphs, networks, trees, circuits — INCLUDING anything the paper labels as a Figure (e.g. "Figure 6"): printed relation/database schemas, algorithm screens, and grids that are part of the question exhibit are figures, return them as boxes, not as text. One box per WHOLE figure including its labels/caption, never two boxes on one figure. Do NOT box plain question text, tables you transcribed as Markdown (STRUCTURED TABLES rule above), or EMPTY student answer grids. The parser crop-checks every box. Include the complete semantic figure extent, including captions and disconnected components, rather than tight-boxing one shape.
+The parser crop-checks every box: blank boxes, empty ruled grids, and duplicate boxes are rejected and cost you a repair round.
 - "bbox_page_indexes": array with the SAME LENGTH as diagram_bboxes — the 0-based index of the page image each box refers to.
 - Insert the exact token [DIAGRAM_PLACEHOLDER] in "content" where each diagram belongs chronologically.
 
