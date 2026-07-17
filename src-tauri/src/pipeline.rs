@@ -1020,7 +1020,7 @@ async fn extract_span<C: LlmClient>(
                 is_code_acc = true;
             }
             if let Some(m) = item.marks.as_ref().and_then(validate::value_to_marks) {
-                ai_marks = Some(ai_marks.map_or(m, |existing: i32| existing.max(m)));
+                ai_marks = Some(ai_marks.map_or(m, |existing: i32| existing + m));
             }
             contents.push(item_content);
         }
