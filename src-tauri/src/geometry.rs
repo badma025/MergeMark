@@ -21,7 +21,8 @@ pub struct PixelRect {
 }
 
 /// Caption location hint for crop expansion.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
+#[allow(dead_code)]
 pub struct CaptionHint {
     /// Relative coordinates of caption text (0.0-1.0)
     pub x: f32,
@@ -138,6 +139,7 @@ pub fn sanitize_bbox(b: &[f32], img_w: u32, img_h: u32) -> Option<PixelRect> {
 /// - Clamps to page bounds and question region
 /// - Rejects expansion into footer/margin/answer-area zones
 /// - Returns the original bbox if no valid caption hint or expansion unsafe
+#[allow(dead_code)]
 pub fn expand_bbox_for_caption(
     bbox: PixelRect,
     img_w: u32,
@@ -154,7 +156,7 @@ pub fn expand_bbox_for_caption(
     
     // Convert hint to pixel coordinates
     let caption_x = (hint.x * img_w as f32).round() as u32;
-    let caption_y = (hint.y * img_h as f32).round() as u32;
+    let _caption_y = (hint.y * img_h as f32).round() as u32;
     
     // Determine expansion direction and amount
     // Max expansion: 15% of figure height/width or 80px, whichever is smaller
@@ -216,6 +218,7 @@ pub fn expand_bbox_for_caption(
 }
 
 /// Check if a proposed expansion is safe (doesn't enter footer, margin, answer area, etc.)
+#[allow(dead_code)]
 fn is_safe_expansion(
     y: u32,
     h: u32,

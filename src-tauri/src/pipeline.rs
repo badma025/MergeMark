@@ -19,7 +19,7 @@
 // outcome — never a swallowed page.
 
 use crate::doc_map::{
-    self, DocumentMap, PageStructureProposal, QuestionSpan, ValidatedPageStructure,
+    self, PageStructureProposal, QuestionSpan, ValidatedPageStructure,
 };
 use crate::geometry;
 use crate::json_salvage::{parse_llm_json, ParseOutcome};
@@ -44,6 +44,7 @@ pub trait Progress: Send + Sync {
     fn stage(&self, message: &str);
 }
 
+#[allow(dead_code)]
 pub struct NullProgress;
 impl Progress for NullProgress {
     fn stage(&self, _message: &str) {}
@@ -195,8 +196,7 @@ pub struct SkippedPage {
 
 #[derive(Debug, Clone, Default, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
-#[derive(Debug, Clone, serde::Serialize)]
-#[serde(rename_all = "camelCase")]
+
 pub struct TimingEntry {
     pub stage: String,
     pub operation: String,
@@ -274,6 +274,7 @@ pub struct BuiltQuestion {
     pub module: String,
     pub is_code: bool,
     pub needs_review: bool,
+    #[allow(dead_code)]
     pub notes: Vec<String>,
 }
 
@@ -473,7 +474,8 @@ pub async fn run_question_pipeline<C: LlmClient, P: Progress>(
     
     // Time the text-layer document map building
     let text_map_start = Instant::now();
-    let text_map_available = doc_map::build_map_from_text(&page_texts, pages.len()).is_some();
+    let scan = doc_map::scan_text_layer(&page_texts);
+    let text_map_available = scan.page_reliability.iter().all(|r| *r != doc_map::PageReliability::Ambiguous);
     report.record_timing("document_map", "text_layer_scan", None, None, text_map_start.elapsed().as_millis() as u64);
 
     // ── 1. Structure pass ───────────────────────────────────────────────────
@@ -567,7 +569,7 @@ pub async fn run_question_pipeline<C: LlmClient, P: Progress>(
     let doc_map_start = Instant::now();
     
     // Use hybrid map building: reliable text pages + vision for ambiguous pages
-    let map = doc_map::build_hybrid_map(&page_texts, &structures, pages.len());
+    let mut map = doc_map::build_hybrid_map(&page_texts, &structures, pages.len());
     
     // Record which pages used vision fallback
     report.timings.push(TimingEntry {
@@ -685,7 +687,7 @@ pub async fn run_question_pipeline<C: LlmClient, P: Progress>(
                 .filter(|&pi| {
                     map.non_question_pages.is_empty()
                         || !map.non_question_pages.contains(&pi)
-                        || structures[pi].role == doc_map::PageRole::Blank
+                        || structures.get(pi).map(|s| s.role == doc_map::PageRole::Blank).unwrap_or(false)
                 })
                 .map(|pi| (pi, &pages[pi]))
                 .collect();
@@ -1838,11 +1840,10 @@ mod tests {
         AtomicBool::new(false)
     }
 
-    // Three-page paper: cover, Q1 (3 marks), Q2 (4 marks), total 7.
     fn paper_pages() -> Vec<PageInput> {
         vec![
             PageInput { b64: String::new(), text: "Instructions\nAnswer ALL questions".into() },
-            PageInput { b64: String::new(), text: "1. Prove the thing. (Total for Question 1 is 3 marks)".into() },
+            PageInput { b64: String::new(), text: "1. Prove the thing. - This page needs to be longer than 100 characters so it is considered ambiguous, and we remove the footer so it's not considered reliable. Let's pad it out with some more text to be absolutely sure.".into() },
             PageInput { b64: String::new(), text: "2. Integrate this. (Total for Question 2 is 4 marks)\nTOTAL FOR PAPER IS 7 MARKS".into() },
         ]
     }
@@ -2169,9 +2170,11 @@ mod tests {
             start_page: 0,
             end_page: 0,
             expected_marks: Some(6),
+            reliable_pages: vec![],
+            ambiguous_pages: vec![],
         };
-        let bad_response = r#"{"items":[{"question_number":30,"content":"Complete the trace table below. [DIAGRAM_PLACEHOLDER] **[6 marks]**","marks":6,"topics":["Proof"],"module":"A","diagram_bboxes":[[0.02,0.02,0.93,0.93]],"bbox_page_indexes":[0]}]}"#;
-        let good_response = r#"{"items":[{"question_number":30,"content":"Complete the trace table below.\n\n| R1 | R2 |\n| --- | --- |\n| 0 | 0 |\n\nState the final value. **[6 marks]**","marks":6,"topics":["Proof"],"module":"A"}]}"#;
+        let bad_response = r#"{"items":[{"question_number":30,"content":"Complete the flow chart below. [DIAGRAM_PLACEHOLDER] **[6 marks]**","marks":6,"topics":["Proof"],"module":"A","diagram_bboxes":[[0.02,0.02,0.93,0.93]],"bbox_page_indexes":[0]}]}"#;
+        let good_response = r#"{"items":[{"question_number":30,"content":"Complete the flow chart below.\n\n[flowchart descriptions]\n\nState the final value. **[6 marks]**","marks":6,"topics":["Proof"],"module":"A"}]}"#;
         let mock = MockLlm::new(vec![ok_chat(bad_response), ok_chat(good_response)]);
         let (built_opt, report) = extract_span(&mock, &config(), &span, &span_pages).await;
         let built = built_opt.expect("question must build after the repair round");
@@ -2184,8 +2187,8 @@ mod tests {
             "the audit feedback must be quoted back to the model"
         );
         assert!(
-            built.content.contains("| R1 | R2 |"),
-            "recovered Markdown table"
+            built.content.contains("[flowchart descriptions]"),
+            "recovered flowchart content"
         );
         assert!(!built.content.contains("[DIAGRAM_PLACEHOLDER]"));
         assert!(report.repairs >= 1);
@@ -2200,8 +2203,10 @@ mod tests {
             start_page: 0,
             end_page: 0,
             expected_marks: Some(6),
+            reliable_pages: vec![],
+            ambiguous_pages: vec![],
         };
-        let heavy_boxing = r#"{"items":[{"question_number":30,"content":"Complete the trace table below. [DIAGRAM_PLACEHOLDER] **[6 marks]**","marks":6,"topics":["Proof"],"module":"A","diagram_bboxes":[[0.02,0.02,0.93,0.93]],"bbox_page_indexes":[0]}]}"#;
+        let heavy_boxing = r#"{"items":[{"question_number":30,"content":"Complete the flow chart below. [DIAGRAM_PLACEHOLDER] **[6 marks]**","marks":6,"topics":["Proof"],"module":"A","diagram_bboxes":[[0.02,0.02,0.93,0.93]],"bbox_page_indexes":[0]}]}"#;
         // Model never learns: every attempt comes back with the same bad box.
         let mock = MockLlm::new(vec![
             ok_chat(heavy_boxing),
@@ -2215,7 +2220,7 @@ mod tests {
             !built.content.contains("[DIAGRAM_PLACEHOLDER]"),
             "no dangling tags"
         );
-        assert!(built.content.contains("Complete the trace table below."));
+        assert!(built.content.contains("Complete the flow chart below."));
         assert!(
             report
                 .anomalies

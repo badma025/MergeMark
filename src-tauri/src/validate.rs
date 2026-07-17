@@ -313,6 +313,7 @@ pub fn diagram_consistency_errors(content: &str, bbox_count: usize) -> Vec<Strin
 }
 
 /// Extract figure numbers from "Figure N" references.
+#[allow(dead_code)]
 pub fn figure_reference_numbers(content: &str) -> Vec<u32> {
     let re_fig = re(r"(?i)\bfig(?:ure)?\.?\s*(\d+)");
     re_fig.captures_iter(content)
@@ -323,6 +324,7 @@ pub fn figure_reference_numbers(content: &str) -> Vec<u32> {
 /// Semantic figure kind validation: genuine figures have visual structure
 /// beyond plain text. Returns true if the content suggests a legitimate
 /// figure type (graph, schema, flowchart, circuit, multi-panel).
+#[allow(dead_code)]
 pub fn looks_like_semantic_figure(content: &str) -> bool {
     let s = content.to_ascii_lowercase();
     // Positive signals: explicit figure kinds mentioned
@@ -340,6 +342,7 @@ pub fn looks_like_semantic_figure(content: &str) -> bool {
 /// False-positive detection for crops that should NOT be diagrams.
 /// Returns a list of rejection reasons if the proposed crop looks like
 /// ordinary prose, code, empty answer area, markdown table, footer, etc.
+#[allow(dead_code)]
 pub fn false_positive_crop_signals(
     content: &str,
     bbox: &[f32],
@@ -402,7 +405,7 @@ pub fn false_positive_crop_signals(
     }
     
     // 8. Empty response areas (ruled lines for student answers)
-    if looks_like_answer_grid_request(content) {
+    if is_answer_grid_request(content) {
         signals.push("student answer grid / trace table instruction".to_string());
     }
     
@@ -415,6 +418,7 @@ pub fn false_positive_crop_signals(
 }
 
 /// Estimate text density (0.0 to 1.0) based on content characteristics.
+#[allow(dead_code)]
 fn estimate_text_density(content: &str) -> f32 {
     if content.trim().is_empty() {
         return 0.0;
@@ -434,6 +438,7 @@ fn estimate_text_density(content: &str) -> f32 {
 }
 
 /// Detect code-block-like content.
+#[allow(dead_code)]
 fn looks_like_code_block(content: &str) -> bool {
     let s = content.to_ascii_lowercase();
     let lines: Vec<&str> = content.lines().collect();
@@ -448,7 +453,7 @@ fn looks_like_code_block(content: &str) -> bool {
         "public ", "private ", "class ", "def ", "import ", "from ",
         "select ", "from ", "where ", "insert ", "update ", "delete ",
     ];
-    let keyword_hits = code_keywords.iter().filter(|k| s.contains(k)).count();
+    let keyword_hits = code_keywords.iter().filter(|k| s.contains(*k)).count();
     
     // Check for indentation patterns
     let indented_lines = lines.iter().filter(|l| l.starts_with("    ") || l.starts_with("\t")).count();
@@ -458,6 +463,7 @@ fn looks_like_code_block(content: &str) -> bool {
 }
 
 /// Detect markdown-eligible table (regular |---|---| pattern).
+#[allow(dead_code)]
 fn looks_like_markdown_table(content: &str) -> bool {
     let lines: Vec<&str> = content.lines().collect();
     if lines.len() < 3 {
@@ -469,6 +475,7 @@ fn looks_like_markdown_table(content: &str) -> bool {
 }
 
 /// Detect footer-like content.
+#[allow(dead_code)]
 fn looks_like_footer(content: &str) -> bool {
     let s = content.to_ascii_lowercase();
     let footer_patterns = [
@@ -483,6 +490,7 @@ fn looks_like_footer(content: &str) -> bool {
 /// Validate semantic figure metadata against page text/captions.
 /// Returns errors if the proposed figure's caption/kind doesn't match
 /// textual evidence on the page.
+#[allow(dead_code)]
 pub fn validate_figure_metadata(
     proposed_captions: &[String],
     proposed_kinds: &[String],

@@ -238,7 +238,7 @@ mod tests {
         struct Row {
             c: String,
         }
-        let wire = r#"{"c":"$\nabla f$ and $\tan \theta$"}"#;
+        let wire = r#"{"c":"$\\nabla f$ and $\\tan \\theta$"}"#;
         match parse_llm_json::<Row>(wire) {
             ParseOutcome::Clean(r) => assert_eq!(r.c, "$\\nabla f$ and $\\tan \\theta$"),
             _ => panic!("expected Clean"),
