@@ -756,7 +756,7 @@ mod tests {
         let img = image::DynamicImage::ImageLuma8(page_grid);
         // Box around the whole trace table (relative coords) → AnswerGrid.
         assert_eq!(
-            crop_diagram(&img, &[0.02, 0.02, 0.9, 0.9], 0),
+            crop_diagram(&img, &[0.1, 0.1, 0.8, 0.8], 0),
             Err(CropReject::AnswerGrid)
         );
 
