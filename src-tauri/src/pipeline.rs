@@ -308,7 +308,7 @@ Normally there is exactly ONE item. Return more than one ONLY if Question {numbe
 EVERY item MUST have:
 - "question_number": {number} (integer, exactly).
 - "content": FULL transcription (never a summary). Preserve all punctuation. Separate sub-parts (a), (b), (c) with double newlines. Append the mark tag `**[X marks]**` to every sub-part that shows a mark allocation. Transcribe every sentence, including instructions to the candidate that belong to the question. Do NOT include: page headers/footers ("Question X continued", "Turn over"), the "(Total for Question X is Y marks)" footer, plain ruled answer lines, or "BLANK PAGE".
-- STRUCTURED TABLES WITH HEADERS — trace tables, function tables, working grids — ARE question content even when the body cells are EMPTY. Transcribe them as Markdown tables in "content" (keeping every header and any pre-filled cells), NEVER as diagram boxes.
+- STRUCTURED TABLES WITH HEADERS — trace tables, function tables, working grids — ARE question content even when the body cells are EMPTY. If the text says Complete the trace table, Complete the table, or show the results of executing, NEVER return a diagram box for that grid, even when the question mentions another Figure; transcribe every row and pre-filled cell as Markdown. Transcribe them as Markdown tables in "content" (keeping every header and any pre-filled cells), NEVER as diagram boxes.
 - "marks": integer total for this question's visible part, or null if unknown.
 - "topics": array chosen ONLY from this list: {topics:?}. At least one. Never invent topics.
 - "module": string — infer from the paper context; use "Unknown" if unclear.
@@ -816,6 +816,14 @@ async fn extract_span<C: LlmClient>(
                     cons_errors.push(format!("item {}: {}", ii + 1, e));
                 }
             }
+            // A trace/answer-grid instruction overrides a Figure reference:
+            // the referenced figure may be elsewhere, while this page's grid
+            // must remain Markdown and must never trigger figure repairs.
+            if cons_errors.len() > 0 && page_items.items.iter().all(|item| {
+                validate::is_answer_grid_request(item.content.as_deref().unwrap_or(""))
+            }) {
+                cons_errors.clear();
+            }
             if !cons_errors.is_empty() {
                 report.repairs += 1;
                 if attempt < max_attempts {
@@ -832,6 +840,15 @@ async fn extract_span<C: LlmClient>(
             // ── Diagram boxes: Rust audits every crop the AI proposed ─────
             let (bad, box_issues) = audit_diagram_boxes(chunk, &page_items.items);
             if !box_issues.is_empty() {
+                let answer_grid_only = page_items.items.iter().all(|item| {
+                    validate::is_answer_grid_request(item.content.as_deref().unwrap_or(""))
+                }) && box_issues.iter().all(|e| e.contains("EMPTY RULED ANSWER GRID"));
+                if answer_grid_only {
+                    let mut items = page_items.items;
+                    prune_bad_diagram_boxes(&mut items, &bad, report);
+                    accepted = Some((items, salvaged));
+                    break;
+                }
                 last_error = box_issues.join("; ");
                 report.repairs += 1;
                 if attempt < max_attempts {
