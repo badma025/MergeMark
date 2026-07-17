@@ -1,15 +1,10 @@
 import { useState } from "react";
 import "katex/dist/katex.min.css";
+import { RichTextEditor } from "./RichTextEditor";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
+import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { Plus, Trash2, Pencil } from "lucide-react";
-import {
-  Dialog,
-  DialogContent,
-  DialogHeader,
-  DialogTitle,
-  DialogFooter,
-} from "@/components/ui/dialog";
 import ReactMarkdown from "react-markdown";
 import remarkMath from "remark-math";
 import rehypeKatex from "rehype-katex";
@@ -47,10 +42,31 @@ function fixSlashes(s: string): string {
  *   D) \int expr            — raw LaTeX with no delimiters at all
  *   E) text $\int expr$ text — display expr embedded mid-sentence
  */
+export function stripAnswerSpaces(raw: string): string {
+  if (!raw) return "";
+  let s = raw;
+
+  // 1. Coordinate Answer Spaces e.g. (..........,..........) or (_____,_____)
+  // Matches coordinates with 2 or more components, where each component is an answer line of 4+ dots/underscores.
+  s = s.replace(/\(\s*(?:(?:[.][ \t]*){4,}|(?:[_][ \t]*){4,})(?:\s*,\s*(?:(?:[.][ \t]*){4,}|(?:[_][ \t]*){4,}))+\s*\)/g, "");
+
+  // 2. Main Answer Spaces
+  // Matches 8 or more dots or underscores, optionally separated by spaces.
+  // Also captures preceding currency symbols (£, $, €) and commonly attached
+  // proceeding units (cm^2, %, mm, etc.) without partially stripping words.
+  s = s.replace(/(?:[£$€]\s*)?(?:(?:[.][ \t]*){8,}|(?:[_][ \t]*){8,})(?:\s*(?:cm\^?[23]?|mm\^?[23]?|m\^?[23]?|km|g|grams?|kg|kilograms?|mg|l|litres?|ml|seconds?|secs?|s|mins?|minutes?|hours?|hrs?|p|pence|%|°|degrees?|m\/s|km\/h|m\/s\^?2)(?![a-zA-Z]))?/gi, "");
+
+  return s;
+}
+
 export function preprocessMath(raw: string, isCode?: boolean, subject?: string): string {
   if (!raw) return "";
 
   let s = raw.trim();
+
+  // ── Strip Answer Spaces (Dots and Underscores) ──────────────────────────
+  s = stripAnswerSpaces(s);
+
 
   // ── 0: Convert Markdown Code Blocks to LaTeX Math Blocks ───────────────
   // If the AI outputs ```latex ... ```, ReactMarkdown treats it as a `<pre>` block,
@@ -71,6 +87,52 @@ export function preprocessMath(raw: string, isCode?: boolean, subject?: string):
       return `$$${clean}$$`;
     });
   }
+
+  // ── 0.5: Convert Markdown Tables to LaTeX Arrays ─────────────────────────
+  // The system should render tables automatically in latex (KaTeX arrays)
+  s = s.replace(/(?:^|\n)((?:[ \t]*\|[^\n]+\|[ \t]*(?:\n|$))+)/g, (match, tableBlock) => {
+    const lines = tableBlock.trim().split('\n');
+    if (lines.length < 3) return match; 
+    
+    const divider = lines[1];
+    if (!/^[ \t]*\|(?:[ \t]*:?-+:?[ \t]*\|)+[ \t]*$/.test(divider)) return match;
+
+    const cols = divider.split('|').slice(1, -1).map((c: string) => c.trim());
+    const format = cols.map((c: string) => {
+      if (c.startsWith(':') && c.endsWith(':')) return 'c';
+      if (c.endsWith(':')) return 'r';
+      return 'l';
+    }).join('|');
+
+    let latex = `\n\n$$\n\\begin{array}{|${format}|}\n\\hline\n`;
+
+    for (let i = 0; i < lines.length; i++) {
+      if (i === 1) continue; // skip divider
+      
+      const line = lines[i];
+      const cells = line.split('|').slice(1, -1).map((c: string) => c.trim());
+      
+      const latexCells = cells.map((cell: string) => {
+        const parts = cell.split(/(\$[^$]+\$)/g);
+        return parts.map((part: string) => {
+          if (part.startsWith('$') && part.endsWith('$')) {
+            return part.slice(1, -1);
+          } else if (part !== '') {
+            // Escape & and % which break LaTeX arrays, wrap in \text{}
+            let text = part.replace(/&/g, '\\&').replace(/%/g, '\\%').replace(/\$/g, '\\$');
+            // KaTeX \text{} preserves spaces but we must ensure it doesn't break
+            return `\\text{${text}}`;
+          }
+          return '';
+        }).join(' ');
+      });
+
+      latex += latexCells.join(' & ') + ' \\\\\n\\hline\n';
+    }
+
+    latex += `\\end{array}\n$$\n\n`;
+    return (match.startsWith('\n') ? '\n' : '') + latex;
+  });
 
   // ── A: protect already-correct $$ blocks from further processing ──────────
   // We mark them with a placeholder, restore at end.
@@ -169,7 +231,9 @@ export function QuestionCard({
     console.error("Failed to parse topics:", e);
   }
 
-  let displayContent = content ?? "";
+  let displayContent = stripAnswerSpaces(content ?? "");
+  const strippedAnswerContent = stripAnswerSpaces(answerContent ?? "");
+  
   const snippet = (mathSnippet || "").trim();
   if (snippet !== "") {
     const contentTrim = displayContent.trimEnd();
@@ -191,7 +255,7 @@ export function QuestionCard({
 
   const [editContent, setEditContent] = useState(displayContent);
   const [editMarks, setEditMarks] = useState(marks);
-  const [editAnswerContent, setEditAnswerContent] = useState(answerContent || "");
+  const [editAnswerContent, setEditAnswerContent] = useState(strippedAnswerContent);
   const [editTopics, setEditTopics] = useState<string[]>(parsedTopics);
 
   function handleSave(e?: React.MouseEvent) {
@@ -204,7 +268,7 @@ export function QuestionCard({
     e?.stopPropagation();
     setEditContent(displayContent);
     setEditMarks(marks);
-    setEditAnswerContent(answerContent || "");
+    setEditAnswerContent(strippedAnswerContent);
     setEditTopics(parsedTopics);
     setIsEditing(false);
   }
@@ -214,7 +278,7 @@ export function QuestionCard({
       onClick={() => {
         setEditContent(displayContent);
         setEditMarks(marks);
-        setEditAnswerContent(answerContent || "");
+        setEditAnswerContent(strippedAnswerContent);
         setEditTopics(parsedTopics);
         setIsEditing(true);
       }}
@@ -233,7 +297,7 @@ export function QuestionCard({
               e.stopPropagation();
               setEditContent(displayContent);
               setEditMarks(marks);
-              setEditAnswerContent(answerContent || "");
+              setEditAnswerContent(strippedAnswerContent);
               setEditTopics(parsedTopics);
               setIsEditing(true);
             }}
@@ -297,7 +361,7 @@ export function QuestionCard({
 
       {/* ── Question content ── */}
       {/* ── Question / Answer Content (Crossfade) ── */}
-      <div className="relative text-sm leading-relaxed text-foreground prose prose-sm dark:prose-invert max-w-none prose-p:my-1 prose-pre:my-1">
+      <div className="relative text-sm leading-relaxed text-foreground prose prose-sm dark:prose-invert max-w-none prose-p:my-1 prose-pre:my-1 break-words">
         
         {/* Question Content */}
         <div 
@@ -395,26 +459,15 @@ export function QuestionCard({
         </div>
       </div>
       {/* ── Edit Modal ── */}
-      <Dialog open={isEditing} onOpenChange={(open) => {
-        if (!open) handleCancel();
-        else {
-          setEditContent(displayContent);
-          setEditMarks(marks);
-          setEditAnswerContent(answerContent || "");
-          setEditTopics(parsedTopics);
-          setIsEditing(true);
-        }
-      }}>
-        <DialogContent 
-          className="max-w-[95vw] sm:max-w-[95vw] h-[95vh] w-full flex flex-col"
-          onClick={(e) => e.stopPropagation()}
-        >
+      <Dialog open={isEditing} onOpenChange={(open) => { if (!open) handleCancel(); }}>
+        <DialogContent className="max-w-[95vw] sm:max-w-[95vw] h-[95vh] w-full flex flex-col p-6">
           <DialogHeader>
             <DialogTitle>Edit Question</DialogTitle>
           </DialogHeader>
-          <div className="flex flex-col gap-4 py-2 flex-1 min-h-0">
-            <div className="flex items-center gap-4 flex-wrap">
-              <div className="flex items-center gap-4">
+          <div className="flex flex-col gap-4 py-2 flex-1 min-h-0 overflow-y-auto pr-2">
+            {/* Top Controls Row */}
+            <div className="flex items-center gap-4 flex-wrap bg-muted/30 p-3 rounded-lg border border-border/50">
+              <div className="flex items-center gap-2">
                 <label className="text-sm font-semibold text-foreground whitespace-nowrap">Marks:</label>
                 <input
                   type="number"
@@ -422,10 +475,15 @@ export function QuestionCard({
                   max={100}
                   value={editMarks}
                   onChange={(e) => setEditMarks(parseInt(e.target.value) || 1)}
-                  className="w-24 p-2 text-sm bg-background border border-input rounded-md focus:outline-none focus:ring-2 focus:ring-primary/50"
+                  className="w-20 p-1.5 text-sm bg-background border border-input rounded-md focus:outline-none focus:ring-2 focus:ring-primary/50"
                 />
               </div>
-              <div className="flex flex-wrap items-center gap-1.5 flex-1 ml-4 border-l pl-4 border-border">
+            </div>
+
+            {/* Topics selection */}
+            <div className="flex flex-col gap-2">
+              <label className="text-sm font-semibold text-foreground">Topics:</label>
+              <div className="flex flex-wrap items-center gap-1.5">
                 {(() => {
                   if (subject === "All") return [];
                   const subjectMods = TOPICS_BY_SUBJECT[subject] || {};
@@ -455,30 +513,36 @@ export function QuestionCard({
                 })}
               </div>
             </div>
-            <div className="grid grid-cols-1 md:grid-cols-2 gap-4 flex-1 min-h-0">
-              <div className="flex flex-col gap-2 flex-1 min-h-0">
-                <label className="text-sm font-semibold text-foreground">Question Content (Markdown):</label>
-                <textarea 
-                  value={editContent}
-                  onChange={(e) => setEditContent(e.target.value)}
-                  className="w-full h-full p-3 text-sm bg-background border border-input rounded-md font-mono resize-none focus:outline-none focus:ring-2 focus:ring-primary/50"
+
+            {/* Content Editors */}
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-4 flex-1 min-h-[300px]">
+              <div className="flex flex-col gap-2 h-full">
+                <div>
+                  <label className="text-sm font-semibold text-foreground">Question Content:</label>
+                  <p className="text-xs text-muted-foreground">Markdown supported. Inline math: $...$, Block math: $$...$$</p>
+                </div>
+                <RichTextEditor 
+                  markdown={editContent}
+                  onChange={setEditContent}
+                  className="flex-1 w-full h-full"
                 />
               </div>
-              <div className="flex flex-col gap-2 flex-1 min-h-0">
-                <label className="text-sm font-semibold text-foreground">Answer Content (Mark Scheme):</label>
-                <textarea 
-                  value={editAnswerContent}
-                  onChange={(e) => setEditAnswerContent(e.target.value)}
+              <div className="flex flex-col gap-2 h-full">
+                <label className="text-sm font-semibold text-foreground">Mark Scheme Answer (Optional):</label>
+                <RichTextEditor 
+                  markdown={editAnswerContent}
+                  onChange={setEditAnswerContent}
                   placeholder="Paste or edit the mark scheme answer here..."
-                  className="w-full h-full p-3 text-sm bg-background border border-input rounded-md font-mono resize-none focus:outline-none focus:ring-2 focus:ring-primary/50"
+                  className="flex-1 w-full h-full mt-[18px]"
                 />
               </div>
             </div>
           </div>
-          <DialogFooter className="mt-auto">
+
+          <div className="flex justify-end gap-2 mt-auto pt-4 border-t border-border shrink-0">
             <Button variant="outline" onClick={handleCancel}>Cancel</Button>
             <Button onClick={handleSave}>Save Changes</Button>
-          </DialogFooter>
+          </div>
         </DialogContent>
       </Dialog>
       {/* ── Footer: Add to Worksheet & Show Answer ── */}

@@ -4,9 +4,11 @@ import { listen } from "@tauri-apps/api/event";
 import { ReviewSyncModal, type ProposedMapping } from "./ReviewSyncModal";
 import { open } from "@tauri-apps/plugin-dialog";
 import { toast } from "sonner";
-import { UploadCloud, FileText, Loader2 } from "lucide-react";
+import { UploadCloud, FileText, Loader2, AlertTriangle, CheckCircle2 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { SUBJECTS } from "@/lib/taxonomy";
+import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/ui/dialog";
+import { Button } from "@/components/ui/button";
 
 import * as pdfjsLib from "pdfjs-dist";
 
@@ -15,6 +17,30 @@ pdfjsLib.GlobalWorkerOptions.workerSrc = new URL(
   import.meta.url
 ).toString();
 
+export interface Quarantine { scope: string; page?: number; questionNumber?: number; reason: string }
+export interface TimingEntry {
+  stage: string;
+  operation: string;
+  page?: number;
+  questionNumber?: number;
+  milliseconds: number;
+}
+export interface ImportReport {
+  paperName: string;
+  kind: string;
+  pagesTotal: number;
+  questionsExpected: number;
+  questionsExtracted: number;
+  marksChecksumOk: boolean | null;
+  quarantined: Quarantine[];
+  repairs: number;
+  salvageEvents: number;
+  cropRejections: number;
+  diagramsSaved: number;
+  diagramsDeduped: number;
+  anomalies: string[];
+  timings: TimingEntry[];
+}
 
 // ── IngestionDropzone ─────────────────────────────────────────────────────────
 
@@ -34,6 +60,8 @@ export function IngestionDropzone({ onSuccess }: IngestionDropzoneProps) {
   const [isProcessing, setIsProcessing] = useState(false);
   const [progressMsg, setProgressMsg] = useState("");
   const [lastFile, setLastFile] = useState<string | null>(null);
+  const [reports, setReports] = useState<ImportReport[]>([]);
+  const [showLogs, setShowLogs] = useState(false);
   const dragCounter = useRef(0); // tracks nested enter/leave events
 
   useEffect(() => {
@@ -43,35 +71,8 @@ export function IngestionDropzone({ onSuccess }: IngestionDropzoneProps) {
     return () => { unlisten.then(f => f()); };
   }, []);
 
-  // Structured completion report from the ingestion pipeline. This is where
-  // repairs, salvages, quarantines and checksums surface — nothing may fail
-  // silently, so anything noteworthy becomes a toast.
+  // Structured completion report from the ingestion pipeline.
   useEffect(() => {
-    interface Quarantine { scope: string; page?: number; questionNumber?: number; reason: string }
-    interface TimingEntry {
-      stage: string;
-      operation: string;
-      page?: number;
-      questionNumber?: number;
-      milliseconds: number;
-    }
-    interface ImportReport {
-      paperName: string;
-      kind: string;
-      pagesTotal: number;
-      questionsExpected: number;
-      questionsExtracted: number;
-      marksChecksumOk: boolean | null;
-      quarantined: Quarantine[];
-      repairs: number;
-      salvageEvents: number;
-      cropRejections: number;
-      diagramsSaved: number;
-      diagramsDeduped: number;
-      anomalies: string[];
-      timings: TimingEntry[];
-    }
-    
     // Helper to build human-readable timing summary
     function buildTimingSummary(timings: TimingEntry[]): string[] {
       const byStage = new Map<string, Map<string, number>>();
@@ -93,6 +94,7 @@ export function IngestionDropzone({ onSuccess }: IngestionDropzoneProps) {
 
     const unlisten = listen('import-report', (event: any) => {
       const r = event.payload as ImportReport;
+      setReports(prev => [r, ...prev]);
       const warnings: number = r.quarantined.length;
       const checksumFailed = r.marksChecksumOk === false;
       
@@ -122,7 +124,8 @@ export function IngestionDropzone({ onSuccess }: IngestionDropzoneProps) {
           .slice(0, 3)
           .map(q => q.questionNumber ? `Q${q.questionNumber}` : q.page ? `page ${q.page}` : q.scope)
           .join(", ");
-        parts.push(`${warnings} item${warnings > 1 ? "s" : ""} quarantined (${where})`);
+        const firstReason = r.quarantined[0]?.reason || "unknown";
+        parts.push(`${warnings} item${warnings > 1 ? "s" : ""} quarantined (${where}). First error: ${firstReason}`);
       }
       toast.warning("Import finished with warnings", {
         description: `${r.paperName}: ${parts.join(" · ")}. Review flagged cards before building worksheets.${timingStr}`,
@@ -406,7 +409,7 @@ export function IngestionDropzone({ onSuccess }: IngestionDropzoneProps) {
             value={subject}
             onChange={(e) => setSubject(e.target.value)}
             disabled={isProcessing}
-            className="h-9 w-48 rounded-md border border-input bg-background px-3 py-1 text-sm shadow-sm transition-colors focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring disabled:cursor-not-allowed disabled:opacity-50"
+            className="h-9 w-[300px] rounded-md border border-input bg-background px-3 py-1 text-sm shadow-sm transition-colors focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring disabled:cursor-not-allowed disabled:opacity-50"
           >
             {SUBJECTS.map((s) => (
               <option key={s} value={s}>{s}</option>
@@ -567,6 +570,79 @@ export function IngestionDropzone({ onSuccess }: IngestionDropzoneProps) {
           if (onSuccess) onSuccess();
         }}
       />
+
+      {/* ── Import Logs Modal ── */}
+      {reports.length > 0 && (
+        <div className="mt-8 select-none">
+          <Button variant="outline" onClick={() => setShowLogs(true)} className="gap-2">
+            <FileText className="size-4" />
+            View Import Logs ({reports.length})
+          </Button>
+
+          <Dialog open={showLogs} onOpenChange={setShowLogs}>
+            <DialogContent className="max-w-2xl max-h-[85vh] flex flex-col p-6">
+              <DialogHeader>
+                <DialogTitle>Import Logs</DialogTitle>
+              </DialogHeader>
+              <div className="flex-1 overflow-y-auto space-y-4 pr-2 py-2">
+                {reports.map((r, i) => {
+                  const hasWarnings = r.quarantined.length > 0 || r.marksChecksumOk === false;
+                  return (
+                    <div key={i} className="border border-border/50 rounded-lg p-4 bg-muted/20">
+                      <div className="flex items-center gap-2 mb-2">
+                        {hasWarnings ? (
+                          <AlertTriangle className="size-5 text-yellow-500" />
+                        ) : (
+                          <CheckCircle2 className="size-5 text-green-500" />
+                        )}
+                        <h3 className="font-semibold text-foreground text-lg">{r.paperName}</h3>
+                      </div>
+                      
+                      <p className="text-sm text-muted-foreground mb-4">
+                        {r.questionsExtracted}/{r.questionsExpected} questions extracted.
+                        {r.marksChecksumOk === false && " Marks don't match the printed paper total."}
+                      </p>
+
+                      {r.quarantined.length > 0 && (
+                        <div className="mb-4">
+                          <span className="text-xs font-semibold text-destructive uppercase tracking-wider">Quarantined ({r.quarantined.length})</span>
+                          <ul className="mt-2 space-y-2">
+                            {r.quarantined.map((q, idx) => (
+                              <li key={idx} className="text-sm text-foreground bg-destructive/10 px-3 py-2 rounded-md border border-destructive/20">
+                                <span className="font-medium mr-2">{q.questionNumber ? `Q${q.questionNumber}` : q.page ? `Page ${q.page}` : q.scope}:</span>
+                                {q.reason}
+                              </li>
+                            ))}
+                          </ul>
+                        </div>
+                      )}
+
+                      {r.anomalies && r.anomalies.length > 0 && (
+                        <div className="mb-4">
+                          <span className="text-xs font-semibold text-yellow-500 uppercase tracking-wider">Anomalies ({r.anomalies.length})</span>
+                          <ul className="mt-2 space-y-2">
+                            {r.anomalies.map((a, idx) => (
+                              <li key={idx} className="text-sm text-foreground bg-yellow-500/10 px-3 py-2 rounded-md border border-yellow-500/20">
+                                {a}
+                              </li>
+                            ))}
+                          </ul>
+                        </div>
+                      )}
+
+                      <div className="text-xs font-medium text-muted-foreground/70 pt-2 border-t border-border/50 flex flex-wrap gap-x-4 gap-y-1">
+                        <span>Repairs: {r.repairs}</span>
+                        <span>Salvaged: {r.salvageEvents}</span>
+                        <span>Crops Rejected: {r.cropRejections}</span>
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            </DialogContent>
+          </Dialog>
+        </div>
+      )}
     </section>
   );
 }

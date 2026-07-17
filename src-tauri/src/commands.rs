@@ -65,16 +65,24 @@ const _FM_FM1: &[&str] = &["Momentum and impulse", "Work, energy and power", "El
 const _FM_FS1: &[&str] = &["Discrete probability distributions", "Poisson distribution", "Geometric and negative binomial", "Hypothesis testing", "Central Limit Theorem", "Chi-squared tests", "Probability generating functions", "Quality of tests"];
 const _FM_FP1: &[&str] = &["Vectors (Cross product & planes)", "Conic sections", "Inequalities", "t-formulae", "Taylor series", "Numerical methods (Further)", "Reducible differential equations"];
 const _FM_D1: &[&str] = &["Algorithms", "Graphs and networks", "Algorithms on graphs", "Route inspection", "Travelling Salesperson Problem", "Linear programming", "Simplex algorithm"];
-const FURTHER_MATHS_TOPICS: &[&str] = &["Complex numbers", "Argand diagrams", "Series", "Roots of polynomials", "Volumes of revolution", "Matrices", "Linear transformations", "Proof by induction", "Vectors", "Differential equations", "Polar coordinates", "Hyperbolic functions", "Maclaurin series", "Methods in calculus", "Momentum and impulse", "Work, energy and power", "Elastic strings and springs", "Elastic collisions in one dimension", "Elastic collisions in two dimensions", "Discrete probability distributions", "Poisson distribution", "Geometric and negative binomial", "Hypothesis testing", "Central Limit Theorem", "Chi-squared tests", "Probability generating functions", "Quality of tests", "Vectors (Cross product & planes)", "Conic sections", "Inequalities", "t-formulae", "Taylor series", "Numerical methods (Further)", "Reducible differential equations", "Algorithms", "Graphs and networks", "Algorithms on graphs", "Route inspection", "Travelling Salesperson Problem", "Linear programming", "Simplex algorithm"];
-const PHYSICS_TOPICS: &[&str] = &["Measurements and their errors", "Particles and radiation", "Waves", "Mechanics and materials", "Electricity", "Further mechanics", "Thermal physics", "Fields and their consequences", "Nuclear physics", "Telescopes", "Classification of stars", "Cosmology"];
-const CS_TOPICS: &[&str] = &["Fundamentals of programming", "Fundamentals of data structures", "Fundamentals of algorithms", "Theory of computation", "Fundamentals of data representation", "Fundamentals of computer systems", "Computer organisation and architecture", "Consequences of uses of computing", "Communication and networking", "Fundamentals of databases", "Big Data", "Fundamentals of functional programming"];
+const _FM_FP2: &[&str] = &["Number theory", "Groups", "Further calculus", "Further matrix algebra", "Further complex numbers", "Maclaurin series"];
+const _FM_FM2: &[&str] = &["Circular motion", "Centres of mass of plane figures", "Further centres of mass", "Kinematics", "Dynamics"];
+const _FM_FS2: &[&str] = &["Linear regression", "Continuous probability distributions", "Correlation", "Hypothesis testing"];
+const _FM_DM2: &[&str] = &["Transportation problems", "Allocation (assignment) problems", "Flows in networks", "Dynamic programming", "Game theory", "Recurrence relations", "Decision analysis"];
+const FURTHER_MATHS_TOPICS: &[&str] = &["Complex numbers", "Argand diagrams", "Series", "Roots of polynomials", "Volumes of revolution", "Matrices", "Linear transformations", "Proof by induction", "Vectors", "Differential equations", "Polar coordinates", "Hyperbolic functions", "Maclaurin series", "Methods in calculus", "Momentum and impulse", "Work, energy and power", "Elastic strings and springs", "Elastic collisions in one dimension", "Elastic collisions in two dimensions", "Discrete probability distributions", "Poisson distribution", "Geometric and negative binomial", "Hypothesis testing", "Central Limit Theorem", "Chi-squared tests", "Probability generating functions", "Quality of tests", "Vectors (Cross product & planes)", "Conic sections", "Inequalities", "t-formulae", "Taylor series", "Numerical methods (Further)", "Reducible differential equations", "Algorithms", "Graphs and networks", "Algorithms on graphs", "Route inspection", "Travelling Salesperson Problem", "Linear programming", "Simplex algorithm", "Number theory", "Groups", "Further calculus", "Further matrix algebra", "Further complex numbers", "Circular motion", "Centres of mass of plane figures", "Further centres of mass", "Kinematics", "Dynamics", "Linear regression", "Continuous probability distributions", "Correlation", "Transportation problems", "Allocation (assignment) problems", "Flows in networks", "Dynamic programming", "Game theory", "Recurrence relations", "Decision analysis"];
+const GCSE_MATHS_TOPICS: &[&str] = &["Number", "Algebra", "Ratio, proportion and rates of change", "Geometry and measures", "Probability", "Statistics"];
+const GCSE_FM_TOPICS: &[&str] = &["Number", "Algebra", "Coordinate Geometry", "Calculus", "Matrix Transformations", "Geometry"];
+const _PHYSICS_TOPICS: &[&str] = &["Measurements and their errors", "Particles and radiation", "Waves", "Mechanics and materials", "Electricity", "Further mechanics", "Thermal physics", "Fields and their consequences", "Nuclear physics", "Telescopes", "Classification of stars", "Cosmology"];
+const _CS_TOPICS: &[&str] = &["Fundamentals of programming", "Fundamentals of data structures", "Fundamentals of algorithms", "Theory of computation", "Fundamentals of data representation", "Fundamentals of computer systems", "Computer organisation and architecture", "Consequences of uses of computing", "Communication and networking", "Fundamentals of databases", "Big Data", "Fundamentals of functional programming"];
 
 fn allowed_topics_for_subject(subject: &str) -> Vec<String> {
     let slice: &[&str] = match subject {
-        "Mathematics" => EDEXCEL_MATHS_TOPICS,
-        "Further Mathematics" => FURTHER_MATHS_TOPICS,
-        "Physics" => PHYSICS_TOPICS,
-        "Computer Science" => CS_TOPICS,
+        "A Level Mathematics (Edexcel)" | "A Level Mathematics" | "Mathematics" => EDEXCEL_MATHS_TOPICS,
+        "A Level Further Mathematics (Edexcel)" | "A Level Further Mathematics" | "Further Mathematics" => FURTHER_MATHS_TOPICS,
+        "GCSE Mathematics (Edexcel)" | "GCSE Mathematics" => GCSE_MATHS_TOPICS,
+        "GCSE Further Mathematics (AQA)" | "GCSE Further Mathematics" => GCSE_FM_TOPICS,
+        // "Physics" => PHYSICS_TOPICS,
+        // "Computer Science" => CS_TOPICS,
         _ => &[],
     };
     slice.iter().map(|s| s.to_string()).collect()
@@ -175,19 +183,36 @@ impl SubjectClassifier {
         if max == 0 {
             return ("General", "Imported", false);
         }
+        /*
         if cs == max {
             return ("Computer Science", "Algorithms & Data Structures", true);
         }
+        */
         if math == max {
-            return ("Further Maths", "Pure Mathematics", false);
+            let is_gcse = lower.contains("gcse") || lower.contains("level 2 certificate") || lower.contains("secondary education");
+            let is_further = lower.contains("further");
+            if is_gcse && is_further {
+                return ("GCSE Further Mathematics (AQA)", "Algebra", false);
+            } else if is_gcse {
+                return ("GCSE Mathematics (Edexcel)", "Algebra", false);
+            } else if is_further {
+                return ("A Level Further Mathematics (Edexcel)", "Pure Mathematics", false);
+            } else {
+                return ("A Level Mathematics (Edexcel)", "Pure", false);
+            }
         }
+        /*
         if phys == max {
             return ("Physics", "Mechanics & Fields", false);
         }
+        */
+        /*
         if chem == max {
             return ("Chemistry", "Physical Chemistry", false);
         }
         ("Biology", "Cell Biology", false)
+        */
+        ("General", "Imported", false)
     }
 
     fn extract_marks(&self, text: &str) -> i32 {
@@ -298,8 +323,8 @@ pub async fn add_question(question: Question, state: State<'_, AppState>) -> Res
     let pool = state.db.lock().await;
     sqlx::query(
         r#"
-        INSERT INTO questions (id, subject, subtopic, topics, marks, content, math_snippet, is_code, module)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO questions (id, subject, subtopic, topics, marks, content, math_snippet, is_code, module, answer_content, paper_name, question_number)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         "#,
     )
     .bind(question.id)
@@ -311,6 +336,9 @@ pub async fn add_question(question: Question, state: State<'_, AppState>) -> Res
     .bind(question.math_snippet)
     .bind(question.is_code)
     .bind(question.module)
+    .bind(question.answer_content)
+    .bind(question.paper_name)
+    .bind(question.question_number)
     .execute(&*pool)
     .await
     .map_err(|e| e.to_string())?;
@@ -671,7 +699,7 @@ pub async fn parse_pdf_vision(
     config.allowed_topics = allowed_topics_for_subject(&subject);
     config.diagrams_dir = diagrams_dir;
     config.max_repairs = 2;
-    config.max_output_tokens = 32768;
+    config.max_output_tokens = 16384;
     config.parallelism = std::env::var("MERGEMARK_PARALLELISM").ok().and_then(|v| v.parse::<usize>().ok()).map(|v| v.clamp(1, 8)).unwrap_or(4);
 
     let client = ReqwestLlm::new(LlmConfig {
@@ -829,6 +857,26 @@ pub async fn delete_all_questions(state: State<'_, AppState>) -> Result<bool, St
         .await
         .map_err(|e| e.to_string())?;
     Ok(true)
+}
+
+#[tauri::command]
+pub async fn delete_questions_by_paper(
+    paper_name: String,
+    state: State<'_, AppState>,
+) -> Result<i64, String> {
+    let name = paper_name.trim();
+    if name.is_empty() {
+        return Err("Cannot delete questions with an empty paper name".to_string());
+    }
+
+    let pool = state.db.lock().await;
+    let result = sqlx::query("DELETE FROM questions WHERE paper_name = ? AND trim(paper_name) != ''")
+        .bind(name)
+        .execute(&*pool)
+        .await
+        .map_err(|e| e.to_string())?;
+        
+    Ok(result.rows_affected() as i64)
 }
 
 #[tauri::command]

@@ -57,6 +57,7 @@ pub fn run() {
             commands::add_question,
             commands::delete_question,
             commands::delete_all_questions,
+            commands::delete_questions_by_paper,
             commands::import_questions,
             commands::compile_worksheet,
             commands::parse_pdf,

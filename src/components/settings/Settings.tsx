@@ -1,8 +1,9 @@
 import { useState, useEffect } from "react";
-import { Settings as SettingsIcon, Key, RefreshCw, AlertCircle } from "lucide-react";
+import { Settings as SettingsIcon, Key, RefreshCw, AlertCircle, Trash2, AlertTriangle } from "lucide-react";
 import { Input } from "@/components/ui/input";
 import { Button } from "@/components/ui/button";
 import { invoke } from "@tauri-apps/api/core";
+import { toast } from "sonner";
 
 
 export function Settings() {
@@ -12,6 +13,11 @@ export function Settings() {
   const [availableModels, setAvailableModels] = useState<string[]>([]);
   const [fetchingModels, setFetchingModels] = useState(false);
   const [modelFetchError, setModelFetchError] = useState("");
+  const [confirmingClear, setConfirmingClear] = useState(false);
+  const [clearInput, setClearInput] = useState("");
+  const [clearing, setClearing] = useState(false);
+
+  const REQUIRED_CLEAR_PHRASE = "I understand that this will permanently delete all my questions";
 
   useEffect(() => {
     const savedKey = localStorage.getItem("mergemark_openai_key");
@@ -55,6 +61,22 @@ export function Settings() {
       setModelFetchError(err.toString());
     } finally {
       setFetchingModels(false);
+    }
+  }
+
+  async function handleClearRepository() {
+    if (clearInput !== REQUIRED_CLEAR_PHRASE) return;
+    
+    setClearing(true);
+    try {
+      await invoke("delete_all_questions");
+      toast.success("Repository cleared successfully");
+      setConfirmingClear(false);
+      setClearInput("");
+    } catch (err) {
+      toast.error("Failed to clear repository", { description: String(err) });
+    } finally {
+      setClearing(false);
     }
   }
 
@@ -154,6 +176,64 @@ export function Settings() {
           <p id="openai-api-key-description" className="text-xs text-muted-foreground">
             Required for OpenAI/cloud providers. Leave blank or enter a dummy value for local providers like Ollama.
           </p>
+        </div>
+      </div>
+
+      <div className="w-full max-w-md flex flex-col gap-4 rounded-2xl border border-destructive/30 bg-destructive/5 p-6 shadow-sm mb-12">
+        <h2 className="text-sm font-bold text-destructive flex items-center gap-2">
+          <AlertTriangle className="size-4" />
+          Danger Zone
+        </h2>
+        <div className="flex flex-col gap-2">
+          <p className="text-sm text-muted-foreground">
+            Irreversibly delete all imported questions, mark schemes, and generated content from your local database.
+          </p>
+          {!confirmingClear ? (
+            <Button 
+              variant="destructive" 
+              className="mt-2 w-fit gap-2"
+              onClick={() => setConfirmingClear(true)}
+            >
+              <Trash2 className="size-4" />
+              Clear Repository
+            </Button>
+          ) : (
+            <div className="flex flex-col gap-3 mt-2 bg-background p-4 rounded-xl border border-destructive/20">
+              <p className="text-xs font-medium text-foreground">
+                Type <code className="bg-muted px-1.5 py-0.5 rounded text-destructive select-all">{REQUIRED_CLEAR_PHRASE}</code> below to confirm.
+              </p>
+              <Input
+                type="text"
+                placeholder="Type the phrase above"
+                value={clearInput}
+                onChange={(e) => setClearInput(e.target.value)}
+                onPaste={(e) => e.preventDefault()}
+                onDrop={(e) => e.preventDefault()}
+                className="text-xs"
+              />
+              <div className="flex gap-2 justify-end mt-1">
+                <Button 
+                  variant="ghost" 
+                  size="sm"
+                  onClick={() => {
+                    setConfirmingClear(false);
+                    setClearInput("");
+                  }}
+                  disabled={clearing}
+                >
+                  Cancel
+                </Button>
+                <Button 
+                  variant="destructive" 
+                  size="sm"
+                  disabled={clearInput !== REQUIRED_CLEAR_PHRASE || clearing}
+                  onClick={handleClearRepository}
+                >
+                  {clearing ? "Deleting..." : "Permanently Delete All"}
+                </Button>
+              </div>
+            </div>
+          )}
         </div>
       </div>
     </section>

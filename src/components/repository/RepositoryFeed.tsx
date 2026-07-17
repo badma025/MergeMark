@@ -1,4 +1,4 @@
-import { Search } from "lucide-react";
+import { Search, Plus } from "lucide-react";
 import { useState, useEffect } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { toast } from "sonner";
@@ -7,6 +7,8 @@ import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { cn } from "@/lib/utils";
 import { QuestionCard, type QuestionCardProps } from "./QuestionCard";
+import { AddQuestionModal } from "./AddQuestionModal";
+import { ManagePapersModal } from "./ManagePapersModal";
 import { SUBJECTS, TOPICS_BY_SUBJECT, ALL_TOPICS } from "@/lib/taxonomy";
 
 // ── Component ─────────────────────────────────────────────────────────────────
@@ -18,6 +20,8 @@ export interface RepositoryFeedProps {
 
 export function RepositoryFeed({ isActive = true, onAddToWorksheet }: RepositoryFeedProps) {
   const [search, setSearch] = useState("");
+  const [showAddModal, setShowAddModal] = useState(false);
+  const [showManagePapers, setShowManagePapers] = useState(false);
   const [selectedSubject, setSelectedSubject] = useState<string>("All");
   const [selectedModule, setSelectedModule] = useState<string>("All");
   const [selectedTopics, setSelectedTopics] = useState<string[]>([]);
@@ -66,17 +70,6 @@ export function RepositoryFeed({ isActive = true, onAddToWorksheet }: Repository
       toast.success("Question updated successfully");
     } catch (err) {
       toast.error("Failed to update question", { description: String(err) });
-    }
-  }
-
-  async function handleDeleteAll() {
-    if (!window.confirm("Are you sure you want to delete ALL questions? This cannot be undone.")) return;
-    try {
-      await invoke("delete_all_questions");
-      setQuestions([]);
-      toast.success("Repository cleared");
-    } catch (err) {
-      toast.error("Failed to clear repository", { description: String(err) });
     }
   }
 
@@ -163,14 +156,21 @@ export function RepositoryFeed({ isActive = true, onAddToWorksheet }: Repository
             <span className="text-sm text-muted-foreground whitespace-nowrap">
               Total Questions: <span className="font-semibold text-foreground">{questions.length}</span>
             </span>
-            <Button 
-              variant="destructive" 
-              size="sm" 
-              onClick={handleDeleteAll}
-              disabled={questions.length === 0}
+            <Button
+              onClick={() => setShowAddModal(true)}
+              size="sm"
               className="gap-2"
             >
-              Clear Repository
+              <Plus className="size-4" />
+              Add Question
+            </Button>
+            <Button
+              onClick={() => setShowManagePapers(true)}
+              size="sm"
+              variant="outline"
+              className="gap-2"
+            >
+              Manage PDFs
             </Button>
           </div>
         </div>
@@ -291,6 +291,20 @@ export function RepositoryFeed({ isActive = true, onAddToWorksheet }: Repository
           </ul>
         )}
       </div>
+
+      <AddQuestionModal 
+        open={showAddModal} 
+        onOpenChange={setShowAddModal} 
+        onSuccess={() => {
+          setShowAddModal(false);
+          fetchQuestions();
+        }}
+      />
+      <ManagePapersModal
+        open={showManagePapers}
+        onOpenChange={setShowManagePapers}
+        onPaperDeleted={fetchQuestions}
+      />
     </section>
   );
 }

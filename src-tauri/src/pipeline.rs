@@ -85,19 +85,37 @@ impl PipelineConfig {
 /// become "Further Pure 1"). A model value is accepted only when it is one of
 /// the known module names; otherwise we use a unique topic match or Unknown.
 fn canonical_module(config: &PipelineConfig, proposed: Option<&str>, topics: &[String]) -> String {
+    if config.subject == "GCSE Mathematics (Edexcel)" || config.subject == "GCSE Mathematics" {
+        return "GCSE Mathematics".into();
+    }
+    if config.subject == "GCSE Further Mathematics (AQA)" || config.subject == "GCSE Further Mathematics" {
+        return "GCSE Further Mathematics".into();
+    }
+    /*
     if config.subject == "Physics" {
         return "Physics".into();
     }
     if config.subject == "Computer Science" {
         return "Computer Science".into();
     }
+    */
     let name = config.paper_name.to_ascii_lowercase();
     let paper_module = [
         ("core pure", "Core Pure"),
+        ("further pure 2", "Further Pure 2"),
+        ("further pure 1", "Further Pure 1"),
         ("further pure", "Further Pure 1"),
+        ("further mechanics 2", "Further Mechanics 2"),
+        ("further mechanics 1", "Further Mechanics 1"),
         ("further mechanics", "Further Mechanics 1"),
+        ("further statistics 2", "Further Statistics 2"),
+        ("further statistics 1", "Further Statistics 1"),
         ("further statistics", "Further Statistics 1"),
+        ("decision mathematics 2", "Decision Mathematics 2"),
+        ("decision mathematics 1", "Decision Mathematics 1"),
         ("decision mathematics", "Decision Mathematics 1"),
+        ("decision maths 2", "Decision Mathematics 2"),
+        ("decision maths 1", "Decision Mathematics 1"),
         ("decision maths", "Decision Mathematics 1"),
     ]
     .iter()
@@ -110,9 +128,13 @@ fn canonical_module(config: &PipelineConfig, proposed: Option<&str>, topics: &[S
     let known = [
         "Core Pure",
         "Further Pure 1",
+        "Further Pure 2",
         "Further Mechanics 1",
+        "Further Mechanics 2",
         "Further Statistics 1",
+        "Further Statistics 2",
         "Decision Mathematics 1",
+        "Decision Mathematics 2",
     ];
     if let Some(value) = proposed
         .map(str::trim)
@@ -148,13 +170,23 @@ fn canonical_module(config: &PipelineConfig, proposed: Option<&str>, topics: &[S
                     "Numerical methods (Further)",
                     "Reducible differential equations",
                 ][..],
+                "Further Pure 2" => &[
+                    "Number theory",
+                    "Groups",
+                    "Further calculus",
+                    "Further matrix algebra",
+                    "Further complex numbers",
+                ][..],
                 "Further Mechanics 1" => &["Momentum and impulse", "Work, energy and power"][..],
+                "Further Mechanics 2" => &["Circular motion", "Centres of mass of plane figures", "Further centres of mass", "Kinematics", "Dynamics"][..],
                 "Further Statistics 1" => &[
                     "Poisson distribution",
                     "Hypothesis testing",
                     "Chi-squared tests",
                 ][..],
-                _ => &["Algorithms", "Graphs and networks", "Linear programming"][..],
+                "Further Statistics 2" => &["Linear regression", "Continuous probability distributions", "Correlation"][..],
+                "Decision Mathematics 1" => &["Algorithms", "Graphs and networks", "Linear programming"][..],
+                _ => &["Transportation problems", "Allocation (assignment) problems", "Flows in networks", "Dynamic programming", "Game theory", "Recurrence relations", "Decision analysis"][..],
             };
             topics
                 .iter()
@@ -418,6 +450,7 @@ The parser crop-checks every box: blank boxes, empty ruled grids, and duplicate 
 - Insert the exact token [DIAGRAM_PLACEHOLDER] in "content" where each diagram belongs chronologically.
 
 FORMATTING RULES:
+- OMIT the leading question number at the very start of the question text (e.g. if the text reads "17 Here is triangle ABC.", you MUST output "Here is triangle ABC." without the "17").
 - Wrap inline math in single $...$. Use $$...$$ ONLY for display equations on their own line.
 - Tables of text/data: standard Markdown tables. Pure mathematical matrices or Simplex tableaus: LaTeX \begin{{array}} inside $$...$$. Never put $ inside array environments.
 - Multiple-choice options: `a) ...`, `b) ...` separated by double newlines, WITHOUT the question number prefix.
@@ -736,11 +769,17 @@ pub async fn run_question_pipeline<C: LlmClient, P: Progress>(
                         built.push(q);
                     }
                     None => {
+                        let mut reason = "failed validation and all repair attempts".to_string();
+                        if let Some(err) = report.anomalies.last() {
+                            if err.starts_with("fatal_error: ") {
+                                reason = format!("failed validation and all repair attempts (last error: {})", err.trim_start_matches("fatal_error: "));
+                            }
+                        }
                         report.quarantined.push(QuarantineEvent {
                             scope: "question".to_string(),
                             page: Some(span.start_page + 1),
                             question_number: Some(span.number),
-                            reason: "failed validation and all repair attempts".to_string(),
+                            reason,
                         });
                     }
                 }
@@ -980,7 +1019,10 @@ async fn extract_span<C: LlmClient>(
 
         let (items, salvaged) = match accepted {
             Some(v) => v,
-            None => return (None, report),
+            None => {
+                report.anomalies.push(format!("fatal_error: {}", last_error));
+                return (None, report);
+            }
         };
 
         for item in items {
@@ -2132,8 +2174,8 @@ mod tests {
         let item = AiQuestion {
             content: Some("Complete the table. [DIAGRAM_PLACEHOLDER]".into()),
             diagram_bboxes: Some(vec![
-                vec![0.02, 0.02, 0.93, 0.93], // whole trace table → AnswerGrid
-                vec![0.02, 0.05, 0.90, 0.82], // chart → keep
+                vec![0.10, 0.10, 0.80, 0.80], // whole trace table → AnswerGrid
+                vec![0.10, 0.15, 0.70, 0.70], // chart → keep
                 vec![0.03, 0.06, 0.88, 0.80], // same chart → duplicate
             ]),
             bbox_page_indexes: Some(vec![
@@ -2173,7 +2215,7 @@ mod tests {
             reliable_pages: vec![],
             ambiguous_pages: vec![],
         };
-        let bad_response = r#"{"items":[{"question_number":30,"content":"Complete the flow chart below. [DIAGRAM_PLACEHOLDER] **[6 marks]**","marks":6,"topics":["Proof"],"module":"A","diagram_bboxes":[[0.02,0.02,0.93,0.93]],"bbox_page_indexes":[0]}]}"#;
+        let bad_response = r#"{"items":[{"question_number":30,"content":"Complete the flow chart below. [DIAGRAM_PLACEHOLDER] **[6 marks]**","marks":6,"topics":["Proof"],"module":"A","diagram_bboxes":[[0.10,0.10,0.80,0.80]],"bbox_page_indexes":[0]}]}"#;
         let good_response = r#"{"items":[{"question_number":30,"content":"Complete the flow chart below.\n\n[flowchart descriptions]\n\nState the final value. **[6 marks]**","marks":6,"topics":["Proof"],"module":"A"}]}"#;
         let mock = MockLlm::new(vec![ok_chat(bad_response), ok_chat(good_response)]);
         let (built_opt, report) = extract_span(&mock, &config(), &span, &span_pages).await;

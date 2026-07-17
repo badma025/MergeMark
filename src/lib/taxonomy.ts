@@ -1,13 +1,12 @@
 export const SUBJECTS = [
-  "Mathematics",
-  "Further Mathematics"
-  // Physics & CS disabled for V1 - will return in V1.1 with improved parsers
-  // "Physics",
-  // "Computer Science"
+  "A Level Mathematics (Edexcel)",
+  "A Level Further Mathematics (Edexcel)",
+  "GCSE Mathematics (Edexcel)",
+  "GCSE Further Mathematics (AQA)"
 ];
 
 export const TOPICS_BY_SUBJECT: Record<string, Record<string, string[]>> = {
-  "Mathematics": {
+  "A Level Mathematics (Edexcel)": {
     "Pure": [
       "Proof", "Algebra and functions", "Coordinate geometry in the (x, y) plane", 
       "Sequences and series", "Trigonometry", "Exponentials and logarithms", 
@@ -21,7 +20,7 @@ export const TOPICS_BY_SUBJECT: Record<string, Record<string, string[]>> = {
       "Quantities and units in mechanics", "Kinematics", "Forces and Newton's laws", "Moments"
     ]
   },
-  "Further Mathematics": {
+  "A Level Further Mathematics (Edexcel)": {
     "Core Pure": [
       "Complex numbers", "Argand diagrams", "Series", "Roots of polynomials", 
       "Volumes of revolution", "Matrices", "Linear transformations", 
@@ -48,9 +47,37 @@ export const TOPICS_BY_SUBJECT: Record<string, Record<string, string[]>> = {
       "Algorithms", "Graphs and networks", "Algorithms on graphs", 
       "Route inspection", "Travelling Salesperson Problem", 
       "Linear programming", "Simplex algorithm"
+    ],
+    "Further Pure 2": [
+      "Number theory", "Groups", "Further calculus", "Further matrix algebra", 
+      "Further complex numbers", "Maclaurin series"
+    ],
+    "Further Mechanics 2": [
+      "Circular motion", "Centres of mass of plane figures", "Further centres of mass", 
+      "Kinematics", "Dynamics"
+    ],
+    "Further Statistics 2": [
+      "Linear regression", "Continuous probability distributions", 
+      "Correlation", "Hypothesis testing"
+    ],
+    "Decision Mathematics 2": [
+      "Transportation problems", "Allocation (assignment) problems", "Flows in networks", 
+      "Dynamic programming", "Game theory", "Recurrence relations", "Decision analysis"
     ]
   },
-  "Physics": {
+  "GCSE Mathematics (Edexcel)": {
+    "GCSE Mathematics": [
+      "Number", "Algebra", "Ratio, proportion and rates of change", 
+      "Geometry and measures", "Probability", "Statistics"
+    ]
+  },
+  "GCSE Further Mathematics (AQA)": {
+    "GCSE Further Mathematics": [
+      "Number", "Algebra", "Coordinate Geometry", "Calculus", 
+      "Matrix Transformations", "Geometry"
+    ]
+  },
+  /*"Physics": {
     "Physics": [
       "Measurements and their errors", "Particles and radiation", 
       "Waves", "Mechanics and materials", "Electricity", 
@@ -68,7 +95,7 @@ export const TOPICS_BY_SUBJECT: Record<string, Record<string, string[]>> = {
       "Communication and networking", "Fundamentals of databases", 
       "Big Data", "Fundamentals of functional programming"
     ]
-  }
+  }*/
 };
 
 export const ALL_TOPICS = Array.from(new Set(
