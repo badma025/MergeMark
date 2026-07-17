@@ -384,7 +384,7 @@ fn structure_system_prompt() -> String {
 }
 
 RULES:
-- "question_numbers_visible": WHOLE question numbers only (AQA "03.1" counts as 3). Sub-part letters and margin digits are NOT question numbers.
+- "question_numbers_visible": WHOLE question numbers only. AQA Computer Science prints "0 1" for Q1, "0 2" for Q2, ... "0 1 . 1" means Q1 part 1 so visible number is 1. "03.1" counts as 3. Sub-part letters (a)(b)(c) alone are NOT question numbers, but "0 1" spaced format IS a question number.
 - "total_marks_footer": only if a line like "(Total for Question 5 is 8 marks)" is printed on this page. Format: [5, 8]. Otherwise null.
 - page_role: COVER (front cover / candidate details), INSTRUCTIONS (rubric, formula sheet given to candidates), BLANK (empty or "BLANK PAGE"), ANSWER_BOOKLET (empty lined/dotted student writing space), REFERENCE (stand-alone reference/formula table), otherwise QUESTION.
 - Output ONLY the JSON object. No commentary."#
