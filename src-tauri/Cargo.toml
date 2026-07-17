@@ -1,7 +1,7 @@
 [package]
 name = "mergemark"
-version = "0.1.0"
-description = "MergeMark — desktop document merging and annotation tool"
+version = "1.0.0"
+description = "MergeMark — Maths past-paper to topic bank (V1)"
 authors = ["MergeMark Contributors"]
 edition = "2021"
 

@@ -22,3 +22,8 @@ dist-ssr
 *.njsproj
 *.sln
 *.sw?
+
+# App data
+*.db
+*.db-journal
+src-tauri/diagrams/

@@ -1,8 +1,9 @@
 export const SUBJECTS = [
   "Mathematics",
-  "Further Mathematics",
-  "Physics",
-  "Computer Science"
+  "Further Mathematics"
+  // Physics & CS disabled for V1 - will return in V1.1 with improved parsers
+  // "Physics",
+  // "Computer Science"
 ];
 
 export const TOPICS_BY_SUBJECT: Record<string, Record<string, string[]>> = {

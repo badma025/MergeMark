@@ -1,8 +1,8 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "tauri-app",
-  "version": "0.1.0",
-  "identifier": "com.alimb.tauri-app",
+  "productName": "MergeMark",
+  "version": "1.0.0",
+  "identifier": "com.mergemark.app",
   "build": {
     "beforeDevCommand": "npm run dev",
     "devUrl": "http://localhost:1420",
@@ -12,15 +12,15 @@
   "app": {
     "windows": [
       {
-        "title": "tauri-app",
-        "width": 800,
-        "height": 600
+        "title": "MergeMark",
+        "width": 1200,
+        "height": 800
       }
     ],
     "security": {
       "assetProtocol": {
         "enable": true,
-        "scope": ["**", "**/*", "*", "$APPDATA/**/*", "C:/**/*"]
+        "scope": ["$APPDATA/**/*", "$RESOURCE/**/*"]
       },
       "csp": null
     }
