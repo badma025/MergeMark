@@ -54,6 +54,7 @@ pub struct PipelineConfig {
     pub model: String,
     pub paper_name: String,
     pub subject: String,
+    pub module_override: Option<String>,
     pub allowed_topics: Vec<String>,
     /// Where cropped diagrams are written; `None` skips image persistence
     /// (used in tests).
@@ -71,6 +72,7 @@ impl PipelineConfig {
             model,
             paper_name,
             subject,
+            module_override: None,
             allowed_topics: Vec::new(),
             diagrams_dir: None,
             max_repairs: 2,
@@ -85,6 +87,9 @@ impl PipelineConfig {
 /// become "Further Pure 1"). A model value is accepted only when it is one of
 /// the known module names; otherwise we use a unique topic match or Unknown.
 fn canonical_module(config: &PipelineConfig, proposed: Option<&str>, topics: &[String]) -> String {
+    if let Some(ref mo) = config.module_override {
+        return mo.clone();
+    }
     if config.subject == "GCSE Mathematics (Edexcel)" || config.subject == "GCSE Mathematics" {
         return "GCSE Mathematics".into();
     }
@@ -428,6 +433,12 @@ fn extraction_system_prompt(
     span: &QuestionSpan,
     allowed_topics: &[String],
 ) -> String {
+    let module_instruction = if let Some(ref m) = config.module_override {
+        format!("- \"module\": string — The user explicitly declared the module is '{m}'. Output EXACTLY '{m}'. Do not guess.")
+    } else {
+        "- \"module\": string — infer from the paper context; use \"Unknown\" if unclear.".to_string()
+    };
+
     format!(
         r#"You are a precise mathematical OCR engine. Output ONLY a valid JSON object of the form {{"items": [ ... ]}}.
 
@@ -441,7 +452,7 @@ EVERY item MUST have:
 - STRUCTURED TABLES WITH HEADERS — trace tables, function tables, working grids — ARE question content even when the body cells are EMPTY. If the text says Complete the trace table, Complete the table, or show the results of executing, NEVER return a diagram box for that grid, even when the question mentions another Figure; transcribe every row and pre-filled cell as Markdown. Transcribe them as Markdown tables in "content" (keeping every header and any pre-filled cells), NEVER as diagram boxes.
 - "marks": integer total for this question's visible part, or null if unknown.
 - "topics": array chosen ONLY from this list: {topics:?}. At least one. Never invent topics.
-- "module": string — infer from the paper context; use "Unknown" if unclear.
+{module_instruction}
 - "is_code": boolean (true only for code/pseudocode questions).
 - "diagram_captions": array of captions, one per figure box, or empty string; "diagram_kinds": array of semantic kinds such as graph, schema, flowchart, circuit, or multi-panel, one per box. Decide whether each exhibit is a figure before proposing geometry.
 - "diagram_bboxes": array of [x, y, w, h] boxes with RELATIVE 0.0-1.0 coordinates, one per visual exhibit. Box EVERY figure the paper draws — graphs, networks, trees, circuits — INCLUDING anything the paper labels as a Figure (e.g. "Figure 6"): printed relation/database schemas, algorithm screens, and grids that are part of the question exhibit are figures, return them as boxes, not as text. One box per WHOLE figure including its labels/caption, never two boxes on one figure. Do NOT box plain question text, tables you transcribed as Markdown (STRUCTURED TABLES rule above), or EMPTY student answer grids. The parser crop-checks every box. Include the complete semantic figure extent, including captions and disconnected components, rather than tight-boxing one shape.
@@ -461,6 +472,7 @@ FORMATTING RULES:
         number = span.number,
         paper = config.paper_name,
         topics = allowed_topics,
+        module_instruction = module_instruction,
     )
 }
 
@@ -935,6 +947,13 @@ async fn extract_span<C: LlmClient>(
                     continue;
                 }
             };
+
+            if page_items.items.is_empty() && contents.is_empty() {
+                let chunk_pages = chunk.iter().map(|(pi, _)| *pi + 1).collect::<Vec<_>>();
+                last_error = format!("You returned an empty items array, but this batch (pages {:?}) contains the start of Question {}. You must extract it.", chunk_pages, span.number);
+                report.repairs += 1;
+                continue;
+            }
 
             // ── Deterministic validation of the page items ────────────────
             let validation_errors = validate_span_items(&page_items, span);

@@ -411,13 +411,10 @@ fn merge_spans(
 
 /// When question N-1's footer and question N's footer are on the same page,
 /// N both starts and ends there (one-page question). Otherwise N starts on
-/// the page after N-1's footer page.
-fn mid_page_start(prev: &Footer, cur: &Footer) -> usize {
-    if prev.page == cur.page {
-        cur.page
-    } else {
-        prev.page + 1
-    }
+/// the page where N-1's footer is, since questions often start on the same page
+/// the previous question ended.
+fn mid_page_start(prev: &Footer, _cur: &Footer) -> usize {
+    prev.page
 }
 
 /// Find where question 1 plausibly starts: scan pages before its footer for
@@ -646,7 +643,7 @@ mod tests {
         assert_eq!(map.spans[0].number, 1);
         assert_eq!(map.spans[0].expected_marks, Some(5));
         assert_eq!(map.spans[0].end_page, 2);
-        assert_eq!(map.spans[1].start_page, 3);
+        assert_eq!(map.spans[1].start_page, 2); // Now starts on the same page as Q1's footer
         assert_eq!(map.paper_total_marks, Some(11));
         // Cover page detected as front matter:
         assert_eq!(map.spans[0].start_page, 1);
@@ -661,7 +658,7 @@ mod tests {
         let map = build_hybrid_map(&t, &[], 2);
         assert_eq!(map.spans[1].number, 2);
         assert_eq!(map.spans[1].start_page, 0); // same page as Q1's footer
-        assert_eq!(map.spans[2].start_page, 1);
+        assert_eq!(map.spans[2].start_page, 0); // Now starts on the same page as Q2's footer
     }
 
     #[test]

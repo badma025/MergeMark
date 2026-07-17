@@ -116,6 +116,10 @@ pub fn has_terminal_ending(content: &str) -> bool {
     if t.ends_with('|') {
         return true;
     }
+    let lower = t.to_ascii_lowercase();
+    if lower.ends_with("continued") || lower.ends_with("turn over") || lower.ends_with("blank page") {
+        return true;
+    }
     matches!(
         t.chars().last(),
         Some('.') | Some('?') | Some('!') | Some(')') | Some(']') | Some(':') | Some(';')
