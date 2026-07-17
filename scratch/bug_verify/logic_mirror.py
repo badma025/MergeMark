@@ -141,13 +141,19 @@ def qnum(v):
     elif isinstance(v, str):
         t = v.strip()
         if '.' in t or ',' in t: return None
-        try: n = int(t)
+        # AQA "0 1" -> "01" -> 1
+        compact = ''.join(ch for ch in t if not ch.isspace())
+        if not compact:
+            return None
+        try: n = int(compact)
         except ValueError: return None
     else: return None
     return n if 1 <= n <= 60 else None
 
 check("qnum 7→7", qnum(7)==7)
 check("qnum '12'→12", qnum("12")==12)
+check("qnum '0 1'→1 (AQA spaced)", qnum("0 1")==1)
+check("qnum '0 5'→5", qnum("0 5")==5)
 check("qnum '03.1'→None (not 31!)", qnum("03.1") is None)
 check("qnum 0/99/3.7→None", qnum(0) is None and qnum(99) is None and qnum(3.7) is None)
 
@@ -156,10 +162,13 @@ def terminal(s):
     if not t: return False
     if re.search(r"(?i)(?:\[|\()\s*\d{1,2}\s*marks?\s*(?:\]|\))\s*\**\s*$", t): return True
     if t.endswith(("$$","```","$","`")): return True
+    if t.endswith("|"):  # trace tables ending with '|'
+        return True
     return t[-1] in ".!?)]);:" and True or False
 
 check("terminal marks tag", terminal("Find the gradient. **[4 marks]**"))
 check("terminal math", terminal("Hence $x = 2$."), )
+check("terminal table pipe", terminal("| A | B |\n| --- | --- |\n| 1 | 2 |"))
 check("not terminal mid-word", not terminal("Evaluate the integ"))
 
 # ── doc_map.rs ──────────────────────────────────────────────────────────────

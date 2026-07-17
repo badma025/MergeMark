@@ -21,7 +21,12 @@ def scan_text_layer(page_texts):
     footers = []
     paper_total = None
     page_reliability = [PageReliability.Ambiguous] * len(page_texts)
-    
+    FIGURE_RE = re.compile(r'(?i)\bfig(?:ure)?\.?\s*\d+')
+    TABLE_RE = re.compile(r'(?i)\btable\s+\d+')
+    AQA_MAIN_RE = re.compile(r'0\s+\d{1,2}')
+    AQA_SUB_RE = re.compile(r'(?m)^\s*0?\s*\d{1,2}\s*\.\s*\d+')
+    MARKS_RE = re.compile(r'(?i)\[\s*\d+\s*marks?')
+
     for page, text in enumerate(page_texts):
         has_footer = False
         for m in FOOTER_RE.finditer(text):
@@ -35,13 +40,21 @@ def scan_text_layer(page_texts):
             if m and int(m.group(1)) > 0:
                 paper_total = int(m.group(1))
         
+        has_question_signal = (
+            FIGURE_RE.search(text) is not None
+            or TABLE_RE.search(text) is not None
+            or AQA_MAIN_RE.search(text) is not None
+            or AQA_SUB_RE.search(text) is not None
+            or MARKS_RE.search(text) is not None
+        )
+
         if BLANK_RE.match(text) or not text.strip():
-            page_reliability[page] = PageReliability.NonQuestion
-        elif INSTR_RE.search(text) or REF_RE.match(text):
             page_reliability[page] = PageReliability.NonQuestion
         elif has_footer:
             page_reliability[page] = PageReliability.Reliable
-        elif len(text) > 100:
+        elif (INSTR_RE.search(text) or REF_RE.search(text)) and not has_question_signal:
+            page_reliability[page] = PageReliability.NonQuestion
+        elif len(text) > 100 or has_question_signal:
             page_reliability[page] = PageReliability.Ambiguous
         else:
             page_reliability[page] = PageReliability.NonQuestion
@@ -55,7 +68,8 @@ def build_spans_from_reliable(scan, num_pages):
     reliable_footers = [f for f in scan["footers"] 
                        if scan["page_reliability"][f["page"]] == PageReliability.Reliable]
     
-    if len(reliable_footers) < 2:
+    # Rust now allows 0 reliable footers in hybrid mode (vision fills rest)
+    if len(reliable_footers) == 0:
         return [], set(), anomalies
     
     footers = sorted(reliable_footers, key=lambda f: (f["page"], f["question"]))
@@ -122,7 +136,7 @@ def build_spans_from_vision(structures, ambiguous_pages, num_pages):
             last_seen[q]["page"] = p["page"]
             last_seen[q]["marks"] = m
     
-    if len(last_seen) < 2:
+    if len(last_seen) == 0:
         return []
     
     spans = []

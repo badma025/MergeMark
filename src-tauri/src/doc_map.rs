@@ -111,6 +111,13 @@ pub fn scan_text_layer(page_texts: &[String]) -> TextScan {
     ).unwrap();
     let blank_re = regex::Regex::new(r"(?i)^\s*(blank page|this page is intentionally blank)\s*$").unwrap();
     let ref_re = regex::Regex::new(r"(?i)^\s*(formulae|data|reference|constants)\s*(sheet|table|booklet)?\s*$").unwrap();
+    // AQA CS signals that a page is question content even when it contains
+    // instruction boilerplate (e.g. "Answer all questions" on same page as Q1).
+    let aqa_figure_re = regex::Regex::new(r"(?i)\bfig(?:ure)?\.?\s*\d+").unwrap();
+    let aqa_table_re = regex::Regex::new(r"(?i)\btable\s+\d+").unwrap();
+    let aqa_main_re = regex::Regex::new(r"0\s+\d{1,2}").unwrap();
+    let aqa_sub_re = regex::Regex::new(r"(?m)^\s*0?\s*\d{1,2}\s*\.\s*\d+").unwrap();
+    let marks_re = regex::Regex::new(r"(?i)\[\s*\d+\s*marks?").unwrap();
 
     for (page, text) in page_texts.iter().enumerate() {
         let mut has_footer = false;
@@ -132,15 +139,25 @@ pub fn scan_text_layer(page_texts: &[String]) -> TextScan {
             }
         }
 
+        // Does this page look like a real question despite containing generic
+        // instruction keywords? (critical for AQA where "Answer all questions"
+        // appears on Q1 page).
+        let has_question_signal = aqa_figure_re.is_match(text)
+            || aqa_table_re.is_match(text)
+            || aqa_main_re.is_match(text)
+            || aqa_sub_re.is_match(text)
+            || marks_re.is_match(text);
+
         // Classify page reliability
         if blank_re.is_match(text) || text.trim().is_empty() {
             page_reliability[page] = PageReliability::NonQuestion;
-        } else if instr_re.is_match(text) || ref_re.is_match(text) {
-            page_reliability[page] = PageReliability::NonQuestion;
         } else if has_footer {
             page_reliability[page] = PageReliability::Reliable;
-        } else if text.len() > 100 {
-            // Has substantial text but no footer - ambiguous
+        } else if (instr_re.is_match(text) || ref_re.is_match(text)) && !has_question_signal {
+            // Instruction / reference pages that are NOT also question pages
+            page_reliability[page] = PageReliability::NonQuestion;
+        } else if text.len() > 100 || has_question_signal {
+            // Has substantial text but no footer - ambiguous (needs vision)
             page_reliability[page] = PageReliability::Ambiguous;
         } else {
             page_reliability[page] = PageReliability::NonQuestion;

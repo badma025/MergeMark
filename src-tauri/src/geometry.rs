@@ -337,13 +337,16 @@ pub fn looks_like_answer_grid(gray: &image::GrayImage) -> bool {
     // Cheap early exit: an EMPTY grid is mostly white. Figures with real
     // content (charts, photos, shaded Gantt bars) blow straight past this —
     // one O(n) pass instead of the full structural scan below.
+    // AQA trace tables can be pre-filled (first row completed) pushing ink
+    // to ~20% — raise from 15% to 25% so they still enter the structural
+    // check instead of being early-rejected as "not a grid" and saved as PNG.
     let mut ink = 0u64;
     for px in gray.pixels() {
         if px[0] < INK {
             ink += 1;
         }
     }
-    if ink as f64 > 0.15 * (w as f64) * (h as f64) {
+    if ink as f64 > 0.25 * (w as f64) * (h as f64) {
         return false;
     }
 

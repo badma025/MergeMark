@@ -74,7 +74,15 @@ pub fn value_to_question_number(v: &serde_json::Value) -> Option<u32> {
                 // "03.1" or "1,2" are sub-part styles — refuse to guess.
                 None
             } else {
-                t.parse::<u64>().ok()
+                // AQA prints "0 1" / "0 2" (space between 0 and number).
+                // Strip all whitespace so "0 1" → "01" → 1, while still
+                // rejecting non-numeric strings like "Question 1".
+                let compact: String = t.chars().filter(|c| !c.is_whitespace()).collect();
+                if compact.is_empty() {
+                    None
+                } else {
+                    compact.parse::<u64>().ok()
+                }
             }
         }
         _ => None,
@@ -100,6 +108,12 @@ pub fn has_terminal_ending(content: &str) -> bool {
     }
     // Ends with display math close, code fence, or terminal punctuation?
     if t.ends_with("$$") || t.ends_with("```") || t.ends_with('$') || t.ends_with('`') {
+        return true;
+    }
+    // Markdown tables (AQA trace tables) end with '|' — treat as terminal.
+    // Without this, questions ending in a trace table get flagged as truncated
+    // and quarantined after 3 repair attempts (the June 2024 CS regression).
+    if t.ends_with('|') {
         return true;
     }
     matches!(
@@ -616,6 +630,17 @@ mod tests {
     }
 
     #[test]
+    fn question_number_aqa_spaced() {
+        // AQA prints "0 1", "0 2" — space between 0 and number.
+        assert_eq!(value_to_question_number(&serde_json::json!("0 1")), Some(1));
+        assert_eq!(value_to_question_number(&serde_json::json!("0 5")), Some(5));
+        assert_eq!(value_to_question_number(&serde_json::json!(" 0 10 ")), Some(10));
+        assert_eq!(value_to_question_number(&serde_json::json!("01")), Some(1));
+        // Still reject decimals
+        assert_eq!(value_to_question_number(&serde_json::json!("0 1.1")), None);
+    }
+
+    #[test]
     fn marks_value_tolerant() {
         assert_eq!(value_to_marks(&serde_json::json!(4)), Some(4));
         assert_eq!(value_to_marks(&serde_json::json!("[5 marks]")), Some(5));
@@ -630,6 +655,15 @@ mod tests {
         assert!(has_terminal_ending("$$ y = mx + c $$"));
         assert!(!has_terminal_ending("Evaluate the integ"));
         assert!(!has_terminal_ending(""));
+    }
+
+    #[test]
+    fn terminal_endings_markdown_table() {
+        // AQA trace tables end with '|' — must be treated as terminal
+        // otherwise questions ending in a trace table quarantine (June 2024 CS regression).
+        assert!(has_terminal_ending("| A | B |\n| --- | --- |\n| 1 | 2 |"));
+        assert!(has_terminal_ending("| Temp | Done | Pos |"));
+        assert!(has_terminal_ending("Some table:\n| a | b |"));
     }
 
     #[test]
