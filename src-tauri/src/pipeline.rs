@@ -899,9 +899,11 @@ async fn extract_span<C: LlmClient>(
             // A trace/answer-grid instruction overrides a Figure reference:
             // the referenced figure may be elsewhere, while this page's grid
             // must remain Markdown and must never trigger figure repairs.
-            if cons_errors.len() > 0 && page_items.items.iter().all(|item| {
-                validate::is_answer_grid_request(item.content.as_deref().unwrap_or(""))
-            }) {
+            if cons_errors.len() > 0
+                && page_items.items.iter().all(|item| {
+                    validate::is_answer_grid_request(item.content.as_deref().unwrap_or(""))
+                })
+            {
                 cons_errors.clear();
             }
             if !cons_errors.is_empty() {
@@ -922,10 +924,12 @@ async fn extract_span<C: LlmClient>(
             if !box_issues.is_empty() {
                 let answer_grid_only = page_items.items.iter().all(|item| {
                     validate::is_answer_grid_request(item.content.as_deref().unwrap_or(""))
-                }) && box_issues.iter().all(|e| e.contains("EMPTY RULED ANSWER GRID"));
+                }) && box_issues
+                    .iter()
+                    .all(|e| e.contains("EMPTY RULED ANSWER GRID"));
                 if answer_grid_only {
                     let mut items = page_items.items;
-                    prune_bad_diagram_boxes(&mut items, &bad, report);
+                    prune_bad_diagram_boxes(&mut items, &bad, &mut report);
                     accepted = Some((items, salvaged));
                     break;
                 }
