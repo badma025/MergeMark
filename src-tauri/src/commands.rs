@@ -5,7 +5,7 @@ use crate::pipeline::{
 use crate::AppState;
 use serde::{Deserialize, Serialize};
 use tauri::{Emitter, Manager, State};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 // ── Shared data model ─────────────────────────────────────────────────────────
 
@@ -720,6 +720,7 @@ pub async fn parse_pdf_vision(
             .map(|(i,)| i)
             .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
 
+        let db_start = Instant::now();
         sqlx::query(
             r#"
             INSERT INTO questions (id, subject, subtopic, topics, marks, content, math_snippet, is_code, paper_name, question_number, module)
@@ -747,6 +748,7 @@ pub async fn parse_pdf_vision(
         .execute(&*pool)
         .await
         .map_err(|e| format!("DB upsert failed for question {}: {}", q.question_number, e))?;
+        report.record_timing("database", "upsert_question", None, Some(q.question_number), db_start.elapsed().as_millis() as u64);
 
         final_questions.push(Question {
             id,

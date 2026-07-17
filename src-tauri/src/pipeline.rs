@@ -27,6 +27,7 @@ use crate::llm::{self, LlmClient};
 use crate::validate;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Instant;
 
 // ══════════════════════════════════════════════════════════════════════════
 // Public types
@@ -194,6 +195,18 @@ pub struct SkippedPage {
 
 #[derive(Debug, Clone, Default, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TimingEntry {
+    pub stage: String,
+    pub operation: String,
+    pub page: Option<usize>,
+    pub question_number: Option<u32>,
+    pub milliseconds: u64,
+}
+
+#[derive(Debug, Clone, Default, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ImportReport {
     pub paper_name: String,
     pub kind: String,
@@ -213,6 +226,7 @@ pub struct ImportReport {
     pub diagrams_saved: usize,
     pub diagrams_deduped: usize,
     pub anomalies: Vec<String>,
+    pub timings: Vec<TimingEntry>,
 }
 
 /// Concurrent vision calls in flight at once. Validation is per unit of work
@@ -236,6 +250,18 @@ impl ImportReport {
         self.quarantined.extend(o.quarantined);
         self.skipped_pages.extend(o.skipped_pages);
         self.anomalies.extend(o.anomalies);
+        self.timings.extend(o.timings);
+    }
+    
+    /// Record a timing entry.
+    pub fn record_timing(&mut self, stage: &str, operation: &str, page: Option<usize>, question_number: Option<u32>, milliseconds: u64) {
+        self.timings.push(TimingEntry {
+            stage: stage.to_string(),
+            operation: operation.to_string(),
+            page,
+            question_number,
+            milliseconds,
+        });
     }
 }
 
@@ -442,9 +468,13 @@ pub async fn run_question_pipeline<C: LlmClient, P: Progress>(
         ..Default::default()
     };
 
-    // Prefer the free PDF text layer: it avoids one vision request per page.
+// Prefer the free PDF text layer: it avoids one vision request per page.
     let page_texts: Vec<String> = pages.iter().map(|p| p.text.clone()).collect();
+    
+    // Time the text-layer document map building
+    let text_map_start = Instant::now();
     let text_map_available = doc_map::build_map_from_text(&page_texts, pages.len()).is_some();
+    report.record_timing("document_map", "text_layer_scan", None, None, text_map_start.elapsed().as_millis() as u64);
 
     // ── 1. Structure pass ───────────────────────────────────────────────────
     let mut structures: Vec<ValidatedPageStructure> = Vec::with_capacity(pages.len());
@@ -468,6 +498,7 @@ pub async fn run_question_pipeline<C: LlmClient, P: Progress>(
                 base + batch.len(),
                 pages.len()
             ));
+            let struct_batch_start = Instant::now();
             let futs: Vec<_> = batch
                 .iter()
                 .map(|page| {
@@ -488,6 +519,7 @@ pub async fn run_question_pipeline<C: LlmClient, P: Progress>(
                 })
                 .collect();
             let results = futures_util::future::join_all(futs).await;
+            report.record_timing("structure", "api_call_batch", Some(base + 1), None, struct_batch_start.elapsed().as_millis() as u64);
             for (k, res) in results.into_iter().enumerate() {
                 let i = base + k;
                 match res {
@@ -532,50 +564,30 @@ pub async fn run_question_pipeline<C: LlmClient, P: Progress>(
 
     // ── 2. Document map ─────────────────────────────────────────────────────
     let page_texts: Vec<String> = pages.iter().map(|p| p.text.clone()).collect();
-    let text_map = doc_map::build_map_from_text(&page_texts, pages.len());
-    let struct_map = doc_map::build_map_from_structure(&structures, pages.len());
-
-    let mut map: DocumentMap = match (text_map, struct_map) {
-        (Some(mut t), Some(s)) => {
-            // Text-layer footers win; cross-check and note disagreements.
-            let t_nums: Vec<u32> = t.spans.iter().map(|x| x.number).collect();
-            let s_nums: Vec<u32> = s.spans.iter().map(|x| x.number).collect();
-            if t_nums != s_nums {
-                report.anomalies.push(format!(
-                    "structure disagreement: text-layer questions {:?} vs vision {:?} — trusting text layer",
-                    t_nums, s_nums
-                ));
-            }
-            if t.paper_total_marks.is_none() {
-                t.paper_total_marks = s.paper_total_marks;
-            }
-            t.non_question_pages = s.non_question_pages;
-            t
-        }
-        (Some(t), None) => {
-            let mut t = t;
-            t.non_question_pages = structures
-                .iter()
-                .filter(|s| !s.role.is_question_content())
-                .map(|s| s.page)
-                .collect();
-            t
-        }
-        (None, Some(s)) => {
-            report
-                .anomalies
-                .push("text layer unusable; map built from vision structure pass".to_string());
-            s
-        }
-        (None, None) => {
-            report.anomalies.push(
-                "no reliable document structure — falling back to per-page extraction".to_string(),
-            );
-            DocumentMap::default()
-        }
-    };
-
-    // Mark footers seen in the structure pass backfill text-scan gaps.
+    let doc_map_start = Instant::now();
+    
+    // Use hybrid map building: reliable text pages + vision for ambiguous pages
+    let map = doc_map::build_hybrid_map(&page_texts, &structures, pages.len());
+    
+    // Record which pages used vision fallback
+    report.timings.push(TimingEntry {
+        stage: "document_map".to_string(),
+        operation: "build_hybrid_map".to_string(),
+        page: None,
+        question_number: None,
+        milliseconds: doc_map_start.elapsed().as_millis() as u64,
+    });
+    
+    // Report vision fallback pages
+    if !map.vision_fallback_pages.is_empty() {
+        report.anomalies.push(format!(
+            "vision structure fallback used for {} pages: {:?}",
+            map.vision_fallback_pages.len(),
+            map.vision_fallback_pages.iter().map(|p| p + 1).collect::<Vec<_>>()
+        ));
+    }
+    
+    // Backfill footers from structure pass
     if !map.spans.is_empty() {
         for s in &structures {
             if let Some((q, m)) = s.footer {
@@ -612,11 +624,13 @@ pub async fn run_question_pipeline<C: LlmClient, P: Progress>(
                 batch[batch.len() - 1] + 1,
                 pages.len()
             ));
+            let extract_batch_start = Instant::now();
             let futs: Vec<_> = batch
                 .iter()
                 .map(|&i| extract_fallback_page(client, config, &pages[i], i, next_allowed))
                 .collect();
             let results = futures_util::future::join_all(futs).await;
+            report.record_timing("extraction", "fallback_batch", Some(batch[0] + 1), None, extract_batch_start.elapsed().as_millis() as u64);
             for (&i, (mut outcome, local)) in batch.iter().zip(results) {
                 report.absorb(local);
                 report.pages_processed += 1;
@@ -702,11 +716,13 @@ pub async fn run_question_pipeline<C: LlmClient, P: Progress>(
                 last,
                 total
             ));
+            let extract_batch_start = Instant::now();
             let futs: Vec<_> = batch
                 .iter()
                 .map(|job| extract_span(client, config, job.1, &job.2))
                 .collect();
             let results = futures_util::future::join_all(futs).await;
+            report.record_timing("extraction", "span_batch", Some(batch[0].1.number as usize), None, extract_batch_start.elapsed().as_millis() as u64);
             for (job, (opt, local)) in batch.iter().zip(results) {
                 let span: &QuestionSpan = job.1;
                 let sp = &job.2;
@@ -784,7 +800,7 @@ async fn extract_span<C: LlmClient>(
     // for near-duplicate reuse across chunk boundaries.
     let mut saved_diagrams: Vec<([u8; 64], String)> = Vec::new();
 
-    for chunk in chunks {
+        for chunk in chunks {
         let images: Vec<String> = chunk
             .iter()
             .map(|(_, p)| p.b64.clone())
@@ -836,6 +852,7 @@ async fn extract_span<C: LlmClient>(
                 config.max_output_tokens,
             );
 
+            let api_start = Instant::now();
             let resp = match client.chat(&body).await {
                 Ok(r) => r,
                 Err(e) => {
@@ -846,6 +863,7 @@ async fn extract_span<C: LlmClient>(
                     continue;
                 }
             };
+            report.record_timing("extraction", "api_call", Some(span_pages[0].0 + 1), Some(span.number), api_start.elapsed().as_millis() as u64);
             let content = match llm::message_content(&resp) {
                 Ok(c) => c,
                 Err(e) => {
@@ -920,7 +938,9 @@ async fn extract_span<C: LlmClient>(
             }
 
             // ── Diagram boxes: Rust audits every crop the AI proposed ─────
+            let audit_start = Instant::now();
             let (bad, box_issues) = audit_diagram_boxes(chunk, &page_items.items);
+            report.record_timing("diagram_processing", "crop_audit", Some(span_pages[0].0 + 1), Some(span.number), audit_start.elapsed().as_millis() as u64);
             if !box_issues.is_empty() {
                 let answer_grid_only = page_items.items.iter().all(|item| {
                     validate::is_answer_grid_request(item.content.as_deref().unwrap_or(""))
@@ -967,6 +987,7 @@ async fn extract_span<C: LlmClient>(
             // Cropping: sanitizer + blank guard, fully deterministic.
             if let Some(bboxes) = &item.diagram_bboxes {
                 let indexes = item.bbox_page_indexes.clone().unwrap_or_default();
+                let diagram_save_start = Instant::now();
                 for (bi, bbox) in bboxes.iter().enumerate() {
                     let page_idx = indexes
                         .get(bi)
@@ -983,6 +1004,7 @@ async fn extract_span<C: LlmClient>(
                         }
                     }
                 }
+                report.record_timing("diagram_processing", "save_diagrams", Some(span_pages[0].0 + 1), Some(span.number), diagram_save_start.elapsed().as_millis() as u64);
             }
             item_content = item_content.replace("[DIAGRAM_PLACEHOLDER]", "");
 

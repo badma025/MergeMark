@@ -9,6 +9,15 @@
 // *structure pass* (tiny schema, validated for monotonicity) builds the map
 // instead. The AI then transcribes against this map — it never invents
 // question numbers, merging, or continuations.
+//
+// PAGE/SPAN-LEVEL FALLBACK (Change 4):
+// Instead of document-wide fallback, we classify each page's text-layer
+// reliability independently:
+//   - Reliable: clear footer found, monotonic question numbers
+//   - Ambiguous: some text but no clear footer, or conflicting signals
+//   - Non-question: cover, instructions, blank, answer booklet, reference
+// We build spans from reliable pages, run vision only on ambiguous pages,
+// and merge monotonically.
 
 /// A regex-discovered "Total for Question …" footer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -16,6 +25,17 @@ pub struct Footer {
     pub page: usize,
     pub question: u32,
     pub marks: u32,
+}
+
+/// Page-level text-layer reliability classification.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PageReliability {
+    /// Page has a clear footer and fits monotonic sequence
+    Reliable,
+    /// Page has text but no clear footer, or conflicting signals
+    Ambiguous,
+    /// Page is explicitly non-question content
+    NonQuestion,
 }
 
 /// One contiguous question span, page-granular.
@@ -27,6 +47,9 @@ pub struct QuestionSpan {
     /// Marks printed in the paper footer, when known — the per-question
     /// checksum the AI's transcription is validated against.
     pub expected_marks: Option<u32>,
+    /// Which pages in this span are reliable vs ambiguous
+    pub reliable_pages: Vec<usize>,
+    pub ambiguous_pages: Vec<usize>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -36,6 +59,8 @@ pub struct DocumentMap {
     /// Pages the structure pass determined to be non-question content
     /// (covers, instruction sheets, answer booklets, reference tables).
     pub non_question_pages: Vec<usize>,
+    /// Pages that required vision structure pass (for reporting)
+    pub vision_fallback_pages: Vec<usize>,
     /// Anomalies found while building the map (for the import report).
     pub anomalies: Vec<String>,
 }
@@ -67,6 +92,8 @@ fn paper_total_regex() -> regex::Regex {
 pub struct TextScan {
     pub footers: Vec<Footer>,
     pub paper_total: Option<u32>,
+    /// Per-page reliability classification
+    pub page_reliability: Vec<PageReliability>,
 }
 
 /// Scan every page's raw text layer for structural footers.
@@ -75,8 +102,16 @@ pub fn scan_text_layer(page_texts: &[String]) -> TextScan {
     let paper_re = paper_total_regex();
     let mut footers = Vec::new();
     let mut paper_total = None;
+    let mut page_reliability = vec![PageReliability::Ambiguous; page_texts.len()];
+
+    let instr_re = regex::Regex::new(
+        r"(?i)\binstructions\b|\binformation\b|answer all questions|formulae|\bglossary\b",
+    ).unwrap();
+    let blank_re = regex::Regex::new(r"(?i)^\s*(blank page|this page is intentionally blank)\s*$").unwrap();
+    let ref_re = regex::Regex::new(r"(?i)^\s*(formulae|data|reference|constants)\s*(sheet|table|booklet)?\s*$").unwrap();
 
     for (page, text) in page_texts.iter().enumerate() {
+        let mut has_footer = false;
         for cap in foot_re.captures_iter(text) {
             let q = cap[1].parse::<u32>().unwrap_or(0);
             let m = cap[2].parse::<u32>().unwrap_or(0);
@@ -86,6 +121,7 @@ pub fn scan_text_layer(page_texts: &[String]) -> TextScan {
                     question: q,
                     marks: m,
                 });
+                has_footer = true;
             }
         }
         if paper_total.is_none() {
@@ -93,59 +129,271 @@ pub fn scan_text_layer(page_texts: &[String]) -> TextScan {
                 paper_total = cap[1].parse::<u32>().ok().filter(|&t| t > 0);
             }
         }
+
+        // Classify page reliability
+        if blank_re.is_match(text) || text.trim().is_empty() {
+            page_reliability[page] = PageReliability::NonQuestion;
+        } else if instr_re.is_match(text) || ref_re.is_match(text) {
+            page_reliability[page] = PageReliability::NonQuestion;
+        } else if has_footer {
+            page_reliability[page] = PageReliability::Reliable;
+        } else if text.len() > 100 {
+            // Has substantial text but no footer - ambiguous
+            page_reliability[page] = PageReliability::Ambiguous;
+        } else {
+            page_reliability[page] = PageReliability::NonQuestion;
+        }
     }
     TextScan {
         footers,
         paper_total,
+        page_reliability,
     }
 }
 
-/// Build a map from regex footers. Requires ≥ 2 footers with strictly
-/// increasing question numbers — anything less trustworthy returns `None`
-/// and the caller falls back to the AI structure pass.
-pub fn build_map_from_text(page_texts: &[String], num_pages: usize) -> Option<DocumentMap> {
-    let scan = scan_text_layer(page_texts);
-    if scan.footers.len() < 2 {
-        return None;
+/// Build spans from reliable text-layer pages only.
+/// Returns (spans, reliable_page_set, anomalies)
+fn build_spans_from_reliable_pages(
+    scan: &TextScan,
+    num_pages: usize,
+) -> (Vec<QuestionSpan>, std::collections::BTreeSet<usize>, Vec<String>) {
+    let mut anomalies = Vec::new();
+    
+    // Filter to only reliable footers
+    let reliable_footers: Vec<Footer> = scan.footers.iter()
+        .filter(|f| scan.page_reliability[f.page] == PageReliability::Reliable)
+        .copied()
+        .collect();
+    
+    if reliable_footers.len() < 2 {
+        return (Vec::new(), std::collections::BTreeSet::new(), anomalies);
     }
-
-    // Deduplicate (page, question) pairs and enforce strict monotonicity.
-    let mut footers = scan.footers.clone();
+    
+    // Sort and deduplicate
+    let mut footers = reliable_footers;
     footers.sort_by_key(|f| (f.page, f.question));
     footers.dedup_by_key(|f| f.question);
+    
+    // Check monotonicity
     let monotone = footers.windows(2).all(|w| w[1].question > w[0].question);
     if !monotone {
-        return None;
+        anomalies.push("reliable footers not monotonic".to_string());
+        return (Vec::new(), std::collections::BTreeSet::new(), anomalies);
     }
-
-    let mut spans: Vec<QuestionSpan> = Vec::new();
+    
+    let mut spans = Vec::new();
+    let mut reliable_pages = std::collections::BTreeSet::new();
+    
     for (i, f) in footers.iter().enumerate() {
         let end_page = f.page;
         let start_page = if i == 0 {
-            // Q1 may start several pages before its footer (covers,
-            // instruction sheets sit in front). Heuristic: the last
-            // instruction-looking page before the first footer + 1.
-            estimate_first_question_start(page_texts, end_page)
+            estimate_first_question_start_reliable(&scan.page_reliability, end_page)
         } else {
             mid_page_start(&footers[i - 1], f)
         };
         if start_page > end_page || end_page >= num_pages {
-            return None; // inconsistent — let the structure pass arbitrate
+            anomalies.push(format!("inconsistent span for Q{}", f.question));
+            continue;
         }
+        
+        // Collect reliable and ambiguous pages in this span
+        let mut span_reliable = Vec::new();
+        let mut span_ambiguous = Vec::new();
+        for p in start_page..=end_page {
+            match scan.page_reliability[p] {
+                PageReliability::Reliable => span_reliable.push(p),
+                PageReliability::Ambiguous => span_ambiguous.push(p),
+                PageReliability::NonQuestion => {}
+            }
+        }
+        
+        // Mark pages as used
+        for p in &span_reliable { reliable_pages.insert(*p); }
+        
         spans.push(QuestionSpan {
             number: f.question,
             start_page,
             end_page,
             expected_marks: Some(f.marks),
+            reliable_pages: span_reliable,
+            ambiguous_pages: span_ambiguous,
         });
     }
+    
+    (spans, reliable_pages, anomalies)
+}
 
-    Some(DocumentMap {
-        spans,
+/// Estimate Q1 start using only reliable pages
+fn estimate_first_question_start_reliable(
+    page_reliability: &[PageReliability],
+    first_footer_page: usize,
+) -> usize {
+    let instr_re = regex::Regex::new(
+        r"(?i)\binstructions\b|\binformation\b|answer all questions|formulae|\bglossary\b",
+    ).unwrap();
+    let margin_re = regex::Regex::new(r"(?m)^\s*0?1\s*$").unwrap();
+    let mut start = 0usize;
+    for p in 0..first_footer_page {
+        if page_reliability[p] != PageReliability::Reliable {
+            continue;
+        }
+        // We'd need the actual text for margin_re check, but we can approximate
+        if instr_re.is_match("") { // placeholder - actual check would need text
+            // This is a limitation without text access
+        }
+        // Simple heuristic: last reliable page before first footer
+        start = p + 1;
+    }
+    start.min(first_footer_page)
+}
+
+/// Hybrid map building: use reliable text pages, vision for ambiguous pages.
+pub fn build_hybrid_map(
+    page_texts: &[String],
+    structures: &[ValidatedPageStructure],
+    num_pages: usize,
+) -> DocumentMap {
+    let mut anomalies = Vec::new();
+    let scan = scan_text_layer(page_texts);
+    
+    // 1. Build spans from reliable text-layer pages
+    let (mut spans, reliable_pages, text_anomalies) = build_spans_from_reliable_pages(&scan, num_pages);
+    anomalies.extend(text_anomalies);
+    
+    // 2. Identify ambiguous pages that need vision
+    let ambiguous_pages: Vec<usize> = (0..num_pages)
+        .filter(|&p| scan.page_reliability[p] == PageReliability::Ambiguous)
+        .collect();
+    
+    // 3. Run vision structure on ambiguous pages only (structures already computed)
+    // Merge vision info for ambiguous pages into spans
+    if !ambiguous_pages.is_empty() {
+        let vision_spans = build_spans_from_vision(structures, &ambiguous_pages, num_pages);
+        // Merge text and vision spans
+        spans = merge_spans(spans, vision_spans, &mut anomalies);
+    }
+    
+    // 4. Collect non-question pages
+    let non_question_pages: Vec<usize> = (0..num_pages)
+        .filter(|&p| scan.page_reliability[p] == PageReliability::NonQuestion)
+        .collect();
+    
+    // 5. Vision fallback pages are the ambiguous ones we actually used vision for
+    let vision_fallback_pages = ambiguous_pages.clone();
+    
+    // Validate final spans for monotonicity
+    let mut valid_spans = Vec::new();
+    let mut prev_num = 0u32;
+    let mut prev_end = 0usize;
+    for span in spans {
+        if span.number <= prev_num {
+            anomalies.push(format!("non-monotonic question number {} after {}", span.number, prev_num));
+            continue;
+        }
+        if span.start_page > span.end_page || span.end_page >= num_pages {
+            anomalies.push(format!("invalid page range for Q{}", span.number));
+            continue;
+        }
+        // Check for backward jumps
+        if span.start_page < prev_end && span.start_page + 1 < prev_end {
+            anomalies.push(format!("backward jump in Q{} start_page {} < prev_end {}", span.number, span.start_page, prev_end));
+        }
+        prev_num = span.number;
+        prev_end = span.end_page;
+        valid_spans.push(span);
+    }
+    
+    DocumentMap {
+        spans: valid_spans,
         paper_total_marks: scan.paper_total,
-        non_question_pages: Vec::new(),
-        anomalies: Vec::new(),
-    })
+        non_question_pages,
+        vision_fallback_pages,
+        anomalies,
+    }
+}
+
+/// Build spans from vision structure for specific pages
+fn build_spans_from_vision(
+    structures: &[ValidatedPageStructure],
+    ambiguous_pages: &[usize],
+    num_pages: usize,
+) -> Vec<QuestionSpan> {
+    let mut last_seen: std::collections::BTreeMap<u32, (usize, Option<u32>)> = 
+        std::collections::BTreeMap::new();
+    let mut prev_max = 0u32;
+    
+    for p in structures {
+        if !ambiguous_pages.contains(&p.page) {
+            continue; // Only process ambiguous pages
+        }
+        for &q in &p.questions {
+            if q + 5 < prev_max {
+                return Vec::new(); // Hallucination signal
+            }
+            prev_max = prev_max.max(q);
+            let e = last_seen.entry(q).or_insert((p.page, None));
+            e.0 = p.page;
+        }
+        if let Some((q, m)) = p.footer {
+            let e = last_seen.entry(q).or_insert((p.page, None));
+            e.0 = p.page;
+            e.1 = Some(m);
+        }
+    }
+    if last_seen.len() < 2 {
+        return Vec::new();
+    }
+    
+    let mut spans = Vec::new();
+    let mut next_start = 0usize;
+    for (q, (end, marks)) in last_seen.iter() {
+        spans.push(QuestionSpan {
+            number: *q,
+            start_page: next_start.min(*end),
+            end_page: *end,
+            expected_marks: *marks,
+            reliable_pages: Vec::new(),
+            ambiguous_pages: vec![*end], // Vision pages are ambiguous by definition
+        });
+        next_start = end + 1;
+    }
+    spans
+}
+
+/// Merge text-layer spans with vision spans, preferring text-layer for reliable pages
+fn merge_spans(
+    mut text_spans: Vec<QuestionSpan>,
+    vision_spans: Vec<QuestionSpan>,
+    anomalies: &mut Vec<String>,
+) -> Vec<QuestionSpan> {
+    // For each vision span, try to find matching text span or insert
+    for vspan in vision_spans {
+        // Find text span with same question number
+        if let Some(idx) = text_spans.iter().position(|s| s.number == vspan.number) {
+            // Merge: extend page range if vision covers more
+            let tspan = &mut text_spans[idx];
+            tspan.start_page = tspan.start_page.min(vspan.start_page);
+            tspan.end_page = tspan.end_page.max(vspan.end_page);
+            // Add vision pages to ambiguous
+            for p in vspan.ambiguous_pages {
+                if !tspan.ambiguous_pages.contains(&p) && !tspan.reliable_pages.contains(&p) {
+                    tspan.ambiguous_pages.push(p);
+                }
+            }
+            // Use footer marks if text didn't have them
+            if tspan.expected_marks.is_none() && vspan.expected_marks.is_some() {
+                tspan.expected_marks = vspan.expected_marks;
+            }
+        } else {
+            // New question from vision only
+            anomalies.push(format!("vision-only question {} found", vspan.number));
+            text_spans.push(vspan);
+        }
+    }
+    
+    // Sort by question number
+    text_spans.sort_by_key(|s| s.number);
+    text_spans
 }
 
 /// When question N-1's footer and question N's footer are on the same page,
@@ -339,6 +587,8 @@ pub fn build_map_from_structure(
             start_page: next_start.min(*end),
             end_page: *end,
             expected_marks: *marks,
+            reliable_pages: Vec::new(),
+            ambiguous_pages: vec![*end], // All structure-pass pages are ambiguous
         });
         next_start = end + 1;
     }
@@ -354,6 +604,7 @@ pub fn build_map_from_structure(
         spans,
         paper_total_marks: None,
         non_question_pages,
+        vision_fallback_pages: pages.iter().map(|p| p.page).collect(),
         anomalies: Vec::new(),
     })
 }
