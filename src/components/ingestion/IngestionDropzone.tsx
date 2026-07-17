@@ -48,6 +48,13 @@ export function IngestionDropzone({ onSuccess }: IngestionDropzoneProps) {
   // silently, so anything noteworthy becomes a toast.
   useEffect(() => {
     interface Quarantine { scope: string; page?: number; questionNumber?: number; reason: string }
+    interface TimingEntry {
+      stage: string;
+      operation: string;
+      page?: number;
+      questionNumber?: number;
+      milliseconds: number;
+    }
     interface ImportReport {
       paperName: string;
       kind: string;
@@ -59,20 +66,51 @@ export function IngestionDropzone({ onSuccess }: IngestionDropzoneProps) {
       repairs: number;
       salvageEvents: number;
       cropRejections: number;
+      diagramsSaved: number;
+      diagramsDeduped: number;
       anomalies: string[];
+      timings: TimingEntry[];
     }
+    
+    // Helper to build human-readable timing summary
+    function buildTimingSummary(timings: TimingEntry[]): string[] {
+      const byStage = new Map<string, Map<string, number>>();
+      for (const t of timings) {
+        if (!byStage.has(t.stage)) byStage.set(t.stage, new Map());
+        const ops = byStage.get(t.stage)!;
+        ops.set(t.operation, (ops.get(t.operation) || 0) + t.milliseconds);
+      }
+      const summary: string[] = [];
+      for (const [stage, ops] of byStage) {
+        const parts: string[] = [];
+        for (const [op, ms] of ops) {
+          parts.push(`${op}: ${(ms / 1000).toFixed(1)}s`);
+        }
+        summary.push(`${stage} [${parts.join(", ")}]`);
+      }
+      return summary;
+    }
+
     const unlisten = listen('import-report', (event: any) => {
       const r = event.payload as ImportReport;
       const warnings: number = r.quarantined.length;
       const checksumFailed = r.marksChecksumOk === false;
+      
+      // Build timing summary
+      const timingSummary = buildTimingSummary(r.timings);
+      const totalMs = r.timings.reduce((sum, t) => sum + t.milliseconds, 0);
+      const timingStr = timingSummary.length > 0 
+        ? `\n\nTiming: ${timingSummary.join(", ")} (total: ${(totalMs / 1000).toFixed(1)}s)`
+        : "";
+      
       if (warnings === 0 && !checksumFailed) {
         if (r.repairs > 0 || r.salvageEvents > 0 || r.cropRejections > 0) {
           toast.success("Import complete", {
-            description: `${r.paperName}: all checks passed (${r.repairs} auto-repairs, ${r.salvageEvents} truncations salvaged, ${r.cropRejections} bad crops rejected).`,
-            duration: 6000,
+            description: `${r.paperName}: all checks passed (${r.repairs} auto-repairs, ${r.salvageEvents} truncations salvaged, ${r.cropRejections} bad crops rejected).${timingStr}`,
+            duration: 8000,
           });
         }
-        return; // perfectly clean run — the success toast below covers it
+        return;
       }
       const parts: string[] = [];
       if (r.questionsExpected > 0) {
@@ -87,8 +125,8 @@ export function IngestionDropzone({ onSuccess }: IngestionDropzoneProps) {
         parts.push(`${warnings} item${warnings > 1 ? "s" : ""} quarantined (${where})`);
       }
       toast.warning("Import finished with warnings", {
-        description: `${r.paperName}: ${parts.join(" · ")}. Review flagged cards before building worksheets.`,
-        duration: 12000,
+        description: `${r.paperName}: ${parts.join(" · ")}. Review flagged cards before building worksheets.${timingStr}`,
+        duration: 15000,
       });
     });
     return () => { unlisten.then(f => f()); };

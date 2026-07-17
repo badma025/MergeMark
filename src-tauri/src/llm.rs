@@ -36,6 +36,7 @@ impl std::fmt::Display for LlmError {
 pub struct LlmConfig {
     pub base_url: String,
     pub api_key: String,
+    #[allow(dead_code)]
     pub model: String,
     pub timeout: std::time::Duration,
 }
@@ -196,6 +197,7 @@ impl MockLlm {
             observed_bodies: std::sync::Mutex::new(Vec::new()),
         }
     }
+    #[allow(dead_code)]
     pub fn push(&self, r: Result<serde_json::Value, LlmError>) {
         self.scripts.lock().unwrap().push_back(r);
     }

@@ -312,6 +312,250 @@ pub fn diagram_consistency_errors(content: &str, bbox_count: usize) -> Vec<Strin
     errors
 }
 
+/// Extract figure numbers from "Figure N" references.
+#[allow(dead_code)]
+pub fn figure_reference_numbers(content: &str) -> Vec<u32> {
+    let re_fig = re(r"(?i)\bfig(?:ure)?\.?\s*(\d+)");
+    re_fig.captures_iter(content)
+        .filter_map(|c| c[1].parse::<u32>().ok())
+        .collect()
+}
+
+/// Semantic figure kind validation: genuine figures have visual structure
+/// beyond plain text. Returns true if the content suggests a legitimate
+/// figure type (graph, schema, flowchart, circuit, multi-panel).
+#[allow(dead_code)]
+pub fn looks_like_semantic_figure(content: &str) -> bool {
+    let s = content.to_ascii_lowercase();
+    // Positive signals: explicit figure kinds mentioned
+    let figure_kinds = [
+        "graph", "schema", "flowchart", "circuit", "diagram", "network",
+        "tree", "chart", "plot", "circuit", "logic gate", "state diagram",
+        "entity relationship", "er diagram", "class diagram", "sequence diagram",
+        "activity diagram", "use case", "gantt", "timeline", "multi-panel",
+        "figure 1", "figure 2", "figure 3", "figure 4", "figure 5",
+        "figure 6", "figure 7", "figure 8", "figure 9", "figure 10",
+    ];
+    figure_kinds.iter().any(|k| s.contains(k))
+}
+
+/// False-positive detection for crops that should NOT be diagrams.
+/// Returns a list of rejection reasons if the proposed crop looks like
+/// ordinary prose, code, empty answer area, markdown table, footer, etc.
+#[allow(dead_code)]
+pub fn false_positive_crop_signals(
+    content: &str,
+    bbox: &[f32],
+    _page_width: u32,
+    _page_height: u32,
+    has_caption_ref: bool,
+    has_visual_structure: bool,
+) -> Vec<String> {
+    let mut signals = Vec::new();
+    let s = content.to_ascii_lowercase();
+    
+    // Convert relative bbox to pixel coordinates for position analysis
+    let (x, y, w, h) = if bbox.len() == 4 {
+        (bbox[0], bbox[1], bbox[2], bbox[3])
+    } else {
+        return vec!["invalid bbox".to_string()];
+    };
+    
+    // 1. Position near page margins (footer, header, side margins)
+    const MARGIN_FRAC: f32 = 0.05; // 5% from edge
+    if y < MARGIN_FRAC {
+        signals.push("crop touches top margin".to_string());
+    }
+    if y + h > 1.0 - MARGIN_FRAC {
+        signals.push("crop touches bottom margin (likely footer)".to_string());
+    }
+    if x < MARGIN_FRAC || x + w > 1.0 - MARGIN_FRAC {
+        signals.push("crop touches side margin".to_string());
+    }
+    
+    // 2. Very high text density with no visual structure (prose block)
+    let text_density = estimate_text_density(content);
+    if text_density > 0.8 && !has_visual_structure && !has_caption_ref {
+        signals.push("high text density without visual structure or caption".to_string());
+    }
+    
+    // 3. Code-like patterns (monospaced, indentation, keywords)
+    if looks_like_code_block(content) && !has_caption_ref {
+        signals.push("code block without figure caption/reference".to_string());
+    }
+    
+    // 4. Ordinary markdown-eligible table (not a figure)
+    if looks_like_markdown_table(content) && !has_caption_ref {
+        signals.push("markdown-eligible table without figure caption".to_string());
+    }
+    
+    // 5. Footer/page identifier content
+    if looks_like_footer(content) {
+        signals.push("footer/page identifier content".to_string());
+    }
+    
+    // 6. "Turn over" / continuation areas
+    if s.contains("turn over") || s.contains("continued") {
+        signals.push("\"turn over\" or continuation area".to_string());
+    }
+    
+    // 7. Barcode/QR code regions (small, dense, corner)
+    if w < 0.15 && h < 0.15 && (x < 0.1 || x > 0.9 || y < 0.1 || y > 0.9) {
+        signals.push("small corner region (possible barcode/QR)".to_string());
+    }
+    
+    // 8. Empty response areas (ruled lines for student answers)
+    if is_answer_grid_request(content) {
+        signals.push("student answer grid / trace table instruction".to_string());
+    }
+    
+    // 9. No figure caption/reference AND no non-text visual structure
+    if !has_caption_ref && !has_visual_structure && !looks_like_semantic_figure(content) {
+        signals.push("no caption/reference and no visual structure evidence".to_string());
+    }
+    
+    signals
+}
+
+/// Estimate text density (0.0 to 1.0) based on content characteristics.
+#[allow(dead_code)]
+fn estimate_text_density(content: &str) -> f32 {
+    if content.trim().is_empty() {
+        return 0.0;
+    }
+    let lines: Vec<&str> = content.lines().collect();
+    if lines.is_empty() {
+        return 0.0;
+    }
+    // Heuristic: ratio of non-whitespace chars to total, plus line length factor
+    let non_ws: usize = content.chars().filter(|c| !c.is_whitespace()).count();
+    let total = content.len().max(1);
+    let density = non_ws as f32 / total as f32;
+    // Adjust for average line length (long lines = prose)
+    let avg_line_len: f32 = lines.iter().map(|l| l.len()).sum::<usize>() as f32 / lines.len() as f32;
+    let line_factor = (avg_line_len / 80.0).min(1.0); // 80 chars = full prose line
+    (density * 0.7 + line_factor * 0.3).min(1.0)
+}
+
+/// Detect code-block-like content.
+#[allow(dead_code)]
+fn looks_like_code_block(content: &str) -> bool {
+    let s = content.to_ascii_lowercase();
+    let lines: Vec<&str> = content.lines().collect();
+    if lines.len() < 3 {
+        return false;
+    }
+    // Check for common code patterns
+    let code_keywords = [
+        "function", "procedure", "if ", "else", "while ", "for ", "return ",
+        "var ", "let ", "const ", "int ", "float ", "bool ", "string ",
+        "print", "input", "output", "begin", "end", "then", "do ",
+        "public ", "private ", "class ", "def ", "import ", "from ",
+        "select ", "from ", "where ", "insert ", "update ", "delete ",
+    ];
+    let keyword_hits = code_keywords.iter().filter(|k| s.contains(*k)).count();
+    
+    // Check for indentation patterns
+    let indented_lines = lines.iter().filter(|l| l.starts_with("    ") || l.starts_with("\t")).count();
+    let indent_ratio = indented_lines as f32 / lines.len() as f32;
+    
+    keyword_hits >= 2 || indent_ratio > 0.3
+}
+
+/// Detect markdown-eligible table (regular |---|---| pattern).
+#[allow(dead_code)]
+fn looks_like_markdown_table(content: &str) -> bool {
+    let lines: Vec<&str> = content.lines().collect();
+    if lines.len() < 3 {
+        return false;
+    }
+    let has_pipes = lines.iter().filter(|l| l.contains('|')).count();
+    let has_separator = lines.iter().any(|l| l.contains("---") && l.contains('|'));
+    has_pipes >= 2 && has_separator
+}
+
+/// Detect footer-like content.
+#[allow(dead_code)]
+fn looks_like_footer(content: &str) -> bool {
+    let s = content.to_ascii_lowercase();
+    let footer_patterns = [
+        "page ", "paper ", "total for question", "marks",
+        "copyright", "©", "aqa", "edexcel", "ocr", "wjec",
+        "specimen", "version", "draft", "confidential",
+    ];
+    // Short content with footer patterns
+    content.len() < 200 && footer_patterns.iter().any(|p| s.contains(p))
+}
+
+/// Validate semantic figure metadata against page text/captions.
+/// Returns errors if the proposed figure's caption/kind doesn't match
+/// textual evidence on the page.
+#[allow(dead_code)]
+pub fn validate_figure_metadata(
+    proposed_captions: &[String],
+    proposed_kinds: &[String],
+    page_text: &str,
+    figure_refs: &[u32],
+    _bbox_page_idx: usize,
+    _total_pages: usize,
+) -> Vec<String> {
+    let mut errors = Vec::new();
+    let page_text_lower = page_text.to_ascii_lowercase();
+    
+    // Check each proposed figure
+    for (i, (caption, kind)) in proposed_captions.iter().zip(proposed_kinds.iter()).enumerate() {
+        let caption_lower = caption.to_ascii_lowercase();
+        let kind_lower = kind.to_ascii_lowercase();
+        
+        // 1. Caption should appear in nearby page text
+        let caption_words: Vec<&str> = caption_lower.split_whitespace().collect();
+        let meaningful_words: Vec<&str> = caption_words.iter()
+            .filter(|w| w.len() > 3 && !["figure", "fig", "the", "and", "shows", "showing"].contains(w))
+            .copied()
+            .collect();
+        
+        let caption_match = meaningful_words.iter().any(|w| page_text_lower.contains(w));
+        if !meaningful_words.is_empty() && !caption_match {
+            errors.push(format!(
+                "figure {}: caption '{}' not found in page text", i + 1, caption
+            ));
+        }
+        
+        // 2. Kind should be a recognized semantic type
+        let valid_kinds = [
+            "graph", "schema", "flowchart", "circuit", "multi-panel",
+            "diagram", "chart", "plot", "network", "tree", "timeline",
+            "gantt", "state diagram", "entity relationship", "class diagram",
+            "sequence diagram", "activity diagram", "use case",
+        ];
+        if !valid_kinds.iter().any(|k| kind_lower.contains(k)) && !kind_lower.is_empty() {
+            errors.push(format!(
+                "figure {}: unrecognized kind '{}'", i + 1, kind
+            ));
+        }
+        
+        // 3. If content references "Figure N", that figure number should
+        // correspond to one of the proposed figures (by index or caption)
+        for &ref_num in figure_refs {
+            let ref_str = format!("figure {}", ref_num);
+            if caption_lower.contains(&ref_str) || page_text_lower.contains(&ref_str) {
+                // This reference exists - good, the figure should be boxed
+            }
+        }
+    }
+    
+    // 4. Count mismatch: referenced figures vs proposed figures
+    let ref_count = figure_refs.len();
+    let proposed_count = proposed_captions.len().max(proposed_kinds.len());
+    if ref_count > 0 && proposed_count == 0 {
+        errors.push(format!(
+            "content references {} figure(s) but no figure metadata proposed", ref_count
+        ));
+    }
+    
+    errors
+}
+
 // ── Answer deduplication (mark-scheme stitching) ───────────────────────────
 
 /// Normalized word stream: lowercase alphanumeric tokens.

@@ -20,6 +20,17 @@ pub struct PixelRect {
     pub h: u32,
 }
 
+/// Caption location hint for crop expansion.
+#[derive(Debug, Clone, Copy, PartialEq)]
+#[allow(dead_code)]
+pub struct CaptionHint {
+    /// Relative coordinates of caption text (0.0-1.0)
+    pub x: f32,
+    pub y: f32,
+    /// Whether caption is above (true) or below (false) the figure
+    pub above: bool,
+}
+
 /// Minimum crop edge in pixels — anything smaller is a meaningless speck.
 const MIN_EDGE_PX: u32 = 12;
 /// Reject boxes covering more than this fraction of the page — that's a
@@ -120,6 +131,155 @@ pub fn sanitize_bbox(b: &[f32], img_w: u32, img_h: u32) -> Option<PixelRect> {
     }
 
     None
+}
+
+/// Expand a sanitized bbox to include nearby caption text, supporting
+/// multi-component figures. The expansion is conservative and bounded:
+/// - Expands by at most 15% of the figure dimension in the caption direction
+/// - Clamps to page bounds and question region
+/// - Rejects expansion into footer/margin/answer-area zones
+/// - Returns the original bbox if no valid caption hint or expansion unsafe
+#[allow(dead_code)]
+pub fn expand_bbox_for_caption(
+    bbox: PixelRect,
+    img_w: u32,
+    img_h: u32,
+    caption_hint: Option<CaptionHint>,
+    question_region: Option<PixelRect>, // Optional: the question's content region
+) -> PixelRect {
+    let mut expanded = bbox;
+    
+    // If no caption hint, return original with standard padding already applied upstream
+    let Some(hint) = caption_hint else {
+        return expanded;
+    };
+    
+    // Convert hint to pixel coordinates
+    let caption_x = (hint.x * img_w as f32).round() as u32;
+    let _caption_y = (hint.y * img_h as f32).round() as u32;
+    
+    // Determine expansion direction and amount
+    // Max expansion: 15% of figure height/width or 80px, whichever is smaller
+    const MAX_EXPANSION_FRAC: f32 = 0.15;
+    const MAX_EXPANSION_PX: u32 = 80;
+    
+    let vertical_expansion = ((bbox.h as f32 * MAX_EXPANSION_FRAC).round() as u32).min(MAX_EXPANSION_PX);
+    let horizontal_expansion = ((bbox.w as f32 * MAX_EXPANSION_FRAC).round() as u32).min(MAX_EXPANSION_PX);
+    
+    if hint.above {
+        // Caption is above the figure: expand upward
+        let new_y = expanded.y.saturating_sub(vertical_expansion);
+        let new_h = expanded.h + (expanded.y - new_y);
+        
+        // Check if expansion would enter forbidden zones
+        if is_safe_expansion(new_y, new_h, expanded.x, expanded.w, img_w, img_h, question_region) {
+            expanded.y = new_y;
+            expanded.h = new_h;
+        }
+    } else {
+        // Caption is below the figure: expand downward
+        let new_h = (expanded.h + vertical_expansion).min(img_h - expanded.y);
+        
+        if is_safe_expansion(expanded.y, new_h, expanded.x, expanded.w, img_w, img_h, question_region) {
+            expanded.h = new_h;
+        }
+    }
+    
+    // Also expand horizontally slightly to include caption width if caption
+    // extends beyond figure bounds
+    if caption_x < expanded.x {
+        let expand_left = (expanded.x - caption_x).min(horizontal_expansion);
+        let new_x = expanded.x.saturating_sub(expand_left);
+        let new_w = expanded.w + (expanded.x - new_x);
+        if is_safe_expansion(expanded.y, expanded.h, new_x, new_w, img_w, img_h, question_region) {
+            expanded.x = new_x;
+            expanded.w = new_w;
+        }
+    } else if caption_x > expanded.x + expanded.w {
+        let expand_right = (caption_x - (expanded.x + expanded.w)).min(horizontal_expansion);
+        let new_w = (expanded.w + expand_right).min(img_w - expanded.x);
+        if is_safe_expansion(expanded.y, expanded.h, expanded.x, new_w, img_w, img_h, question_region) {
+            expanded.w = new_w;
+        }
+    }
+    
+    // Final clamp to page bounds
+    expanded.x = expanded.x.min(img_w.saturating_sub(1));
+    expanded.y = expanded.y.min(img_h.saturating_sub(1));
+    expanded.w = expanded.w.min(img_w - expanded.x);
+    expanded.h = expanded.h.min(img_h - expanded.y);
+    
+    // Ensure minimum size
+    if expanded.w < MIN_EDGE_PX || expanded.h < MIN_EDGE_PX {
+        return bbox; // Revert to original if expansion broke minimum size
+    }
+    
+    expanded
+}
+
+/// Check if a proposed expansion is safe (doesn't enter footer, margin, answer area, etc.)
+#[allow(dead_code)]
+fn is_safe_expansion(
+    y: u32,
+    h: u32,
+    x: u32,
+    w: u32,
+    img_w: u32,
+    img_h: u32,
+    question_region: Option<PixelRect>,
+) -> bool {
+    // 1. Must stay within page bounds
+    if x + w > img_w || y + h > img_h {
+        return false;
+    }
+    
+    // 2. Must not enter bottom margin (footer zone: bottom 8% of page)
+    const FOOTER_ZONE_FRAC: f32 = 0.08;
+    let footer_start = (img_h as f32 * (1.0 - FOOTER_ZONE_FRAC)).round() as u32;
+    if y + h > footer_start && y < img_h {
+        // Expansion enters footer zone
+        return false;
+    }
+    
+    // 3. Must not enter top margin (header zone: top 5% of page)
+    const HEADER_ZONE_FRAC: f32 = 0.05;
+    let header_end = (img_h as f32 * HEADER_ZONE_FRAC).round() as u32;
+    if y < header_end {
+        return false;
+    }
+    
+    // 4. Must not enter side margins (left/right 5%)
+    const SIDE_MARGIN_FRAC: f32 = 0.05;
+    let left_margin = (img_w as f32 * SIDE_MARGIN_FRAC).round() as u32;
+    let right_margin = img_w - left_margin;
+    if x < left_margin || x + w > right_margin {
+        return false;
+    }
+    
+    // 5. If question region provided, expansion must stay within it (with small tolerance)
+    if let Some(qr) = question_region {
+        const TOLERANCE: u32 = 20;
+        if x < qr.x.saturating_sub(TOLERANCE) {
+            return false;
+        }
+        if y < qr.y.saturating_sub(TOLERANCE) {
+            return false;
+        }
+        if x + w > qr.x + qr.w + TOLERANCE {
+            return false;
+        }
+        if y + h > qr.y + qr.h + TOLERANCE {
+            return false;
+        }
+    }
+    
+    // 6. Area fraction sanity check (don't become a full-page crop)
+    let area_frac = (w as f64 * h as f64) / (img_w as f64 * img_h as f64);
+    if area_frac > MAX_AREA_FRAC {
+        return false;
+    }
+    
+    true
 }
 
 /// Variance/luma check — true when a crop is blank or an empty student grid.

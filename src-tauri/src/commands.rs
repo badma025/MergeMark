@@ -5,7 +5,7 @@ use crate::pipeline::{
 use crate::AppState;
 use serde::{Deserialize, Serialize};
 use tauri::{Emitter, Manager, State};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 // ── Shared data model ─────────────────────────────────────────────────────────
 
@@ -55,16 +55,16 @@ impl Progress for TauriProgress {
 
 // ── Topic allow-lists (single source of truth for prompts + containment) ──────
 
-const EDEXCEL_MATHS_PURE: &[&str] = &["Proof", "Algebra and functions", "Coordinate geometry in the (x, y) plane", "Sequences and series", "Trigonometry", "Exponentials and logarithms", "Differentiation", "Integration", "Numerical methods", "Vectors"];
-const EDEXCEL_MATHS_STATS: &[&str] = &["Statistical sampling", "Data presentation and interpretation", "Probability", "Statistical distributions", "Statistical hypothesis testing"];
-const EDEXCEL_MATHS_MECH: &[&str] = &["Quantities and units in mechanics", "Kinematics", "Forces and Newton's laws", "Moments"];
+const _EDEXCEL_MATHS_PURE: &[&str] = &["Proof", "Algebra and functions", "Coordinate geometry in the (x, y) plane", "Sequences and series", "Trigonometry", "Exponentials and logarithms", "Differentiation", "Integration", "Numerical methods", "Vectors"];
+const _EDEXCEL_MATHS_STATS: &[&str] = &["Statistical sampling", "Data presentation and interpretation", "Probability", "Statistical distributions", "Statistical hypothesis testing"];
+const _EDEXCEL_MATHS_MECH: &[&str] = &["Quantities and units in mechanics", "Kinematics", "Forces and Newton's laws", "Moments"];
 const EDEXCEL_MATHS_TOPICS: &[&str] = &["Proof", "Algebra and functions", "Coordinate geometry in the (x, y) plane", "Sequences and series", "Trigonometry", "Exponentials and logarithms", "Differentiation", "Integration", "Numerical methods", "Vectors", "Statistical sampling", "Data presentation and interpretation", "Probability", "Statistical distributions", "Statistical hypothesis testing", "Quantities and units in mechanics", "Kinematics", "Forces and Newton's laws", "Moments"];
 
-const FM_CORE_PURE: &[&str] = &["Complex numbers", "Argand diagrams", "Series", "Roots of polynomials", "Volumes of revolution", "Matrices", "Linear transformations", "Proof by induction", "Vectors", "Differential equations", "Polar coordinates", "Hyperbolic functions", "Maclaurin series", "Methods in calculus"];
-const FM_FM1: &[&str] = &["Momentum and impulse", "Work, energy and power", "Elastic strings and springs", "Elastic collisions in one dimension", "Elastic collisions in two dimensions"];
-const FM_FS1: &[&str] = &["Discrete probability distributions", "Poisson distribution", "Geometric and negative binomial", "Hypothesis testing", "Central Limit Theorem", "Chi-squared tests", "Probability generating functions", "Quality of tests"];
-const FM_FP1: &[&str] = &["Vectors (Cross product & planes)", "Conic sections", "Inequalities", "t-formulae", "Taylor series", "Numerical methods (Further)", "Reducible differential equations"];
-const FM_D1: &[&str] = &["Algorithms", "Graphs and networks", "Algorithms on graphs", "Route inspection", "Travelling Salesperson Problem", "Linear programming", "Simplex algorithm"];
+const _FM_CORE_PURE: &[&str] = &["Complex numbers", "Argand diagrams", "Series", "Roots of polynomials", "Volumes of revolution", "Matrices", "Linear transformations", "Proof by induction", "Vectors", "Differential equations", "Polar coordinates", "Hyperbolic functions", "Maclaurin series", "Methods in calculus"];
+const _FM_FM1: &[&str] = &["Momentum and impulse", "Work, energy and power", "Elastic strings and springs", "Elastic collisions in one dimension", "Elastic collisions in two dimensions"];
+const _FM_FS1: &[&str] = &["Discrete probability distributions", "Poisson distribution", "Geometric and negative binomial", "Hypothesis testing", "Central Limit Theorem", "Chi-squared tests", "Probability generating functions", "Quality of tests"];
+const _FM_FP1: &[&str] = &["Vectors (Cross product & planes)", "Conic sections", "Inequalities", "t-formulae", "Taylor series", "Numerical methods (Further)", "Reducible differential equations"];
+const _FM_D1: &[&str] = &["Algorithms", "Graphs and networks", "Algorithms on graphs", "Route inspection", "Travelling Salesperson Problem", "Linear programming", "Simplex algorithm"];
 const FURTHER_MATHS_TOPICS: &[&str] = &["Complex numbers", "Argand diagrams", "Series", "Roots of polynomials", "Volumes of revolution", "Matrices", "Linear transformations", "Proof by induction", "Vectors", "Differential equations", "Polar coordinates", "Hyperbolic functions", "Maclaurin series", "Methods in calculus", "Momentum and impulse", "Work, energy and power", "Elastic strings and springs", "Elastic collisions in one dimension", "Elastic collisions in two dimensions", "Discrete probability distributions", "Poisson distribution", "Geometric and negative binomial", "Hypothesis testing", "Central Limit Theorem", "Chi-squared tests", "Probability generating functions", "Quality of tests", "Vectors (Cross product & planes)", "Conic sections", "Inequalities", "t-formulae", "Taylor series", "Numerical methods (Further)", "Reducible differential equations", "Algorithms", "Graphs and networks", "Algorithms on graphs", "Route inspection", "Travelling Salesperson Problem", "Linear programming", "Simplex algorithm"];
 const PHYSICS_TOPICS: &[&str] = &["Measurements and their errors", "Particles and radiation", "Waves", "Mechanics and materials", "Electricity", "Further mechanics", "Thermal physics", "Fields and their consequences", "Nuclear physics", "Telescopes", "Classification of stars", "Cosmology"];
 const CS_TOPICS: &[&str] = &["Fundamentals of programming", "Fundamentals of data structures", "Fundamentals of algorithms", "Theory of computation", "Fundamentals of data representation", "Fundamentals of computer systems", "Computer organisation and architecture", "Consequences of uses of computing", "Communication and networking", "Fundamentals of databases", "Big Data", "Fundamentals of functional programming"];
@@ -682,7 +682,7 @@ pub async fn parse_pdf_vision(
     });
 
     let progress = TauriProgress { app: app.clone() };
-    let (built, report): (Vec<BuiltQuestion>, ImportReport) = pipeline::run_question_pipeline(
+    let (built, mut report): (Vec<BuiltQuestion>, ImportReport) = pipeline::run_question_pipeline(
         &client,
         &pages,
         &config,
@@ -720,6 +720,7 @@ pub async fn parse_pdf_vision(
             .map(|(i,)| i)
             .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
 
+        let db_start = Instant::now();
         sqlx::query(
             r#"
             INSERT INTO questions (id, subject, subtopic, topics, marks, content, math_snippet, is_code, paper_name, question_number, module)
@@ -747,6 +748,7 @@ pub async fn parse_pdf_vision(
         .execute(&*pool)
         .await
         .map_err(|e| format!("DB upsert failed for question {}: {}", q.question_number, e))?;
+        report.record_timing("database", "upsert_question", None, Some(q.question_number), db_start.elapsed().as_millis() as u64);
 
         final_questions.push(Question {
             id,
