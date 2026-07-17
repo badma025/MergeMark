@@ -57,6 +57,8 @@ pub struct PipelineConfig {
     /// Repair attempts after the first request per unit of work.
     pub max_repairs: u32,
     pub max_output_tokens: u32,
+    /// Maximum concurrent API requests.
+    pub parallelism: usize,
 }
 
 impl PipelineConfig {
@@ -69,6 +71,7 @@ impl PipelineConfig {
             diagrams_dir: None,
             max_repairs: 2,
             max_output_tokens: 32768,
+            parallelism: DEFAULT_PARALLEL,
         }
     }
 }
@@ -162,7 +165,7 @@ pub struct ImportReport {
 /// correctness — every response still passes the same Rust gates. It only
 /// stops us paying API latency serially. 429 backpressure is per-call
 /// (llm.rs), so bursts self-limit.
-const PARALLEL: usize = 4;
+const DEFAULT_PARALLEL: usize = 4;
 
 impl ImportReport {
     /// Fold a per-unit report (one span / page / window processed inside a
@@ -366,7 +369,12 @@ pub async fn run_question_pipeline<C: LlmClient, P: Progress>(
         ..Default::default()
     };
 
+    // Prefer the free PDF text layer: it avoids one vision request per page.
+    let page_texts: Vec<String> = pages.iter().map(|p| p.text.clone()).collect();
+    let text_map_available = doc_map::build_map_from_text(&page_texts, pages.len()).is_some();
+
     // ── 1. Structure pass ───────────────────────────────────────────────────
+    if !text_map_available {
     // One tiny call per page, but PARALLEL in bounded batches: the per-page
     // validation below doesn't care when a response arrived.
     progress.stage("Scanning document structure…");
@@ -378,9 +386,9 @@ pub async fn run_question_pipeline<C: LlmClient, P: Progress>(
         footer: None,
         role: doc_map::PageRole::Unknown,
     };
-    for (bi, batch) in pages.chunks(PARALLEL).enumerate() {
+    for (bi, batch) in pages.chunks(config.parallelism.max(1)).enumerate() {
         cancelled(cancel)?;
-        let base = bi * PARALLEL;
+        let base = bi * config.parallelism.max(1);
         progress.stage(&format!(
             "Scanning document structure (pages {}–{} of {})…",
             base + 1,
@@ -446,6 +454,8 @@ pub async fn run_question_pipeline<C: LlmClient, P: Progress>(
                 role: format!("{:?}", s.role),
             });
         }
+    }
+
     }
 
     // ── 2. Document map ─────────────────────────────────────────────────────
@@ -522,7 +532,7 @@ pub async fn run_question_pipeline<C: LlmClient, P: Progress>(
             .filter(|&i| structures[i].role.is_question_content())
             .collect();
         let mut next_allowed: u32 = 1;
-        for batch in q_pages.chunks(PARALLEL) {
+        for batch in q_pages.chunks(config.parallelism.max(1)) {
             cancelled(cancel)?;
             progress.stage(&format!(
                 "Extracting pages {}–{} of {}…",
@@ -606,7 +616,7 @@ pub async fn run_question_pipeline<C: LlmClient, P: Progress>(
         // Spans are independent units: extract in PARALLEL batches. Every
         // response still passes the full validator chain — order of arrival
         // is irrelevant to correctness, and results are assembled in order.
-        for batch in jobs.chunks(PARALLEL) {
+        for batch in jobs.chunks(config.parallelism.max(1)) {
             cancelled(cancel)?;
             let first = batch[0].0 + 1;
             let last = batch[batch.len() - 1].0 + 1;
@@ -1529,7 +1539,7 @@ pub async fn run_markscheme_pipeline<C: LlmClient, P: Progress>(
         }
     }
 
-    for batch in windows.chunks(PARALLEL) {
+    for batch in windows.chunks(config.parallelism.max(1)) {
         cancelled(cancel)?;
         progress.stage(&format!(
             "Reading mark scheme pages {}–{} of {}…",

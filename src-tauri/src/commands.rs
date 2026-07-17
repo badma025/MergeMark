@@ -672,6 +672,7 @@ pub async fn parse_pdf_vision(
     config.diagrams_dir = diagrams_dir;
     config.max_repairs = 2;
     config.max_output_tokens = 32768;
+    config.parallelism = std::env::var("MERGEMARK_PARALLELISM").ok().and_then(|v| v.parse::<usize>().ok()).map(|v| v.clamp(1, 8)).unwrap_or(4);
 
     let client = ReqwestLlm::new(LlmConfig {
         base_url,
