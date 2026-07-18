@@ -432,6 +432,7 @@ pub async fn compile_worksheet(
     latex.push_str("\\usepackage[margin=1in]{geometry}\n");
     latex.push_str("\\usepackage{amsmath, amssymb, graphicx, xcolor, mdframed, parskip, enumitem}\n");
     latex.push_str("\\usepackage{fancyhdr}\n");
+    latex.push_str("\\usepackage[T1]{fontenc}\n");
     latex.push_str("\\usepackage{lmodern}\n");
     latex.push_str("\\renewcommand{\\familydefault}{\\sfdefault}\n");
     latex.push_str("% Pin all vertical rhythm at the document level so it cannot vary per question.\n");
@@ -465,6 +466,7 @@ pub async fn compile_worksheet(
     answer_latex.push_str("\\usepackage[margin=1in]{geometry}\n");
     answer_latex.push_str("\\usepackage{amsmath, amssymb, graphicx, xcolor, mdframed, parskip, enumitem}\n");
     answer_latex.push_str("\\usepackage{fancyhdr}\n");
+    answer_latex.push_str("\\usepackage[T1]{fontenc}\n");
     answer_latex.push_str("\\usepackage{lmodern}\n");
     answer_latex.push_str("\\renewcommand{\\familydefault}{\\sfdefault}\n");
     answer_latex.push_str("\\setlist{topsep=0.5cm, parsep=0.3cm, itemsep=0.25cm, leftmargin=1.2cm, labelsep=0.5cm}\n");
