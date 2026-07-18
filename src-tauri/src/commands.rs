@@ -553,11 +553,11 @@ pub async fn compile_worksheet(
             }
 
             // Escape LaTeX special characters that could break compilation
-            content = content.replace("_", "\_");
-            content = content.replace("^", "\^{}");
-            content = content.replace("%", "\%");
-            content = content.replace("#", "\#");
-            content = content.replace("&", "\&");
+            content = content.replace("_", "\\_");
+            content = content.replace("^", "\\^{}");
+            content = content.replace("%", "\\%");
+            content = content.replace("#", "\\#");
+            content = content.replace("&", "\\&");
 
             latex.push_str(&format!("  \\item {}\n", content));
             if !question.math_snippet.is_empty() {
@@ -619,11 +619,11 @@ pub async fn compile_worksheet(
                 }
 
                 // Escape LaTeX special characters in mark scheme content
-                ans_content = ans_content.replace("_", "\_");
-                ans_content = ans_content.replace("^", "\^{}");
-                ans_content = ans_content.replace("%", "\%");
-                ans_content = ans_content.replace("#", "\#");
-                ans_content = ans_content.replace("&", "\&");
+                ans_content = ans_content.replace("_", "\\_");
+                ans_content = ans_content.replace("^", "\\^{}");
+                ans_content = ans_content.replace("%", "\\%");
+                ans_content = ans_content.replace("#", "\\#");
+                ans_content = ans_content.replace("&", "\\&");
 
                 answer_latex.push_str("  \\vspace{0.5em}\n  \\begin{mdframed}[backgroundcolor=gray!10, linewidth=0.5pt, roundcorner=4pt]\n");
                 answer_latex.push_str("  \\textbf{Mark Scheme:}\\\\[0.5em]\n");
