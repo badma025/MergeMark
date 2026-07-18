@@ -434,7 +434,7 @@ pub async fn compile_worksheet(
     latex.push_str("\\usepackage{fancyhdr}\n");
     latex.push_str("\\renewcommand{\\familydefault}{\\sfdefault}\n");
     latex.push_str("% Pin all vertical rhythm at the document level so it cannot vary per question.\n");
-    latex.push_str("\\setlist{topsep=0.4cm, parsep=0.2cm, itemsep=0.2cm, leftmargin=1.2cm, labelsep=0.4cm}\n");
+    latex.push_str("\\setlist{topsep=0.5cm, parsep=0.3cm, itemsep=0.25cm, leftmargin=1.2cm, labelsep=0.5cm}\n");
     latex.push_str("\\setlist[1]{label=\\textbf{\\arabic*.}, leftmargin=*}\n");
     latex.push_str("\\setlist[2]{label=\\textbf{(\\alph*)}, leftmargin=0.8cm}\n");
     latex.push_str("\\setlist[3]{label=\\textbf{(\\roman*)}, leftmargin=1.8cm}\n");
@@ -442,15 +442,22 @@ pub async fn compile_worksheet(
     latex.push_str("\\setlength{\\parindent}{0pt}\n");
     latex.push_str("\\fancypagestyle{firstpage}{%\n");
     latex.push_str("  \\fancyhf{}%\n");
-    latex.push_str("  \\lhead{\\textbf{Name:}\\hspace{0.4cm}\\makebox[2.5in]{\\hrulefill}}%\n");
-    latex.push_str("  \\chead{\\textbf{Date:}\\hspace{0.4cm}\\makebox[1.5in]{\\hrulefill}}%\n");
-    latex.push_str("  \\rhead{\\textbf{Score:}\\hspace{0.4cm}\\makebox[1in]{\\hrulefill} / Total}%\n");
+    latex.push_str("  \\lhead{\\textbf{Name:}\\hspace{0.2cm}\\makebox[1.4in]{\\hrulefill}}%\n");
+    latex.push_str("  \\chead{\\textbf{Date:}\\hspace{0.2cm}\\makebox[1.0in]{\\hrulefill}}%\n");
+    latex.push_str("  \\rhead{\\textbf{Score:}\\hspace{0.2cm}\\makebox[0.7in]{\\hrulefill} / Total}%\n");
+    latex.push_str("}%\n");
+    latex.push_str("\\fancypagestyle{empty}{%\n");
+    latex.push_str("  \\fancyhf{}%\n");
+    latex.push_str("  \\renewcommand{\\headrulewidth}{0pt}%\n");
+    latex.push_str("  \\renewcommand{\\footrulewidth}{0pt}%\n");
     latex.push_str("}%\n");
     latex.push_str("\\pagestyle{empty}\n");
     latex.push_str("\\setlength{\\headheight}{28pt}\n");
+    latex.push_str("\\newcount\\numlines\n");
     latex.push_str("\\setlength{\\headsep}{0.5cm}\n");
     latex.push_str("\\begin{document}\n");
     latex.push_str("\\thispagestyle{firstpage}\n\n");
+    latex.push_str("\\pagestyle{empty}\n\n");
     latex.push_str("\\begin{enumerate}\n");
 
     let mut answer_latex = String::new();
@@ -459,7 +466,7 @@ pub async fn compile_worksheet(
     answer_latex.push_str("\\usepackage{amsmath, amssymb, graphicx, xcolor, mdframed, parskip, enumitem}\n");
     answer_latex.push_str("\\usepackage{fancyhdr}\n");
     answer_latex.push_str("\\renewcommand{\\familydefault}{\\sfdefault}\n");
-    answer_latex.push_str("\\setlist{topsep=0.4cm, parsep=0.2cm, itemsep=0.2cm, leftmargin=1.2cm, labelsep=0.4cm}\n");
+    answer_latex.push_str("\\setlist{topsep=0.5cm, parsep=0.3cm, itemsep=0.25cm, leftmargin=1.2cm, labelsep=0.5cm}\n");
     answer_latex.push_str("\\setlist[1]{label=\\textbf{\\arabic*.}, leftmargin=*}\n");
     answer_latex.push_str("\\setlist[2]{label=\\textbf{(\\alph*)}, leftmargin=0.8cm}\n");
     answer_latex.push_str("\\setlist[3]{label=\\textbf{(\\roman*)}, leftmargin=1.8cm}\n");
@@ -555,31 +562,20 @@ pub async fn compile_worksheet(
                     latex.push_str(&format!("  \\[ {} \\]\n", question.math_snippet));
                 }
             }
-            // Inline "Total for question" footer — does not introduce a \par or \hfill that would
-            // disturb the ruled-line rhythm below it.
-            latex.push_str(&format!("  \\hfill\\textbf{{[Total for Question {} is {} marks]}}\\par\\vspace{{0.4cm}}\n", question_num, question.marks));
+            // "Total for question" footer — placed on its own line at the end of the question.
+            latex.push_str(&format!("  \\par\\vspace{{0.2cm}}\\noindent\\hfill\\textbf{{[Total for Question {} is {} marks]}}\\n", question_num, question.marks));
 
-            // Ruled lines: exact 0.9cm pitch, full A4 page coverage.
-            //
-            // A4 at 1in margins has ~24.13cm of usable vertical height. We compute the number of
-            // 0.9cm lines needed to fill the page from the current cursor down to the bottom margin.
-            // \pagetotal + \textheight - \baselineskip gives the remaining space, but the
-            // simplest robust approach is to draw (marks * 3) lines or enough to cover one full
-            // page (27 lines at 0.9cm = 24.3cm, which exactly fills the area) — whichever is
-            // larger. We use a tabbing-free \rule + \vspace pattern that gives a guaranteed
-            // 0.9cm pitch independent of \baselineskip.
-            //
-            // 0.3pt line + 0.9cm - 0.3pt = 0.89cm-ish of gap. We use \vspace* to prevent the gap
-            // collapsing at page breaks, and \nointerlineskip so the ruled lines don't
-            // inherit a \baselineskip between them.
+            // Ruled lines: dynamically compute remaining page space and fill it entirely.
+            // Uses TeX's \pagegoal and \pagetotal to measure what's left, then draws
+            // enough 0.6cm-pitch lines to cover every remaining centimetre of the page.
             latex.push_str("  \\nointerlineskip\n");
-            let lines_to_draw = (question.marks * 3).max(27);
-            for _ in 0..lines_to_draw {
-                // \rule with width=\linewidth draws a 0.3pt line across the full text width.
-                // The \vspace{0.9cm} is the gap ABOVE the next line, which combined with the
-                // 0.3pt line below gives an exact 0.9cm pitch.
-                latex.push_str("  \\vspace{0.9cm}\\par\\noindent{\\color{gray!60}\\rule{\\linewidth}{0.3pt}}\\nointerlineskip\n");
-            }
+            latex.push_str("  \\dimen0=\\dimexpr\\pagegoal-\\pagetotal\\relax\n");
+            latex.push_str("  \\numlines=\\dimen0\n");
+            latex.push_str("  \\divide\\numlines by 1118809\n");
+            latex.push_str("  \\loop\\ifnum\\numlines>0\n");
+            latex.push_str("    \\vspace{0.6cm}\\par\\noindent{\\color{gray!60}\\rule{0.85\\linewidth}{0.2pt}}\\nointerlineskip\n");
+            latex.push_str("    \\advance\\numlines by -1\n");
+            latex.push_str("  \\repeat\n");
             latex.push_str("  \\newpage\n\n");
 
             answer_latex.push_str(&format!("  \\item {}\n", content));
@@ -593,8 +589,8 @@ pub async fn compile_worksheet(
                     answer_latex.push_str(&format!("  \\[ {} \\]\n", question.math_snippet));
                 }
             }
-            // Same inline "Total" footer treatment as the worksheet (no \par + \hfill disruption).
-            answer_latex.push_str(&format!("  \\hfill\\textbf{{[Total for Question {} is {} marks]}}\\par\n", question_num, question.marks));
+            // Same "Total for question" footer treatment as the worksheet.
+            answer_latex.push_str(&format!("  \\par\\vspace{{0.2cm}}\\noindent\\hfill\\textbf{{[Total for Question {} is {} marks]}}\\n", question_num, question.marks));
 
             if let Some(mut ans_content) = question.answer_content {
                 ans_content = ans_content.replace("\r\n", "\n");
