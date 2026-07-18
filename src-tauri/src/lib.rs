@@ -7,6 +7,7 @@ use tokio::sync::Mutex;
 /// Wrapped in Arc<Mutex<>> so it can safely be accessed from concurrent Tauri commands.
 mod db;
 
+mod backup;
 mod commands;
 mod doc_map;
 mod geometry;
@@ -53,6 +54,9 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            backup::export_backup,
+            backup::preview_backup,
+            backup::import_backup,
             commands::get_all_questions,
             commands::add_question,
             commands::delete_question,
