@@ -422,34 +422,47 @@ pub async fn parse_pdf(
 pub async fn compile_worksheet(
     app: tauri::AppHandle,
     question_ids: Vec<String>,
+    file_name: String,
 ) -> Result<Vec<String>, String> {
     let state: State<'_, AppState> = app.state();
     let pool = state.db.lock().await;
 
     let mut latex = String::new();
-    latex.push_str("\\documentclass{article}\n");
-    latex.push_str("\\usepackage{amsmath}\n");
-    latex.push_str("\\usepackage{amssymb}\n");
-    latex.push_str("\\usepackage{graphicx}\n");
-    latex.push_str("\\usepackage{xcolor}\n");
-    latex.push_str("\\usepackage{mdframed}\n");
-    latex.push_str("\\begin{document}\n\n");
-    latex.push_str("\\title{Mergemark Practice Paper}\n");
-    latex.push_str("\\maketitle\n\n");
-    latex.push_str("\\begin{enumerate}\n");
+    latex.push_str("\\documentclass[11pt]{article}\n");
+    latex.push_str("\\usepackage[margin=1in]{geometry}\n");
+    latex.push_str("\\usepackage{amsmath, amssymb, graphicx, xcolor, mdframed, parskip, enumitem}\n");
+    latex.push_str("\\usepackage{fancyhdr}\n");
+    latex.push_str("\\renewcommand{\\familydefault}{\\sfdefault}\n");
+    latex.push_str("\\fancypagestyle{firstpage}{%\n");
+    latex.push_str("  \\fancyhf{}%\n");
+    latex.push_str("  \\lhead{\\textbf{Name:}\\hspace{0.2cm}\\makebox[2.5in]{\\hrulefill}}%\n");
+    latex.push_str("  \\chead{\\textbf{Date:}\\hspace{0.2cm}\\makebox[1.5in]{\\hrulefill}}%\n");
+    latex.push_str("  \\rhead{\\textbf{Score:}\\hspace{0.2cm}\\makebox[1in]{\\hrulefill} / Total}%\n");
+    latex.push_str("}%\n");
+    latex.push_str("\\pagestyle{empty}\n");
+    latex.push_str("\\setlength{\\headheight}{28pt}\n");
+    latex.push_str("\\setlength{\\headsep}{0.5cm}\n");
+    latex.push_str("\\begin{document}\n");
+    latex.push_str("\\thispagestyle{firstpage}\n\n");
+    latex.push_str("\\begin{enumerate}[leftmargin=*, label=\\textbf{\\arabic*.}, labelsep=0.4cm]\n");
 
     let mut answer_latex = String::new();
-    answer_latex.push_str("\\documentclass{article}\n");
-    answer_latex.push_str("\\usepackage{amsmath}\n");
-    answer_latex.push_str("\\usepackage{amssymb}\n");
-    answer_latex.push_str("\\usepackage{graphicx}\n");
-    answer_latex.push_str("\\usepackage{xcolor}\n");
-    answer_latex.push_str("\\usepackage{mdframed}\n");
-    answer_latex.push_str("\\begin{document}\n\n");
-    answer_latex.push_str("\\title{Mergemark Practice Paper -- Answer Key}\n");
-    answer_latex.push_str("\\maketitle\n\n");
-    answer_latex.push_str("\\begin{enumerate}\n");
+    answer_latex.push_str("\\documentclass[11pt]{article}\n");
+    answer_latex.push_str("\\usepackage[margin=1in]{geometry}\n");
+    answer_latex.push_str("\\usepackage{amsmath, amssymb, graphicx, xcolor, mdframed, parskip, enumitem}\n");
+    answer_latex.push_str("\\usepackage{fancyhdr}\n");
+    answer_latex.push_str("\\renewcommand{\\familydefault}{\\sfdefault}\n");
+    answer_latex.push_str("\\fancypagestyle{firstpage}{%\n");
+    answer_latex.push_str("  \\fancyhf{}%\n");
+    answer_latex.push_str("  \\chead{\\Large\\textbf{Mergemark Practice Paper -- Answer Key}}%\n");
+    answer_latex.push_str("}%\n");
+    answer_latex.push_str("\\pagestyle{empty}\n");
+    answer_latex.push_str("\\setlength{\\headheight}{28pt}\n");
+    answer_latex.push_str("\\begin{document}\n");
+    answer_latex.push_str("\\thispagestyle{firstpage}\n\n");
+    answer_latex.push_str("\\begin{enumerate}[leftmargin=*, label=\\textbf{\\arabic*.}, labelsep=0.4cm]\n");
 
+    let mut question_num: usize = 0;
     for id in question_ids {
         let q: Option<Question> = sqlx::query_as("SELECT * FROM questions WHERE id = ?")
             .bind(&id)
@@ -458,7 +471,27 @@ pub async fn compile_worksheet(
             .map_err(|e| e.to_string())?;
 
         if let Some(question) = q {
+            question_num += 1;
             let mut content = question.content.trim().to_string();
+            content = content.replace("\r\n", "\n");
+
+            // Format markdown to LaTeX
+            let bold_re = regex::Regex::new(r"\*\*(.+?)\*\*").unwrap();
+            content = bold_re.replace_all(&content, r"\textbf{${1}}").to_string();
+            let italic_re = regex::Regex::new(r"\*([^\*]+?)\*").unwrap();
+            content = italic_re.replace_all(&content, r"\textit{${1}}").to_string();
+            let multiple_nl_re = regex::Regex::new(r"\n+").unwrap();
+            content = multiple_nl_re.replace_all(&content, "\n\n").to_string();
+
+            // Format inline marks
+            let inline_marks_re = regex::Regex::new(r"\[(\d+)\s*marks?\]").unwrap();
+            content = inline_marks_re.replace_all(&content, r"\null\hfill \textbf{[${1} marks]}").to_string();
+
+            // Format list indents for parts (a) and subparts (i)
+            let subpart_re = regex::Regex::new(r"(?m)^[ \t]*\((i|ii|iii|iv|v|vi|vii|viii|ix|x)\)[ \t]+(.*)").unwrap();
+            content = subpart_re.replace_all(&content, "\\vspace{0.2cm}\n\\begin{itemize}[leftmargin=1.8cm, labelsep=0.4cm, topsep=0pt, parsep=0pt, itemsep=4pt]\n\\item[\\textbf{(${1})}] ${2}\n\\end{itemize}").to_string();
+            let part_re = regex::Regex::new(r"(?m)^[ \t]*\(([a-z])\)[ \t]+(.*)").unwrap();
+            content = part_re.replace_all(&content, "\\vspace{0.3cm}\n\\begin{itemize}[leftmargin=0.8cm, labelsep=0.4cm, topsep=0pt, parsep=0pt, itemsep=4pt]\n\\item[\\textbf{(${1})}] ${2}\n\\end{itemize}").to_string();
 
             // 1. Strip leading numbers (e.g., "1. ", "1)", "- ")
             let leading_num_re = regex::Regex::new(r"^\s*\d+[\.\)\-\s]*").unwrap();
@@ -507,7 +540,15 @@ pub async fn compile_worksheet(
                     latex.push_str(&format!("  \\[ {} \\]\n", question.math_snippet));
                 }
             }
-            latex.push_str(&format!("  \\hfill [{} marks]\n\n", question.marks));
+            latex.push_str(&format!("  \\par\\vspace{{0.3cm}}\\null\\hfill \\textit{{(Total for Question {} is {} marks)}}\n\n", question_num, question.marks));
+            // 22 lines x 0.9 cm = ~20 cm which fills a full A4 page (1-inch margins).
+            // This minimum ensures answer pages are always fully ruled with CONSISTENT spacing.
+            let min_lines_per_page: i32 = 22;
+            let lines_to_draw = (question.marks * 3).max(min_lines_per_page);
+            for _ in 0..lines_to_draw {
+                latex.push_str("  {\\color{gray!60}\\noindent\\rule{\\linewidth}{0.3pt}}\\par\\vspace{0.9cm}\n");
+            }
+            latex.push_str("  \\newpage\n\n");
 
             answer_latex.push_str(&format!("  \\item {}\n", content));
             if !question.math_snippet.is_empty() {
@@ -520,9 +561,17 @@ pub async fn compile_worksheet(
                     answer_latex.push_str(&format!("  \\[ {} \\]\n", question.math_snippet));
                 }
             }
-            answer_latex.push_str(&format!("  \\hfill [{} marks]\n\n", question.marks));
+            answer_latex.push_str(&format!("  \\par\\vspace{{0.3cm}}\\null\\hfill \\textit{{(Total for Question {} is {} marks)}}\n\n", question_num, question.marks));
 
             if let Some(mut ans_content) = question.answer_content {
+                ans_content = ans_content.replace("\r\n", "\n");
+                ans_content = bold_re.replace_all(&ans_content, r"\textbf{${1}}").to_string();
+                ans_content = italic_re.replace_all(&ans_content, r"\textit{${1}}").to_string();
+                ans_content = multiple_nl_re.replace_all(&ans_content, "\n\n").to_string();
+                ans_content = inline_marks_re.replace_all(&ans_content, r"\null\hfill \textbf{[${1} marks]}").to_string();
+                ans_content = subpart_re.replace_all(&ans_content, "\\begin{itemize}[leftmargin=1.5cm, labelsep=0.3cm, topsep=0pt, parsep=0pt, itemsep=0pt]\n\\item[\\textbf{(${1})}] ${2}\n\\end{itemize}").to_string();
+                ans_content = part_re.replace_all(&ans_content, "\\begin{itemize}[leftmargin=0.5cm, labelsep=0.3cm, topsep=0pt, parsep=0pt, itemsep=0pt]\n\\item[\\textbf{(${1})}] ${2}\n\\end{itemize}").to_string();
+                
                 ans_content = greek_re.replace_all(&ans_content, r"${1}$\$${2}$${3}").to_string();
                 ans_content = list_re.replace_all(&ans_content, "\n\n").to_string();
 
@@ -552,8 +601,41 @@ pub async fn compile_worksheet(
 
     let download_dir = app.path().download_dir().map_err(|e| e.to_string())?;
 
-    let worksheet_tex = download_dir.join("worksheet.tex");
-    let answer_key_tex = download_dir.join("answer_key.tex");
+    // Sanitize file name: keep alphanumeric, spaces, hyphens, underscores
+    let sanitized: String = file_name
+        .chars()
+        .map(|c| if c.is_alphanumeric() || c == ' ' || c == '-' || c == '_' { c } else { '_' })
+        .collect::<String>()
+        .trim()
+        .to_string();
+
+    // Fall back to timestamp-based name if blank
+    let base_name = if sanitized.is_empty() {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        format!("worksheet_{}", now)
+    } else {
+        sanitized.replace(' ', "_")
+    };
+
+    // Ensure unique by appending counter if file already exists
+    let base_name = {
+        let mut candidate = base_name.clone();
+        let mut counter = 1u32;
+        while download_dir.join(format!("{}.pdf", candidate)).exists() {
+            candidate = format!("{}_{}", base_name, counter);
+            counter += 1;
+        }
+        candidate
+    };
+
+    let worksheet_stem = format!("{}", base_name);
+    let answer_stem = format!("{}_answers", base_name);
+
+    let worksheet_tex = download_dir.join(format!("{}.tex", worksheet_stem));
+    let answer_key_tex = download_dir.join(format!("{}.tex", answer_stem));
 
     std::fs::write(&worksheet_tex, &latex).map_err(|e| format!("Failed to write worksheet file: {}", e))?;
     std::fs::write(&answer_key_tex, &answer_latex).map_err(|e| format!("Failed to write answer key file: {}", e))?;
@@ -581,7 +663,7 @@ pub async fn compile_worksheet(
         .output()
         .map_err(|e| format!("Failed to execute pdflatex for worksheet: {}", e))?;
 
-    let worksheet_pdf = download_dir.join("worksheet.pdf");
+    let worksheet_pdf = download_dir.join(format!("{}.pdf", worksheet_stem));
     if !worksheet_pdf.exists() {
         let stdout = String::from_utf8_lossy(&output_worksheet.stdout);
         let stderr = String::from_utf8_lossy(&output_worksheet.stderr);
@@ -597,17 +679,20 @@ pub async fn compile_worksheet(
         .output()
         .map_err(|e| format!("Failed to execute pdflatex for answer key: {}", e))?;
 
-    let answer_key_pdf = download_dir.join("answer_key.pdf");
+    let answer_key_pdf = download_dir.join(format!("{}.pdf", answer_stem));
     if !answer_key_pdf.exists() {
         let stdout = String::from_utf8_lossy(&output_answer_key.stdout);
         let stderr = String::from_utf8_lossy(&output_answer_key.stderr);
         return Err(format!("pdflatex failed to generate answer key PDF:\n{}\n{}", stdout, stderr));
     }
 
-    let _ = std::fs::remove_file(download_dir.join("worksheet.aux"));
-    let _ = std::fs::remove_file(download_dir.join("worksheet.log"));
-    let _ = std::fs::remove_file(download_dir.join("answer_key.aux"));
-    let _ = std::fs::remove_file(download_dir.join("answer_key.log"));
+    // Clean up all intermediary files
+    let _ = std::fs::remove_file(download_dir.join(format!("{}.tex", worksheet_stem)));
+    let _ = std::fs::remove_file(download_dir.join(format!("{}.aux", worksheet_stem)));
+    let _ = std::fs::remove_file(download_dir.join(format!("{}.log", worksheet_stem)));
+    let _ = std::fs::remove_file(download_dir.join(format!("{}.tex", answer_stem)));
+    let _ = std::fs::remove_file(download_dir.join(format!("{}.aux", answer_stem)));
+    let _ = std::fs::remove_file(download_dir.join(format!("{}.log", answer_stem)));
 
     Ok(vec![
         worksheet_pdf.to_string_lossy().to_string(),

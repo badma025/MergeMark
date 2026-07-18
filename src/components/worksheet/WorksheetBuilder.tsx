@@ -61,6 +61,7 @@ export function WorksheetBuilder({ selectedQuestions, onRemove, onReorder }: Wor
   const totalMarks = selectedQuestions.reduce((acc, q) => acc + q.marks, 0);
   const estMinutes = totalMarks; // 1 min per mark heuristic
   const [isCompiling, setIsCompiling] = useState(false);
+  const [fileName, setFileName] = useState("");
 
   const sensors = useSensors(
     useSensor(PointerSensor, { activationConstraint: { distance: 4 } }),
@@ -82,7 +83,10 @@ export function WorksheetBuilder({ selectedQuestions, onRemove, onReorder }: Wor
     const ids = selectedQuestions.map((q) => q.id);
     setIsCompiling(true);
     try {
-      const filePaths = await invoke<string[]>("compile_worksheet", { questionIds: ids });
+      const filePaths = await invoke<string[]>("compile_worksheet", {
+        questionIds: ids,
+        fileName: fileName.trim(),
+      });
       toast.success("Worksheet & Answer Key compiled!", {
         description: filePaths.join("\n"),
         duration: 8000,
@@ -161,7 +165,27 @@ export function WorksheetBuilder({ selectedQuestions, onRemove, onReorder }: Wor
       </div>
 
       {/* ── Pinned compile button ── */}
-      <div className="border-t border-border px-4 py-3 bg-background">
+      <div className="border-t border-border px-4 py-3 bg-background flex flex-col gap-2">
+        <div className="flex flex-col gap-1">
+          <label
+            htmlFor="worksheet-file-name"
+            className="text-[0.65rem] uppercase tracking-widest text-muted-foreground"
+          >
+            File name <span className="normal-case opacity-60">(optional)</span>
+          </label>
+          <input
+            id="worksheet-file-name"
+            type="text"
+            value={fileName}
+            onChange={(e) => setFileName(e.target.value)}
+            placeholder="e.g. Algebra_Mock_1"
+            className={cn(
+              "w-full rounded-md border border-border bg-muted/40 px-3 py-1.5",
+              "text-sm text-foreground placeholder:text-muted-foreground/50",
+              "focus:outline-none focus:ring-1 focus:ring-primary"
+            )}
+          />
+        </div>
         <Button
           id="compile-pdf-btn"
           className={cn(
