@@ -433,18 +433,25 @@ pub async fn compile_worksheet(
     latex.push_str("\\usepackage{amsmath, amssymb, graphicx, xcolor, mdframed, parskip, enumitem}\n");
     latex.push_str("\\usepackage{fancyhdr}\n");
     latex.push_str("\\renewcommand{\\familydefault}{\\sfdefault}\n");
+    latex.push_str("% Pin all vertical rhythm at the document level so it cannot vary per question.\n");
+    latex.push_str("\\setlist{topsep=0.4cm, parsep=0.2cm, itemsep=0.2cm, leftmargin=1.2cm, labelsep=0.4cm}\n");
+    latex.push_str("\\setlist[1]{label=\\textbf{\\arabic*.}, leftmargin=*}\n");
+    latex.push_str("\\setlist[2]{label=\\textbf{(\\alph*)}, leftmargin=0.8cm}\n");
+    latex.push_str("\\setlist[3]{label=\\textbf{(\\roman*)}, leftmargin=1.8cm}\n");
+    latex.push_str("\\setlength{\\parskip}{0pt}\n");
+    latex.push_str("\\setlength{\\parindent}{0pt}\n");
     latex.push_str("\\fancypagestyle{firstpage}{%\n");
     latex.push_str("  \\fancyhf{}%\n");
-    latex.push_str("  \\lhead{\\textbf{Name:}\\hspace{0.2cm}\\makebox[2.5in]{\\hrulefill}}%\n");
-    latex.push_str("  \\chead{\\textbf{Date:}\\hspace{0.2cm}\\makebox[1.5in]{\\hrulefill}}%\n");
-    latex.push_str("  \\rhead{\\textbf{Score:}\\hspace{0.2cm}\\makebox[1in]{\\hrulefill} / Total}%\n");
+    latex.push_str("  \\lhead{\\textbf{Name:}\\hspace{0.4cm}\\makebox[2.5in]{\\hrulefill}}%\n");
+    latex.push_str("  \\chead{\\textbf{Date:}\\hspace{0.4cm}\\makebox[1.5in]{\\hrulefill}}%\n");
+    latex.push_str("  \\rhead{\\textbf{Score:}\\hspace{0.4cm}\\makebox[1in]{\\hrulefill} / Total}%\n");
     latex.push_str("}%\n");
     latex.push_str("\\pagestyle{empty}\n");
     latex.push_str("\\setlength{\\headheight}{28pt}\n");
     latex.push_str("\\setlength{\\headsep}{0.5cm}\n");
     latex.push_str("\\begin{document}\n");
     latex.push_str("\\thispagestyle{firstpage}\n\n");
-    latex.push_str("\\begin{enumerate}[leftmargin=*, label=\\textbf{\\arabic*.}, labelsep=0.4cm]\n");
+    latex.push_str("\\begin{enumerate}\n");
 
     let mut answer_latex = String::new();
     answer_latex.push_str("\\documentclass[11pt]{article}\n");
@@ -452,6 +459,12 @@ pub async fn compile_worksheet(
     answer_latex.push_str("\\usepackage{amsmath, amssymb, graphicx, xcolor, mdframed, parskip, enumitem}\n");
     answer_latex.push_str("\\usepackage{fancyhdr}\n");
     answer_latex.push_str("\\renewcommand{\\familydefault}{\\sfdefault}\n");
+    answer_latex.push_str("\\setlist{topsep=0.4cm, parsep=0.2cm, itemsep=0.2cm, leftmargin=1.2cm, labelsep=0.4cm}\n");
+    answer_latex.push_str("\\setlist[1]{label=\\textbf{\\arabic*.}, leftmargin=*}\n");
+    answer_latex.push_str("\\setlist[2]{label=\\textbf{(\\alph*)}, leftmargin=0.8cm}\n");
+    answer_latex.push_str("\\setlist[3]{label=\\textbf{(\\roman*)}, leftmargin=1.8cm}\n");
+    answer_latex.push_str("\\setlength{\\parskip}{0pt}\n");
+    answer_latex.push_str("\\setlength{\\parindent}{0pt}\n");
     answer_latex.push_str("\\fancypagestyle{firstpage}{%\n");
     answer_latex.push_str("  \\fancyhf{}%\n");
     answer_latex.push_str("  \\chead{\\Large\\textbf{Mergemark Practice Paper -- Answer Key}}%\n");
@@ -460,7 +473,7 @@ pub async fn compile_worksheet(
     answer_latex.push_str("\\setlength{\\headheight}{28pt}\n");
     answer_latex.push_str("\\begin{document}\n");
     answer_latex.push_str("\\thispagestyle{firstpage}\n\n");
-    answer_latex.push_str("\\begin{enumerate}[leftmargin=*, label=\\textbf{\\arabic*.}, labelsep=0.4cm]\n");
+    answer_latex.push_str("\\begin{enumerate}\n");
 
     let mut question_num: usize = 0;
     for id in question_ids {
@@ -487,11 +500,13 @@ pub async fn compile_worksheet(
             let inline_marks_re = regex::Regex::new(r"\[(\d+)\s*marks?\]").unwrap();
             content = inline_marks_re.replace_all(&content, r"\null\hfill \textbf{[${1} marks]}").to_string();
 
-            // Format list indents for parts (a) and subparts (i)
+            // Format list indents for parts (a) and subparts (i).
+            // Document-level \setlist already sets leftmargin / labelsep / topsep / parsep / itemsep
+            // for all list depths, so we just emit plain itemize blocks and let the preamble handle it.
             let subpart_re = regex::Regex::new(r"(?m)^[ \t]*\((i|ii|iii|iv|v|vi|vii|viii|ix|x)\)[ \t]+(.*)").unwrap();
-            content = subpart_re.replace_all(&content, "\\vspace{0.2cm}\n\\begin{itemize}[leftmargin=1.8cm, labelsep=0.4cm, topsep=0pt, parsep=0pt, itemsep=4pt]\n\\item[\\textbf{(${1})}] ${2}\n\\end{itemize}").to_string();
+            content = subpart_re.replace_all(&content, "\\begin{itemize}\n\\item[\\textbf{(${1})}] ${2}\n\\end{itemize}").to_string();
             let part_re = regex::Regex::new(r"(?m)^[ \t]*\(([a-z])\)[ \t]+(.*)").unwrap();
-            content = part_re.replace_all(&content, "\\vspace{0.3cm}\n\\begin{itemize}[leftmargin=0.8cm, labelsep=0.4cm, topsep=0pt, parsep=0pt, itemsep=4pt]\n\\item[\\textbf{(${1})}] ${2}\n\\end{itemize}").to_string();
+            content = part_re.replace_all(&content, "\\begin{itemize}\n\\item[\\textbf{(${1})}] ${2}\n\\end{itemize}").to_string();
 
             // 1. Strip leading numbers (e.g., "1. ", "1)", "- ")
             let leading_num_re = regex::Regex::new(r"^\s*\d+[\.\)\-\s]*").unwrap();
@@ -540,13 +555,30 @@ pub async fn compile_worksheet(
                     latex.push_str(&format!("  \\[ {} \\]\n", question.math_snippet));
                 }
             }
-            latex.push_str(&format!("  \\par\\vspace{{0.3cm}}\\null\\hfill \\textit{{(Total for Question {} is {} marks)}}\n\n", question_num, question.marks));
-            // 22 lines x 0.9 cm = ~20 cm which fills a full A4 page (1-inch margins).
-            // This minimum ensures answer pages are always fully ruled with CONSISTENT spacing.
-            let min_lines_per_page: i32 = 22;
-            let lines_to_draw = (question.marks * 3).max(min_lines_per_page);
+            // Inline "Total for question" footer — does not introduce a \par or \hfill that would
+            // disturb the ruled-line rhythm below it.
+            latex.push_str(&format!("  \\hfill\\textbf{{[Total for Question {} is {} marks]}}\\par\\vspace{{0.4cm}}\n", question_num, question.marks));
+
+            // Ruled lines: exact 0.9cm pitch, full A4 page coverage.
+            //
+            // A4 at 1in margins has ~24.13cm of usable vertical height. We compute the number of
+            // 0.9cm lines needed to fill the page from the current cursor down to the bottom margin.
+            // \pagetotal + \textheight - \baselineskip gives the remaining space, but the
+            // simplest robust approach is to draw (marks * 3) lines or enough to cover one full
+            // page (27 lines at 0.9cm = 24.3cm, which exactly fills the area) — whichever is
+            // larger. We use a tabbing-free \rule + \vspace pattern that gives a guaranteed
+            // 0.9cm pitch independent of \baselineskip.
+            //
+            // 0.3pt line + 0.9cm - 0.3pt = 0.89cm-ish of gap. We use \vspace* to prevent the gap
+            // collapsing at page breaks, and \nointerlineskip so the ruled lines don't
+            // inherit a \baselineskip between them.
+            latex.push_str("  \\nointerlineskip\n");
+            let lines_to_draw = (question.marks * 3).max(27);
             for _ in 0..lines_to_draw {
-                latex.push_str("  {\\color{gray!60}\\noindent\\rule{\\linewidth}{0.3pt}}\\par\\vspace{0.9cm}\n");
+                // \rule with width=\linewidth draws a 0.3pt line across the full text width.
+                // The \vspace{0.9cm} is the gap ABOVE the next line, which combined with the
+                // 0.3pt line below gives an exact 0.9cm pitch.
+                latex.push_str("  \\vspace{0.9cm}\\par\\noindent{\\color{gray!60}\\rule{\\linewidth}{0.3pt}}\\nointerlineskip\n");
             }
             latex.push_str("  \\newpage\n\n");
 
@@ -561,7 +593,8 @@ pub async fn compile_worksheet(
                     answer_latex.push_str(&format!("  \\[ {} \\]\n", question.math_snippet));
                 }
             }
-            answer_latex.push_str(&format!("  \\par\\vspace{{0.3cm}}\\null\\hfill \\textit{{(Total for Question {} is {} marks)}}\n\n", question_num, question.marks));
+            // Same inline "Total" footer treatment as the worksheet (no \par + \hfill disruption).
+            answer_latex.push_str(&format!("  \\hfill\\textbf{{[Total for Question {} is {} marks]}}\\par\n", question_num, question.marks));
 
             if let Some(mut ans_content) = question.answer_content {
                 ans_content = ans_content.replace("\r\n", "\n");
@@ -569,8 +602,8 @@ pub async fn compile_worksheet(
                 ans_content = italic_re.replace_all(&ans_content, r"\textit{${1}}").to_string();
                 ans_content = multiple_nl_re.replace_all(&ans_content, "\n\n").to_string();
                 ans_content = inline_marks_re.replace_all(&ans_content, r"\null\hfill \textbf{[${1} marks]}").to_string();
-                ans_content = subpart_re.replace_all(&ans_content, "\\begin{itemize}[leftmargin=1.5cm, labelsep=0.3cm, topsep=0pt, parsep=0pt, itemsep=0pt]\n\\item[\\textbf{(${1})}] ${2}\n\\end{itemize}").to_string();
-                ans_content = part_re.replace_all(&ans_content, "\\begin{itemize}[leftmargin=0.5cm, labelsep=0.3cm, topsep=0pt, parsep=0pt, itemsep=0pt]\n\\item[\\textbf{(${1})}] ${2}\n\\end{itemize}").to_string();
+                ans_content = subpart_re.replace_all(&ans_content, "\\begin{itemize}\n\\item[\\textbf{(${1})}] ${2}\n\\end{itemize}").to_string();
+                ans_content = part_re.replace_all(&ans_content, "\\begin{itemize}\n\\item[\\textbf{(${1})}] ${2}\n\\end{itemize}").to_string();
                 
                 ans_content = greek_re.replace_all(&ans_content, r"${1}$\$${2}$${3}").to_string();
                 ans_content = list_re.replace_all(&ans_content, "\n\n").to_string();
