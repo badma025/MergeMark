@@ -143,8 +143,8 @@ fn rewrite_for_import(text: &str, extracted: &HashMap<String, String>) -> String
 /// touching the database. The UI uses this to show a confirmation dialog.
 #[tauri::command]
 pub async fn preview_backup(src_path: String) -> Result<BackupPreview, String> {
-    let file = std::fs::File::open(&src_path)
-        .map_err(|e| format!("Could not open backup file: {}", e))?;
+    let file =
+        std::fs::File::open(&src_path).map_err(|e| format!("Could not open backup file: {}", e))?;
     let mut archive = zip::ZipArchive::new(file)
         .map_err(|_| "That file is not a valid MergeMark backup (not a zip archive)".to_string())?;
 
@@ -155,6 +155,7 @@ pub async fn preview_backup(src_path: String) -> Result<BackupPreview, String> {
     manifest_file
         .read_to_string(&mut manifest_str)
         .map_err(|e| format!("Backup manifest is unreadable: {}", e))?;
+    drop(manifest_file);
     let manifest: Manifest = serde_json::from_str(&manifest_str)
         .map_err(|_| "That file is not a valid MergeMark backup (corrupt manifest)".to_string())?;
 
@@ -172,8 +173,9 @@ pub async fn preview_backup(src_path: String) -> Result<BackupPreview, String> {
         let mut qs = String::new();
         qf.read_to_string(&mut qs)
             .map_err(|e| format!("Backup questions are unreadable: {}", e))?;
-        serde_json::from_str(&qs)
-            .map_err(|_| "That file is not a valid MergeMark backup (corrupt questions)".to_string())?
+        serde_json::from_str(&qs).map_err(|_| {
+            "That file is not a valid MergeMark backup (corrupt questions)".to_string()
+        })?
     };
 
     Ok(BackupPreview {
@@ -232,19 +234,19 @@ pub async fn export_backup(
             image_count: image_map.len(),
         };
         zip.start_file("manifest.json", options)
-            .and_then(|_| {
-                zip.write_all(
-                    serde_json::to_string_pretty(&manifest)
-                        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?
-                        .as_bytes(),
-                )
-            })
-            .map_err(|e| format!("Failed to write manifest: {}", e))?;
+            .map_err(|e| format!("Failed to start manifest: {}", e))?;
+        zip.write_all(
+            serde_json::to_string_pretty(&manifest)
+                .map_err(|e| format!("Failed to serialise manifest: {}", e))?
+                .as_bytes(),
+        )
+        .map_err(|e| format!("Failed to write manifest: {}", e))?;
 
         let questions_json = serde_json::to_string_pretty(&questions)
             .map_err(|e| format!("Failed to serialise questions: {}", e))?;
         zip.start_file("questions.json", options)
-            .and_then(|_| zip.write_all(questions_json.as_bytes()))
+            .map_err(|e| format!("Failed to add questions to backup: {}", e))?;
+        zip.write_all(questions_json.as_bytes())
             .map_err(|e| format!("Failed to write questions: {}", e))?;
 
         for (abs_path, entry_name) in &image_map {
@@ -303,8 +305,8 @@ pub async fn import_backup(
     };
 
     // 1. Parse and validate the archive (no DB touched yet).
-    let file = std::fs::File::open(&src_path)
-        .map_err(|e| format!("Could not open backup file: {}", e))?;
+    let file =
+        std::fs::File::open(&src_path).map_err(|e| format!("Could not open backup file: {}", e))?;
     let mut archive = zip::ZipArchive::new(file)
         .map_err(|_| "That file is not a valid MergeMark backup (not a zip archive)".to_string())?;
 
@@ -315,8 +317,9 @@ pub async fn import_backup(
         let mut s = String::new();
         mf.read_to_string(&mut s)
             .map_err(|e| format!("Backup manifest is unreadable: {}", e))?;
-        serde_json::from_str(&s)
-            .map_err(|_| "That file is not a valid MergeMark backup (corrupt manifest)".to_string())?
+        serde_json::from_str(&s).map_err(|_| {
+            "That file is not a valid MergeMark backup (corrupt manifest)".to_string()
+        })?
     };
     if manifest.format_version > FORMAT_VERSION {
         return Err(format!(
@@ -332,8 +335,9 @@ pub async fn import_backup(
         let mut s = String::new();
         qf.read_to_string(&mut s)
             .map_err(|e| format!("Backup questions are unreadable: {}", e))?;
-        serde_json::from_str(&s)
-            .map_err(|_| "That file is not a valid MergeMark backup (corrupt questions)".to_string())?
+        serde_json::from_str(&s).map_err(|_| {
+            "That file is not a valid MergeMark backup (corrupt questions)".to_string()
+        })?
     };
 
     // 2. Extract images to fresh filenames and build the reference rewrite map.
@@ -400,8 +404,7 @@ pub async fn import_backup(
         let mut updated = 0i64;
 
         for q in &questions {
-            let has_composite =
-                !q.paper_name.trim().is_empty() && q.question_number.is_some();
+            let has_composite = !q.paper_name.trim().is_empty() && q.question_number.is_some();
 
             // Merge mode: if a row with the same (paper_name, question_number)
             // exists, update it in place and keep its existing id.
@@ -533,7 +536,11 @@ mod tests {
         let text = format!("before\n\n![Diagram]({})\n\nafter", slashy(&p1));
         let out = rewrite_for_export(&text, &mut map, &mut used, &mut missing);
         assert_eq!(missing, 0);
-        assert!(out.contains("](images/a.png)"), "rewrote to relative: {}", out);
+        assert!(
+            out.contains("](images/a.png)"),
+            "rewrote to relative: {}",
+            out
+        );
 
         // Same file referenced again -> same archive name, still one entry.
         let out2 = rewrite_for_export(&text, &mut map, &mut used, &mut missing);
