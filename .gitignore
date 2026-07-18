@@ -27,3 +27,10 @@ dist-ssr
 *.db
 *.db-journal
 src-tauri/diagrams/
+
+# Local experiments / one-off test scripts
+scratch/
+pull.cjs
+pull.js
+test.cjs
+test.json
