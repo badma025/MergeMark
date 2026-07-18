@@ -432,6 +432,7 @@ pub async fn compile_worksheet(
     latex.push_str("\\usepackage[margin=1in]{geometry}\n");
     latex.push_str("\\usepackage{amsmath, amssymb, graphicx, xcolor, mdframed, parskip, enumitem}\n");
     latex.push_str("\\usepackage{fancyhdr}\n");
+    latex.push_str("\\usepackage{lmodern}\n");
     latex.push_str("\\renewcommand{\\familydefault}{\\sfdefault}\n");
     latex.push_str("% Pin all vertical rhythm at the document level so it cannot vary per question.\n");
     latex.push_str("\\setlist{topsep=0.5cm, parsep=0.3cm, itemsep=0.25cm, leftmargin=1.2cm, labelsep=0.5cm}\n");
@@ -464,6 +465,7 @@ pub async fn compile_worksheet(
     answer_latex.push_str("\\usepackage[margin=1in]{geometry}\n");
     answer_latex.push_str("\\usepackage{amsmath, amssymb, graphicx, xcolor, mdframed, parskip, enumitem}\n");
     answer_latex.push_str("\\usepackage{fancyhdr}\n");
+    answer_latex.push_str("\\usepackage{lmodern}\n");
     answer_latex.push_str("\\renewcommand{\\familydefault}{\\sfdefault}\n");
     answer_latex.push_str("\\setlist{topsep=0.5cm, parsep=0.3cm, itemsep=0.25cm, leftmargin=1.2cm, labelsep=0.5cm}\n");
     answer_latex.push_str("\\setlist[1]{label=\\textbf{\\arabic*.}, leftmargin=*}\n");
@@ -550,6 +552,13 @@ pub async fn compile_worksheet(
                 }
             }
 
+            // Escape LaTeX special characters that could break compilation
+            content = content.replace("_", "\_");
+            content = content.replace("^", "\^{}");
+            content = content.replace("%", "\%");
+            content = content.replace("#", "\#");
+            content = content.replace("&", "\&");
+
             latex.push_str(&format!("  \\item {}\n", content));
             if !question.math_snippet.is_empty() {
                 if question.is_code {
@@ -608,6 +617,13 @@ pub async fn compile_worksheet(
                         break;
                     }
                 }
+
+                // Escape LaTeX special characters in mark scheme content
+                ans_content = ans_content.replace("_", "\_");
+                ans_content = ans_content.replace("^", "\^{}");
+                ans_content = ans_content.replace("%", "\%");
+                ans_content = ans_content.replace("#", "\#");
+                ans_content = ans_content.replace("&", "\&");
 
                 answer_latex.push_str("  \\vspace{0.5em}\n  \\begin{mdframed}[backgroundcolor=gray!10, linewidth=0.5pt, roundcorner=4pt]\n");
                 answer_latex.push_str("  \\textbf{Mark Scheme:}\\\\[0.5em]\n");
