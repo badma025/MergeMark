@@ -1,0 +1,80 @@
+name: Release
+
+# Builds MergeMark installers for macOS (universal), Windows, and Linux
+# whenever a version tag is pushed, then attaches them to a draft
+# GitHub Release for review.
+#
+# Usage:
+#   git tag v1.0.0 master
+#   git push origin v1.0.0
+#
+# Builds are unsigned by default. To sign/notarize them, add the signing
+# secrets documented at https://v2.tauri.app/distribute/ and pass them as
+# env vars to the tauri-action step below.
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write # required to create the draft release
+
+jobs:
+  build-installers:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: macos-latest
+            args: "--target universal-apple-darwin"
+            rustTargets: "aarch64-apple-darwin,x86_64-apple-darwin"
+          - platform: ubuntu-22.04
+            args: ""
+            rustTargets: ""
+          - platform: windows-latest
+            args: ""
+            rustTargets: ""
+
+    runs-on: ${{ matrix.platform }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.rustTargets }}
+
+      - name: Cache Rust build
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - name: Install Linux dependencies
+        if: matrix.platform == 'ubuntu-22.04'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Build app and upload to draft release
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tagName: ${{ github.ref_name }}
+          releaseName: "MergeMark ${{ github.ref_name }}"
+          releaseBody: "Download the installer for your platform below."
+          releaseDraft: true
+          prerelease: false
+          args: ${{ matrix.args }}
