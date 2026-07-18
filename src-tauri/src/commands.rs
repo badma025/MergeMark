@@ -453,7 +453,6 @@ pub async fn compile_worksheet(
     latex.push_str("}%\n");
     latex.push_str("\\pagestyle{empty}\n");
     latex.push_str("\\setlength{\\headheight}{28pt}\n");
-    latex.push_str("\\newcount\\numlines\n");
     latex.push_str("\\setlength{\\headsep}{0.5cm}\n");
     latex.push_str("\\begin{document}\n");
     latex.push_str("\\thispagestyle{firstpage}\n\n");
@@ -565,17 +564,13 @@ pub async fn compile_worksheet(
             // "Total for question" footer — placed on its own line at the end of the question.
             latex.push_str(&format!("  \\par\\vspace{{0.2cm}}\\noindent\\hfill\\textbf{{[Total for Question {} is {} marks]}}\\n", question_num, question.marks));
 
-            // Ruled lines: dynamically compute remaining page space and fill it entirely.
-            // Uses TeX's \pagegoal and \pagetotal to measure what's left, then draws
-            // enough 0.6cm-pitch lines to cover every remaining centimetre of the page.
+            // Ruled lines: enough 0.6cm-pitch lines to fill at least one full A4 page.
+            // 41 lines × 0.6cm = 24.6cm, which exceeds the ~24.13cm usable A4 height.
             latex.push_str("  \\nointerlineskip\n");
-            latex.push_str("  \\dimen0=\\dimexpr\\pagegoal-\\pagetotal\\relax\n");
-            latex.push_str("  \\numlines=\\dimen0\n");
-            latex.push_str("  \\divide\\numlines by 1118809\n");
-            latex.push_str("  \\loop\\ifnum\\numlines>0\n");
-            latex.push_str("    \\vspace{0.6cm}\\par\\noindent{\\color{gray!60}\\rule{0.85\\linewidth}{0.2pt}}\\nointerlineskip\n");
-            latex.push_str("    \\advance\\numlines by -1\n");
-            latex.push_str("  \\repeat\n");
+            let lines_to_draw = (question.marks * 5).max(41);
+            for _ in 0..lines_to_draw {
+                latex.push_str("  \\vspace{0.6cm}\\par\\noindent{\\color{gray!60}\\rule{0.85\\linewidth}{0.2pt}}\\nointerlineskip\n");
+            }
             latex.push_str("  \\newpage\n\n");
 
             answer_latex.push_str(&format!("  \\item {}\n", content));
