@@ -71,6 +71,7 @@ jobs:
         uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          MERGEMARK_OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
         with:
           tagName: ${{ github.ref_name }}
           releaseName: "MergeMark ${{ github.ref_name }}"
