@@ -4,8 +4,8 @@ use crate::pipeline::{
 };
 use crate::AppState;
 use serde::{Deserialize, Serialize};
-use tauri::{Emitter, Manager, State};
 use std::time::{Duration, Instant};
+use tauri::{Emitter, Manager, State};
 
 // ── Shared data model ─────────────────────────────────────────────────────────
 
@@ -70,7 +70,7 @@ async fn resolve_llm_client<'a>(
                 model: crate::billing::OPENROUTER_MODEL.to_string(),
                 timeout: crate::billing::REQUEST_TIMEOUT,
             }
-        },
+        }
         crate::billing::BillingRoute::Byok => LlmConfig {
             base_url: byok_base,
             api_key: byok_key.unwrap(),
@@ -101,30 +101,250 @@ impl Progress for TauriProgress {
 
 // ── Topic allow-lists (single source of truth for prompts + containment) ──────
 
-const _EDEXCEL_MATHS_PURE: &[&str] = &["Proof", "Algebra and functions", "Coordinate geometry in the (x, y) plane", "Sequences and series", "Trigonometry", "Exponentials and logarithms", "Differentiation", "Integration", "Numerical methods", "Vectors"];
-const _EDEXCEL_MATHS_STATS: &[&str] = &["Statistical sampling", "Data presentation and interpretation", "Probability", "Statistical distributions", "Statistical hypothesis testing"];
-const _EDEXCEL_MATHS_MECH: &[&str] = &["Quantities and units in mechanics", "Kinematics", "Forces and Newton's laws", "Moments"];
-const EDEXCEL_MATHS_TOPICS: &[&str] = &["Proof", "Algebra and functions", "Coordinate geometry in the (x, y) plane", "Sequences and series", "Trigonometry", "Exponentials and logarithms", "Differentiation", "Integration", "Numerical methods", "Vectors", "Statistical sampling", "Data presentation and interpretation", "Probability", "Statistical distributions", "Statistical hypothesis testing", "Quantities and units in mechanics", "Kinematics", "Forces and Newton's laws", "Moments"];
+const _EDEXCEL_MATHS_PURE: &[&str] = &[
+    "Proof",
+    "Algebra and functions",
+    "Coordinate geometry in the (x, y) plane",
+    "Sequences and series",
+    "Trigonometry",
+    "Exponentials and logarithms",
+    "Differentiation",
+    "Integration",
+    "Numerical methods",
+    "Vectors",
+];
+const _EDEXCEL_MATHS_STATS: &[&str] = &[
+    "Statistical sampling",
+    "Data presentation and interpretation",
+    "Probability",
+    "Statistical distributions",
+    "Statistical hypothesis testing",
+];
+const _EDEXCEL_MATHS_MECH: &[&str] = &[
+    "Quantities and units in mechanics",
+    "Kinematics",
+    "Forces and Newton's laws",
+    "Moments",
+];
+const EDEXCEL_MATHS_TOPICS: &[&str] = &[
+    "Proof",
+    "Algebra and functions",
+    "Coordinate geometry in the (x, y) plane",
+    "Sequences and series",
+    "Trigonometry",
+    "Exponentials and logarithms",
+    "Differentiation",
+    "Integration",
+    "Numerical methods",
+    "Vectors",
+    "Statistical sampling",
+    "Data presentation and interpretation",
+    "Probability",
+    "Statistical distributions",
+    "Statistical hypothesis testing",
+    "Quantities and units in mechanics",
+    "Kinematics",
+    "Forces and Newton's laws",
+    "Moments",
+];
 
-const _FM_CORE_PURE: &[&str] = &["Complex numbers", "Argand diagrams", "Series", "Roots of polynomials", "Volumes of revolution", "Matrices", "Linear transformations", "Proof by induction", "Vectors", "Differential equations", "Polar coordinates", "Hyperbolic functions", "Maclaurin series", "Methods in calculus"];
-const _FM_FM1: &[&str] = &["Momentum and impulse", "Work, energy and power", "Elastic strings and springs", "Elastic collisions in one dimension", "Elastic collisions in two dimensions"];
-const _FM_FS1: &[&str] = &["Discrete probability distributions", "Poisson distribution", "Geometric and negative binomial", "Hypothesis testing", "Central Limit Theorem", "Chi-squared tests", "Probability generating functions", "Quality of tests"];
-const _FM_FP1: &[&str] = &["Vectors (Cross product & planes)", "Conic sections", "Inequalities", "t-formulae", "Taylor series", "Numerical methods (Further)", "Reducible differential equations"];
-const _FM_D1: &[&str] = &["Algorithms", "Graphs and networks", "Algorithms on graphs", "Route inspection", "Travelling Salesperson Problem", "Linear programming", "Simplex algorithm"];
-const _FM_FP2: &[&str] = &["Number theory", "Groups", "Further calculus", "Further matrix algebra", "Further complex numbers", "Maclaurin series"];
-const _FM_FM2: &[&str] = &["Circular motion", "Centres of mass of plane figures", "Further centres of mass", "Kinematics", "Dynamics"];
-const _FM_FS2: &[&str] = &["Linear regression", "Continuous probability distributions", "Correlation", "Hypothesis testing"];
-const _FM_DM2: &[&str] = &["Transportation problems", "Allocation (assignment) problems", "Flows in networks", "Dynamic programming", "Game theory", "Recurrence relations", "Decision analysis"];
-const FURTHER_MATHS_TOPICS: &[&str] = &["Complex numbers", "Argand diagrams", "Series", "Roots of polynomials", "Volumes of revolution", "Matrices", "Linear transformations", "Proof by induction", "Vectors", "Differential equations", "Polar coordinates", "Hyperbolic functions", "Maclaurin series", "Methods in calculus", "Momentum and impulse", "Work, energy and power", "Elastic strings and springs", "Elastic collisions in one dimension", "Elastic collisions in two dimensions", "Discrete probability distributions", "Poisson distribution", "Geometric and negative binomial", "Hypothesis testing", "Central Limit Theorem", "Chi-squared tests", "Probability generating functions", "Quality of tests", "Vectors (Cross product & planes)", "Conic sections", "Inequalities", "t-formulae", "Taylor series", "Numerical methods (Further)", "Reducible differential equations", "Algorithms", "Graphs and networks", "Algorithms on graphs", "Route inspection", "Travelling Salesperson Problem", "Linear programming", "Simplex algorithm", "Number theory", "Groups", "Further calculus", "Further matrix algebra", "Further complex numbers", "Circular motion", "Centres of mass of plane figures", "Further centres of mass", "Kinematics", "Dynamics", "Linear regression", "Continuous probability distributions", "Correlation", "Transportation problems", "Allocation (assignment) problems", "Flows in networks", "Dynamic programming", "Game theory", "Recurrence relations", "Decision analysis"];
-const GCSE_MATHS_TOPICS: &[&str] = &["Number", "Algebra", "Ratio, proportion and rates of change", "Geometry and measures", "Probability", "Statistics"];
-const GCSE_FM_TOPICS: &[&str] = &["Number", "Algebra", "Coordinate Geometry", "Calculus", "Matrix Transformations", "Geometry"];
-const _PHYSICS_TOPICS: &[&str] = &["Measurements and their errors", "Particles and radiation", "Waves", "Mechanics and materials", "Electricity", "Further mechanics", "Thermal physics", "Fields and their consequences", "Nuclear physics", "Telescopes", "Classification of stars", "Cosmology"];
-const _CS_TOPICS: &[&str] = &["Fundamentals of programming", "Fundamentals of data structures", "Fundamentals of algorithms", "Theory of computation", "Fundamentals of data representation", "Fundamentals of computer systems", "Computer organisation and architecture", "Consequences of uses of computing", "Communication and networking", "Fundamentals of databases", "Big Data", "Fundamentals of functional programming"];
+const _FM_CORE_PURE: &[&str] = &[
+    "Complex numbers",
+    "Argand diagrams",
+    "Series",
+    "Roots of polynomials",
+    "Volumes of revolution",
+    "Matrices",
+    "Linear transformations",
+    "Proof by induction",
+    "Vectors",
+    "Differential equations",
+    "Polar coordinates",
+    "Hyperbolic functions",
+    "Maclaurin series",
+    "Methods in calculus",
+];
+const _FM_FM1: &[&str] = &[
+    "Momentum and impulse",
+    "Work, energy and power",
+    "Elastic strings and springs",
+    "Elastic collisions in one dimension",
+    "Elastic collisions in two dimensions",
+];
+const _FM_FS1: &[&str] = &[
+    "Discrete probability distributions",
+    "Poisson distribution",
+    "Geometric and negative binomial",
+    "Hypothesis testing",
+    "Central Limit Theorem",
+    "Chi-squared tests",
+    "Probability generating functions",
+    "Quality of tests",
+];
+const _FM_FP1: &[&str] = &[
+    "Vectors (Cross product & planes)",
+    "Conic sections",
+    "Inequalities",
+    "t-formulae",
+    "Taylor series",
+    "Numerical methods (Further)",
+    "Reducible differential equations",
+];
+const _FM_D1: &[&str] = &[
+    "Algorithms",
+    "Graphs and networks",
+    "Algorithms on graphs",
+    "Route inspection",
+    "Travelling Salesperson Problem",
+    "Linear programming",
+    "Simplex algorithm",
+];
+const _FM_FP2: &[&str] = &[
+    "Number theory",
+    "Groups",
+    "Further calculus",
+    "Further matrix algebra",
+    "Further complex numbers",
+    "Maclaurin series",
+];
+const _FM_FM2: &[&str] = &[
+    "Circular motion",
+    "Centres of mass of plane figures",
+    "Further centres of mass",
+    "Kinematics",
+    "Dynamics",
+];
+const _FM_FS2: &[&str] = &[
+    "Linear regression",
+    "Continuous probability distributions",
+    "Correlation",
+    "Hypothesis testing",
+];
+const _FM_DM2: &[&str] = &[
+    "Transportation problems",
+    "Allocation (assignment) problems",
+    "Flows in networks",
+    "Dynamic programming",
+    "Game theory",
+    "Recurrence relations",
+    "Decision analysis",
+];
+const FURTHER_MATHS_TOPICS: &[&str] = &[
+    "Complex numbers",
+    "Argand diagrams",
+    "Series",
+    "Roots of polynomials",
+    "Volumes of revolution",
+    "Matrices",
+    "Linear transformations",
+    "Proof by induction",
+    "Vectors",
+    "Differential equations",
+    "Polar coordinates",
+    "Hyperbolic functions",
+    "Maclaurin series",
+    "Methods in calculus",
+    "Momentum and impulse",
+    "Work, energy and power",
+    "Elastic strings and springs",
+    "Elastic collisions in one dimension",
+    "Elastic collisions in two dimensions",
+    "Discrete probability distributions",
+    "Poisson distribution",
+    "Geometric and negative binomial",
+    "Hypothesis testing",
+    "Central Limit Theorem",
+    "Chi-squared tests",
+    "Probability generating functions",
+    "Quality of tests",
+    "Vectors (Cross product & planes)",
+    "Conic sections",
+    "Inequalities",
+    "t-formulae",
+    "Taylor series",
+    "Numerical methods (Further)",
+    "Reducible differential equations",
+    "Algorithms",
+    "Graphs and networks",
+    "Algorithms on graphs",
+    "Route inspection",
+    "Travelling Salesperson Problem",
+    "Linear programming",
+    "Simplex algorithm",
+    "Number theory",
+    "Groups",
+    "Further calculus",
+    "Further matrix algebra",
+    "Further complex numbers",
+    "Circular motion",
+    "Centres of mass of plane figures",
+    "Further centres of mass",
+    "Kinematics",
+    "Dynamics",
+    "Linear regression",
+    "Continuous probability distributions",
+    "Correlation",
+    "Transportation problems",
+    "Allocation (assignment) problems",
+    "Flows in networks",
+    "Dynamic programming",
+    "Game theory",
+    "Recurrence relations",
+    "Decision analysis",
+];
+const GCSE_MATHS_TOPICS: &[&str] = &[
+    "Number",
+    "Algebra",
+    "Ratio, proportion and rates of change",
+    "Geometry and measures",
+    "Probability",
+    "Statistics",
+];
+const GCSE_FM_TOPICS: &[&str] = &[
+    "Number",
+    "Algebra",
+    "Coordinate Geometry",
+    "Calculus",
+    "Matrix Transformations",
+    "Geometry",
+];
+const _PHYSICS_TOPICS: &[&str] = &[
+    "Measurements and their errors",
+    "Particles and radiation",
+    "Waves",
+    "Mechanics and materials",
+    "Electricity",
+    "Further mechanics",
+    "Thermal physics",
+    "Fields and their consequences",
+    "Nuclear physics",
+    "Telescopes",
+    "Classification of stars",
+    "Cosmology",
+];
+const _CS_TOPICS: &[&str] = &[
+    "Fundamentals of programming",
+    "Fundamentals of data structures",
+    "Fundamentals of algorithms",
+    "Theory of computation",
+    "Fundamentals of data representation",
+    "Fundamentals of computer systems",
+    "Computer organisation and architecture",
+    "Consequences of uses of computing",
+    "Communication and networking",
+    "Fundamentals of databases",
+    "Big Data",
+    "Fundamentals of functional programming",
+];
 
 fn allowed_topics_for_subject(subject: &str) -> Vec<String> {
     let slice: &[&str] = match subject {
-        "A Level Mathematics (Edexcel)" | "A Level Mathematics" | "Mathematics" => EDEXCEL_MATHS_TOPICS,
-        "A Level Further Mathematics (Edexcel)" | "A Level Further Mathematics" | "Further Mathematics" => FURTHER_MATHS_TOPICS,
+        "A Level Mathematics (Edexcel)" | "A Level Mathematics" | "Mathematics" => {
+            EDEXCEL_MATHS_TOPICS
+        }
+        "A Level Further Mathematics (Edexcel)"
+        | "A Level Further Mathematics"
+        | "Further Mathematics" => FURTHER_MATHS_TOPICS,
         "GCSE Mathematics (Edexcel)" | "GCSE Mathematics" => GCSE_MATHS_TOPICS,
         "GCSE Further Mathematics (AQA)" | "GCSE Further Mathematics" => GCSE_FM_TOPICS,
         // "Physics" => PHYSICS_TOPICS,
@@ -146,18 +366,12 @@ struct SubjectClassifier {
 impl SubjectClassifier {
     fn new() -> Self {
         Self {
-            marks_re: regex::Regex::new(
-                r"(?i)\[\s*(\d+)\s*marks?\s*\]|\(\s*(\d+)\s*\)",
-            )
-            .unwrap(),
+            marks_re: regex::Regex::new(r"(?i)\[\s*(\d+)\s*marks?\s*\]|\(\s*(\d+)\s*\)").unwrap(),
             q_split_re: regex::Regex::new(
                 r"(?m)(?:^|\n)(?:Question\s+\d+|Q\.?\s*\d+|\d{1,2}[.)]\s)",
             )
             .unwrap(),
-            math_re: regex::Regex::new(
-                r"(?s)\$\$?.+?\$\$?|\\\[.+?\\\]|\\\(.+?\\\)",
-            )
-            .unwrap(),
+            math_re: regex::Regex::new(r"(?s)\$\$?.+?\$\$?|\\\[.+?\\\]|\\\(.+?\\\)").unwrap(),
         }
     }
 
@@ -165,54 +379,159 @@ impl SubjectClassifier {
         let lower = text.to_lowercase();
 
         let cs_keywords: &[&str] = &[
-            "array", "pointer", "recursion", "binary tree", "linked list",
-            "stack", "queue", "hash table", "algorithm", "big-o", "o(n)",
-            "complexity", "sql", "database", "sorting", "searching",
-            "compiler", "interpreter", "cpu", "register", "cache",
-            "encryption", "network", "protocol", "tcp", "ip address",
-            "subroutine", "function call", "object-oriented", "class",
-            "inheritance", "polymorphism", "binary", "hexadecimal",
-            "boolean", "pseudocode", "flowchart", "assembly",
+            "array",
+            "pointer",
+            "recursion",
+            "binary tree",
+            "linked list",
+            "stack",
+            "queue",
+            "hash table",
+            "algorithm",
+            "big-o",
+            "o(n)",
+            "complexity",
+            "sql",
+            "database",
+            "sorting",
+            "searching",
+            "compiler",
+            "interpreter",
+            "cpu",
+            "register",
+            "cache",
+            "encryption",
+            "network",
+            "protocol",
+            "tcp",
+            "ip address",
+            "subroutine",
+            "function call",
+            "object-oriented",
+            "class",
+            "inheritance",
+            "polymorphism",
+            "binary",
+            "hexadecimal",
+            "boolean",
+            "pseudocode",
+            "flowchart",
+            "assembly",
         ];
 
         let math_keywords: &[&str] = &[
-            "matrix", "determinant", "eigenvalue", "eigenvector",
-            "differential equation", "integration", "differentiation",
-            "calculus", "gradient", "vector", "scalar", "proof",
-            "induction", "complex number", "argand", "polynomial",
-            "binomial", "series", "sequence", "limit", "convergence",
-            "trigonometry", "sine", "cosine", "tangent", "logarithm",
-            "exponent", "modulus", "inequality", "quadratic",
+            "matrix",
+            "determinant",
+            "eigenvalue",
+            "eigenvector",
+            "differential equation",
+            "integration",
+            "differentiation",
+            "calculus",
+            "gradient",
+            "vector",
+            "scalar",
+            "proof",
+            "induction",
+            "complex number",
+            "argand",
+            "polynomial",
+            "binomial",
+            "series",
+            "sequence",
+            "limit",
+            "convergence",
+            "trigonometry",
+            "sine",
+            "cosine",
+            "tangent",
+            "logarithm",
+            "exponent",
+            "modulus",
+            "inequality",
+            "quadratic",
         ];
 
         let phys_keywords: &[&str] = &[
-            "kinetic energy", "potential energy", "momentum", "velocity",
-            "acceleration", "force", "newton", "wavelength", "frequency",
-            "magnetic field", "electric field", "voltage", "current",
-            "resistance", "ohm", "capacitor", "inductor", "photon",
-            "quantum", "nuclear", "radioactive", "half-life", "thermal",
-            "entropy", "pressure", "density", "refraction", "diffraction",
+            "kinetic energy",
+            "potential energy",
+            "momentum",
+            "velocity",
+            "acceleration",
+            "force",
+            "newton",
+            "wavelength",
+            "frequency",
+            "magnetic field",
+            "electric field",
+            "voltage",
+            "current",
+            "resistance",
+            "ohm",
+            "capacitor",
+            "inductor",
+            "photon",
+            "quantum",
+            "nuclear",
+            "radioactive",
+            "half-life",
+            "thermal",
+            "entropy",
+            "pressure",
+            "density",
+            "refraction",
+            "diffraction",
         ];
 
         let chem_keywords: &[&str] = &[
-            "mole", "molarity", "titration", "oxidation", "reduction",
-            "electrode", "catalyst", "reaction rate", "equilibrium",
-            "enthalpy", "entropy", "gibbs", "bond energy", "lattice",
-            "atomic number", "electron configuration", "periodic table",
-            "organic", "hydrocarbon", "ester", "polymer",
+            "mole",
+            "molarity",
+            "titration",
+            "oxidation",
+            "reduction",
+            "electrode",
+            "catalyst",
+            "reaction rate",
+            "equilibrium",
+            "enthalpy",
+            "entropy",
+            "gibbs",
+            "bond energy",
+            "lattice",
+            "atomic number",
+            "electron configuration",
+            "periodic table",
+            "organic",
+            "hydrocarbon",
+            "ester",
+            "polymer",
         ];
 
         let bio_keywords: &[&str] = &[
-            "cell membrane", "mitosis", "meiosis", "dna", "rna",
-            "protein synthesis", "enzyme", "atp", "photosynthesis",
-            "respiration", "ecosystem", "natural selection", "evolution",
-            "chromosome", "allele", "genotype", "phenotype",
-            "nervous system", "homeostasis", "osmosis",
+            "cell membrane",
+            "mitosis",
+            "meiosis",
+            "dna",
+            "rna",
+            "protein synthesis",
+            "enzyme",
+            "atp",
+            "photosynthesis",
+            "respiration",
+            "ecosystem",
+            "natural selection",
+            "evolution",
+            "chromosome",
+            "allele",
+            "genotype",
+            "phenotype",
+            "nervous system",
+            "homeostasis",
+            "osmosis",
         ];
 
-        let score = |kws: &[&str]| -> usize {
-            kws.iter().filter(|&&kw| lower.contains(kw)).count()
-        };
+        let score =
+            |kws: &[&str]| -> usize { kws.iter().filter(|&&kw| lower.contains(kw)).count() };
 
         let cs = score(cs_keywords);
         let math = score(math_keywords);
@@ -235,14 +554,20 @@ impl SubjectClassifier {
         }
         */
         if math == max {
-            let is_gcse = lower.contains("gcse") || lower.contains("level 2 certificate") || lower.contains("secondary education");
+            let is_gcse = lower.contains("gcse")
+                || lower.contains("level 2 certificate")
+                || lower.contains("secondary education");
             let is_further = lower.contains("further");
             if is_gcse && is_further {
                 return ("GCSE Further Mathematics (AQA)", "Algebra", false);
             } else if is_gcse {
                 return ("GCSE Mathematics (Edexcel)", "Algebra", false);
             } else if is_further {
-                return ("A Level Further Mathematics (Edexcel)", "Pure Mathematics", false);
+                return (
+                    "A Level Further Mathematics (Edexcel)",
+                    "Pure Mathematics",
+                    false,
+                );
             } else {
                 return ("A Level Mathematics (Edexcel)", "Pure", false);
             }
@@ -406,12 +731,9 @@ pub async fn delete_question(id: String, state: State<'_, AppState>) -> Result<(
 
 /// Import from a plain-text file (legacy "---"-delimited format or numbered questions).
 #[tauri::command]
-pub async fn import_questions(
-    app: tauri::AppHandle,
-    file_path: String,
-) -> Result<usize, String> {
-    let content = std::fs::read_to_string(&file_path)
-        .map_err(|e| format!("Failed to read file: {}", e))?;
+pub async fn import_questions(app: tauri::AppHandle, file_path: String) -> Result<usize, String> {
+    let content =
+        std::fs::read_to_string(&file_path).map_err(|e| format!("Failed to read file: {}", e))?;
 
     let state: State<'_, AppState> = app.state();
     let pool = state.db.lock().await;
@@ -423,10 +745,7 @@ pub async fn import_questions(
 /// Parse a PDF (or plain-text) past paper with heuristic regex slicing.
 /// Returns the total number of questions inserted.
 #[tauri::command]
-pub async fn parse_pdf(
-    app: tauri::AppHandle,
-    file_path: String,
-) -> Result<usize, String> {
+pub async fn parse_pdf(app: tauri::AppHandle, file_path: String) -> Result<usize, String> {
     let path_clone = file_path.clone();
     let raw_text = tokio::task::spawn_blocking(move || -> Result<String, String> {
         let lower = path_clone.to_lowercase();
@@ -434,19 +753,16 @@ pub async fn parse_pdf(
             pdf_extract::extract_text(&path_clone)
                 .map_err(|e| format!("PDF extraction failed: {}", e))
         } else {
-            std::fs::read_to_string(&path_clone)
-                .map_err(|e| format!("Failed to read file: {}", e))
+            std::fs::read_to_string(&path_clone).map_err(|e| format!("Failed to read file: {}", e))
         }
     })
     .await
     .map_err(|e| format!("Thread-pool error: {}", e))??;
 
     if raw_text.trim().is_empty() {
-        return Err(
-            "No text could be extracted from this file. \
+        return Err("No text could be extracted from this file. \
              It may be a scanned/image-only PDF."
-                .into(),
-        );
+            .into());
     }
 
     let cleaned = raw_text
@@ -454,7 +770,9 @@ pub async fn parse_pdf(
         .map(|l| l.trim())
         .collect::<Vec<_>>()
         .join("\n");
-    let cleaned = regex::Regex::new(r"\n{3,}").unwrap().replace_all(&cleaned, "\n\n");
+    let cleaned = regex::Regex::new(r"\n{3,}")
+        .unwrap()
+        .replace_all(&cleaned, "\n\n");
 
     let classifier = SubjectClassifier::new();
 
@@ -476,11 +794,17 @@ pub async fn compile_worksheet(
     let mut latex = String::new();
     latex.push_str("\\documentclass[11pt]{article}\n");
     latex.push_str("\\usepackage[margin=1in]{geometry}\n");
-    latex.push_str("\\usepackage{amsmath, amssymb, graphicx, xcolor, mdframed, parskip, enumitem}\n");
+    latex.push_str(
+        "\\usepackage{amsmath, amssymb, graphicx, xcolor, mdframed, parskip, enumitem}\n",
+    );
     latex.push_str("\\usepackage{fancyhdr}\n");
     latex.push_str("\\renewcommand{\\familydefault}{\\sfdefault}\n");
-    latex.push_str("% Pin all vertical rhythm at the document level so it cannot vary per question.\n");
-    latex.push_str("\\setlist{topsep=0.4cm, parsep=0.2cm, itemsep=0.2cm, leftmargin=1.2cm, labelsep=0.4cm}\n");
+    latex.push_str(
+        "% Pin all vertical rhythm at the document level so it cannot vary per question.\n",
+    );
+    latex.push_str(
+        "\\setlist{topsep=0.4cm, parsep=0.2cm, itemsep=0.2cm, leftmargin=1.2cm, labelsep=0.4cm}\n",
+    );
     latex.push_str("\\setlist[1]{label=\\textbf{\\arabic*.}, leftmargin=*}\n");
     latex.push_str("\\setlist[2]{label=\\textbf{(\\alph*)}, leftmargin=0.8cm}\n");
     latex.push_str("\\setlist[3]{label=\\textbf{(\\roman*)}, leftmargin=1.8cm}\n");
@@ -490,7 +814,9 @@ pub async fn compile_worksheet(
     latex.push_str("  \\fancyhf{}%\n");
     latex.push_str("  \\lhead{\\textbf{Name:}\\hspace{0.4cm}\\makebox[2.5in]{\\hrulefill}}%\n");
     latex.push_str("  \\chead{\\textbf{Date:}\\hspace{0.4cm}\\makebox[1.5in]{\\hrulefill}}%\n");
-    latex.push_str("  \\rhead{\\textbf{Score:}\\hspace{0.4cm}\\makebox[1in]{\\hrulefill} / Total}%\n");
+    latex.push_str(
+        "  \\rhead{\\textbf{Score:}\\hspace{0.4cm}\\makebox[1in]{\\hrulefill} / Total}%\n",
+    );
     latex.push_str("}%\n");
     latex.push_str("\\pagestyle{empty}\n");
     latex.push_str("\\setlength{\\headheight}{28pt}\n");
@@ -502,10 +828,14 @@ pub async fn compile_worksheet(
     let mut answer_latex = String::new();
     answer_latex.push_str("\\documentclass[11pt]{article}\n");
     answer_latex.push_str("\\usepackage[margin=1in]{geometry}\n");
-    answer_latex.push_str("\\usepackage{amsmath, amssymb, graphicx, xcolor, mdframed, parskip, enumitem}\n");
+    answer_latex.push_str(
+        "\\usepackage{amsmath, amssymb, graphicx, xcolor, mdframed, parskip, enumitem}\n",
+    );
     answer_latex.push_str("\\usepackage{fancyhdr}\n");
     answer_latex.push_str("\\renewcommand{\\familydefault}{\\sfdefault}\n");
-    answer_latex.push_str("\\setlist{topsep=0.4cm, parsep=0.2cm, itemsep=0.2cm, leftmargin=1.2cm, labelsep=0.4cm}\n");
+    answer_latex.push_str(
+        "\\setlist{topsep=0.4cm, parsep=0.2cm, itemsep=0.2cm, leftmargin=1.2cm, labelsep=0.4cm}\n",
+    );
     answer_latex.push_str("\\setlist[1]{label=\\textbf{\\arabic*.}, leftmargin=*}\n");
     answer_latex.push_str("\\setlist[2]{label=\\textbf{(\\alph*)}, leftmargin=0.8cm}\n");
     answer_latex.push_str("\\setlist[3]{label=\\textbf{(\\roman*)}, leftmargin=1.8cm}\n");
@@ -538,21 +868,37 @@ pub async fn compile_worksheet(
             let bold_re = regex::Regex::new(r"\*\*(.+?)\*\*").unwrap();
             content = bold_re.replace_all(&content, r"\textbf{${1}}").to_string();
             let italic_re = regex::Regex::new(r"\*([^\*]+?)\*").unwrap();
-            content = italic_re.replace_all(&content, r"\textit{${1}}").to_string();
+            content = italic_re
+                .replace_all(&content, r"\textit{${1}}")
+                .to_string();
             let multiple_nl_re = regex::Regex::new(r"\n+").unwrap();
             content = multiple_nl_re.replace_all(&content, "\n\n").to_string();
 
             // Format inline marks
             let inline_marks_re = regex::Regex::new(r"\[(\d+)\s*marks?\]").unwrap();
-            content = inline_marks_re.replace_all(&content, r"\null\hfill \textbf{[${1} marks]}").to_string();
+            content = inline_marks_re
+                .replace_all(&content, r"\null\hfill \textbf{[${1} marks]}")
+                .to_string();
 
             // Format list indents for parts (a) and subparts (i).
             // Document-level \setlist already sets leftmargin / labelsep / topsep / parsep / itemsep
             // for all list depths, so we just emit plain itemize blocks and let the preamble handle it.
-            let subpart_re = regex::Regex::new(r"(?m)^[ \t]*\((i|ii|iii|iv|v|vi|vii|viii|ix|x)\)[ \t]+(.*)").unwrap();
-            content = subpart_re.replace_all(&content, "\\begin{itemize}\n\\item[\\textbf{(${1})}] ${2}\n\\end{itemize}").to_string();
+            let subpart_re =
+                regex::Regex::new(r"(?m)^[ \t]*\((i|ii|iii|iv|v|vi|vii|viii|ix|x)\)[ \t]+(.*)")
+                    .unwrap();
+            content = subpart_re
+                .replace_all(
+                    &content,
+                    "\\begin{itemize}\n\\item[\\textbf{(${1})}] ${2}\n\\end{itemize}",
+                )
+                .to_string();
             let part_re = regex::Regex::new(r"(?m)^[ \t]*\(([a-z])\)[ \t]+(.*)").unwrap();
-            content = part_re.replace_all(&content, "\\begin{itemize}\n\\item[\\textbf{(${1})}] ${2}\n\\end{itemize}").to_string();
+            content = part_re
+                .replace_all(
+                    &content,
+                    "\\begin{itemize}\n\\item[\\textbf{(${1})}] ${2}\n\\end{itemize}",
+                )
+                .to_string();
 
             // 1. Strip leading numbers (e.g., "1. ", "1)", "- ")
             let leading_num_re = regex::Regex::new(r"^\s*\d+[\.\)\-\s]*").unwrap();
@@ -563,17 +909,24 @@ pub async fn compile_worksheet(
             if !snippet.is_empty() {
                 let content_trim = content.trim_end();
                 if content_trim.ends_with(snippet) {
-                    content = content_trim[..content_trim.len() - snippet.len()].trim_end().to_string();
+                    content = content_trim[..content_trim.len() - snippet.len()]
+                        .trim_end()
+                        .to_string();
                 }
             }
 
             // 3. Fix missing inline math wrapping on bare Greek variables
-            let greek_re = regex::Regex::new(r"(?x)
+            let greek_re = regex::Regex::new(
+                r"(?x)
                 (^|[\s,.\-\(])
                 \\(theta|alpha|beta|gamma|pi|mu|lambda|phi|omega|sigma|delta)
                 ([\s,.\-\)]|$)
-            ").unwrap();
-            content = greek_re.replace_all(&content, r"${1}$\$${2}$${3}").to_string();
+            ",
+            )
+            .unwrap();
+            content = greek_re
+                .replace_all(&content, r"${1}$\$${2}$${3}")
+                .to_string();
 
             // 4. Clean up markdown lists
             let list_re = regex::Regex::new(r"(?m)^[\*\-]\s+").unwrap();
@@ -603,7 +956,10 @@ pub async fn compile_worksheet(
             }
             // Inline "Total for question" footer — does not introduce a \par or \hfill that would
             // disturb the ruled-line rhythm below it.
-            latex.push_str(&format!("  \\hfill\\textbf{{[Total for Question {} is {} marks]}}\\par\\vspace{{0.4cm}}\n", question_num, question.marks));
+            latex.push_str(&format!(
+                "  \\hfill\\textbf{{[Total for Question {} is {} marks]}}\\par\\vspace{{0.4cm}}\n",
+                question_num, question.marks
+            ));
 
             // Ruled lines: exact 0.9cm pitch, full A4 page coverage.
             //
@@ -640,18 +996,39 @@ pub async fn compile_worksheet(
                 }
             }
             // Same inline "Total" footer treatment as the worksheet (no \par + \hfill disruption).
-            answer_latex.push_str(&format!("  \\hfill\\textbf{{[Total for Question {} is {} marks]}}\\par\n", question_num, question.marks));
+            answer_latex.push_str(&format!(
+                "  \\hfill\\textbf{{[Total for Question {} is {} marks]}}\\par\n",
+                question_num, question.marks
+            ));
 
             if let Some(mut ans_content) = question.answer_content {
                 ans_content = ans_content.replace("\r\n", "\n");
-                ans_content = bold_re.replace_all(&ans_content, r"\textbf{${1}}").to_string();
-                ans_content = italic_re.replace_all(&ans_content, r"\textit{${1}}").to_string();
+                ans_content = bold_re
+                    .replace_all(&ans_content, r"\textbf{${1}}")
+                    .to_string();
+                ans_content = italic_re
+                    .replace_all(&ans_content, r"\textit{${1}}")
+                    .to_string();
                 ans_content = multiple_nl_re.replace_all(&ans_content, "\n\n").to_string();
-                ans_content = inline_marks_re.replace_all(&ans_content, r"\null\hfill \textbf{[${1} marks]}").to_string();
-                ans_content = subpart_re.replace_all(&ans_content, "\\begin{itemize}\n\\item[\\textbf{(${1})}] ${2}\n\\end{itemize}").to_string();
-                ans_content = part_re.replace_all(&ans_content, "\\begin{itemize}\n\\item[\\textbf{(${1})}] ${2}\n\\end{itemize}").to_string();
-                
-                ans_content = greek_re.replace_all(&ans_content, r"${1}$\$${2}$${3}").to_string();
+                ans_content = inline_marks_re
+                    .replace_all(&ans_content, r"\null\hfill \textbf{[${1} marks]}")
+                    .to_string();
+                ans_content = subpart_re
+                    .replace_all(
+                        &ans_content,
+                        "\\begin{itemize}\n\\item[\\textbf{(${1})}] ${2}\n\\end{itemize}",
+                    )
+                    .to_string();
+                ans_content = part_re
+                    .replace_all(
+                        &ans_content,
+                        "\\begin{itemize}\n\\item[\\textbf{(${1})}] ${2}\n\\end{itemize}",
+                    )
+                    .to_string();
+
+                ans_content = greek_re
+                    .replace_all(&ans_content, r"${1}$\$${2}$${3}")
+                    .to_string();
                 ans_content = list_re.replace_all(&ans_content, "\n\n").to_string();
 
                 while let Some(start_idx) = ans_content.find("![Diagram](") {
@@ -683,7 +1060,13 @@ pub async fn compile_worksheet(
     // Sanitize file name: keep alphanumeric, spaces, hyphens, underscores
     let sanitized: String = file_name
         .chars()
-        .map(|c| if c.is_alphanumeric() || c == ' ' || c == '-' || c == '_' { c } else { '_' })
+        .map(|c| {
+            if c.is_alphanumeric() || c == ' ' || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
         .collect::<String>()
         .trim()
         .to_string();
@@ -716,10 +1099,16 @@ pub async fn compile_worksheet(
     let worksheet_tex = download_dir.join(format!("{}.tex", worksheet_stem));
     let answer_key_tex = download_dir.join(format!("{}.tex", answer_stem));
 
-    std::fs::write(&worksheet_tex, &latex).map_err(|e| format!("Failed to write worksheet file: {}", e))?;
-    std::fs::write(&answer_key_tex, &answer_latex).map_err(|e| format!("Failed to write answer key file: {}", e))?;
+    std::fs::write(&worksheet_tex, &latex)
+        .map_err(|e| format!("Failed to write worksheet file: {}", e))?;
+    std::fs::write(&answer_key_tex, &answer_latex)
+        .map_err(|e| format!("Failed to write answer key file: {}", e))?;
 
-    let pdflatex_cmd = if std::process::Command::new("pdflatex").arg("--version").output().is_ok() {
+    let pdflatex_cmd = if std::process::Command::new("pdflatex")
+        .arg("--version")
+        .output()
+        .is_ok()
+    {
         "pdflatex".to_string()
     } else if let Some(local_app_data) = std::env::var_os("LOCALAPPDATA") {
         let miktex_path = std::path::PathBuf::from(local_app_data)
@@ -746,7 +1135,10 @@ pub async fn compile_worksheet(
     if !worksheet_pdf.exists() {
         let stdout = String::from_utf8_lossy(&output_worksheet.stdout);
         let stderr = String::from_utf8_lossy(&output_worksheet.stderr);
-        return Err(format!("pdflatex failed to generate worksheet PDF:\n{}\n{}", stdout, stderr));
+        return Err(format!(
+            "pdflatex failed to generate worksheet PDF:\n{}\n{}",
+            stdout, stderr
+        ));
     }
 
     let output_answer_key = std::process::Command::new(&pdflatex_cmd)
@@ -762,7 +1154,10 @@ pub async fn compile_worksheet(
     if !answer_key_pdf.exists() {
         let stdout = String::from_utf8_lossy(&output_answer_key.stdout);
         let stderr = String::from_utf8_lossy(&output_answer_key.stderr);
-        return Err(format!("pdflatex failed to generate answer key PDF:\n{}\n{}", stdout, stderr));
+        return Err(format!(
+            "pdflatex failed to generate answer key PDF:\n{}\n{}",
+            stdout, stderr
+        ));
     }
 
     // Clean up all intermediary files
@@ -775,7 +1170,7 @@ pub async fn compile_worksheet(
 
     Ok(vec![
         worksheet_pdf.to_string_lossy().to_string(),
-        answer_key_pdf.to_string_lossy().to_string()
+        answer_key_pdf.to_string_lossy().to_string(),
     ])
 }
 
@@ -827,11 +1222,15 @@ pub async fn parse_pdf_vision(
     paper_name: String,
     state: State<'_, AppState>,
 ) -> Result<Vec<Question>, String> {
-    let _concurrency_guard = state.extraction_in_progress.try_lock().map_err(|_| "Another extraction is already in progress. Please wait for it to finish.".to_string())?;
-    
+    let _concurrency_guard = state.extraction_in_progress.try_lock().map_err(|_| {
+        "Another extraction is already in progress. Please wait for it to finish.".to_string()
+    })?;
+
     let model_name = model_name.trim().to_string();
 
-    state.cancel_flag.store(false, std::sync::atomic::Ordering::Relaxed);
+    state
+        .cancel_flag
+        .store(false, std::sync::atomic::Ordering::Relaxed);
 
     let pdf_pages = match pdf_base64_pages {
         Some(p) if !p.is_empty() => p,
@@ -841,9 +1240,10 @@ pub async fn parse_pdf_vision(
 
     // Per-page raw text (for the document map + OCR hints), off the async loop.
     let path_clone = file_path.clone();
-    let page_texts = tokio::task::spawn_blocking(move || extract_page_texts(&path_clone, num_pages))
-        .await
-        .map_err(|e| format!("Thread-pool error: {}", e))?;
+    let page_texts =
+        tokio::task::spawn_blocking(move || extract_page_texts(&path_clone, num_pages))
+            .await
+            .map_err(|e| format!("Thread-pool error: {}", e))?;
 
     let pages: Vec<PageInput> = pdf_pages
         .into_iter()
@@ -854,37 +1254,40 @@ pub async fn parse_pdf_vision(
         })
         .collect();
 
-    let diagrams_dir = app
-        .path()
-        .app_data_dir()
-        .map(|d| d.join("diagrams"))
-        .ok();
+    let diagrams_dir = app.path().app_data_dir().map(|d| d.join("diagrams")).ok();
 
-    let mut config = PipelineConfig::new(model_name.clone(), paper_name.trim().to_string(), subject.clone());
-    config.module_override = module_override.map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+    let mut config = PipelineConfig::new(
+        model_name.clone(),
+        paper_name.trim().to_string(),
+        subject.clone(),
+    );
+    config.module_override = module_override
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
     config.allowed_topics = allowed_topics_for_subject(&subject);
     config.diagrams_dir = diagrams_dir;
     config.max_repairs = 2;
     config.max_output_tokens = 16384;
-    config.parallelism = std::env::var("MERGEMARK_PARALLELISM").ok().and_then(|v| v.parse::<usize>().ok()).map(|v| v.clamp(1, 8)).unwrap_or(4);
+    config.parallelism = std::env::var("MERGEMARK_PARALLELISM")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .map(|v| v.clamp(1, 8))
+        .unwrap_or(4);
 
-    let (route, client) = resolve_llm_client(&state, model_name.clone()).await.map_err(|e| e.hint.unwrap_or(e.message))?;
+    let (route, client) = resolve_llm_client(&state, model_name.clone())
+        .await
+        .map_err(|e| e.hint.unwrap_or(e.message))?;
 
     let progress = TauriProgress { app: app.clone() };
-    let (built, mut report): (Vec<BuiltQuestion>, ImportReport) = pipeline::run_question_pipeline(
-        &client,
-        &pages,
-        &config,
-        &progress,
-        &state.cancel_flag,
-    )
-    .await?;
+    let (built, mut report): (Vec<BuiltQuestion>, ImportReport) =
+        pipeline::run_question_pipeline(&client, &pages, &config, &progress, &state.cancel_flag)
+            .await?;
 
     // Surface the report to the UI — nothing fails silently anymore.
     let _ = app.emit("import-report", &report);
 
     let pool = state.db.lock().await;
-    
+
     // Increment free uploads if we used the Free Tier
     if matches!(route, crate::billing::BillingRoute::FreeTier { .. }) {
         let _ = crate::db::increment_free_uploads(&pool).await;
@@ -899,7 +1302,11 @@ pub async fn parse_pdf_vision(
         } else {
             serde_json::to_string(&q.topics).unwrap_or_else(|_| "[]".to_string())
         };
-        let subtopic = q.topics.first().cloned().unwrap_or_else(|| "Imported".to_string());
+        let subtopic = q
+            .topics
+            .first()
+            .cloned()
+            .unwrap_or_else(|| "Imported".to_string());
 
         // Keep the existing row's UUID when we're refreshing it.
         let existing: Option<(String,)> = sqlx::query_as(
@@ -943,7 +1350,13 @@ pub async fn parse_pdf_vision(
         .execute(&*pool)
         .await
         .map_err(|e| format!("DB upsert failed for question {}: {}", q.question_number, e))?;
-        report.record_timing("database", "upsert_question", None, Some(q.question_number), db_start.elapsed().as_millis() as u64);
+        report.record_timing(
+            "database",
+            "upsert_question",
+            None,
+            Some(q.question_number),
+            db_start.elapsed().as_millis() as u64,
+        );
 
         final_questions.push(Question {
             id,
@@ -984,7 +1397,8 @@ pub async fn fetch_models(base_url: String, api_key: String) -> Result<Vec<Strin
 
     let url = format!("{}/models", base_url.trim_end_matches('/'));
 
-    let res = client.get(&url)
+    let res = client
+        .get(&url)
         .header("Authorization", format!("Bearer {}", api_key))
         .send()
         .await
@@ -1012,7 +1426,9 @@ pub async fn fetch_models(base_url: String, api_key: String) -> Result<Vec<Strin
 
 #[tauri::command]
 pub async fn cancel_import(state: State<'_, AppState>) -> Result<(), String> {
-    state.cancel_flag.store(true, std::sync::atomic::Ordering::Relaxed);
+    state
+        .cancel_flag
+        .store(true, std::sync::atomic::Ordering::Relaxed);
     Ok(())
 }
 
@@ -1037,12 +1453,13 @@ pub async fn delete_questions_by_paper(
     }
 
     let pool = state.db.lock().await;
-    let result = sqlx::query("DELETE FROM questions WHERE paper_name = ? AND trim(paper_name) != ''")
-        .bind(name)
-        .execute(&*pool)
-        .await
-        .map_err(|e| e.to_string())?;
-        
+    let result =
+        sqlx::query("DELETE FROM questions WHERE paper_name = ? AND trim(paper_name) != ''")
+            .bind(name)
+            .execute(&*pool)
+            .await
+            .map_err(|e| e.to_string())?;
+
     Ok(result.rows_affected() as i64)
 }
 
@@ -1083,15 +1500,26 @@ pub async fn parse_mark_scheme_vision(
     paper_name: String,
     state: State<'_, AppState>,
 ) -> Result<Vec<ProposedMapping>, String> {
-    let _concurrency_guard = state.extraction_in_progress.try_lock().map_err(|_| "Another extraction is already in progress. Please wait for it to finish.".to_string())?;
+    let _concurrency_guard = state.extraction_in_progress.try_lock().map_err(|_| {
+        "Another extraction is already in progress. Please wait for it to finish.".to_string()
+    })?;
 
     let model_name = model_name.trim().to_string();
 
-    state.cancel_flag.store(false, std::sync::atomic::Ordering::Relaxed);
+    state
+        .cancel_flag
+        .store(false, std::sync::atomic::Ordering::Relaxed);
 
-    let ext = std::path::Path::new(&file_path).extension().and_then(|s| s.to_str()).unwrap_or("").to_lowercase();
+    let ext = std::path::Path::new(&file_path)
+        .extension()
+        .and_then(|s| s.to_str())
+        .unwrap_or("")
+        .to_lowercase();
     let is_image = ext == "png" || ext == "jpg" || ext == "jpeg";
-    let has_pdf_pages = pdf_base64_pages.as_ref().map(|p| !p.is_empty()).unwrap_or(false);
+    let has_pdf_pages = pdf_base64_pages
+        .as_ref()
+        .map(|p| !p.is_empty())
+        .unwrap_or(false);
 
     // ── Build PageInput list from whatever source we have ───────────────────
     let pages: Vec<PageInput> = if has_pdf_pages {
@@ -1129,17 +1557,25 @@ pub async fn parse_mark_scheme_vision(
             .collect()
     } else if is_image {
         use base64::Engine;
-        let image_bytes = tokio::fs::read(&file_path).await.map_err(|e| format!("Failed to read image: {}", e))?;
+        let image_bytes = tokio::fs::read(&file_path)
+            .await
+            .map_err(|e| format!("Failed to read image: {}", e))?;
         let b64 = base64::engine::general_purpose::STANDARD.encode(&image_bytes);
-        vec![PageInput { b64, text: String::new() }]
+        vec![PageInput {
+            b64,
+            text: String::new(),
+        }]
     } else {
         // Plain-text source: one synthetic page carrying the whole text.
         let text = match ext.as_str() {
-            "txt" => tokio::fs::read_to_string(&file_path).await.map_err(|e| e.to_string())?,
+            "txt" => tokio::fs::read_to_string(&file_path)
+                .await
+                .map_err(|e| e.to_string())?,
             _ => {
                 let path_clone = file_path.clone();
                 tokio::task::spawn_blocking(move || {
-                    pdf_extract::extract_text(&path_clone).map_err(|e| format!("PDF extraction failed: {}", e))
+                    pdf_extract::extract_text(&path_clone)
+                        .map_err(|e| format!("PDF extraction failed: {}", e))
                 })
                 .await
                 .map_err(|e| e.to_string())??
@@ -1149,17 +1585,26 @@ pub async fn parse_mark_scheme_vision(
         if text.trim().is_empty() {
             return Err("File is empty or contains only unextractable images.".to_string());
         }
-        vec![PageInput { b64: String::new(), text }]
+        vec![PageInput {
+            b64: String::new(),
+            text,
+        }]
     };
 
     let diagrams_dir = app.path().app_data_dir().map(|d| d.join("diagrams")).ok();
 
-    let mut config = PipelineConfig::new(model_name.clone(), paper_name.trim().to_string(), "MarkScheme".into());
+    let mut config = PipelineConfig::new(
+        model_name.clone(),
+        paper_name.trim().to_string(),
+        "MarkScheme".into(),
+    );
     config.diagrams_dir = diagrams_dir;
     config.max_repairs = 2;
     config.max_output_tokens = 32768;
 
-    let (route, client) = resolve_llm_client(&state, model_name.clone()).await.map_err(|e| e.hint.unwrap_or(e.message))?;
+    let (route, client) = resolve_llm_client(&state, model_name.clone())
+        .await
+        .map_err(|e| e.hint.unwrap_or(e.message))?;
 
     let progress = TauriProgress { app: app.clone() };
     let (drafts, report): (Vec<AnswerDraft>, ImportReport) =
@@ -1169,7 +1614,7 @@ pub async fn parse_mark_scheme_vision(
     let _ = app.emit("import-report", &report);
 
     let pool = state.db.lock().await;
-    
+
     // Increment free uploads if we used the Free Tier
     if matches!(route, crate::billing::BillingRoute::FreeTier { .. }) {
         let _ = crate::db::increment_free_uploads(&pool).await;
@@ -1181,16 +1626,16 @@ pub async fn parse_mark_scheme_vision(
 
     // ── Match answers to DB questions for this paper ────────────────────────
     let pool = state.db.lock().await;
-    let questions: Vec<Question> = sqlx::query_as(
-        "SELECT * FROM questions WHERE paper_name = ? ORDER BY rowid ASC",
-    )
-    .bind(paper_name.trim())
-    .fetch_all(&*pool)
-    .await
-    .map_err(|e| format!("DB error: {}", e))?;
+    let questions: Vec<Question> =
+        sqlx::query_as("SELECT * FROM questions WHERE paper_name = ? ORDER BY rowid ASC")
+            .bind(paper_name.trim())
+            .fetch_all(&*pool)
+            .await
+            .map_err(|e| format!("DB error: {}", e))?;
 
     let leading_num_re = regex::Regex::new(r"^(?:Question\s+)?(\d+)").unwrap();
-    let mut q_by_number: std::collections::HashMap<i64, &Question> = std::collections::HashMap::new();
+    let mut q_by_number: std::collections::HashMap<i64, &Question> =
+        std::collections::HashMap::new();
     for q in &questions {
         if let Some(n) = q.question_number {
             q_by_number.entry(n).or_insert(q);
@@ -1300,15 +1745,34 @@ impl HybridTextOutput {
 }
 
 impl pdf_extract::OutputDev for HybridTextOutput {
-    fn begin_page(&mut self, _page_num: u32, media_box: &pdf_extract::MediaBox, _art_box: Option<(f64, f64, f64, f64)>) -> Result<(), pdf_extract::OutputError> {
-        self.flip_ctm = Some(pdf_extract::Transform::row_major(1., 0., 0., -1., 0., media_box.ury - media_box.lly));
+    fn begin_page(
+        &mut self,
+        _page_num: u32,
+        media_box: &pdf_extract::MediaBox,
+        _art_box: Option<(f64, f64, f64, f64)>,
+    ) -> Result<(), pdf_extract::OutputError> {
+        self.flip_ctm = Some(pdf_extract::Transform::row_major(
+            1.,
+            0.,
+            0.,
+            -1.,
+            0.,
+            media_box.ury - media_box.lly,
+        ));
         Ok(())
     }
     fn end_page(&mut self) -> Result<(), pdf_extract::OutputError> {
         self.flush_word();
         Ok(())
     }
-    fn output_character(&mut self, trm: &pdf_extract::Transform, width: f64, _spacing: f64, font_size: f64, char: &str) -> Result<(), pdf_extract::OutputError> {
+    fn output_character(
+        &mut self,
+        trm: &pdf_extract::Transform,
+        width: f64,
+        _spacing: f64,
+        font_size: f64,
+        char: &str,
+    ) -> Result<(), pdf_extract::OutputError> {
         let flip_ctm = self.flip_ctm.unwrap();
         let m31 = trm.m31 * flip_ctm.m11 + trm.m32 * flip_ctm.m21 + flip_ctm.m31;
         let m32 = trm.m31 * flip_ctm.m12 + trm.m32 * flip_ctm.m22 + flip_ctm.m32;
@@ -1344,9 +1808,15 @@ impl pdf_extract::OutputDev for HybridTextOutput {
         self.last_end = x + width * transformed_font_size;
         Ok(())
     }
-    fn begin_word(&mut self) -> Result<(), pdf_extract::OutputError> { Ok(()) }
-    fn end_word(&mut self) -> Result<(), pdf_extract::OutputError> { Ok(()) }
-    fn end_line(&mut self) -> Result<(), pdf_extract::OutputError> { Ok(()) }
+    fn begin_word(&mut self) -> Result<(), pdf_extract::OutputError> {
+        Ok(())
+    }
+    fn end_word(&mut self) -> Result<(), pdf_extract::OutputError> {
+        Ok(())
+    }
+    fn end_line(&mut self) -> Result<(), pdf_extract::OutputError> {
+        Ok(())
+    }
 }
 
 // ── Hybrid billing command: generate_worksheet_from_pdf ──────────────────────
@@ -1422,8 +1892,7 @@ pub async fn generate_worksheet_from_pdf(
             pdf_extract::extract_text(&path_clone)
                 .map_err(|e| format!("PDF extraction failed: {e}"))
         } else {
-            std::fs::read_to_string(&path_clone)
-                .map_err(|e| format!("Failed to read file: {e}"))
+            std::fs::read_to_string(&path_clone).map_err(|e| format!("Failed to read file: {e}"))
         }
     })
     .await
@@ -1522,7 +1991,10 @@ pub async fn generate_worksheet_from_pdf(
         let remaining = (crate::db::FREE_UPLOAD_LIMIT - updated).max(0);
         (updated, remaining)
     } else {
-        (free_uploads_used, crate::db::FREE_UPLOAD_LIMIT - free_uploads_used)
+        (
+            free_uploads_used,
+            crate::db::FREE_UPLOAD_LIMIT - free_uploads_used,
+        )
     };
 
     let summary = WorksheetBillingSummary {
@@ -1553,9 +2025,7 @@ pub struct UsageStatus {
 }
 
 #[tauri::command]
-pub async fn get_usage_status(
-    state: tauri::State<'_, AppState>,
-) -> Result<UsageStatus, String> {
+pub async fn get_usage_status(state: tauri::State<'_, AppState>) -> Result<UsageStatus, String> {
     let pool = state.db.lock().await;
     let used = crate::db::get_free_uploads_used(&pool)
         .await
@@ -1583,12 +2053,8 @@ pub async fn set_byok_key(
     state: tauri::State<'_, AppState>,
 ) -> Result<(), String> {
     let pool = state.db.lock().await;
-    crate::db::set_byok_api_key(
-        &pool,
-        api_key.as_deref(),
-        base_url.as_deref(),
-    )
-    .await
-    .map_err(|e| format!("DB write failed: {e}"))?;
+    crate::db::set_byok_api_key(&pool, api_key.as_deref(), base_url.as_deref())
+        .await
+        .map_err(|e| format!("DB write failed: {e}"))?;
     Ok(())
 }
