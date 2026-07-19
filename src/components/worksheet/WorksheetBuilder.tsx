@@ -124,8 +124,8 @@ export function WorksheetBuilder({ selectedQuestions, onRemove, onReorder }: Wor
 
       {/* ── Stats row ── */}
       <div className="flex gap-2 px-4 py-3 border-b border-border">
-        <StatChip icon={Hash}  label="Total Marks" value={`${totalMarks}`} />
-        <StatChip icon={Clock} label="Est. Time"   value={`${estMinutes}m`} />
+        <StatChip icon={Hash} label="Total Marks" value={`${totalMarks}`} />
+        <StatChip icon={Clock} label="Est. Time" value={`${estMinutes}m`} />
       </div>
 
       {/* ── Scrollable sortable list ── */}

@@ -66,7 +66,7 @@ function App() {
           aria-label="Main navigation"
         >
           <div className="flex items-center mr-8 pb-2 pt-1">
-            <img src="/mergemark-full.svg" alt="MergeMark Logo" className="h-8 w-auto" />
+            <img src="/mergemark-full.svg" alt="MergeMark Logo" className="h-9 w-auto" />
           </div>
 
           {TABS.map(({ id, label, icon: Icon }) => (
