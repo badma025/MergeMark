@@ -7,6 +7,7 @@ import { IngestionDropzone } from "@/components/ingestion/IngestionDropzone";
 import { Settings } from "@/components/settings/Settings";
 import { type QuestionCardProps } from "@/components/repository/QuestionCard";
 import { type WorksheetItemData } from "@/components/worksheet/WorksheetItem";
+import { UploadCounter, useUploadCounter } from "@/components/UploadCounter";
 import { cn } from "@/lib/utils";
 
 export type SelectedQuestion = Omit<QuestionCardProps, "onAddToWorksheet">;
@@ -22,6 +23,14 @@ const TABS: { id: Tab; label: string; icon: React.ElementType }[] = [
 function App() {
   const [activeTab, setActiveTab] = useState<Tab>("repository");
   const [selectedQuestions, setSelectedQuestions] = useState<WorksheetItemData[]>([]);
+
+  // ── Free-tier upload counter ──────────────────────────────────────────
+  // `status` is the live SQLite snapshot of `usage_config.free_uploads_used`.
+  // The hook also subscribes to a window-level "usage changed" event, so any
+  // component that successfully invokes `generate_worksheet_from_pdf` can
+  // call `notifyUsageChanged()` and the badge will tick down without
+  // forcing the teacher to restart the app.
+  const { status: usageStatus, loading: usageLoading } = useUploadCounter();
 
   function handleAddQuestion(question: SelectedQuestion) {
     setSelectedQuestions((prev) => {
@@ -53,7 +62,7 @@ function App() {
 
         {/* Tab bar */}
         <nav
-          className="flex items-center gap-1 border-b border-border px-4 pt-2 bg-background/80 backdrop-blur-sm"
+          className="flex items-center gap-1 border-b border-border px-4 pt-8 bg-background/80 backdrop-blur-sm"
           aria-label="Main navigation"
         >
           {TABS.map(({ id, label, icon: Icon }) => (
@@ -76,6 +85,11 @@ function App() {
               {label}
             </button>
           ))}
+
+          {/* Free-tier counter — pushed to the right edge of the tab bar. */}
+          <div className="ml-auto pr-1 pb-1 pt-1.5">
+            <UploadCounter status={usageStatus} loading={usageLoading} />
+          </div>
         </nav>
 
         {/* Tab panels */}
@@ -84,7 +98,7 @@ function App() {
             <RepositoryFeed isActive={activeTab === "repository"} onAddToWorksheet={handleAddQuestion} />
           </div>
           <div className={cn("absolute inset-0 flex flex-col min-h-0 overflow-hidden bg-background", activeTab === "ingestion" ? "z-10 opacity-100 pointer-events-auto" : "z-0 opacity-0 pointer-events-none")}>
-            <IngestionDropzone onSuccess={() => setActiveTab("repository")} />
+            <IngestionDropzone isActive={activeTab === "ingestion"} onSuccess={() => setActiveTab("repository")} />
           </div>
           <div className={cn("absolute inset-0 flex flex-col min-h-0 overflow-hidden bg-background", activeTab === "settings" ? "z-10 opacity-100 pointer-events-auto" : "z-0 opacity-0 pointer-events-none")}>
             <Settings />

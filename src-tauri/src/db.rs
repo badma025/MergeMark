@@ -91,47 +91,149 @@ pub async fn init_db(app_data_dir: PathBuf) -> Result<SqlitePool, sqlx::Error> {
     .execute(&pool)
     .await;
 
-    // 5. Seed the database with mock data if it's empty
-    seed_database_if_empty(&pool).await?;
+    // ── Billing / usage_config table ───────────────────────────────────────
+    // A single-row table (id = 1) that tracks the beta-launch hybrid billing
+    // model:
+    //   * `free_uploads_used`  — count of successful 200 OK responses through
+    //                            the OpenRouter free tier (Gemini 2.5 Flash).
+    //                            Capped at 3 by the Tauri command; we never
+    //                            auto-reset it here.
+    //   * `byok_api_key`       — user-supplied personal LLM key. When present
+    //                            the OpenRouter free-tier route is bypassed
+    //                            entirely and requests go direct to the
+    //                            upstream provider.
+    //   * `byok_base_url`      — optional override of the LLM base URL used
+    //                            when the user supplies a BYOK key. Defaults
+    //                            to OpenAI's compatible endpoint if NULL.
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS usage_config (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            free_uploads_used INTEGER NOT NULL DEFAULT 0,
+            byok_api_key TEXT,
+            byok_base_url TEXT,
+            updated_at INTEGER NOT NULL DEFAULT 0
+        );
+        "#,
+    )
+    .execute(&pool)
+    .await?;
+
+    // Make sure the singleton row exists. INSERT OR IGNORE is safe across
+    // re-opens because of the CHECK (id = 1) primary key.
+    sqlx::query(
+        r#"
+        INSERT OR IGNORE INTO usage_config (id, free_uploads_used, byok_api_key, byok_base_url, updated_at)
+        VALUES (1, 0, NULL, NULL, ?);
+        "#,
+    )
+    .bind(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0),
+    )
+    .execute(&pool)
+    .await?;
 
     Ok(pool)
 }
 
-async fn seed_database_if_empty(pool: &SqlitePool) -> Result<(), sqlx::Error> {
-    let count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM questions")
+// ── usage_config helpers ─────────────────────────────────────────────────────
+//
+// These are the only sanctioned entry points for the rest of the crate to
+// touch the billing table. Keeping the SQL in one place means the schema can
+// evolve without grepping the whole codebase.
+
+/// Free-tier ceiling. Once `free_uploads_used >= FREE_UPLOAD_LIMIT` the
+/// command will refuse to route through the OpenRouter free tier.
+pub const FREE_UPLOAD_LIMIT: i64 = 3;
+
+/// Read the current `free_uploads_used` counter.
+pub async fn get_free_uploads_used(pool: &SqlitePool) -> Result<i64, sqlx::Error> {
+    let row: (i64,) = sqlx::query_as("SELECT free_uploads_used FROM usage_config WHERE id = 1")
         .fetch_one(pool)
         .await?;
+    Ok(row.0)
+}
 
-    if count.0 == 0 {
-        let mock_data = vec![
-            ("q1", "Mathematics", "Calculus", "[\"Differentiation\"]", 4, "Find the derivative of f(x) with respect to x, and determine all critical points in the interval [0, 2π].", "f(x) = 3x³ - 2sin(x) + e^(2x)", false, Some("Pure".to_string())),
-            ("q2", "Physics", "Mechanics", "[]", 6, "A particle of mass m moves under a conservative force. Show that the total mechanical energy is conserved and find the equilibrium positions.", "F(x) = -dV/dx,   V(x) = ½kx² - mgx", false, Some("Physics".to_string())),
-            ("q3", "Computer Science", "Algorithms", "[]", 3, "Analyse the time complexity of the following recursive function and express your answer using Big-O notation.", "def fib(n):\n    if n <= 1:\n        return n\n    return fib(n-1) + fib(n-2)", true, Some("Computer Science".to_string())),
-            ("q4", "Mathematics", "Statistics", "[\"Statistical distributions\"]", 5, "Given a normal distribution X ~ N(μ, σ²), find the probability P(X > 72) given that μ = 65 and σ = 8.", "P(X > 72) = P(Z > (72 - μ) / σ)", false, Some("Statistics".to_string())),
-            ("q5", "Chemistry", "Thermodynamics", "[]", 4, "Calculate the Gibbs free energy change for the reaction at 298 K. State whether the reaction is spontaneous.", "ΔG° = ΔH° - TΔS°\n     = -120 kJ - (298)(0.250 kJ/K)", false, Some("General".to_string())),
-            ("q6", "Computer Science", "Data Structures", "[]", 3, "Write a function that reverses a singly linked list in-place and returns the new head node. Analyse its space complexity.", "def reverse(head):\n    prev = None\n    curr = head\n    while curr:\n        nxt = curr.next\n        curr.next = prev\n        prev, curr = curr, nxt\n    return prev", true, Some("Computer Science".to_string())),
-        ];
+/// Increment `free_uploads_used` by one. Returns the new value.
+pub async fn increment_free_uploads(pool: &SqlitePool) -> Result<i64, sqlx::Error> {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    sqlx::query(
+        r#"
+        UPDATE usage_config
+        SET free_uploads_used = free_uploads_used + 1,
+            updated_at = ?
+        WHERE id = 1
+        "#,
+    )
+    .bind(now)
+    .execute(pool)
+    .await?;
+    get_free_uploads_used(pool).await
+}
 
-        for (id, subject, subtopic, topics, marks, content, math_snippet, is_code, module) in mock_data {
-            sqlx::query(
-                r#"
-                INSERT INTO questions (id, subject, subtopic, topics, marks, content, math_snippet, is_code, module)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                "#,
-            )
-            .bind(id)
-            .bind(subject)
-            .bind(subtopic)
-            .bind(topics)
-            .bind(marks)
-            .bind(content)
-            .bind(math_snippet)
-            .bind(is_code)
-            .bind(module)
-            .execute(pool)
+/// Read the user-supplied BYOK key. `None` means no key is stored.
+pub async fn get_byok_api_key(pool: &SqlitePool) -> Result<Option<String>, sqlx::Error> {
+    let row: (Option<String>,) =
+        sqlx::query_as("SELECT byok_api_key FROM usage_config WHERE id = 1")
+            .fetch_one(pool)
             .await?;
+    Ok(row.0.and_then(|s| {
+        let trimmed = s.trim().to_string();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed)
         }
-    }
+    }))
+}
 
+/// Read the optional BYOK base URL override.
+pub async fn get_byok_base_url(pool: &SqlitePool) -> Result<Option<String>, sqlx::Error> {
+    let row: (Option<String>,) = sqlx::query_as("SELECT byok_base_url FROM usage_config WHERE id = 1")
+        .fetch_one(pool)
+        .await?;
+    Ok(row.0.and_then(|s| {
+        let trimmed = s.trim().to_string();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed)
+        }
+    }))
+}
+
+/// Persist (or clear) the user's BYOK key. Empty/whitespace strings clear it.
+pub async fn set_byok_api_key(
+    pool: &SqlitePool,
+    key: Option<&str>,
+    base_url: Option<&str>,
+) -> Result<(), sqlx::Error> {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let key = key.map(|k| k.trim()).filter(|k| !k.is_empty());
+    let base_url = base_url.map(|b| b.trim()).filter(|b| !b.is_empty());
+    sqlx::query(
+        r#"
+        UPDATE usage_config
+        SET byok_api_key = ?,
+            byok_base_url = ?,
+            updated_at = ?
+        WHERE id = 1
+        "#,
+    )
+    .bind(key)
+    .bind(base_url)
+    .bind(now)
+    .execute(pool)
+    .await?;
     Ok(())
 }
+

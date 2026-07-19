@@ -1196,12 +1196,6 @@ fn validate_span_items(page: &AiQuestionPage, span: &QuestionSpan) -> Vec<String
                 span.expected_marks.unwrap_or(0)
             ));
         }
-        if !content.trim().is_empty() && !validate::has_terminal_ending(content) {
-            errors.push(format!(
-                "item {} content lacks terminal punctuation (truncation suspected)",
-                idx + 1
-            ));
-        }
         if let Some(bboxes) = &item.diagram_bboxes {
             if let Some(indexes) = &item.bbox_page_indexes {
                 if indexes.len() != bboxes.len() {

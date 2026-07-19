@@ -38,6 +38,52 @@ pub struct ProposedMapping {
     pub paper_name: String,
 }
 
+// ── Billing integration helper ──────────────────────────────────────────────────
+
+async fn resolve_llm_client<'a>(
+    state: &State<'a, AppState>,
+    frontend_model: String,
+) -> Result<(crate::billing::BillingRoute, ReqwestLlm), crate::billing::BillingError> {
+    let pool = state.db.lock().await;
+    let free_uploads_used = crate::db::get_free_uploads_used(&pool)
+        .await
+        .map_err(|e| crate::billing::BillingError::network(&format!("DB read failed: {e}")))?;
+    let byok_key = crate::db::get_byok_api_key(&pool)
+        .await
+        .map_err(|e| crate::billing::BillingError::network(&format!("DB read failed: {e}")))?;
+    let byok_base = crate::db::get_byok_base_url(&pool)
+        .await
+        .map_err(|e| crate::billing::BillingError::network(&format!("DB read failed: {e}")))?
+        .unwrap_or_else(|| "https://api.openai.com/v1".to_string());
+    drop(pool);
+
+    let route = crate::billing::pick_route(free_uploads_used, byok_key.is_some());
+    let config = match &route {
+        crate::billing::BillingRoute::FreeTier { .. } => {
+            let key = crate::billing::openrouter_api_key();
+            if key == "dev-openrouter-key-not-set" {
+                return Err(crate::billing::BillingError::network("The built-in Free Tier is unavailable on this installation. Please enter your own API Key in Settings."));
+            }
+            LlmConfig {
+                base_url: crate::billing::OPENROUTER_API_URL.to_string(),
+                api_key: key.to_string(),
+                model: crate::billing::OPENROUTER_MODEL.to_string(),
+                timeout: crate::billing::REQUEST_TIMEOUT,
+            }
+        },
+        crate::billing::BillingRoute::Byok => LlmConfig {
+            base_url: byok_base,
+            api_key: byok_key.unwrap(),
+            model: frontend_model,
+            timeout: crate::billing::REQUEST_TIMEOUT,
+        },
+        crate::billing::BillingRoute::NeedsByok => {
+            return Err(crate::billing::BillingError::needs_byok(free_uploads_used));
+        }
+    };
+    Ok((route, ReqwestLlm::new(config)))
+}
+
 // ── Progress bridge: pipeline stages → frontend `import-progress` events ──────
 
 struct TauriProgress {
@@ -771,18 +817,18 @@ fn extract_page_texts(file_path: &str, num_pages: usize) -> Vec<String> {
 #[tauri::command]
 pub async fn parse_pdf_vision(
     app: tauri::AppHandle,
-    api_key: String,
+    _api_key: String,
     file_path: String,
     pdf_base64_pages: Option<Vec<String>>,
-    base_url: String,
+    _base_url: String,
     model_name: String,
     subject: String,
     module_override: Option<String>,
     paper_name: String,
     state: State<'_, AppState>,
 ) -> Result<Vec<Question>, String> {
-    let base_url = base_url.trim().to_string();
-    let api_key = api_key.trim().to_string();
+    let _concurrency_guard = state.extraction_in_progress.try_lock().map_err(|_| "Another extraction is already in progress. Please wait for it to finish.".to_string())?;
+    
     let model_name = model_name.trim().to_string();
 
     state.cancel_flag.store(false, std::sync::atomic::Ordering::Relaxed);
@@ -822,12 +868,7 @@ pub async fn parse_pdf_vision(
     config.max_output_tokens = 16384;
     config.parallelism = std::env::var("MERGEMARK_PARALLELISM").ok().and_then(|v| v.parse::<usize>().ok()).map(|v| v.clamp(1, 8)).unwrap_or(4);
 
-    let client = ReqwestLlm::new(LlmConfig {
-        base_url,
-        api_key,
-        model: model_name,
-        timeout: Duration::from_secs(300),
-    });
+    let (route, client) = resolve_llm_client(&state, model_name.clone()).await.map_err(|e| e.hint.unwrap_or(e.message))?;
 
     let progress = TauriProgress { app: app.clone() };
     let (built, mut report): (Vec<BuiltQuestion>, ImportReport) = pipeline::run_question_pipeline(
@@ -842,8 +883,14 @@ pub async fn parse_pdf_vision(
     // Surface the report to the UI — nothing fails silently anymore.
     let _ = app.emit("import-report", &report);
 
-    // ── Persist: idempotent upserts keyed by (paper_name, question_number) ──
     let pool = state.db.lock().await;
+    
+    // Increment free uploads if we used the Free Tier
+    if matches!(route, crate::billing::BillingRoute::FreeTier { .. }) {
+        let _ = crate::db::increment_free_uploads(&pool).await;
+    }
+
+    // ── Persist: idempotent upserts keyed by (paper_name, question_number) ──
     let mut final_questions = Vec::with_capacity(built.len());
 
     for q in built {
@@ -1028,16 +1075,16 @@ pub async fn update_question(
 #[tauri::command]
 pub async fn parse_mark_scheme_vision(
     app: tauri::AppHandle,
-    api_key: String,
+    _api_key: String,
     file_path: String,
     pdf_base64_pages: Option<Vec<String>>,
-    base_url: String,
+    _base_url: String,
     model_name: String,
     paper_name: String,
     state: State<'_, AppState>,
 ) -> Result<Vec<ProposedMapping>, String> {
-    let base_url = base_url.trim().to_string();
-    let api_key = api_key.trim().to_string();
+    let _concurrency_guard = state.extraction_in_progress.try_lock().map_err(|_| "Another extraction is already in progress. Please wait for it to finish.".to_string())?;
+
     let model_name = model_name.trim().to_string();
 
     state.cancel_flag.store(false, std::sync::atomic::Ordering::Relaxed);
@@ -1110,12 +1157,7 @@ pub async fn parse_mark_scheme_vision(
     config.max_repairs = 2;
     config.max_output_tokens = 32768;
 
-    let client = ReqwestLlm::new(LlmConfig {
-        base_url,
-        api_key,
-        model: model_name,
-        timeout: Duration::from_secs(300),
-    });
+    let (route, client) = resolve_llm_client(&state, model_name.clone()).await.map_err(|e| e.hint.unwrap_or(e.message))?;
 
     let progress = TauriProgress { app: app.clone() };
     let (drafts, report): (Vec<AnswerDraft>, ImportReport) =
@@ -1123,6 +1165,13 @@ pub async fn parse_mark_scheme_vision(
             .await?;
 
     let _ = app.emit("import-report", &report);
+
+    let pool = state.db.lock().await;
+    
+    // Increment free uploads if we used the Free Tier
+    if matches!(route, crate::billing::BillingRoute::FreeTier { .. }) {
+        let _ = crate::db::increment_free_uploads(&pool).await;
+    }
 
     if drafts.is_empty() {
         return Err("No answers could be extracted from this document. It may be unreadable, or contain no mark-scheme content.".to_string());
@@ -1296,4 +1345,247 @@ impl pdf_extract::OutputDev for HybridTextOutput {
     fn begin_word(&mut self) -> Result<(), pdf_extract::OutputError> { Ok(()) }
     fn end_word(&mut self) -> Result<(), pdf_extract::OutputError> { Ok(()) }
     fn end_line(&mut self) -> Result<(), pdf_extract::OutputError> { Ok(()) }
+}
+
+// ── Hybrid billing command: generate_worksheet_from_pdf ──────────────────────
+//
+// This is the entry point the React frontend calls to ask MergeMark to
+// extract a PDF, route it through the correct LLM transport (free tier or
+// the user's own key), and return the structured worksheet JSON.
+//
+// The command implements every requirement in the spec:
+//   1. Reads `usage_config.free_uploads_used` and the stored BYOK key.
+//   2. Picks OpenRouter (free tier) or BYOK accordingly.
+//   3. Rejects concurrent calls with a 429-style BillingError.
+//   4. Drops oversize payloads locally (60 000 chars) before any HTTP.
+//   5. Increments `free_uploads_used` ONLY on a 200 OK from OpenRouter.
+//   6. Hard 45-second reqwest timeout + 15 000-token cap are owned by
+//      `billing.rs`; this command just orchestrates them.
+
+/// The shape React will receive on success. Wraps the raw chat-completion
+/// `choices[0].message.content` plus a billing summary so the UI can show
+/// "2 of 3 free uploads remaining" without an extra round-trip.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorksheetBillingSummary {
+    pub route: crate::billing::BillingRoute,
+    pub free_uploads_used: i64,
+    pub free_uploads_remaining: i64,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorksheetResult {
+    /// Raw chat-completion payload from the LLM (provider-agnostic).
+    pub completion: serde_json::Value,
+    pub billing: WorksheetBillingSummary,
+}
+
+#[tauri::command]
+pub async fn generate_worksheet_from_pdf(
+    app: tauri::AppHandle,
+    file_path: String,
+    system_prompt: Option<String>,
+    model: Option<String>,
+) -> Result<WorksheetResult, crate::billing::BillingError> {
+    use crate::billing::{
+        call_byok_direct, call_openrouter_free_tier, pick_route, BillingError, BillingRoute,
+        MAX_PDF_TEXT_CHARS,
+    };
+    use crate::AppState;
+    use tauri::Manager;
+
+    // ── 1. Concurrency lock — reject overlapping calls with 429 ───────────
+    // We hold the lock for the full lifetime of the extraction. The lock
+    // is non-blocking: if it can't be acquired instantly, we surface a
+    // BillingError::too_many_requests() without doing any work.
+    let state: tauri::State<'_, AppState> = app.state();
+    let _concurrency_guard = match state.extraction_in_progress.try_lock() {
+        Ok(g) => g,
+        Err(_) => {
+            // Another call is already running. The spec wants a 429.
+            return Err(BillingError::too_many_requests());
+        }
+    };
+    // _concurrency_guard is held until end of scope, releasing the lock
+    // on any return path.
+
+    // ── 2. Pre-flight payload cap ─────────────────────────────────────────
+    // Extract the PDF text off the async runtime. We measure the cleaned
+    // length BEFORE any HTTP so the bandwidth is never wasted.
+    let path_clone = file_path.clone();
+    let extracted_text = tokio::task::spawn_blocking(move || -> Result<String, String> {
+        let lower = path_clone.to_lowercase();
+        if lower.ends_with(".pdf") {
+            pdf_extract::extract_text(&path_clone)
+                .map_err(|e| format!("PDF extraction failed: {e}"))
+        } else {
+            std::fs::read_to_string(&path_clone)
+                .map_err(|e| format!("Failed to read file: {e}"))
+        }
+    })
+    .await
+    .map_err(|e| BillingError::network(&format!("thread pool error: {e}")))?
+    .map_err(|e| BillingError::network(&e))?;
+
+    let cleaned: String = extracted_text
+        .lines()
+        .map(|l| l.trim())
+        .collect::<Vec<_>>()
+        .join("\n");
+    let cleaned = regex::Regex::new(r"\n{3,}")
+        .unwrap()
+        .replace_all(&cleaned, "\n\n")
+        .to_string();
+
+    if cleaned.trim().is_empty() {
+        return Err(BillingError::network(
+            "No text could be extracted from this file. It may be a scanned/image-only PDF.",
+        ));
+    }
+
+    if cleaned.chars().count() > MAX_PDF_TEXT_CHARS {
+        return Err(BillingError::payload_too_large(cleaned.chars().count()));
+    }
+
+    // ── 3. Read the live billing state from SQLite ───────────────────────
+    let pool = state.db.lock().await;
+    let free_uploads_used = crate::db::get_free_uploads_used(&pool)
+        .await
+        .map_err(|e| BillingError::network(&format!("DB read failed: {e}")))?;
+    let byok_key = crate::db::get_byok_api_key(&pool)
+        .await
+        .map_err(|e| BillingError::network(&format!("DB read failed: {e}")))?;
+    let byok_key_present = byok_key.is_some();
+    drop(pool);
+
+    // ── 4. Pick the route ────────────────────────────────────────────────
+    let route = pick_route(free_uploads_used, byok_key_present);
+    // The free tier pins its model inside `billing::call_openrouter_free_tier`
+    // (google/gemini-2.5-flash), so `model_name` is only forwarded to the
+    // BYOK path. We still resolve a sensible default up front so the
+    // BYOK arm has something to send if the caller didn't override.
+    let model_name = model.unwrap_or_else(|| {
+        if matches!(route, BillingRoute::Byok) {
+            "gpt-4o-mini".to_string()
+        } else {
+            crate::billing::OPENROUTER_MODEL.to_string()
+        }
+    });
+    let system = system_prompt
+        .as_deref()
+        .unwrap_or("You are a teacher creating a structured educational worksheet from the given source material. Return JSON only.");
+
+    // ── 5. Make the HTTP call ────────────────────────────────────────────
+    // The free-tier transport returns a raw `String` (the model's
+    // `choices[0].message.content`). The BYOK transport returns the full
+    // `serde_json::Value` chat-completion payload. We normalise both into
+    // a `serde_json::Value` for the `WorksheetResult.completion` field so
+    // the React side sees a consistent shape regardless of route.
+    let completion = match &route {
+        BillingRoute::FreeTier { .. } => {
+            // Route through OpenRouter (Gemini 2.5 Flash, developer's
+            // embedded key). The `?` here is the gating step: only when
+            // this returns `Ok(_)` do we fall through to step 6 and
+            // increment `free_uploads_used`. Any BillingError short-
+            // circuits the counter.
+            let raw = call_openrouter_free_tier(&cleaned).await?;
+            serde_json::Value::String(raw)
+        }
+        BillingRoute::Byok => {
+            // Re-read the base URL on this branch since we didn't need it
+            // for the other routes.
+            let pool = state.db.lock().await;
+            let byok_base = crate::db::get_byok_base_url(&pool)
+                .await
+                .map_err(|e| BillingError::network(&format!("DB read failed: {e}")))?
+                .unwrap_or_else(|| "https://api.openai.com/v1".to_string());
+            let byok_key = byok_key.expect("byok_key must be Some when route is Byok");
+            drop(pool);
+            call_byok_direct(&byok_base, &byok_key, &model_name, system, &cleaned).await?
+        }
+        BillingRoute::NeedsByok => {
+            // 3 free uploads used and no key on file. Refuse cleanly.
+            return Err(BillingError::needs_byok(free_uploads_used));
+        }
+    };
+
+    // ── 6. Increment the counter — ONLY on a 200 OK from OpenRouter ────
+    let (new_used, remaining) = if matches!(route, BillingRoute::FreeTier { .. }) {
+        let pool = state.db.lock().await;
+        let updated = crate::db::increment_free_uploads(&pool)
+            .await
+            .map_err(|e| BillingError::network(&format!("DB write failed: {e}")))?;
+        let remaining = (crate::db::FREE_UPLOAD_LIMIT - updated).max(0);
+        (updated, remaining)
+    } else {
+        (free_uploads_used, crate::db::FREE_UPLOAD_LIMIT - free_uploads_used)
+    };
+
+    let summary = WorksheetBillingSummary {
+        route,
+        free_uploads_used: new_used,
+        free_uploads_remaining: remaining,
+    };
+
+    Ok(WorksheetResult {
+        completion,
+        billing: summary,
+    })
+}
+
+// ── BYOK key CRUD commands (called from React Settings page) ─────────────────
+
+/// Returns the current free-tier counter plus a boolean indicating whether
+/// a BYOK key is on file. The actual key value is never returned to the
+/// frontend (it lives only in SQLite).
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UsageStatus {
+    pub free_uploads_used: i64,
+    pub free_uploads_limit: i64,
+    pub free_uploads_remaining: i64,
+    pub byok_key_present: bool,
+    pub byok_base_url: Option<String>,
+}
+
+#[tauri::command]
+pub async fn get_usage_status(
+    state: tauri::State<'_, AppState>,
+) -> Result<UsageStatus, String> {
+    let pool = state.db.lock().await;
+    let used = crate::db::get_free_uploads_used(&pool)
+        .await
+        .map_err(|e| format!("DB read failed: {e}"))?;
+    let byok = crate::db::get_byok_api_key(&pool)
+        .await
+        .map_err(|e| format!("DB read failed: {e}"))?;
+    let base = crate::db::get_byok_base_url(&pool)
+        .await
+        .map_err(|e| format!("DB read failed: {e}"))?;
+    Ok(UsageStatus {
+        free_uploads_used: used,
+        free_uploads_limit: crate::db::FREE_UPLOAD_LIMIT,
+        free_uploads_remaining: (crate::db::FREE_UPLOAD_LIMIT - used).max(0),
+        byok_key_present: byok.is_some(),
+        byok_base_url: base,
+    })
+}
+
+/// Save (or clear, with empty string) the user's BYOK key.
+#[tauri::command]
+pub async fn set_byok_key(
+    api_key: Option<String>,
+    base_url: Option<String>,
+    state: tauri::State<'_, AppState>,
+) -> Result<(), String> {
+    let pool = state.db.lock().await;
+    crate::db::set_byok_api_key(
+        &pool,
+        api_key.as_deref(),
+        base_url.as_deref(),
+    )
+    .await
+    .map_err(|e| format!("DB write failed: {e}"))?;
+    Ok(())
 }

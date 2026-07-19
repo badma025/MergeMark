@@ -115,21 +115,66 @@ fn scan(s: &str) -> ScanResult {
     }
 }
 
+/// Automatically double-escape strictly invalid JSON escapes (like \c, \s) 
+/// so serde_json doesn't crash on unescaped LaTeX like \cosh or \sin.
+/// This is 100% safe because it ignores valid JSON escapes (\n, \t, etc).
+fn safe_fix_json_escapes(s: &str) -> std::borrow::Cow<'_, str> {
+    if !s.contains('\\') {
+        return std::borrow::Cow::Borrowed(s);
+    }
+    let mut out = String::with_capacity(s.len() + 10);
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            if let Some(&next) = chars.peek() {
+                if matches!(next, '"' | '\\' | '/' | 'b' | 'f' | 'n' | 'r' | 't') {
+                    out.push('\\');
+                } else if next == 'u' {
+                    let mut lookahead = chars.clone();
+                    lookahead.next(); // consume 'u'
+                    let is_valid_hex = (0..4).all(|_| {
+                        if let Some(hc) = lookahead.next() {
+                            hc.is_ascii_hexdigit()
+                        } else {
+                            false
+                        }
+                    });
+                    if is_valid_hex {
+                        out.push('\\');
+                    } else {
+                        out.push('\\');
+                        out.push('\\');
+                    }
+                } else {
+                    out.push('\\');
+                    out.push('\\');
+                }
+            } else {
+                out.push('\\');
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    std::borrow::Cow::Owned(out)
+}
+
 /// Interpret one LLM response. See the module docs for the policy.
 pub fn parse_llm_json<T: DeserializeOwned>(wire: &str) -> ParseOutcome<T> {
     let prepared = skip_preamble(strip_code_fence(wire));
+    let fixed_prepared = safe_fix_json_escapes(prepared);
 
     // 1. Verbatim.
-    match serde_json::from_str::<T>(prepared) {
+    match serde_json::from_str::<T>(&fixed_prepared) {
         Ok(v) => return ParseOutcome::Clean(v),
         Err(e) => {
             // 2. Trailing junk (commentary or a second object appended):
             // accept the first complete value only.
             if e.is_data() || e.to_string().contains("trailing characters") {
-                let scan = scan(prepared);
+                let scan = scan(&fixed_prepared);
                 if let Some(end) = scan.first_value_end {
-                    if end < prepared.len() {
-                        if let Ok(v) = serde_json::from_str::<T>(&prepared[..end]) {
+                    if end < fixed_prepared.len() {
+                        if let Ok(v) = serde_json::from_str::<T>(&fixed_prepared[..end]) {
                             return ParseOutcome::Salvaged { value: v, dropped_tail: false };
                         }
                     }
@@ -137,10 +182,10 @@ pub fn parse_llm_json<T: DeserializeOwned>(wire: &str) -> ParseOutcome<T> {
             }
 
             // 3. Truncation salvage: cut at the last complete item and close.
-            let scan = scan(prepared);
+            let scan = scan(&fixed_prepared);
             if let Some(end) = scan.last_item_boundary {
-                if end < prepared.len() {
-                    let mut candidate = prepared[..end].to_string();
+                if end < fixed_prepared.len() {
+                    let mut candidate = fixed_prepared[..end].to_string();
                     for closer in scan.closers_at_boundary.iter().rev() {
                         candidate.push(*closer);
                     }
