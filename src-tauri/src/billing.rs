@@ -1,13 +1,15 @@
-// ── Hybrid billing model (Arena.ai gateway + BYOK) ───────────────────────────
+// ── Hybrid billing model (OpenRouter free tier + BYOK) ──────────────────────
 //
 // The free tier is funded by the developer: the first FREE_UPLOAD_LIMIT (= 3)
-// successful extractions route through the Arena.ai Enterprise API Gateway
-// using the developer's embedded API key. The free tier is capped by a local
-// SQLite counter (`usage_config.free_uploads_used`) that only ever ticks up
-// on a 200 OK from the gateway.
+// successful extractions route through OpenRouter's public API using
+// `google/gemini-2.5-flash` and the developer's embedded OpenRouter key
+// (sourced from the `MERGEMARK_OPENROUTER_API_KEY` env var at build time).
+// The free tier is capped by a local SQLite counter
+// (`usage_config.free_uploads_used`) that only ever ticks up on a 200 OK
+// from OpenRouter.
 //
 // Beyond the cap, the user must supply a personal LLM key in `usage_config`.
-// When that key is present the command bypasses the gateway entirely and
+// When that key is present the command bypasses OpenRouter entirely and
 // calls the upstream provider directly using the user's key.
 //
 // Two safety nets are enforced in the calling command BEFORE any of the
@@ -18,17 +20,14 @@
 // This file owns only the route decision and the actual HTTP wiring.
 
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
 use std::time::Duration;
 
 /// Hard pre-flight cap on the extracted PDF text, in characters. Anything
-/// larger than this is dropped locally — the gateway never sees it.
+/// larger than this is dropped locally — OpenRouter never sees it.
 pub const MAX_PDF_TEXT_CHARS: usize = 60_000;
 
-/// Hard upper bound on the model output. Sent both as a JSON body field and
-/// (in the gateway case) as the `X-Arena-Max-Tokens` header so we are
-/// protected against runaway completions even if the gateway strips one
-/// signal but not the other.
+/// Hard upper bound on the model output. Sent as `max_tokens` in the JSON
+/// body so the provider enforces the cap server-side.
 pub const MAX_OUTPUT_TOKENS: u32 = 15_000;
 
 /// Hard request timeout for the reqwest client. 45 seconds — anything longer
@@ -36,20 +35,28 @@ pub const MAX_OUTPUT_TOKENS: u32 = 15_000;
 /// this when capped at 15k tokens.
 pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(45);
 
-/// Developer-side defaults. The developer's Arena.ai gateway key is embedded
-/// at build time via the `MERGEMARK_ARENA_API_KEY` env var. If the env var
-/// is absent we fall back to a development placeholder string so the binary
-/// still links and runs in `cargo test` environments; calls will fail with
-/// 401, which is the correct behaviour for a missing key.
-pub const ARENA_GATEWAY_URL: &str = "https://api.arena.ai/v1";
-pub const ARENA_MODEL: &str = "arena-pro";
+/// OpenRouter's public chat-completions endpoint.
+pub const OPENROUTER_API_URL: &str = "https://openrouter.ai/api/v1";
 
-fn arena_developer_key() -> &'static str {
-    // The key is baked in at compile time. Using a `static` rather than
-    // `include_str!` keeps the constant initialised lazily only on first
-    // use, which is the right behaviour for the free-tier codepath that
-    // will short-circuit before we ever need it.
-    option_env!("MERGEMARK_ARENA_API_KEY").unwrap_or("dev-arena-key-not-set")
+/// The model string for the free tier. OpenRouter uses
+/// `vendor/model-name` as the canonical id, and `google/gemini-2.5-flash`
+/// is the model we route beta traffic through.
+pub const OPENROUTER_MODEL: &str = "google/gemini-2.5-flash";
+
+/// Default system prompt sent with every free-tier request. Kept short
+/// and deterministic so the model is biased toward structured JSON output.
+pub const OPENROUTER_SYSTEM_PROMPT: &str =
+    "You are a teacher creating a structured educational worksheet from \
+     the given source material. Return JSON only.";
+
+/// Resolve the developer's OpenRouter API key from the compile-time env
+/// var. The key is baked in at build time via
+/// `MERGEMARK_OPENROUTER_API_KEY`. If the env var is absent we fall back
+/// to a development placeholder string so the binary still links and runs
+/// in `cargo test` environments; calls will fail with 401, which is the
+/// correct behaviour for a missing key.
+fn openrouter_api_key() -> &'static str {
+    option_env!("MERGEMARK_OPENROUTER_API_KEY").unwrap_or("dev-openrouter-key-not-set")
 }
 
 // ── Route decision ───────────────────────────────────────────────────────────
@@ -58,9 +65,10 @@ fn arena_developer_key() -> &'static str {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum BillingRoute {
-    /// Free tier: the Arena.ai gateway with the developer's embedded key.
-    /// `remaining_after` is the value the counter will hold AFTER this
-    /// successful 200 OK (used for the "X of N used" UI hint).
+    /// Free tier: OpenRouter's public API with `google/gemini-2.5-flash`
+    /// using the developer's embedded key. `remaining_after` is the value
+    /// the counter will hold AFTER this successful 200 OK (used for the
+    /// "X of N used" UI hint).
     FreeTier { remaining_after: i64 },
     /// BYOK: user's personal LLM key, going direct to the upstream provider.
     Byok,
@@ -156,6 +164,10 @@ impl BillingError {
         }
     }
 
+    /// Map an upstream HTTP status to one of our stable error codes.
+    /// Specifically called out by the spec for the OpenRouter free-tier
+    /// transport: 401 (unauthorized / bad key), 429 (rate limited),
+    /// 503 (provider unavailable).
     pub fn upstream(status: u16, body: &str) -> Self {
         let snippet: String = body.chars().take(400).collect();
         Self {
@@ -186,10 +198,14 @@ impl BillingError {
 
 // ── The actual transport calls ───────────────────────────────────────────────
 //
-// Both `call_arena_gateway` and `call_byok_direct` share the same JSON
-// body shape (chat/completions). The differences are only the URL, the
-// Authorization header, the `X-Arena-*` enforcement headers, and the
-// decision of when (if ever) to bump the free-tier counter.
+// `call_openrouter_free_tier` is the developer-funded transport for the
+// first FREE_UPLOAD_LIMIT (= 3) successful extractions. It uses the
+// embedded OpenRouter key and Gemini 2.5 Flash.
+//
+// `call_byok_direct` is the BYOK transport: the user's own key, going
+// direct to the provider of their choice. There is no token cap enforced
+// server-side here (we don't control the provider), but the `max_tokens`
+// field in the body is still sent so OpenAI-compatible providers honour it.
 
 /// Build the shared reqwest client. Hard 45s timeout, no auto-redirect
 /// (LLM providers don't redirect), and a sensible user agent so the
@@ -204,52 +220,55 @@ fn build_client() -> reqwest::Client {
         .expect("reqwest client must build with the hard-coded timeouts")
 }
 
-/// Common body for both transports. The caller decides which model string
-/// and which transport to send it to. The `max_tokens` cap is what saves
-/// us from runaway bills even if the provider ignores the `X-Arena-Max-Tokens`
-/// header.
-fn build_chat_body(model: &str, system: &str, user_text: &str) -> Value {
+/// Build the OpenRouter chat-completion body. The model string is fixed
+/// (`google/gemini-2.5-flash`) for the free tier; only the user-supplied
+/// payload text varies. `max_tokens` is what saves us from runaway bills
+/// even if OpenRouter ignores any cap we'd otherwise enforce via headers.
+fn build_openrouter_body(payload_text: &str) -> serde_json::Value {
     serde_json::json!({
-        "model": model,
+        "model": OPENROUTER_MODEL,
         "messages": [
-            { "role": "system", "content": system },
-            { "role": "user",   "content": user_text }
+            { "role": "system",    "content": OPENROUTER_SYSTEM_PROMPT },
+            { "role": "user",      "content": payload_text }
         ],
         "temperature": 0.1,
         "max_tokens": MAX_OUTPUT_TOKENS,
-        "response_format": { "type": "json_object" },
-        // Extra defence-in-depth: most providers also honour this field
-        // by name and the Arena.ai gateway passes it through.
-        "max_output_tokens": MAX_OUTPUT_TOKENS,
+        "response_format": { "type": "json_object" }
     })
 }
 
-/// Send the request through the Arena.ai gateway. On a 200 OK the caller
-/// must increment `free_uploads_used`; we do NOT touch the DB here so the
-/// caller can decide what to do on a 5xx (don't burn a free credit).
+/// Send the request through OpenRouter's public API using the developer's
+/// embedded key and the pinned `google/gemini-2.5-flash` model.
 ///
-/// The gateway-specific protections:
-///   * `X-Arena-Max-Tokens: 15000`         — gateway enforces the cap
-///   * `X-Arena-User-Tier: free`          — gateway picks the free quota path
-///   * `X-Arena-Enforce-Limits: strict`   — gateway rejects oversize bodies
-///   * Hard 45s timeout                    — reqwest-level kill switch
-pub async fn call_arena_gateway(
-    model: &str,
-    system: &str,
-    user_text: &str,
-) -> Result<Value, BillingError> {
+/// On a 200 OK the caller MUST increment `free_uploads_used`; this
+/// function does NOT touch the DB so the caller can decide what to do on
+/// a 5xx (don't burn a free credit).
+///
+/// Status-code mapping — handled by `BillingError::upstream`:
+///   * 401 (or 403)  → `upstream_unauthorized`  (bad / missing key)
+///   * 429           → `upstream_rate_limited`  (back off and retry)
+///   * 503 / 5xx     → `upstream_unavailable`   (provider degraded)
+///   * other 4xx     → `upstream_error`
+///
+/// Other protections:
+///   * Hard 45s `reqwest` timeout (also on the client builder).
+///   * No redirects — LLM providers don't redirect and a silent redirect
+///     could leak the request.
+pub async fn call_openrouter_free_tier(
+    payload_text: &str,
+) -> Result<String, BillingError> {
     let client = build_client();
-    let url = format!("{}/chat/completions", ARENA_GATEWAY_URL.trim_end_matches('/'));
+    let url = format!(
+        "{}/chat/completions",
+        OPENROUTER_API_URL.trim_end_matches('/')
+    );
 
-    let body = build_chat_body(model, system, user_text);
+    let body = build_openrouter_body(payload_text);
 
     let res = client
         .post(&url)
-        .header("Authorization", format!("Bearer {}", arena_developer_key()))
+        .header("Authorization", format!("Bearer {}", openrouter_api_key()))
         .header("Content-Type", "application/json")
-        .header("X-Arena-Max-Tokens", MAX_OUTPUT_TOKENS.to_string())
-        .header("X-Arena-User-Tier", "free")
-        .header("X-Arena-Enforce-Limits", "strict")
         .timeout(REQUEST_TIMEOUT)
         .json(&body)
         .send()
@@ -261,9 +280,22 @@ pub async fn call_arena_gateway(
         let text = res.text().await.unwrap_or_default();
         return Err(BillingError::upstream(status.as_u16(), &text));
     }
-    res.json::<Value>()
+
+    let json: serde_json::Value = res
+        .json()
         .await
-        .map_err(|e| BillingError::network(&format!("bad response shape: {e}")))
+        .map_err(|e| BillingError::network(&format!("bad response shape: {e}")))?;
+
+    // OpenRouter's response shape is OpenAI-compatible:
+    // { "choices": [ { "message": { "content": "..." } } ] }
+    // We hand the raw `content` string back to the caller; the calling
+    // command wraps it into a `serde_json::Value` for the frontend.
+    let content = json["choices"][0]["message"]["content"]
+        .as_str()
+        .ok_or_else(|| BillingError::network("missing choices[0].message.content"))?
+        .to_string();
+
+    Ok(content)
 }
 
 /// Send the request directly to the user's chosen LLM provider, using
@@ -276,14 +308,23 @@ pub async fn call_byok_direct(
     model: &str,
     system: &str,
     user_text: &str,
-) -> Result<Value, BillingError> {
+) -> Result<serde_json::Value, BillingError> {
     let client = build_client();
     let url = format!(
         "{}/chat/completions",
         byok_base_url.trim_end_matches('/')
     );
 
-    let body = build_chat_body(model, system, user_text);
+    let body = serde_json::json!({
+        "model": model,
+        "messages": [
+            { "role": "system", "content": system },
+            { "role": "user",   "content": user_text }
+        ],
+        "temperature": 0.1,
+        "max_tokens": MAX_OUTPUT_TOKENS,
+        "response_format": { "type": "json_object" }
+    });
 
     let res = client
         .post(&url)
@@ -300,7 +341,7 @@ pub async fn call_byok_direct(
         let text = res.text().await.unwrap_or_default();
         return Err(BillingError::upstream(status.as_u16(), &text));
     }
-    res.json::<Value>()
+    res.json::<serde_json::Value>()
         .await
         .map_err(|e| BillingError::network(&format!("bad response shape: {e}")))
 }
@@ -360,5 +401,24 @@ mod tests {
     #[test]
     fn request_timeout_is_45s() {
         assert_eq!(REQUEST_TIMEOUT, Duration::from_secs(45));
+    }
+
+    #[test]
+    fn openrouter_url_and_model_constants() {
+        assert_eq!(OPENROUTER_API_URL, "https://openrouter.ai/api/v1");
+        assert_eq!(OPENROUTER_MODEL, "google/gemini-2.5-flash");
+    }
+
+    #[test]
+    fn openrouter_body_uses_pinned_model_and_max_tokens() {
+        let body = build_openrouter_body("hello world");
+        assert_eq!(body["model"], "google/gemini-2.5-flash");
+        assert_eq!(body["max_tokens"], 15_000);
+        // The user payload should appear in the user message, not the
+        // system message.
+        let messages = body["messages"].as_array().expect("messages array");
+        assert_eq!(messages[0]["role"], "system");
+        assert_eq!(messages[1]["role"], "user");
+        assert_eq!(messages[1]["content"], "hello world");
     }
 }

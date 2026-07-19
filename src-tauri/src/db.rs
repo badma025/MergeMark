@@ -95,10 +95,11 @@ pub async fn init_db(app_data_dir: PathBuf) -> Result<SqlitePool, sqlx::Error> {
     // A single-row table (id = 1) that tracks the beta-launch hybrid billing
     // model:
     //   * `free_uploads_used`  — count of successful 200 OK responses through
-    //                            the Arena.ai gateway. Capped at 3 by the
-    //                            Tauri command; we never auto-reset it here.
+    //                            the OpenRouter free tier (Gemini 2.5 Flash).
+    //                            Capped at 3 by the Tauri command; we never
+    //                            auto-reset it here.
     //   * `byok_api_key`       — user-supplied personal LLM key. When present
-    //                            the Arena.ai free-tier route is bypassed
+    //                            the OpenRouter free-tier route is bypassed
     //                            entirely and requests go direct to the
     //                            upstream provider.
     //   * `byok_base_url`      — optional override of the LLM base URL used
@@ -148,7 +149,7 @@ pub async fn init_db(app_data_dir: PathBuf) -> Result<SqlitePool, sqlx::Error> {
 // evolve without grepping the whole codebase.
 
 /// Free-tier ceiling. Once `free_uploads_used >= FREE_UPLOAD_LIMIT` the
-/// command will refuse to route to the Arena.ai gateway.
+/// command will refuse to route through the OpenRouter free tier.
 pub const FREE_UPLOAD_LIMIT: i64 = 3;
 
 /// Read the current `free_uploads_used` counter.

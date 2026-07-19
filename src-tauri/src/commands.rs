@@ -1306,10 +1306,10 @@ impl pdf_extract::OutputDev for HybridTextOutput {
 //
 // The command implements every requirement in the spec:
 //   1. Reads `usage_config.free_uploads_used` and the stored BYOK key.
-//   2. Picks Arena.ai gateway or BYOK accordingly.
+//   2. Picks OpenRouter (free tier) or BYOK accordingly.
 //   3. Rejects concurrent calls with a 429-style BillingError.
 //   4. Drops oversize payloads locally (60 000 chars) before any HTTP.
-//   5. Increments `free_uploads_used` ONLY on a 200 OK from the gateway.
+//   5. Increments `free_uploads_used` ONLY on a 200 OK from OpenRouter.
 //   6. Hard 45-second reqwest timeout + 15 000-token cap are owned by
 //      `billing.rs`; this command just orchestrates them.
 
@@ -1340,7 +1340,7 @@ pub async fn generate_worksheet_from_pdf(
     model: Option<String>,
 ) -> Result<WorksheetResult, crate::billing::BillingError> {
     use crate::billing::{
-        call_arena_gateway, call_byok_direct, pick_route, BillingError, BillingRoute,
+        call_byok_direct, call_openrouter_free_tier, pick_route, BillingError, BillingRoute,
         MAX_PDF_TEXT_CHARS,
     };
     use crate::AppState;
@@ -1412,12 +1412,15 @@ pub async fn generate_worksheet_from_pdf(
 
     // ── 4. Pick the route ────────────────────────────────────────────────
     let route = pick_route(free_uploads_used, byok_key_present);
+    // The free tier pins its model inside `billing::call_openrouter_free_tier`
+    // (google/gemini-2.5-flash), so `model_name` is only forwarded to the
+    // BYOK path. We still resolve a sensible default up front so the
+    // BYOK arm has something to send if the caller didn't override.
     let model_name = model.unwrap_or_else(|| {
         if matches!(route, BillingRoute::Byok) {
-            // Sensible default; the user can override.
             "gpt-4o-mini".to_string()
         } else {
-            crate::billing::ARENA_MODEL.to_string()
+            crate::billing::OPENROUTER_MODEL.to_string()
         }
     });
     let system = system_prompt
@@ -1425,9 +1428,20 @@ pub async fn generate_worksheet_from_pdf(
         .unwrap_or("You are a teacher creating a structured educational worksheet from the given source material. Return JSON only.");
 
     // ── 5. Make the HTTP call ────────────────────────────────────────────
+    // The free-tier transport returns a raw `String` (the model's
+    // `choices[0].message.content`). The BYOK transport returns the full
+    // `serde_json::Value` chat-completion payload. We normalise both into
+    // a `serde_json::Value` for the `WorksheetResult.completion` field so
+    // the React side sees a consistent shape regardless of route.
     let completion = match &route {
         BillingRoute::FreeTier { .. } => {
-            call_arena_gateway(&model_name, system, &cleaned).await?
+            // Route through OpenRouter (Gemini 2.5 Flash, developer's
+            // embedded key). The `?` here is the gating step: only when
+            // this returns `Ok(_)` do we fall through to step 6 and
+            // increment `free_uploads_used`. Any BillingError short-
+            // circuits the counter.
+            let raw = call_openrouter_free_tier(&cleaned).await?;
+            serde_json::Value::String(raw)
         }
         BillingRoute::Byok => {
             // Re-read the base URL on this branch since we didn't need it
@@ -1447,7 +1461,7 @@ pub async fn generate_worksheet_from_pdf(
         }
     };
 
-    // ── 6. Increment the counter — ONLY on a 200 OK from the gateway ────
+    // ── 6. Increment the counter — ONLY on a 200 OK from OpenRouter ────
     let (new_used, remaining) = if matches!(route, BillingRoute::FreeTier { .. }) {
         let pool = state.db.lock().await;
         let updated = crate::db::increment_free_uploads(&pool)
