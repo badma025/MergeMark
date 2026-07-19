@@ -8,6 +8,7 @@ use tokio::sync::Mutex;
 mod db;
 
 mod backup;
+mod billing;
 mod commands;
 mod doc_map;
 mod geometry;
@@ -19,6 +20,11 @@ mod validate;
 pub struct AppState {
     pub db: Arc<Mutex<SqlitePool>>,
     pub cancel_flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Concurrency guard for the hybrid-billing command. Only one
+    /// `generate_worksheet_from_pdf` call may be in flight at a time; the
+    /// command attempts a non-blocking `try_lock` and rejects overlapping
+    /// calls with a 429-style `BillingError` instead of queueing them.
+    pub extraction_in_progress: tokio::sync::Mutex<()>,
 }
 
 // ---------------------------------------------------------------------------
@@ -49,6 +55,7 @@ pub fn run() {
             app.manage(AppState {
                 db: Arc::new(Mutex::new(pool)),
                 cancel_flag: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                extraction_in_progress: tokio::sync::Mutex::new(()),
             });
 
             Ok(())
@@ -71,7 +78,10 @@ pub fn run() {
             commands::update_question,
             commands::commit_mark_schemes,
             commands::get_paper_names,
-            commands::cancel_import
+            commands::cancel_import,
+            commands::generate_worksheet_from_pdf,
+            commands::get_usage_status,
+            commands::set_byok_key
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
