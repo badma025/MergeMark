@@ -1,6 +1,0 @@
-there are some formatting issues: 
-first of all, the "name, date, score" shouldn't be on every single page, it should only be on the first page; the underscore line from name also shouldn't touch the "Date" word
-second, the "total marks" indicator could go at the end of the question, and say ("Total for question X is Y marks")
-the lines MUST be narrower and less space between them
-the lines must also COVER THE WHOLE PAGE IF THEY DO (what I mean is that if there is a page with nothing but lines, the lines MUST span the WHOLE page (image 2 is an example of what not to do)
-question numbers MUST be bold, and so should part numbers, even if they are referenced in questions; image 3 is an example of what not to do, there is not enough spacing between the question number and the question part

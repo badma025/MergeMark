@@ -62,9 +62,13 @@ function App() {
 
         {/* Tab bar */}
         <nav
-          className="flex items-center gap-1 border-b border-border px-4 pt-8 bg-background/80 backdrop-blur-sm"
+          className="flex items-center gap-1 border-b border-border px-4 pt-4 bg-background/80 backdrop-blur-sm"
           aria-label="Main navigation"
         >
+          <div className="flex items-center mr-8">
+            <img src="/mergemark-full.svg" alt="MergeMark Logo" className="h-8 w-auto" />
+          </div>
+
           {TABS.map(({ id, label, icon: Icon }) => (
             <button
               key={id}

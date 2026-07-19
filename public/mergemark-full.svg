@@ -1,0 +1,30 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1800 1024">
+  <!-- Sharp Pitch Black Canvas -->
+  <rect width="1800" height="1024" fill="#000000"/>
+
+  <!-- Centered Group (Icon + Text) -->
+  <!-- 
+       Total composition width is perfectly balanced. 
+       Icon scaled to 80% and aligned to share a perfect Y-axis center (512) with the text.
+  -->
+  <g transform="translate(18.4, 102.4) scale(0.8)">
+    <!-- White Geometric 'M' Base -->
+    <path d="M 232 742 L 232 382 L 382 532 L 512 402" 
+          stroke="#F4F4F5" 
+          stroke-width="72" 
+          stroke-linecap="round" 
+          stroke-linejoin="round" 
+          fill="none"/>
+
+    <!-- Green Checkmark Bursting Out -->
+    <path d="M 512 402 L 612 502 L 792 282" 
+          stroke="#10B981" 
+          stroke-width="72" 
+          stroke-linecap="round" 
+          stroke-linejoin="round" 
+          fill="none"/>
+  </g>
+
+  <!-- "MergeMark" Text (Vertically snapped to center) -->
+  <text x="716" y="512" dominant-baseline="central" font-family="Verdana, sans-serif" font-size="160" font-weight="bold" fill="#FFFFFF">MergeMark</text>
+</svg>
