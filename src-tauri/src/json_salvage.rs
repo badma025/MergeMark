@@ -129,6 +129,7 @@ fn safe_fix_json_escapes(s: &str) -> std::borrow::Cow<'_, str> {
             if let Some(&next) = chars.peek() {
                 if matches!(next, '"' | '\\' | '/' | 'b' | 'f' | 'n' | 'r' | 't') {
                     out.push('\\');
+                    out.push(chars.next().unwrap());
                 } else if next == 'u' {
                     let mut lookahead = chars.clone();
                     lookahead.next(); // consume 'u'
@@ -141,6 +142,7 @@ fn safe_fix_json_escapes(s: &str) -> std::borrow::Cow<'_, str> {
                     });
                     if is_valid_hex {
                         out.push('\\');
+                        out.push(chars.next().unwrap());
                     } else {
                         out.push('\\');
                         out.push('\\');

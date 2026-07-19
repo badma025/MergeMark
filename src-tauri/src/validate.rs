@@ -128,6 +128,16 @@ pub fn has_terminal_ending(content: &str) -> bool {
 
 // ── Boilerplate scrubbing (exact-string policy, moved from commands.rs) ────
 
+pub fn clean_ligatures(s: &str) -> String {
+    s.replace('ﬀ', "ff")
+     .replace('ﬁ', "fi")
+     .replace('ﬂ', "fl")
+     .replace('ﬃ', "ffi")
+     .replace('ﬄ', "ffl")
+     .replace('ﬅ', "st")
+     .replace('ﬆ', "st")
+}
+
 // ── Uniform sub-part labelling ──────────────────────────────────────────────
 //
 // Edexcel prints part labels as (a), (b), (c); AQA prints decimal numbers
