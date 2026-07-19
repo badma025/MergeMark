@@ -55,7 +55,7 @@ pub const OPENROUTER_SYSTEM_PROMPT: &str =
 /// to a development placeholder string so the binary still links and runs
 /// in `cargo test` environments; calls will fail with 401, which is the
 /// correct behaviour for a missing key.
-fn openrouter_api_key() -> &'static str {
+pub fn openrouter_api_key() -> &'static str {
     option_env!("MERGEMARK_OPENROUTER_API_KEY").unwrap_or("dev-openrouter-key-not-set")
 }
 

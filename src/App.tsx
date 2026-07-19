@@ -62,7 +62,7 @@ function App() {
 
         {/* Tab bar */}
         <nav
-          className="flex items-center gap-1 border-b border-border px-4 pt-2 bg-background/80 backdrop-blur-sm"
+          className="flex items-center gap-1 border-b border-border px-4 pt-8 bg-background/80 backdrop-blur-sm"
           aria-label="Main navigation"
         >
           {TABS.map(({ id, label, icon: Icon }) => (
@@ -98,7 +98,7 @@ function App() {
             <RepositoryFeed isActive={activeTab === "repository"} onAddToWorksheet={handleAddQuestion} />
           </div>
           <div className={cn("absolute inset-0 flex flex-col min-h-0 overflow-hidden bg-background", activeTab === "ingestion" ? "z-10 opacity-100 pointer-events-auto" : "z-0 opacity-0 pointer-events-none")}>
-            <IngestionDropzone onSuccess={() => setActiveTab("repository")} />
+            <IngestionDropzone isActive={activeTab === "ingestion"} onSuccess={() => setActiveTab("repository")} />
           </div>
           <div className={cn("absolute inset-0 flex flex-col min-h-0 overflow-hidden bg-background", activeTab === "settings" ? "z-10 opacity-100 pointer-events-auto" : "z-0 opacity-0 pointer-events-none")}>
             <Settings />

@@ -34,9 +34,15 @@
   }
   body {
     @apply bg-background text-foreground;
+    overflow: hidden;
+    height: 100vh;
+    width: 100vw;
   }
   html {
     @apply font-sans;
+    overflow: hidden;
+    height: 100vh;
+    width: 100vw;
   }
 
   /* Global Custom Scrollbar */

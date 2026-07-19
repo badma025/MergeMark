@@ -3,6 +3,7 @@ import { invoke, convertFileSrc } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { ReviewSyncModal, type ProposedMapping } from "./ReviewSyncModal";
 import { open } from "@tauri-apps/plugin-dialog";
+import { notifyUsageChanged } from "@/components/UploadCounter";
 import { toast } from "sonner";
 import { UploadCloud, FileText, Loader2, AlertTriangle, CheckCircle2 } from "lucide-react";
 import { cn } from "@/lib/utils";
@@ -45,10 +46,11 @@ export interface ImportReport {
 // ── IngestionDropzone ─────────────────────────────────────────────────────────
 
 interface IngestionDropzoneProps {
+  isActive?: boolean;
   onSuccess?: () => void;
 }
 
-export function IngestionDropzone({ onSuccess }: IngestionDropzoneProps) {
+export function IngestionDropzone({ isActive = false, onSuccess }: IngestionDropzoneProps) {
   const [importMode, setImportMode] = useState<"questions" | "mark_scheme">("questions");
   const [subject, setSubject] = useState(SUBJECTS[0] || "Mathematics");
   const [moduleOverride, setModuleOverride] = useState(
@@ -278,6 +280,7 @@ export function IngestionDropzone({ onSuccess }: IngestionDropzoneProps) {
         });
       }
     } finally {
+      notifyUsageChanged();
       setLastFile(null);
       setProgressMsg("");
       setIsProcessing(false);
@@ -296,15 +299,20 @@ export function IngestionDropzone({ onSuccess }: IngestionDropzoneProps) {
     isProcessingRef.current = isProcessing;
   }, [isProcessing]);
 
+  const isActiveRef = useRef(isActive);
+  useEffect(() => {
+    isActiveRef.current = isActive;
+  }, [isActive]);
+
   useEffect(() => {
     let unlisten: (() => void) | undefined;
     
     import("@tauri-apps/api/webview").then(({ getCurrentWebview }) => {
       getCurrentWebview().onDragDropEvent((event) => {
+        if (!isActiveRef.current) return;
         const payload = event.payload;
         if (payload.type === 'enter') {
-          setIsDraggingOver(true);
-          dragCounter.current = 1;
+          // Do nothing on global enter to prevent highlighting when dragging outside the zone
         } else if (payload.type === 'leave') {
           setIsDraggingOver(false);
           dragCounter.current = 0;
@@ -313,7 +321,25 @@ export function IngestionDropzone({ onSuccess }: IngestionDropzoneProps) {
           dragCounter.current = 0;
           const paths = payload.paths;
           if (paths && paths.length > 0 && !isProcessingRef.current) {
-            processFileRef.current(paths[0]);
+            // Check if dropped within the dropzone element bounding rect
+            const dropzone = document.getElementById('ingestion-dropzone');
+            if (dropzone && payload.position) {
+              const rect = dropzone.getBoundingClientRect();
+              const { x: rawX, y: rawY } = payload.position;
+              const dpr = window.devicePixelRatio || 1;
+              const logicalX = rawX / dpr;
+              const logicalY = rawY / dpr;
+              
+              const isWithinRect = (px: number, py: number) => 
+                px >= rect.left - 20 && px <= rect.right + 20 && py >= rect.top - 20 && py <= rect.bottom + 20;
+
+              if (isWithinRect(rawX, rawY) || isWithinRect(logicalX, logicalY)) {
+                processFileRef.current(paths[0]);
+              }
+            } else {
+              // Fallback if position check fails
+              processFileRef.current(paths[0]);
+            }
           }
         }
       }).then(fn => {
@@ -487,15 +513,16 @@ export function IngestionDropzone({ onSuccess }: IngestionDropzoneProps) {
       </div>
 
       {/* ── Dropzone card ── */}
-      <button
+      <div
         id="ingestion-dropzone"
-        type="button"
+        role="button"
+        tabIndex={isProcessing ? -1 : 0}
         onClick={handleBrowse}
         onDragEnter={handleDragEnter}
         onDragLeave={handleDragLeave}
         onDragOver={handleDragOver}
         onDrop={handleDrop}
-        disabled={isProcessing}
+        aria-disabled={isProcessing}
         aria-label="Drag and drop a file here, or click to browse"
         className={cn(
           // Layout
@@ -594,7 +621,7 @@ export function IngestionDropzone({ onSuccess }: IngestionDropzoneProps) {
             aria-hidden
           />
         )}
-      </button>
+      </div>
 
       {/* Accepted formats hint */}
       <div className="mt-6 flex items-center gap-2 text-xs text-muted-foreground select-none">

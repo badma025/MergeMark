@@ -59,18 +59,26 @@ export function Settings() {
 
     const savedModel = localStorage.getItem("mergemark_openai_model");
     if (savedModel) setModelName(savedModel);
+
+    // Sync to backend for billing logic
+    invoke("set_byok_key", { 
+      apiKey: savedKey || null, 
+      baseUrl: savedBaseUrl || null 
+    }).catch(console.error);
   }, []);
 
   function handleKeyChange(e: React.ChangeEvent<HTMLInputElement>) {
     const newKey = e.target.value;
     setApiKey(newKey);
     localStorage.setItem("mergemark_openai_key", newKey);
+    invoke("set_byok_key", { apiKey: newKey || null, baseUrl: baseUrl || null }).catch(console.error);
   }
 
   function handleBaseUrlChange(e: React.ChangeEvent<HTMLInputElement>) {
     const newUrl = e.target.value;
     setBaseUrl(newUrl);
     localStorage.setItem("mergemark_openai_base_url", newUrl);
+    invoke("set_byok_key", { apiKey: apiKey || null, baseUrl: newUrl || null }).catch(console.error);
   }
 
   function handleModelChange(e: React.ChangeEvent<HTMLInputElement>) {
@@ -177,10 +185,10 @@ export function Settings() {
 
   return (
     <section
-      className="flex flex-1 flex-col items-center justify-center h-full min-h-0 px-8 py-12 bg-background overflow-y-auto"
+      className="flex flex-1 flex-col items-center justify-start h-full min-h-0 px-8 py-12 bg-background overflow-y-auto"
       aria-label="Settings"
     >
-      <div className="mb-8 text-center space-y-1 select-none">
+      <div className="w-full max-w-md flex flex-col items-center mt-4 mb-8 text-center space-y-1 select-none">
         <h1 className="text-2xl font-bold tracking-tight text-foreground flex items-center justify-center gap-2">
           <SettingsIcon className="size-6 text-primary" />
           Settings
