@@ -33,8 +33,8 @@ interface PendingImport {
 
 export function Settings() {
   const [apiKey, setApiKey] = useState("");
-  const [baseUrl, setBaseUrl] = useState("https://api.openai.com/v1");
-  const [modelName, setModelName] = useState("gpt-4o-mini");
+  const [baseUrl, setBaseUrl] = useState("https://openrouter.ai/api/v1/");
+  const [modelName, setModelName] = useState("google/gemini-2.5-flash");
   const [availableModels, setAvailableModels] = useState<string[]>([]);
   const [fetchingModels, setFetchingModels] = useState(false);
   const [modelFetchError, setModelFetchError] = useState("");

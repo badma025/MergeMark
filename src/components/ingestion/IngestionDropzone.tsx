@@ -173,8 +173,8 @@ export function IngestionDropzone({ isActive = false, onSuccess }: IngestionDrop
 
   async function processFile(filePath: string) {
     let apiKey = localStorage.getItem("mergemark_openai_key");
-    const baseUrl = localStorage.getItem("mergemark_openai_base_url") || "https://api.openai.com/v1";
-    const modelName = localStorage.getItem("mergemark_openai_model") || "gpt-4o-mini";
+    const baseUrl = localStorage.getItem("mergemark_openai_base_url") || "https://openrouter.ai/api/v1/";
+    const modelName = localStorage.getItem("mergemark_openai_model") || "google/gemini-2.5-flash";
 
     // If it's a local base URL (like Ollama) we can tolerate an empty API key, otherwise default to a dummy if they left it blank but still try to proceed, though it'll likely fail at the provider level if they actually need one.
     // For simplicity, we just default to "dummy" if it's empty, allowing local Ollama to work without a key.
