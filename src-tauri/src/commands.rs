@@ -1108,6 +1108,7 @@ pub async fn parse_mark_scheme_vision(
                     let mut out: Vec<String> = pages
                         .into_iter()
                         .map(|s| re_lines.replace_all(&s, "").to_string())
+                        .map(|s| crate::validate::clean_ligatures(&s))
                         .collect();
                     out.resize(num_pages, String::new());
                     out
@@ -1144,6 +1145,7 @@ pub async fn parse_mark_scheme_vision(
                 .map_err(|e| e.to_string())??
             }
         };
+        let text = crate::validate::clean_ligatures(&text);
         if text.trim().is_empty() {
             return Err("File is empty or contains only unextractable images.".to_string());
         }
@@ -1427,6 +1429,7 @@ pub async fn generate_worksheet_from_pdf(
     .await
     .map_err(|e| BillingError::network(&format!("thread pool error: {e}")))?
     .map_err(|e| BillingError::network(&e))?;
+    let extracted_text = crate::validate::clean_ligatures(&extracted_text);
 
     let cleaned: String = extracted_text
         .lines()
