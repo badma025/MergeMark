@@ -569,20 +569,21 @@ pub async fn run_question_pipeline<C: LlmClient, P: Progress>(
             let futs: Vec<_> = batch
                 .iter()
                 .map(|page| {
-                    let is_skip = page.b64 == "__SKIP__" || page.b64 == "SKIP" /*legacy*/;
-                    // Phase 0: a page is text-only iff it has an empty (or
-                    // legacy TEXT_ONLY) b64 payload but carries extractable
-                    // raw text. This was a half-implemented fast path: the
-                    // structure call honoured it, but the EXTRACTION path
-                    // passed the literal "TEXT_ONLY" bytes as a JPEG to the
-                    // model, corrupting the request. See filter below in
-                    // extract_span for the matching rule.
+                    // Phase 1b: use the shared sentinel helper so every
+                    // sentinel (__SKIP__/SKIP/empty/__TEXT_ONLY__/TEXT_ONLY)
+                    // is treated consistently.
+                    let is_skip = is_sentinel_b64(&page.b64) && !page.b64.is_empty()
+                        && page.b64 != "__TEXT_ONLY__"
+                        && page.b64 != "TEXT_ONLY";
+                    // A page is text-only iff its b64 is empty or a TEXT_ONLY
+                    // sentinel but it carries extractable raw text. The
+                    // structure call honours it; chat_body drops sentinels.
                     let is_text_only =
                         page.b64.is_empty() || page.b64 == "__TEXT_ONLY__" || page.b64 == "TEXT_ONLY";
 
                     if is_skip {
                         return futures_util::future::Either::Left(async move {
-                            Ok(r#"{"questions":[]}"#.to_string())
+                            Ok(r#"{"question_numbers_visible":[],"page_role":"BLANK"}"#.to_string())
                         });
                     }
 
@@ -722,6 +723,27 @@ pub async fn run_question_pipeline<C: LlmClient, P: Progress>(
 
     // ── 3. Span extraction ──────────────────────────────────────────────────
     let mut built: Vec<BuiltQuestion> = Vec::new();
+
+    // Phase 1b: if the hybrid map came back empty but the structure pass
+    // returned enough structure to build a pure-vision map, do that BEFORE
+    // dropping into per-page fallback. build_map_from_structure enforces
+    // monotonicity and uses the VisionBounds / y-clip info we already paid
+    // for, so extraction runs with Phase 1's y-band safety net instead of
+    // blindly welding pages. Only when the structure pass also failed do
+    // we fall back to per-page extraction.
+    if map.spans.is_empty() {
+        let structure_qs: usize = structures.iter().map(|s| s.questions.len()).sum();
+        if structure_qs >= 2 {
+            if let Some(structure_map) =
+                doc_map::build_map_from_structure(&structures, pages.len())
+            {
+                report.anomalies.push(
+                    "text-layer map empty; built map from vision structure pass instead of per-page fallback".to_string(),
+                );
+                map = structure_map;
+            }
+        }
+    }
 
     if map.spans.is_empty() {
         // No reliable map → per-page legacy mode with all validators still

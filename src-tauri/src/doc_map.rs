@@ -210,8 +210,26 @@ pub fn scan_text_layer(page_texts: &[String]) -> TextScan {
     let mut paper_total = None;
     let mut page_reliability = vec![PageReliability::Ambiguous; page_texts.len()];
 
+    // Phase 1b: instruction/cover detection used to match ANY page containing
+    // the words "information" or "formulae", which fired constantly on
+    // physics papers ("use the information in Figure 3…", "the following
+    // formulae may be used…") and caused pages to be marked NonQuestion
+    // even when they carried real question content. The cover/instruction
+    // pages we actually want to skip are short, rubric-heavy sheets whose
+    // content is DOMINATED by instruction wording AND have no question
+    // signals. We detect them with:
+    //   * a stricter regex that only matches the rubric phrases themselves
+    //     ("answer all questions", "instructions to candidates", "information"
+    //     only as a heading line, "formulae" only as a "formulae sheet"
+    //     reference), AND
+    //   * a page-length guard: real question pages almost always exceed 300
+    //     characters in the text layer, while cover/instruction pages are
+    //     short.
     let instr_re = regex::Regex::new(
-        r"(?i)\binstructions\b|\binformation\b|answer all questions|formulae|\bglossary\b",
+        r"(?i)(?:^|\n)\s*(?:instructions?\s*(?:to\s+candidates?)?|information|answer\s+all\s+questions|glossary)(?:\s|$|:)",
+    ).unwrap();
+    let formulae_sheet_re = regex::Regex::new(
+        r"(?i)(?:^|\n)\s*(?:formulae?|data|constants|relationships?)\s*(?:sheet|booklet|table|page)?\s*$",
     ).unwrap();
     let blank_re = regex::Regex::new(r"(?i)^\s*(blank page|this page is intentionally blank)\s*$").unwrap();
     let ref_re = regex::Regex::new(r"(?i)^\s*(formulae|data|reference|constants)\s*(sheet|table|booklet)?\s*$").unwrap();
@@ -287,11 +305,26 @@ pub fn scan_text_layer(page_texts: &[String]) -> TextScan {
             || marks_re.is_match(text)
             || headings.iter().any(|h| h.page == page);
 
+        // Phase 1b: tighten NonQuestion classification. A page is front
+        // matter ONLY if (a) it's blank, OR (b) ALL of:
+        //   * it matches an instruction/reference regex (rubric/formula sheet),
+        //   * it has NO question signal (no headings, no marks, no figures,
+        //     no AQA margin numbers, no sub-parts), AND
+        //   * EITHER it is short (<300 chars of text, typical for a cover/
+        //     instruction page) OR the formulae-sheet regex matches a line.
+        // This prevents false positives on physics pages that say "use the
+        // information in Figure 3…" or list "the following formulae" in a
+        // real question.
+        let is_short_rubric = text.trim().len() < 300;
+        let is_formulae_sheet = formulae_sheet_re.is_match(text) && !marks_re.is_match(text);
+        let instr_hit = instr_re.is_match(text);
+        let ref_hit = ref_re.is_match(text) || is_formulae_sheet;
+
         if blank_re.is_match(text) || text.trim().is_empty() {
             page_reliability[page] = PageReliability::NonQuestion;
         } else if has_footer {
             page_reliability[page] = PageReliability::Reliable;
-        } else if (instr_re.is_match(text) || ref_re.is_match(text)) && !has_question_signal {
+        } else if (instr_hit || ref_hit) && !has_question_signal && (is_short_rubric || is_formulae_sheet) {
             page_reliability[page] = PageReliability::NonQuestion;
         } else if text.len() > 100 || has_question_signal {
             page_reliability[page] = PageReliability::Ambiguous;
@@ -314,115 +347,115 @@ fn build_spans_from_reliable_pages(
     num_pages: usize,
 ) -> (Vec<QuestionSpan>, std::collections::BTreeSet<usize>, Vec<String>) {
     let mut anomalies = Vec::new();
-    
+
     // Filter to only reliable footers
     let reliable_footers: Vec<Footer> = scan.footers.iter()
         .filter(|f| scan.page_reliability[f.page] == PageReliability::Reliable)
         .copied()
         .collect();
-    
-    // We do NOT require reliable_footers.len() >= 2 here, because
-    // this is a hybrid map and the rest might be ambiguous pages.
-    if reliable_footers.is_empty() {
-        return (Vec::new(), std::collections::BTreeSet::new(), anomalies);
-    }
-    
-    // Sort and deduplicate
-    let mut footers = reliable_footers;
-    footers.sort_by_key(|f| (f.page, f.question));
-    footers.dedup_by_key(|f| f.question);
-    
-    // Check monotonicity
-    let monotone = footers.windows(2).all(|w| w[1].question > w[0].question);
-    if !monotone {
-        anomalies.push("reliable footers not monotonic".to_string());
-        return (Vec::new(), std::collections::BTreeSet::new(), anomalies);
-    }
-    
+
     let mut spans = Vec::new();
     let mut reliable_pages = std::collections::BTreeSet::new();
 
-    for (i, f) in footers.iter().enumerate() {
-        let end_page = f.page;
-        let prev_footer_page = if i == 0 { None } else { Some(footers[i - 1].page) };
-        let mut start_page = if i == 0 {
-            estimate_first_question_start_reliable(&scan.page_reliability, end_page)
+    // Phase 1b: we NO LONGER return early when reliable_footers is empty.
+    // Pure MCQ / short-answer papers (some boards' Paper 1, Edexcel MCQ
+    // sections, IB Paper 1) print NO "Total for Question N is M marks"
+    // footers at all — they only use per-question [1 mark] tags. For
+    // those papers the text layer still has question headings; we just
+    // skip the footer-driven span building and rely on
+    // append_text_only_short_answer_spans below. The structure pass also
+    // fills in spans via vision when the text layer is corrupt.
+    if !reliable_footers.is_empty() {
+        // Sort and deduplicate
+        let mut footers = reliable_footers;
+        footers.sort_by_key(|f| (f.page, f.question));
+        footers.dedup_by_key(|f| f.question);
+
+        // Check monotonicity. When footers are non-monotonic we can't
+        // trust them; skip footer spans and fall through to heading-
+        // only carving instead of returning an empty Vec (which used to
+        // push the pipeline into full per-page fallback).
+        let monotone = footers.windows(2).all(|w| w[1].question > w[0].question);
+        if !monotone {
+            anomalies.push("reliable footers not monotonic — heading-only carving will be used".to_string());
         } else {
-            mid_page_start(&footers[i - 1], f)
-        };
-        if start_page > end_page || end_page >= num_pages {
-            anomalies.push(format!("inconsistent span for Q{}", f.question));
-            continue;
-        }
-
-        // Phase 1 (weld-bug fix): a long-standing bug set start_page to
-        // prev.page unconditionally ("Q_N always starts on the page where
-        // Q_{N-1}'s footer sits"). That's correct only when Q_N's heading
-        // appears on prev.page. When prev.page shows only the tail of
-        // Q_{N-1} and Q_N starts LATER (e.g. prev footer is page 2 but Q3
-        // heading is on page 3), we must not drag prev.page into Q_N's
-        // span. If Q_N has a heading anywhere strictly AFTER prev.page
-        // and at/before end_page, start there instead.
-        if let Some(pfp) = prev_footer_page {
-            let mut heading_page: Option<usize> = None;
-            for h in &scan.headings {
-                if h.number == f.question && h.page > pfp && h.page <= end_page {
-                    heading_page = Some(match heading_page {
-                        Some(cur) => cur.min(h.page),
-                        None => h.page,
-                    });
+            for (i, f) in footers.iter().enumerate() {
+                let end_page = f.page;
+                let prev_footer_page = if i == 0 { None } else { Some(footers[i - 1].page) };
+                let mut start_page = if i == 0 {
+                    estimate_first_question_start_reliable(&scan.page_reliability, end_page)
+                } else {
+                    mid_page_start(&footers[i - 1], f)
+                };
+                if start_page > end_page || end_page >= num_pages {
+                    anomalies.push(format!("inconsistent span for Q{}", f.question));
+                    continue;
                 }
-            }
-            if let Some(hp) = heading_page {
-                if hp > start_page {
-                    start_page = hp;
+
+                // Phase 1 (weld-bug fix): a long-standing bug set start_page to
+                // prev.page unconditionally ("Q_N always starts on the page where
+                // Q_{N-1}'s footer sits"). That's correct only when Q_N's heading
+                // appears on prev.page. When prev.page shows only the tail of
+                // Q_{N-1} and Q_N starts LATER (e.g. prev footer is page 2 but Q3
+                // heading is on page 3), we must not drag prev.page into Q_N's
+                // span. If Q_N has a heading anywhere strictly AFTER prev.page
+                // and at/before end_page, start there instead.
+                if let Some(pfp) = prev_footer_page {
+                    let mut heading_page: Option<usize> = None;
+                    for h in &scan.headings {
+                        if h.number == f.question && h.page > pfp && h.page <= end_page {
+                            heading_page = Some(match heading_page {
+                                Some(cur) => cur.min(h.page),
+                                None => h.page,
+                            });
+                        }
+                    }
+                    if let Some(hp) = heading_page {
+                        if hp > start_page {
+                            start_page = hp;
+                        }
+                    }
                 }
+
+                // Phase 1: infer vertical clips from headings + footer position.
+                let (start_y_frac, end_y_frac) =
+                    infer_y_clips(scan, f.question, start_page, end_page, f.y_frac);
+
+                // Collect reliable and ambiguous pages in this span
+                let mut span_reliable = Vec::new();
+                let mut span_ambiguous = Vec::new();
+                for p in start_page..=end_page {
+                    match scan.page_reliability[p] {
+                        PageReliability::Reliable => span_reliable.push(p),
+                        PageReliability::Ambiguous => span_ambiguous.push(p),
+                        PageReliability::NonQuestion => {}
+                    }
+                }
+
+                for p in &span_reliable {
+                    reliable_pages.insert(*p);
+                }
+
+                spans.push(QuestionSpan {
+                    number: f.question,
+                    start_page,
+                    end_page,
+                    start_y_frac,
+                    end_y_frac,
+                    expected_marks: Some(f.marks),
+                    reliable_pages: span_reliable,
+                    ambiguous_pages: span_ambiguous,
+                });
             }
         }
-
-        // Phase 1: infer vertical clips from headings + footer position.
-        //
-        // On a page that contains the *previous* question's footer AND
-        // this question's heading, we clip the last page of the previous
-        // question at the footer's y (handled when that span is built;
-        // see below), and clip this question's FIRST page at the heading's
-        // y. On the END page of THIS question, clip at the footer's y so
-        // the next question's heading below it isn't visible to the model.
-        let (start_y_frac, end_y_frac) =
-            infer_y_clips(scan, f.question, start_page, end_page, f.y_frac);
-
-        // Collect reliable and ambiguous pages in this span
-        let mut span_reliable = Vec::new();
-        let mut span_ambiguous = Vec::new();
-        for p in start_page..=end_page {
-            match scan.page_reliability[p] {
-                PageReliability::Reliable => span_reliable.push(p),
-                PageReliability::Ambiguous => span_ambiguous.push(p),
-                PageReliability::NonQuestion => {}
-            }
-        }
-
-        for p in &span_reliable { reliable_pages.insert(*p); }
-
-        spans.push(QuestionSpan {
-            number: f.question,
-            start_page,
-            end_page,
-            start_y_frac,
-            end_y_frac,
-            expected_marks: Some(f.marks),
-            reliable_pages: span_reliable,
-            ambiguous_pages: span_ambiguous,
-        });
     }
 
-    // Detect questions that appear on text-reliable pages WITHOUT a
-    // dedicated footer (common on MCQ / short-answer pages where 3–6
-    // questions share a page and the board prints inline [1 mark] tags
-    // instead of "Total for Question"). For any heading whose number
-    // isn't already covered by a footer span, carve out a span that
-    // extends from that heading's y to the next heading's y on the same
-    // page (or end of page if it's the last one).
+    // Detect questions that appear on pages WITHOUT a dedicated footer
+    // (common on MCQ / short-answer pages where 3–6 questions share a
+    // page and the board prints inline [1 mark] tags instead of "Total
+    // for Question"). For any heading whose number isn't already covered
+    // by a footer span, carve out a span from that heading's y to the
+    // next heading's y on the same page (or end of page).
     append_text_only_short_answer_spans(scan, &mut spans, &mut anomalies);
 
     (spans, reliable_pages, anomalies)
@@ -616,27 +649,63 @@ pub fn build_hybrid_map(
     // 1. Build spans from reliable text-layer pages
     let (mut spans, _reliable_pages, text_anomalies) = build_spans_from_reliable_pages(&scan, num_pages);
     anomalies.extend(text_anomalies);
-    
-    // 2. Identify ambiguous pages that need vision
-    let ambiguous_pages: Vec<usize> = (0..num_pages)
-        .filter(|&p| scan.page_reliability[p] == PageReliability::Ambiguous)
-        .collect();
-    
-    // 3. Run vision structure on ambiguous pages only (structures already computed)
-    // Merge vision info for ambiguous pages into spans
-    if !ambiguous_pages.is_empty() {
-        let vision_spans = build_spans_from_vision(structures, &ambiguous_pages, num_pages);
-        // Merge text and vision spans
+
+    // Phase 1b: when the text layer gave us NO reliable footers (common on
+    // MCQ-heavy papers, scanned PDFs with corrupt text layers, IB/CAIE papers
+    // that don't print "Total for Question N is M marks"), we can't trust
+    // the text-layer reliability classification — many pages that were
+    // marked Reliable/NonQuestion on the strength of a single stray word
+    // ("information", "formulae") are actually question pages. In that
+    // case feed ALL non-truly-blank pages into the vision span builder so
+    // the structure pass's (paid-for) output is not silently discarded.
+    let text_layer_trustworthy = !scan.footers.is_empty()
+        && scan.footers.iter().filter(|f| f.question > 0).count() >= 2;
+
+    // 2. Identify which pages to feed the vision builder. When the text
+    // layer is trustworthy, use only Ambiguous pages (the existing hybrid
+    // approach — saves us from merging against pages the text layer
+    // already placed). When not, feed every page that has structure data
+    // and is not a hard Blank/Cover/etc.
+    let vision_pages: Vec<usize> = if text_layer_trustworthy {
+        (0..num_pages)
+            .filter(|&p| scan.page_reliability[p] == PageReliability::Ambiguous)
+            .collect()
+    } else {
+        (0..num_pages)
+            .filter(|&p| {
+                // Skip pages the AI itself classified as non-question.
+                if let Some(s) = structures.get(p) {
+                    if !s.role.is_question_content() {
+                        return false;
+                    }
+                }
+                // Also skip pages our text scan is confident are blank.
+                !matches!(scan.page_reliability[p], PageReliability::NonQuestion)
+            })
+            .collect()
+    };
+
+    // 3. Run vision structure on the selected pages (structures already computed).
+    if !vision_pages.is_empty() {
+        let vision_spans = build_spans_from_vision(structures, &vision_pages, num_pages);
         spans = merge_spans(spans, vision_spans, &mut anomalies);
     }
     
-    // 4. Collect non-question pages
-    let non_question_pages: Vec<usize> = (0..num_pages)
+    // 4. Collect non-question pages (union of text-layer and structure-pass
+    // verdicts; trust either source when it marks a page as non-question).
+    let mut non_question_pages: Vec<usize> = (0..num_pages)
         .filter(|&p| scan.page_reliability[p] == PageReliability::NonQuestion)
         .collect();
-    
-    // 5. Vision fallback pages are the ambiguous ones we actually used vision for
-    let vision_fallback_pages = ambiguous_pages.clone();
+    for s in structures {
+        if !s.role.is_question_content() && !non_question_pages.contains(&s.page) {
+            non_question_pages.push(s.page);
+        }
+    }
+    non_question_pages.sort();
+    non_question_pages.dedup();
+
+    // 5. Vision-fallback pages are the ones we actually fed to build_spans_from_vision.
+    let vision_fallback_pages = vision_pages.clone();
     
     // Validate final spans for monotonicity. Phase 1: with y-clips, multiple
     // questions can legitimately share a single page (MCQs / short answer).
@@ -713,16 +782,22 @@ struct VisionBounds {
 /// Phase 1: the structure pass now reports per-question y fractions on each
 /// page. We use those to tighten the first/last page clips when a question
 /// starts or ends mid-page (MCQ / short-answer pages).
+///
+/// Phase 1b: `eligible_pages` selects which pages contribute to vision
+/// bounds. When the text layer was trustworthy we pass only Ambiguous pages
+/// (existing hybrid behaviour); when it wasn't, we pass all question pages
+/// so the structure pass's paid-for output isn't discarded just because a
+/// regex false-positive labelled a page NonQuestion/Reliable.
 fn build_spans_from_vision(
     structures: &[ValidatedPageStructure],
-    ambiguous_pages: &[usize],
+    eligible_pages: &[usize],
     _num_pages: usize,
 ) -> Vec<QuestionSpan> {
     let mut vision_bounds: BTreeMap<u32, VisionBounds> = BTreeMap::new();
     let mut prev_max = 0u32;
 
     for p in structures {
-        if !ambiguous_pages.contains(&p.page) {
+        if !eligible_pages.contains(&p.page) {
             continue;
         }
         for (qi, &q) in p.questions.iter().enumerate() {
@@ -788,10 +863,10 @@ fn build_spans_from_vision(
         } else {
             (b.first_y, b.last_y)
         };
-        let mut ambiguous = Vec::new();
+        let mut vision_covered = Vec::new();
         for pg in b.first_page..=b.last_page {
-            if ambiguous_pages.contains(&pg) {
-                ambiguous.push(pg);
+            if eligible_pages.contains(&pg) {
+                vision_covered.push(pg);
             }
         }
         spans.push(QuestionSpan {
@@ -802,7 +877,7 @@ fn build_spans_from_vision(
             end_y_frac: end_y,
             expected_marks: b.marks,
             reliable_pages: Vec::new(),
-            ambiguous_pages: ambiguous,
+            ambiguous_pages: vision_covered,
         });
     }
     spans
