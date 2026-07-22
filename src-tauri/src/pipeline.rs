@@ -1448,8 +1448,11 @@ RULES:
         // Phase 0: never pass sentinel b64 values as images. Build a
         // (possibly-empty) image slice from the page; `chat_body` will
         // produce a text-only body when no images are supplied.
-        let img_for_page: [String; 1] = [page.b64.clone()];
-        let page_images: Vec<&String> = img_for_page.iter().filter(|s| !is_sentinel_b64(s)).collect();
+        let page_images: Vec<String> = if is_sentinel_b64(&page.b64) {
+            vec![]
+        } else {
+            vec![page.b64.clone()]
+        };
         let body = llm::chat_body(
             &config.model,
             &system,
