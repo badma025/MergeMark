@@ -66,13 +66,32 @@ pub fn chat_body(
         content.push(serde_json::json!({ "type": "text", "text": t }));
     }
     for img in images {
-        if img == "SKIP" || img == "TEXT_ONLY" {
+        // Phase 0: mirror pipeline::is_sentinel_b64. Anything that isn't real
+        // base64 JPEG must be dropped here so it never reaches the vision API
+        // as a bogus image. We also accept legacy sentinels so old tests and
+        // code paths don't accidentally ship "TEXT_ONLY" as an image.
+        let t = img.trim();
+        if t.is_empty()
+            || t == "__SKIP__"
+            || t == "SKIP"
+            || t == "__TEXT_ONLY__"
+            || t == "TEXT_ONLY"
+        {
             continue;
         }
         let b64 = crate::geometry::strip_data_url(img);
+        // Phase 0: OpenAI-style vision APIs honour a "detail" hint. "high"
+        // forces 768-px tiles and lets the model see fine detail (small
+        // subscripts, axis labels, circuit symbols). Providers that don't
+        // understand this field (Gemini, Anthropic) ignore it safely. At
+        // our new ~200 DPI render the 2048-px long edge maps cleanly onto
+        // two high-detail tiles.
         content.push(serde_json::json!({
             "type": "image_url",
-            "image_url": { "url": format!("data:image/jpeg;base64,{b64}") }
+            "image_url": {
+                "url": format!("data:image/jpeg;base64,{b64}"),
+                "detail": "high"
+            }
         }));
     }
     let user_content = if content.is_empty() {

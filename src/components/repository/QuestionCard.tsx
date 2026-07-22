@@ -4,7 +4,7 @@ import { RichTextEditor } from "./RichTextEditor";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/ui/dialog";
-import { Plus, Trash2, Pencil } from "lucide-react";
+import { Plus, Trash2, Pencil, ZoomIn, X } from "lucide-react";
 import ReactMarkdown from "react-markdown";
 import remarkMath from "remark-math";
 import rehypeKatex from "rehype-katex";
@@ -24,6 +24,56 @@ const DISPLAY_OP_RE =
 /** Convert \\cmd → \cmd (AI sometimes double-escapes backslashes from JSON) */
 function fixSlashes(s: string): string {
   return s.replace(/\\{2}([a-zA-Z])/g, "\\$1");
+}
+
+/**
+ * Phase 0: Diagram renderer with click-to-enlarge.
+ * Diagrams are now rendered at ~200 DPI from the PDF pipeline, but the
+ * card CSS caps them at the content width (`max-w-full`). Clicking opens
+ * the image at native resolution in a modal so users can inspect axis
+ * labels, circuit symbols, or fine geometry that gets squeezed in a card.
+ */
+function DiagramImg({
+  src,
+  alt,
+  onOpen,
+}: {
+  src: string;
+  alt: string;
+  onOpen: (src: string, alt: string) => void;
+}) {
+  const isLocal = /^[a-zA-Z]:[\\/]/.test(src) || src.startsWith("/");
+  const resolved = isLocal ? convertFileSrc(src) : src;
+  return (
+    <div className="relative group/diag my-4">
+      <img
+        src={resolved}
+        alt={alt}
+        className="max-w-full rounded-md cursor-zoom-in ring-1 ring-border/60 hover:ring-primary/40 transition-shadow"
+        onClick={(e) => {
+          e.stopPropagation();
+          onOpen(src, alt);
+        }}
+        onError={(e) => {
+          console.error("Failed to load diagram:", src, resolved);
+          const target = e.target as HTMLImageElement;
+          target.style.opacity = "0.5";
+          target.title = `Failed to load: ${src}`;
+        }}
+      />
+      <button
+        type="button"
+        onClick={(e) => {
+          e.stopPropagation();
+          onOpen(src, alt);
+        }}
+        className="absolute top-2 right-2 bg-black/70 text-white rounded-md p-1.5 opacity-0 group-hover/diag:opacity-100 transition-opacity"
+        aria-label="Enlarge diagram"
+      >
+        <ZoomIn className="size-3.5" />
+      </button>
+    </div>
+  );
 }
 
 /**
@@ -224,6 +274,8 @@ export function QuestionCard({
   const displaySubject = subjects.find(s => s.id === subject)?.name || subject;
   const [isEditing, setIsEditing] = useState(false);
   const [isShowingAnswer, setIsShowingAnswer] = useState(false);
+  // Phase 0: lightbox state for diagram zoom.
+  const [zoomed, setZoomed] = useState<{ src: string; alt: string } | null>(null);
   let parsedTopics: string[] = [];
   try {
     if (topics) {
@@ -384,37 +436,18 @@ export function QuestionCard({
             urlTransform={(value) => value}
             components={{
               img: ({ node, ...props }) => {
-                            if (props.src && (props.src.match(/^[a-zA-Z]:[\\/]/) || props.src.startsWith("/"))) {
-                              try {
-                                const assetUrl = convertFileSrc(props.src);
-                                return (
-                                  <div className="relative group">
-                                    <img
-                                        {...props}
-                                        src={assetUrl}
-                                        alt={props.alt || "Diagram"}
-                                        className="max-w-full rounded-md my-4"
-                                        onError={(e) => {
-                                          console.error("Failed to load image via asset protocol:", props.src, assetUrl);
-                                          const target = e.target as HTMLImageElement;
-                                          target.style.opacity = '0.5';
-                                          target.title = `Failed to load: ${props.src} -> ${assetUrl}`;
-                                        }}
-                                      />
-                                    <div className="hidden group-hover:block absolute bottom-0 left-0 bg-black/80 text-white text-[10px] p-1 truncate max-w-full">
-                                      {props.src}
-                                    </div>
-                                  </div>
-                                  );
-                                } catch (e) {
-                                  return <div className="text-sm text-destructive border border-destructive/20 p-2 rounded-md bg-destructive/10 text-center">Failed to convert diagram URL: {props.alt || "Image"}</div>;
-                                }
-                              }
-                  return <img {...props} alt={props.alt || "Diagram"} className="max-w-full rounded-md my-4" />;
-                }
-              }}
-            >
-              {preprocessMath(displayContent, isCode, displaySubject)}
+                if (!props.src) return null;
+                return (
+                  <DiagramImg
+                    src={props.src}
+                    alt={props.alt || "Diagram"}
+                    onOpen={(s, a) => setZoomed({ src: s, alt: a })}
+                  />
+                );
+              },
+            }}
+          >
+            {preprocessMath(displayContent, isCode, displaySubject)}
           </ReactMarkdown>
         </div>
 
@@ -432,37 +465,18 @@ export function QuestionCard({
             urlTransform={(value) => value}
             components={{
               img: ({ node, ...props }) => {
-                            if (props.src && (props.src.match(/^[a-zA-Z]:[\\/]/) || props.src.startsWith("/"))) {
-                              try {
-                                const assetUrl = convertFileSrc(props.src);
-                                return (
-                                  <div className="relative group">
-                                    <img
-                                        {...props}
-                                        src={assetUrl}
-                                        alt={props.alt || "Diagram"}
-                                        className="max-w-full rounded-md my-4"
-                                        onError={(e) => {
-                                          console.error("Failed to load image via asset protocol:", props.src, assetUrl);
-                                          const target = e.target as HTMLImageElement;
-                                          target.style.opacity = '0.5';
-                                          target.title = `Failed to load: ${props.src} -> ${assetUrl}`;
-                                        }}
-                                      />
-                                    <div className="hidden group-hover:block absolute bottom-0 left-0 bg-black/80 text-white text-[10px] p-1 truncate max-w-full">
-                                      {props.src}
-                                    </div>
-                                  </div>
-                                  );
-                                } catch (e) {
-                                  return <div className="text-sm text-destructive border border-destructive/20 p-2 rounded-md bg-destructive/10 text-center">Failed to convert diagram URL: {props.alt || "Image"}</div>;
-                                }
-                              }
-                  return <img {...props} alt={props.alt || "Diagram"} className="max-w-full rounded-md my-4" />;
-                }
-              }}
-            >
-              {preprocessMath(answerContent ?? "", isCode, displaySubject)}
+                if (!props.src) return null;
+                return (
+                  <DiagramImg
+                    src={props.src}
+                    alt={props.alt || "Diagram"}
+                    onOpen={(s, a) => setZoomed({ src: s, alt: a })}
+                  />
+                );
+              },
+            }}
+          >
+            {preprocessMath(answerContent ?? "", isCode, displaySubject)}
           </ReactMarkdown>
         </div>
       </div>
@@ -589,6 +603,45 @@ export function QuestionCard({
           Add to Worksheet
         </Button>
       </div>
+
+      {/* ── Diagram zoom lightbox (Phase 0) ── */}
+      <Dialog
+        open={!!zoomed}
+        onOpenChange={(o) => {
+          if (!o) setZoomed(null);
+        }}
+      >
+        <DialogContent
+          className="max-w-[95vw] max-h-[95vh] w-auto h-auto p-0 border-0 bg-transparent shadow-none"
+          onClick={(e) => {
+            e.stopPropagation();
+            setZoomed(null);
+          }}
+          showCloseButton={false}
+        >
+          <div className="relative">
+            <button
+              type="button"
+              onClick={(e) => {
+                e.stopPropagation();
+                setZoomed(null);
+              }}
+              className="absolute -top-2 -right-2 bg-black/80 text-white rounded-full p-1.5 hover:bg-black z-10"
+              aria-label="Close"
+            >
+              <X className="size-4" />
+            </button>
+            {zoomed && (
+              <img
+                src={/^[a-zA-Z]:[\\/]|^\//.test(zoomed.src) ? convertFileSrc(zoomed.src) : zoomed.src}
+                alt={zoomed.alt}
+                className="max-w-[95vw] max-h-[90vh] object-contain rounded-lg"
+                onClick={(e) => e.stopPropagation()}
+              />
+            )}
+          </div>
+        </DialogContent>
+      </Dialog>
     </article>
   );
 }

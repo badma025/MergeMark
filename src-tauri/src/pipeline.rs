@@ -289,6 +289,19 @@ fn cancelled(cancel: &AtomicBool) -> Result<(), String> {
     }
 }
 
+/// Phase 0: recognize sentinel b64 values that the frontend uses to
+/// signal "this page has no renderable image". These must NEVER be sent to
+/// the vision API as base64 JPEG — the previous code sent the literal
+/// ASCII bytes "TEXT_ONLY" as an image, attaching garbage to requests.
+fn is_sentinel_b64(b: &str) -> bool {
+    let t = b.trim();
+    t.is_empty()
+        || t == "__SKIP__"
+        || t == "SKIP" // legacy
+        || t == "__TEXT_ONLY__"
+        || t == "TEXT_ONLY" // legacy
+}
+
 // ══════════════════════════════════════════════════════════════════════════
 // Prompts
 // ══════════════════════════════════════════════════════════════════════════
@@ -442,20 +455,34 @@ pub async fn run_question_pipeline<C: LlmClient, P: Progress>(
             let futs: Vec<_> = batch
                 .iter()
                 .map(|page| {
-                    let is_skip = page.b64 == "SKIP";
-                    let is_text_only = page.b64 == "TEXT_ONLY";
-                    
+                    let is_skip = page.b64 == "__SKIP__" || page.b64 == "SKIP" /*legacy*/;
+                    // Phase 0: a page is text-only iff it has an empty (or
+                    // legacy TEXT_ONLY) b64 payload but carries extractable
+                    // raw text. This was a half-implemented fast path: the
+                    // structure call honoured it, but the EXTRACTION path
+                    // passed the literal "TEXT_ONLY" bytes as a JPEG to the
+                    // model, corrupting the request. See filter below in
+                    // extract_span for the matching rule.
+                    let is_text_only =
+                        page.b64.is_empty() || page.b64 == "__TEXT_ONLY__" || page.b64 == "TEXT_ONLY";
+
                     if is_skip {
                         return futures_util::future::Either::Left(async move {
                             Ok(r#"{"questions":[]}"#.to_string())
                         });
                     }
 
+                    let (img_slice, text_opt): (&[String], Option<&str>) = if is_text_only {
+                        (&[], Some(page.text.as_str()))
+                    } else {
+                        (std::slice::from_ref(&page.b64), None)
+                    };
+
                     let body = llm::chat_body(
                         &config.model,
                         &system_structure,
-                        if is_text_only { &[] } else { std::slice::from_ref(&page.b64) },
-                        if is_text_only { Some(page.text.as_str()) } else { None },
+                        img_slice,
+                        text_opt,
                         200,
                     );
                     futures_util::future::Either::Right(async move {
@@ -803,10 +830,17 @@ async fn extract_span<C: LlmClient>(
     let mut saved_diagrams: Vec<([u8; 64], String)> = Vec::new();
 
     for chunk in chunks {
+        // Phase 0: filter out sentinel b64 values before they reach the
+        // model. Previously "TEXT_ONLY" was 8 non-empty ASCII bytes and was
+        // therefore sent as a base64 JPEG to the vision API, producing
+        // garbage images attached to multi-page chunk requests. Any
+        // recognized sentinel is dropped here so the request only ever
+        // carries real JPEG payloads (real pages have kilobytes of base64
+        // so this exact-match check is safe).
         let images: Vec<String> = chunk
             .iter()
             .map(|(_, p)| p.b64.clone())
-            .filter(|b| !b.trim().is_empty())
+            .filter(|b| !is_sentinel_b64(b))
             .collect();
         let raw_text: String = chunk
             .iter()
@@ -1411,10 +1445,15 @@ RULES:
                 )
             }
         );
+        // Phase 0: never pass sentinel b64 values as images. Build a
+        // (possibly-empty) image slice from the page; `chat_body` will
+        // produce a text-only body when no images are supplied.
+        let img_for_page: [String; 1] = [page.b64.clone()];
+        let page_images: Vec<&String> = img_for_page.iter().filter(|s| !is_sentinel_b64(s)).collect();
         let body = llm::chat_body(
             &config.model,
             &system,
-            std::slice::from_ref(&page.b64),
+            &page_images,
             Some(&user_text),
             config.max_output_tokens,
         );
@@ -1565,7 +1604,7 @@ async fn read_markscheme_window<C: LlmClient>(
     let images: Vec<String> = pages[start..end]
         .iter()
         .map(|p| p.b64.clone())
-        .filter(|b| !b.trim().is_empty())
+        .filter(|b| !is_sentinel_b64(b))
         .collect();
     let mut chunk_text = String::new();
     for i in start..end {

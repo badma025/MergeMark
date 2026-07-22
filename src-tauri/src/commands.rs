@@ -1039,7 +1039,14 @@ pub async fn parse_pdf_vision(
     config.allowed_topics = allowed_topics;
     config.diagrams_dir = diagrams_dir;
     config.max_repairs = 2;
-    config.max_output_tokens = 16384;
+    // Phase 0: questions now get the same output budget as mark schemes.
+    // Long physics questions with sub-parts (a)–(f), derivations, graph
+    // descriptions, and circuit analysis routinely hit the previous 16k
+    // cap, triggering truncation-salvage + repair retries that doubled
+    // latency and quarantined questions. 32k gives a healthy headroom at
+    // modest cost (output tokens are the expensive part, but a truncated
+    // question that requires a full retry is far more expensive).
+    config.max_output_tokens = 32768;
     config.parallelism = std::env::var("MERGEMARK_PARALLELISM")
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
