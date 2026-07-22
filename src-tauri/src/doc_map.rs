@@ -225,8 +225,14 @@ pub fn scan_text_layer(page_texts: &[String]) -> TextScan {
     //   * a page-length guard: real question pages almost always exceed 300
     //     characters in the text layer, while cover/instruction pages are
     //     short.
+    // Phase 1c: "information" is removed from instr_re entirely. Physics
+    // questions constantly wrap sentences so that "information" starts a
+    // line ("Use the information\nin Figure 3…"). Require both "answer all
+    // questions" / "instructions" / "glossary" AND a short page, and match
+    // them only at line start. The line-end anchor (\s|$|:) keeps us from
+    // matching partial words like "instructional".
     let instr_re = regex::Regex::new(
-        r"(?i)(?:^|\n)\s*(?:instructions?\s*(?:to\s+candidates?)?|information|answer\s+all\s+questions|glossary)(?:\s|$|:)",
+        r"(?i)(?:^|\n)\s*(?:instructions?\s*(?:to\s+candidates?)?|answer\s+all\s+questions|glossary)(?:\s|$|:)",
     ).unwrap();
     let formulae_sheet_re = regex::Regex::new(
         r"(?i)(?:^|\n)\s*(?:formulae?|data|constants|relationships?)\s*(?:sheet|booklet|table|page)?\s*$",
@@ -794,17 +800,47 @@ fn build_spans_from_vision(
     _num_pages: usize,
 ) -> Vec<QuestionSpan> {
     let mut vision_bounds: BTreeMap<u32, VisionBounds> = BTreeMap::new();
-    let mut prev_max = 0u32;
-
+    // Phase 1c: the old `q + 5 < prev_max` global guard killed the entire
+    // map whenever a single page returned an outlier number (e.g. reading
+    // "30" from "[30 marks]" or a year on a cover page). Instead we do a
+    // two-pass per-page filter:
+    //   * collect plausible numbers for each page by rejecting numbers
+    //     that jump backward by more than 30 OR forward by more than 30
+    //     from the running maximum, AND are not adjacent to any number
+    //     on the same page (a lone "30" on a page whose other numbers
+    //     are 3,4,5 is almost certainly a misread).
+    //   * a page that produces zero plausible numbers doesn't blow up
+    //     the map — it's simply skipped.
+    let mut running_max = 0u32;
     for p in structures {
         if !eligible_pages.contains(&p.page) {
             continue;
         }
+        // Filter per-page numbers.
+        let mut accepted: Vec<(usize, u32)> = Vec::new();
         for (qi, &q) in p.questions.iter().enumerate() {
-            if q + 5 < prev_max {
-                return Vec::new(); // Hallucination signal
+            if q == 0 || q > 200 {
+                continue;
             }
-            prev_max = prev_max.max(q);
+            // Reject wild jumps backward (>30 drop) or forward (>30 above
+            // running max) UNLESS the number is within 5 of another
+            // accepted number on the same page (which suggests a real
+            // MCQ run rather than an outlier).
+            let backward_jump = running_max > 0 && q + 30 < running_max;
+            let forward_jump = q > running_max + 30 && running_max > 0;
+            if backward_jump || forward_jump {
+                // Keep it only if a sibling on the same page is within 5
+                // of it (signals a contiguous block that simply follows
+                // a gap in the structure pass, not a hallucination).
+                let sibling_close = accepted.iter().any(|(_, qn)| qn.abs_diff(q) <= 5);
+                if !sibling_close {
+                    continue;
+                }
+            }
+            accepted.push((qi, q));
+        }
+        for (qi, q) in accepted {
+            running_max = running_max.max(q);
             let (y0, y1) = p.question_y.get(qi).copied().unwrap_or((None, None));
             let e = vision_bounds.entry(q).or_insert_with(|| VisionBounds {
                 first_page: p.page,
@@ -837,16 +873,23 @@ fn build_spans_from_vision(
             }
         }
         if let Some((q, m)) = p.footer {
-            let e = vision_bounds.entry(q).or_insert_with(|| VisionBounds {
-                first_page: p.page,
-                last_page: p.page,
-                first_y: None,
-                last_y: None,
-                marks: None,
-            });
-            e.last_page = p.page;
-            e.last_y = p.footer_y.or(e.last_y);
-            e.marks = Some(m);
+            // Phase 1c: only trust the footer if its question number is
+            // plausible (same guard as build_map_from_structure). A
+            // misread "30" from "[30 marks]" on a cover page otherwise
+            // poisons bounds for Q30.
+            if q > 0 && q <= 200 {
+                let e = vision_bounds.entry(q).or_insert_with(|| VisionBounds {
+                    first_page: p.page,
+                    last_page: p.page,
+                    first_y: None,
+                    last_y: None,
+                    marks: None,
+                });
+                e.last_page = p.page;
+                e.last_y = p.footer_y.or(e.last_y);
+                e.marks = Some(m);
+                running_max = running_max.max(q);
+            }
         }
     }
 
@@ -1178,16 +1221,35 @@ pub fn build_map_from_structure(
     pages: &[ValidatedPageStructure],
     num_pages: usize,
 ) -> Option<DocumentMap> {
-    // Record per-question running bounds.
+    // Record per-question running bounds. Phase 1c: same per-page
+    // plausible-number filter as build_spans_from_vision, so an outlier
+    // on a single page can't kill the whole structure map.
     let mut bounds: std::collections::BTreeMap<u32, VisionBounds> =
         std::collections::BTreeMap::new();
-    let mut prev_max = 0u32;
+    let mut running_max = 0u32;
     for p in pages {
+        // Skip non-question pages when building bounds (matches the
+        // hybrid path's behaviour).
+        if !p.role.is_question_content() {
+            continue;
+        }
+        let mut accepted: Vec<(usize, u32)> = Vec::new();
         for (qi, &q) in p.questions.iter().enumerate() {
-            if q + 5 < prev_max {
-                return None;
+            if q == 0 || q > 200 {
+                continue;
             }
-            prev_max = prev_max.max(q);
+            let backward_jump = running_max > 0 && q + 30 < running_max;
+            let forward_jump = q > running_max + 30 && running_max > 0;
+            if backward_jump || forward_jump {
+                let sibling_close = accepted.iter().any(|(_, qn)| qn.abs_diff(q) <= 5);
+                if !sibling_close {
+                    continue;
+                }
+            }
+            accepted.push((qi, q));
+        }
+        for (qi, q) in accepted {
+            running_max = running_max.max(q);
             let (y0, y1) = p.question_y.get(qi).copied().unwrap_or((None, None));
             let e = bounds.entry(q).or_insert_with(|| VisionBounds {
                 first_page: p.page,
@@ -1216,16 +1278,21 @@ pub fn build_map_from_structure(
             }
         }
         if let Some((q, m)) = p.footer {
-            let e = bounds.entry(q).or_insert_with(|| VisionBounds {
-                first_page: p.page,
-                last_page: p.page,
-                first_y: None,
-                last_y: None,
-                marks: None,
-            });
-            e.last_page = p.page;
-            e.last_y = p.footer_y.or(e.last_y);
-            e.marks = Some(m);
+            // Only trust the footer if its question number is plausible
+            // (within range of the running sequence or already in bounds).
+            if q > 0 && q <= 200 {
+                let e = bounds.entry(q).or_insert_with(|| VisionBounds {
+                    first_page: p.page,
+                    last_page: p.page,
+                    first_y: None,
+                    last_y: None,
+                    marks: None,
+                });
+                e.last_page = p.page;
+                e.last_y = p.footer_y.or(e.last_y);
+                e.marks = Some(m);
+                running_max = running_max.max(q);
+            }
         }
     }
     if bounds.len() < 2 {

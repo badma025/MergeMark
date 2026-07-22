@@ -566,9 +566,22 @@ pub async fn run_question_pipeline<C: LlmClient, P: Progress>(
                 pages.len()
             ));
             let struct_batch_start = Instant::now();
+            // Phase 1c: skip NonQuestion pages for the structure call too —
+            // pages the text layer is confident are front matter don't need
+            // a vision call, and letting the model guess at question numbers
+            // on cover pages pollutes prev_max in the monotonicity guard.
+            // We consult `scan.page_reliability` (computed above, before the
+            // structure pass) so the check is free; pages the text layer
+            // already marked NonQuestion short-circuit to a synthetic BLANK
+            // response, identical to a __SKIP__ sentinel.
             let futs: Vec<_> = batch
                 .iter()
-                .map(|page| {
+                .enumerate()
+                .map(|(k, page)| {
+                    let page_index = base + k;
+                    let is_non_question_by_text = page_index < scan.page_reliability.len()
+                        && scan.page_reliability[page_index]
+                            == doc_map::PageReliability::NonQuestion;
                     // Phase 1b: use the shared sentinel helper so every
                     // sentinel (__SKIP__/SKIP/empty/__TEXT_ONLY__/TEXT_ONLY)
                     // is treated consistently.
@@ -576,12 +589,11 @@ pub async fn run_question_pipeline<C: LlmClient, P: Progress>(
                         && page.b64 != "__TEXT_ONLY__"
                         && page.b64 != "TEXT_ONLY";
                     // A page is text-only iff its b64 is empty or a TEXT_ONLY
-                    // sentinel but it carries extractable raw text. The
-                    // structure call honours it; chat_body drops sentinels.
+                    // sentinel but it carries extractable raw text.
                     let is_text_only =
                         page.b64.is_empty() || page.b64 == "__TEXT_ONLY__" || page.b64 == "TEXT_ONLY";
 
-                    if is_skip {
+                    if is_skip || is_non_question_by_text {
                         return futures_util::future::Either::Left(async move {
                             Ok(r#"{"question_numbers_visible":[],"page_role":"BLANK"}"#.to_string())
                         });
@@ -593,12 +605,16 @@ pub async fn run_question_pipeline<C: LlmClient, P: Progress>(
                         (std::slice::from_ref(&page.b64), None)
                     };
 
+                    // Phase 1c: raised from 200 to 750. Phase 1's
+                    // question_y_fracs add ~80-120 tokens per MCQ page,
+                    // so dense 5-question pages were truncating mid-JSON
+                    // and being treated as unknown-role.
                     let body = llm::chat_body(
                         &config.model,
                         &system_structure,
                         img_slice,
                         text_opt,
-                        200,
+                        750,
                     );
                     futures_util::future::Either::Right(async move {
                         match client.chat(&body).await {
