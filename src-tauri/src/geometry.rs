@@ -573,6 +573,7 @@ pub struct PageBand {
 #[allow(dead_code)]
 pub fn crop_page_vertical(b64: &str, start_frac: f32, end_frac: f32) -> Option<PageBand> {
     use base64::Engine;
+    use image::GenericImageView;
     let img = decode_page_image(b64)?;
     let (w, h) = img.dimensions();
     if w < 2 || h < 2 {

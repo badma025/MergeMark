@@ -83,7 +83,7 @@ function App() {
               onClick={() => setActiveTab(id)}
               className={cn(
                 "flex items-center gap-2 px-4 py-2 text-sm font-medium rounded-t-lg",
-                "transition-colors duration-150 border-b-2 -mb-px",
+                "transition-colors duration-150 border-b-2 -mb-[1px] translate-y-[1px]",
                 activeTab === id
                   ? "border-primary text-primary bg-primary/5"
                   : "border-transparent text-muted-foreground hover:text-foreground hover:bg-muted/40"

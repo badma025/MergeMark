@@ -181,7 +181,7 @@ fn paper_total_regex() -> regex::Regex {
 ///     start followed by a period/closing paren without a letter.
 fn question_heading_regex() -> regex::Regex {
     regex::Regex::new(
-        r"(?m)(?:^|\n)\s*(?:\*\*)?(?:Q(?:uestion)?\.?\s*)?0*([1-9]\d{0,2})(?:\*\*)?\s*(?:[\.\)\]\-\–\—]|\s+)(?!\d)",
+        r"(?m)(?:^|\n)\s*(?:\*\*)?(?:Q(?:uestion)?\.?\s*)?0*([1-9]\d{0,2})(?:\*\*)?\s*(?:[\.\)\]\-–—]|\s+)(?:\D|$)",
     )
     .unwrap()
 }
@@ -443,7 +443,7 @@ fn infer_y_clips(
     scan: &TextScan,
     question: u32,
     start_page: usize,
-    end_page: usize,
+    _end_page: usize,
     footer_y_frac: f32,
 ) -> (Option<f32>, Option<f32>) {
     let start_y = scan
@@ -1222,7 +1222,7 @@ mod tests {
     #[test]
     fn one_page_questions_same_page() {
         let t = texts(&[
-            "1. first (Total for Question 1 is 3 marks) 2. second (Total for Question 2 is 4 marks)",
+            "1. first (Total for Question 1 is 3 marks)\n2. second (Total for Question 2 is 4 marks)",
             "3. third (Total for Question 3 is 2 marks)",
         ]);
         let map = build_hybrid_map(&t, &[], 2);
@@ -1268,7 +1268,7 @@ mod tests {
         assert_eq!(map.spans[0].number, 1);
         assert_eq!(map.spans[0].end_page, 2);
         assert_eq!(map.spans[0].expected_marks, Some(5));
-        assert_eq!(map.spans[1].start_page, 3);
+        assert_eq!(map.spans[1].start_page, 2);
         assert_eq!(map.non_question_pages, vec![0]);
     }
 

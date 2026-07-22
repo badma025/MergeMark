@@ -794,7 +794,7 @@ pub async fn run_question_pipeline<C: LlmClient, P: Progress>(
                         //     question rather than a continuation).
                         // If any signal fires, treat the new chunk as
                         // question_number+1 and flag it for review.
-                        let (qnum, should_stitch, q_for_push) =
+                        let (qnum, _should_stitch, q_for_push) =
                             if let Some(prev) = built.last_mut() {
                                 if prev.question_number == q.question_number {
                                     if looks_like_new_question(&prev.content, &q.content) {
@@ -1331,7 +1331,11 @@ async fn extract_span<C: LlmClient>(
             item_content = item_content.replace("[DIAGRAM_PLACEHOLDER]", "");
 
             if let Some(t) = item.topics {
-                topics_acc.extend(value_to_topics(&t));
+                for topic in value_to_topics(&t) {
+                    if config.allowed_topics.is_empty() || config.allowed_topics.contains(&topic) {
+                        topics_acc.insert(topic);
+                    }
+                }
             }
             if item.is_code == Some(true) {
                 is_code_acc = true;
@@ -1535,7 +1539,7 @@ fn audit_diagram_boxes(
             // Coordinates are still relative to the FULL page image
             // (we explicitly do NOT physically crop in Phase 1), so the
             // bbox [x,y,w,h] the model returns is in full-page space.
-            let (_x, y, w, h) = (bbox[0], bbox[1], bbox[2], bbox[3]);
+            let (_x, y, _w, h) = (bbox[0], bbox[1], bbox[2], bbox[3]);
             let cy = y + h / 2.0;
 
             // ── Y-band check: reject boxes outside this question's band.
