@@ -7,9 +7,9 @@ import { notifyUsageChanged } from "@/components/UploadCounter";
 import { toast } from "sonner";
 import { UploadCloud, FileText, Loader2, AlertTriangle, CheckCircle2 } from "lucide-react";
 import { cn } from "@/lib/utils";
-import { SUBJECTS, TOPICS_BY_SUBJECT } from "@/lib/taxonomy";
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { Button } from "@/components/ui/button";
+import { useTaxonomy } from "@/lib/TaxonomyContext";
 
 import * as pdfjsLib from "pdfjs-dist";
 
@@ -51,13 +51,16 @@ interface IngestionDropzoneProps {
 }
 
 export function IngestionDropzone({ isActive = false, onSuccess }: IngestionDropzoneProps) {
+  const { subjects } = useTaxonomy();
   const [importMode, setImportMode] = useState<"questions" | "mark_scheme">("questions");
-  const [subject, setSubject] = useState(SUBJECTS[0] || "Mathematics");
-  const [moduleOverride, setModuleOverride] = useState(
-    SUBJECTS[0] && TOPICS_BY_SUBJECT[SUBJECTS[0]] 
-      ? Object.keys(TOPICS_BY_SUBJECT[SUBJECTS[0]])[0] 
-      : ""
-  );
+  const [subject, setSubject] = useState("");
+  const [moduleOverride, setModuleOverride] = useState("");
+
+  useEffect(() => {
+    if (subjects.length > 0 && !subject) {
+      setSubject(subjects[0].id);
+    }
+  }, [subjects, subject]);
   // Paper names already in the DB — populated when the user switches to mark_scheme mode.
   const [availablePaperNames, setAvailablePaperNames] = useState<string[]>([]);
   // The paper name the user has selected to match the mark scheme against.
@@ -70,17 +73,19 @@ export function IngestionDropzone({ isActive = false, onSuccess }: IngestionDrop
   const [reports, setReports] = useState<ImportReport[]>([]);
   const [showLogs, setShowLogs] = useState(false);
   
-  // Derive available modules for the current subject
-  const availableModules = subject && TOPICS_BY_SUBJECT[subject]
-    ? Object.keys(TOPICS_BY_SUBJECT[subject])
-    : [];
+  const activeSubject = subjects.find(s => s.id === subject);
+  const availableModules = activeSubject ? activeSubject.modules : [];
 
   useEffect(() => {
-    const defaultModule = subject && TOPICS_BY_SUBJECT[subject]
-      ? Object.keys(TOPICS_BY_SUBJECT[subject])[0]
-      : "";
-    setModuleOverride(defaultModule);
-  }, [subject]);
+    if (availableModules.length > 0) {
+      // Only set if current moduleOverride is not in the new available list
+      if (!availableModules.find((m: any) => m.id === moduleOverride)) {
+        setModuleOverride(availableModules[0].id);
+      }
+    } else {
+      setModuleOverride("");
+    }
+  }, [subject, availableModules]);
 
   const dragCounter = useRef(0); // tracks nested enter/leave events
 
@@ -457,8 +462,8 @@ export function IngestionDropzone({ isActive = false, onSuccess }: IngestionDrop
               disabled={isProcessing}
               className="h-9 w-[300px] rounded-md border border-input bg-background px-3 py-1 text-sm shadow-sm transition-colors focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring disabled:cursor-not-allowed disabled:opacity-50"
             >
-              {SUBJECTS.map((s) => (
-                <option key={s} value={s}>{s}</option>
+              {subjects.map((s) => (
+                <option key={s.id} value={s.id}>{s.name}</option>
               ))}
             </select>
           </div>
@@ -475,8 +480,8 @@ export function IngestionDropzone({ isActive = false, onSuccess }: IngestionDrop
                 disabled={isProcessing}
                 className="h-9 w-[300px] rounded-md border border-input bg-background px-3 py-1 text-sm shadow-sm transition-colors focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring disabled:cursor-not-allowed disabled:opacity-50"
               >
-                {availableModules.map((m) => (
-                  <option key={m} value={m}>{m}</option>
+                {availableModules.map((m: any) => (
+                  <option key={m.id} value={m.id}>{m.name}</option>
                 ))}
               </select>
             </div>

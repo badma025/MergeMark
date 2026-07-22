@@ -5,7 +5,7 @@ import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/u
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { RichTextEditor } from "./RichTextEditor";
-import { SUBJECTS, TOPICS_BY_SUBJECT } from "@/lib/taxonomy";
+import { useTaxonomy } from "@/lib/TaxonomyContext";
 import { Plus } from "lucide-react";
 import { cn } from "@/lib/utils";
 
@@ -23,11 +23,13 @@ export function AddQuestionModal({ open, onOpenChange, onSuccess }: AddQuestionM
   const [content, setContent] = useState<string>("");
   const [answerContent, setAnswerContent] = useState<string>("");
   const [isSubmitting, setIsSubmitting] = useState<boolean>(false);
+  const { subjects, topicsBySubject } = useTaxonomy();
+  const subjectNames = subjects.map(s => s.name);
 
   // Set default module when modal opens or subject changes
   useEffect(() => {
     if (open) {
-      const subjectMods = TOPICS_BY_SUBJECT[subject] || {};
+      const subjectMods = topicsBySubject[subject] || {};
       const firstMod = Object.keys(subjectMods)[0] || "";
       if (!module) {
         setModule(firstMod);
@@ -38,7 +40,7 @@ export function AddQuestionModal({ open, onOpenChange, onSuccess }: AddQuestionM
   // When subject changes, reset module and topics
   function handleSubjectChange(newSubject: string) {
     setSubject(newSubject);
-    const subjectMods = TOPICS_BY_SUBJECT[newSubject] || {};
+    const subjectMods = topicsBySubject[newSubject] || {};
     const firstMod = Object.keys(subjectMods)[0] || "";
     setModule(firstMod);
     setTopics([]);
@@ -96,7 +98,7 @@ export function AddQuestionModal({ open, onOpenChange, onSuccess }: AddQuestionM
     }
   }
 
-  const subjectMods = TOPICS_BY_SUBJECT[subject] || {};
+  const subjectMods = topicsBySubject[subject] || {};
   const availableTopics = module ? subjectMods[module] || [] : Object.values(subjectMods).flat();
 
   return (
@@ -119,7 +121,7 @@ export function AddQuestionModal({ open, onOpenChange, onSuccess }: AddQuestionM
                 onChange={(e) => handleSubjectChange(e.target.value)}
                 className="p-1.5 text-sm bg-background border border-input rounded-md focus:outline-none focus:ring-2 focus:ring-primary/50"
               >
-                {SUBJECTS.map((s) => (
+                {subjectNames.map((s) => (
                   <option key={s} value={s}>{s}</option>
                 ))}
               </select>

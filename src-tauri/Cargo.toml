@@ -40,3 +40,4 @@ reqwest = { version = "0.13.4", features = ["json", "rustls"] }
 image = "0.25.10"
 base64 = "0.22.1"
 zip = { version = "2", default-features = false, features = ["deflate"] }
+csv = "1.4.0"

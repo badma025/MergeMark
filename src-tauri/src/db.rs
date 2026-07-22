@@ -136,6 +136,46 @@ pub async fn init_db(app_data_dir: PathBuf) -> Result<SqlitePool, sqlx::Error> {
     .execute(&pool)
     .await?;
 
+    // ── Taxonomy Tables (BYOT) ─────────────────────────────────────────────
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS subjects (
+            id TEXT PRIMARY KEY,
+            name TEXT NOT NULL UNIQUE
+        );
+        "#
+    ).execute(&pool).await?;
+
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS modules (
+            id TEXT PRIMARY KEY,
+            subject_id TEXT NOT NULL,
+            name TEXT NOT NULL,
+            FOREIGN KEY(subject_id) REFERENCES subjects(id) ON DELETE CASCADE,
+            UNIQUE(subject_id, name)
+        );
+        "#
+    ).execute(&pool).await?;
+
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS topics (
+            id TEXT PRIMARY KEY,
+            module_id TEXT NOT NULL,
+            name TEXT NOT NULL,
+            FOREIGN KEY(module_id) REFERENCES modules(id) ON DELETE CASCADE,
+            UNIQUE(module_id, name)
+        );
+        "#
+    ).execute(&pool).await?;
+
+    // Seed taxonomy if completely empty
+    let count: (i64,) = sqlx::query_as("SELECT count(*) FROM subjects").fetch_one(&pool).await?;
+    if count.0 == 0 {
+        seed_taxonomy(&pool).await?;
+    }
+
     Ok(pool)
 }
 
@@ -237,3 +277,119 @@ pub async fn set_byok_api_key(
     Ok(())
 }
 
+
+async fn seed_taxonomy(pool: &SqlitePool) -> Result<(), sqlx::Error> {
+    let seed_data = vec![
+        (
+            "A Level Mathematics (Edexcel)",
+            vec![
+                ("Pure", vec![
+                    "Proof", "Algebra and functions", "Coordinate geometry in the (x, y) plane", 
+                    "Sequences and series", "Trigonometry", "Exponentials and logarithms", 
+                    "Differentiation", "Integration", "Numerical methods", "Vectors"
+                ]),
+                ("Statistics", vec![
+                    "Statistical sampling", "Data presentation and interpretation", "Probability", 
+                    "Statistical distributions", "Statistical hypothesis testing"
+                ]),
+                ("Mechanics", vec![
+                    "Quantities and units in mechanics", "Kinematics", "Forces and Newton's laws", "Moments"
+                ])
+            ]
+        ),
+        (
+            "A Level Further Mathematics (Edexcel)",
+            vec![
+                ("Core Pure", vec![
+                    "Complex numbers", "Argand diagrams", "Series", "Roots of polynomials", 
+                    "Volumes of revolution", "Matrices", "Linear transformations", 
+                    "Proof by induction", "Vectors", "Differential equations", 
+                    "Polar coordinates", "Hyperbolic functions", "Maclaurin series", 
+                    "Methods in calculus"
+                ]),
+                ("Further Mechanics 1", vec![
+                    "Momentum and impulse", "Work, energy and power", "Elastic strings and springs", 
+                    "Elastic collisions in one dimension", "Elastic collisions in two dimensions"
+                ]),
+                ("Further Statistics 1", vec![
+                    "Discrete probability distributions", "Poisson distribution", 
+                    "Geometric and negative binomial", "Hypothesis testing", 
+                    "Central Limit Theorem", "Chi-squared tests", "Probability generating functions", 
+                    "Quality of tests"
+                ]),
+                ("Further Pure 1", vec![
+                    "Vectors (Cross product & planes)", "Conic sections", "Inequalities", 
+                    "t-formulae", "Taylor series", "Numerical methods (Further)", 
+                    "Reducible differential equations"
+                ]),
+                ("Decision Mathematics 1", vec![
+                    "Algorithms", "Graphs and networks", "Algorithms on graphs", 
+                    "Route inspection", "Travelling Salesperson Problem", 
+                    "Linear programming", "Simplex algorithm"
+                ]),
+                ("Further Pure 2", vec![
+                    "Number theory", "Groups", "Further calculus", "Further matrix algebra", 
+                    "Further complex numbers", "Maclaurin series"
+                ]),
+                ("Further Mechanics 2", vec![
+                    "Circular motion", "Centres of mass of plane figures", "Further centres of mass", 
+                    "Kinematics", "Dynamics"
+                ]),
+                ("Further Statistics 2", vec![
+                    "Linear regression", "Continuous probability distributions", 
+                    "Correlation", "Hypothesis testing"
+                ]),
+                ("Decision Mathematics 2", vec![
+                    "Transportation problems", "Allocation (assignment) problems", "Flows in networks", 
+                    "Dynamic programming", "Game theory", "Recurrence relations", "Decision analysis"
+                ])
+            ]
+        ),
+        (
+            "GCSE Mathematics (Edexcel)",
+            vec![
+                ("GCSE Mathematics", vec![
+                    "Number", "Algebra", "Ratio, proportion and rates of change", 
+                    "Geometry and measures", "Probability", "Statistics"
+                ])
+            ]
+        ),
+        (
+            "GCSE Further Mathematics (AQA)",
+            vec![
+                ("GCSE Further Mathematics", vec![
+                    "Number", "Algebra", "Coordinate Geometry", "Calculus", 
+                    "Matrix Transformations", "Geometry"
+                ])
+            ]
+        )
+    ];
+
+    for (subject_name, modules) in seed_data {
+        let subject_id = uuid::Uuid::new_v4().to_string();
+        sqlx::query("INSERT INTO subjects (id, name) VALUES (?, ?)")
+            .bind(&subject_id)
+            .bind(subject_name)
+            .execute(pool).await?;
+
+        for (module_name, topics) in modules {
+            let module_id = uuid::Uuid::new_v4().to_string();
+            sqlx::query("INSERT INTO modules (id, subject_id, name) VALUES (?, ?, ?)")
+                .bind(&module_id)
+                .bind(&subject_id)
+                .bind(module_name)
+                .execute(pool).await?;
+
+            for topic_name in topics {
+                let topic_id = uuid::Uuid::new_v4().to_string();
+                sqlx::query("INSERT INTO topics (id, module_id, name) VALUES (?, ?, ?)")
+                    .bind(&topic_id)
+                    .bind(&module_id)
+                    .bind(topic_name)
+                    .execute(pool).await?;
+            }
+        }
+    }
+
+    Ok(())
+}

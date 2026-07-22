@@ -18,9 +18,7 @@
 // Nothing silently `continue`s. Quarantine is a first-class, visible
 // outcome — never a swallowed page.
 
-use crate::doc_map::{
-    self, PageStructureProposal, QuestionSpan, ValidatedPageStructure,
-};
+use crate::doc_map::{self, PageStructureProposal, QuestionSpan, ValidatedPageStructure};
 use crate::geometry;
 use crate::json_salvage::{parse_llm_json, ParseOutcome};
 use crate::llm::{self, LlmClient};
@@ -54,7 +52,7 @@ pub struct PipelineConfig {
     pub model: String,
     pub paper_name: String,
     pub subject: String,
-    pub module_override: Option<String>,
+    pub module_name: String,
     pub allowed_topics: Vec<String>,
     /// Where cropped diagrams are written; `None` skips image persistence
     /// (used in tests).
@@ -67,141 +65,18 @@ pub struct PipelineConfig {
 }
 
 impl PipelineConfig {
-    pub fn new(model: String, paper_name: String, subject: String) -> Self {
+    pub fn new(model: String, paper_name: String, subject: String, module_name: String) -> Self {
         Self {
             model,
             paper_name,
             subject,
-            module_override: None,
+            module_name,
             allowed_topics: Vec::new(),
             diagrams_dir: None,
             max_repairs: 2,
             max_output_tokens: 32768,
             parallelism: DEFAULT_PARALLEL,
         }
-    }
-}
-
-/// Resolve the module in Rust rather than trusting the model's free-form label.
-/// The paper title is authoritative (for example, "Core Pure 1" must never
-/// become "Further Pure 1"). A model value is accepted only when it is one of
-/// the known module names; otherwise we use a unique topic match or Unknown.
-fn canonical_module(config: &PipelineConfig, proposed: Option<&str>, topics: &[String]) -> String {
-    if let Some(ref mo) = config.module_override {
-        return mo.clone();
-    }
-    if config.subject == "GCSE Mathematics (Edexcel)" || config.subject == "GCSE Mathematics" {
-        return "GCSE Mathematics".into();
-    }
-    if config.subject == "GCSE Further Mathematics (AQA)" || config.subject == "GCSE Further Mathematics" {
-        return "GCSE Further Mathematics".into();
-    }
-    /*
-    if config.subject == "Physics" {
-        return "Physics".into();
-    }
-    if config.subject == "Computer Science" {
-        return "Computer Science".into();
-    }
-    */
-    let name = config.paper_name.to_ascii_lowercase();
-    let paper_module = [
-        ("core pure", "Core Pure"),
-        ("further pure 2", "Further Pure 2"),
-        ("further pure 1", "Further Pure 1"),
-        ("further pure", "Further Pure 1"),
-        ("further mechanics 2", "Further Mechanics 2"),
-        ("further mechanics 1", "Further Mechanics 1"),
-        ("further mechanics", "Further Mechanics 1"),
-        ("further statistics 2", "Further Statistics 2"),
-        ("further statistics 1", "Further Statistics 1"),
-        ("further statistics", "Further Statistics 1"),
-        ("decision mathematics 2", "Decision Mathematics 2"),
-        ("decision mathematics 1", "Decision Mathematics 1"),
-        ("decision mathematics", "Decision Mathematics 1"),
-        ("decision maths 2", "Decision Mathematics 2"),
-        ("decision maths 1", "Decision Mathematics 1"),
-        ("decision maths", "Decision Mathematics 1"),
-    ]
-    .iter()
-    .find(|(needle, _)| name.contains(needle))
-    .map(|(_, module)| *module);
-    if let Some(module) = paper_module {
-        return module.into();
-    }
-
-    let known = [
-        "Core Pure",
-        "Further Pure 1",
-        "Further Pure 2",
-        "Further Mechanics 1",
-        "Further Mechanics 2",
-        "Further Statistics 1",
-        "Further Statistics 2",
-        "Decision Mathematics 1",
-        "Decision Mathematics 2",
-    ];
-    if let Some(value) = proposed
-        .map(str::trim)
-        .filter(|value| known.iter().any(|m| m.eq_ignore_ascii_case(value)))
-    {
-        return known
-            .iter()
-            .find(|m| m.eq_ignore_ascii_case(value))
-            .unwrap()
-            .to_string();
-    }
-    let topic_modules: Vec<&str> = known
-        .iter()
-        .copied()
-        .filter(|module| {
-            let module_topics = match *module {
-                "Core Pure" => &[
-                    "Complex numbers",
-                    "Argand diagrams",
-                    "Series",
-                    "Roots of polynomials",
-                    "Matrices",
-                    "Linear transformations",
-                    "Differential equations",
-                    "Maclaurin series",
-                    "Methods in calculus",
-                ][..],
-                "Further Pure 1" => &[
-                    "Conic sections",
-                    "Inequalities",
-                    "t-formulae",
-                    "Taylor series",
-                    "Numerical methods (Further)",
-                    "Reducible differential equations",
-                ][..],
-                "Further Pure 2" => &[
-                    "Number theory",
-                    "Groups",
-                    "Further calculus",
-                    "Further matrix algebra",
-                    "Further complex numbers",
-                ][..],
-                "Further Mechanics 1" => &["Momentum and impulse", "Work, energy and power"][..],
-                "Further Mechanics 2" => &["Circular motion", "Centres of mass of plane figures", "Further centres of mass", "Kinematics", "Dynamics"][..],
-                "Further Statistics 1" => &[
-                    "Poisson distribution",
-                    "Hypothesis testing",
-                    "Chi-squared tests",
-                ][..],
-                "Further Statistics 2" => &["Linear regression", "Continuous probability distributions", "Correlation"][..],
-                "Decision Mathematics 1" => &["Algorithms", "Graphs and networks", "Linear programming"][..],
-                _ => &["Transportation problems", "Allocation (assignment) problems", "Flows in networks", "Dynamic programming", "Game theory", "Recurrence relations", "Decision analysis"][..],
-            };
-            topics
-                .iter()
-                .any(|topic| module_topics.contains(&topic.as_str()))
-        })
-        .collect();
-    if topic_modules.len() == 1 {
-        topic_modules[0].into()
-    } else {
-        "Unknown".into()
     }
 }
 
@@ -289,9 +164,16 @@ impl ImportReport {
         self.anomalies.extend(o.anomalies);
         self.timings.extend(o.timings);
     }
-    
+
     /// Record a timing entry.
-    pub fn record_timing(&mut self, stage: &str, operation: &str, page: Option<usize>, question_number: Option<u32>, milliseconds: u64) {
+    pub fn record_timing(
+        &mut self,
+        stage: &str,
+        operation: &str,
+        page: Option<usize>,
+        question_number: Option<u32>,
+        milliseconds: u64,
+    ) {
         self.timings.push(TimingEntry {
             stage: stage.to_string(),
             operation: operation.to_string(),
@@ -428,17 +310,7 @@ RULES:
         .to_string()
 }
 
-fn extraction_system_prompt(
-    config: &PipelineConfig,
-    span: &QuestionSpan,
-    allowed_topics: &[String],
-) -> String {
-    let module_instruction = if let Some(ref m) = config.module_override {
-        format!("- \"module\": string — The user explicitly declared the module is '{m}'. Output EXACTLY '{m}'. Do not guess.")
-    } else {
-        "- \"module\": string — infer from the paper context; use \"Unknown\" if unclear.".to_string()
-    };
-
+fn extraction_system_prompt(config: &PipelineConfig, span: &QuestionSpan) -> String {
     format!(
         r#"You are a precise mathematical OCR engine. Output ONLY a valid JSON object of the form {{"items": [ ... ]}}.
 
@@ -451,8 +323,8 @@ EVERY item MUST have:
 - "content": FULL transcription (never a summary). Preserve all punctuation. Separate sub-parts (a), (b), (c) with double newlines. Append the mark tag `**[X marks]**` to every sub-part that shows a mark allocation. Transcribe every sentence, including instructions to the candidate that belong to the question. Do NOT include: page headers/footers ("Question X continued", "Turn over"), the "(Total for Question X is Y marks)" footer, plain ruled answer lines, or "BLANK PAGE".
 - STRUCTURED TABLES WITH HEADERS — trace tables, function tables, working grids — ARE question content even when the body cells are EMPTY. If the text says Complete the trace table, Complete the table, or show the results of executing, NEVER return a diagram box for that grid, even when the question mentions another Figure; transcribe every row and pre-filled cell as Markdown. Transcribe them as Markdown tables in "content" (keeping every header and any pre-filled cells), NEVER as diagram boxes.
 - "marks": integer total for this question's visible part, or null if unknown.
-- "topics": array chosen ONLY from this list: {topics:?}. At least one. Never invent topics.
-{module_instruction}
+- "topics": array. At least one. Never invent topics.
+- "module": string — output EXACTLY '{module}'.
 - "is_code": boolean (true only for code/pseudocode questions).
 - "diagram_captions": array of captions, one per figure box, or empty string; "diagram_kinds": array of semantic kinds such as graph, schema, flowchart, circuit, or multi-panel, one per box. Decide whether each exhibit is a figure before proposing geometry.
 - "diagram_bboxes": array of [x, y, w, h] boxes with RELATIVE 0.0-1.0 coordinates, one per visual exhibit. Box EVERY figure the paper draws — graphs, networks, trees, circuits — INCLUDING anything the paper labels as a Figure (e.g. "Figure 6"): printed relation/database schemas, algorithm screens, and grids that are part of the question exhibit are figures, return them as boxes, not as text. One box per WHOLE figure including its labels/caption, never two boxes on one figure. Do NOT box plain question text, tables you transcribed as Markdown (STRUCTURED TABLES rule above), or EMPTY student answer grids. The parser crop-checks every box. Include the complete semantic figure extent, including captions and disconnected components, rather than tight-boxing one shape.
@@ -471,8 +343,7 @@ FORMATTING RULES:
 - The content MUST end with terminal punctuation or a mark tag. Never stop mid-sentence."#,
         number = span.number,
         paper = config.paper_name,
-        topics = allowed_topics,
-        module_instruction = module_instruction,
+        module = config.module_name,
     )
 }
 
@@ -514,14 +385,24 @@ pub async fn run_question_pipeline<C: LlmClient, P: Progress>(
         ..Default::default()
     };
 
-// Prefer the free PDF text layer: it avoids one vision request per page.
+    // Prefer the free PDF text layer: it avoids one vision request per page.
     let page_texts: Vec<String> = pages.iter().map(|p| p.text.clone()).collect();
-    
+
     // Time the text-layer document map building
     let text_map_start = Instant::now();
     let scan = doc_map::scan_text_layer(&page_texts);
-    let text_map_available = scan.page_reliability.iter().all(|r| *r != doc_map::PageReliability::Ambiguous);
-    report.record_timing("document_map", "text_layer_scan", None, None, text_map_start.elapsed().as_millis() as u64);
+    let text_map_available = !scan.footers.is_empty()
+        && scan
+            .page_reliability
+            .iter()
+            .all(|r| *r != doc_map::PageReliability::Ambiguous);
+    report.record_timing(
+        "document_map",
+        "text_layer_scan",
+        None,
+        None,
+        text_map_start.elapsed().as_millis() as u64,
+    );
 
     // ── 1. Structure pass ───────────────────────────────────────────────────
     let mut structures: Vec<ValidatedPageStructure> = Vec::with_capacity(pages.len());
@@ -566,7 +447,13 @@ pub async fn run_question_pipeline<C: LlmClient, P: Progress>(
                 })
                 .collect();
             let results = futures_util::future::join_all(futs).await;
-            report.record_timing("structure", "api_call_batch", Some(base + 1), None, struct_batch_start.elapsed().as_millis() as u64);
+            report.record_timing(
+                "structure",
+                "api_call_batch",
+                Some(base + 1),
+                None,
+                struct_batch_start.elapsed().as_millis() as u64,
+            );
             for (k, res) in results.into_iter().enumerate() {
                 let i = base + k;
                 match res {
@@ -609,13 +496,29 @@ pub async fn run_question_pipeline<C: LlmClient, P: Progress>(
         }
     }
 
+    // Ensure structures contains an entry for every page even if vision structure pass was skipped
+    if structures.len() < pages.len() {
+        for i in structures.len()..pages.len() {
+            let role = match scan.page_reliability.get(i) {
+                Some(doc_map::PageReliability::NonQuestion) => doc_map::PageRole::Blank,
+                _ => doc_map::PageRole::Question,
+            };
+            structures.push(ValidatedPageStructure {
+                page: i,
+                questions: Vec::new(),
+                footer: None,
+                role,
+            });
+        }
+    }
+
     // ── 2. Document map ─────────────────────────────────────────────────────
     let page_texts: Vec<String> = pages.iter().map(|p| p.text.clone()).collect();
     let doc_map_start = Instant::now();
-    
+
     // Use hybrid map building: reliable text pages + vision for ambiguous pages
     let mut map = doc_map::build_hybrid_map(&page_texts, &structures, pages.len());
-    
+
     // Record which pages used vision fallback
     report.timings.push(TimingEntry {
         stage: "document_map".to_string(),
@@ -624,16 +527,19 @@ pub async fn run_question_pipeline<C: LlmClient, P: Progress>(
         question_number: None,
         milliseconds: doc_map_start.elapsed().as_millis() as u64,
     });
-    
+
     // Report vision fallback pages
     if !map.vision_fallback_pages.is_empty() {
         report.anomalies.push(format!(
             "vision structure fallback used for {} pages: {:?}",
             map.vision_fallback_pages.len(),
-            map.vision_fallback_pages.iter().map(|p| p + 1).collect::<Vec<_>>()
+            map.vision_fallback_pages
+                .iter()
+                .map(|p| p + 1)
+                .collect::<Vec<_>>()
         ));
     }
-    
+
     // Backfill footers from structure pass
     if !map.spans.is_empty() {
         for s in &structures {
@@ -660,7 +566,12 @@ pub async fn run_question_pipeline<C: LlmClient, P: Progress>(
         // re-checked sequentially during assembly, and any out-of-order
         // proposal is re-extracted alone with the true bound.
         let q_pages: Vec<usize> = (0..pages.len())
-            .filter(|&i| structures[i].role.is_question_content())
+            .filter(|&i| {
+                structures
+                    .get(i)
+                    .map(|s| s.role.is_question_content())
+                    .unwrap_or(true)
+            })
             .collect();
         let mut next_allowed: u32 = 1;
         for batch in q_pages.chunks(config.parallelism.max(1)) {
@@ -677,7 +588,13 @@ pub async fn run_question_pipeline<C: LlmClient, P: Progress>(
                 .map(|&i| extract_fallback_page(client, config, &pages[i], i, next_allowed))
                 .collect();
             let results = futures_util::future::join_all(futs).await;
-            report.record_timing("extraction", "fallback_batch", Some(batch[0] + 1), None, extract_batch_start.elapsed().as_millis() as u64);
+            report.record_timing(
+                "extraction",
+                "fallback_batch",
+                Some(batch[0] + 1),
+                None,
+                extract_batch_start.elapsed().as_millis() as u64,
+            );
             for (&i, (mut outcome, local)) in batch.iter().zip(results) {
                 report.absorb(local);
                 report.pages_processed += 1;
@@ -732,7 +649,10 @@ pub async fn run_question_pipeline<C: LlmClient, P: Progress>(
                 .filter(|&pi| {
                     map.non_question_pages.is_empty()
                         || !map.non_question_pages.contains(&pi)
-                        || structures.get(pi).map(|s| s.role == doc_map::PageRole::Blank).unwrap_or(false)
+                        || structures
+                            .get(pi)
+                            .map(|s| s.role == doc_map::PageRole::Blank)
+                            .unwrap_or(false)
                 })
                 .map(|pi| (pi, &pages[pi]))
                 .collect();
@@ -769,7 +689,13 @@ pub async fn run_question_pipeline<C: LlmClient, P: Progress>(
                 .map(|job| extract_span(client, config, job.1, &job.2))
                 .collect();
             let results = futures_util::future::join_all(futs).await;
-            report.record_timing("extraction", "span_batch", Some(batch[0].1.number as usize), None, extract_batch_start.elapsed().as_millis() as u64);
+            report.record_timing(
+                "extraction",
+                "span_batch",
+                Some(batch[0].1.number as usize),
+                None,
+                extract_batch_start.elapsed().as_millis() as u64,
+            );
             for (job, (opt, local)) in batch.iter().zip(results) {
                 let span: &QuestionSpan = job.1;
                 let sp = &job.2;
@@ -784,7 +710,10 @@ pub async fn run_question_pipeline<C: LlmClient, P: Progress>(
                         let mut reason = "failed validation and all repair attempts".to_string();
                         if let Some(err) = report.anomalies.last() {
                             if err.starts_with("fatal_error: ") {
-                                reason = format!("failed validation and all repair attempts (last error: {})", err.trim_start_matches("fatal_error: "));
+                                reason = format!(
+                                    "failed validation and all repair attempts (last error: {})",
+                                    err.trim_start_matches("fatal_error: ")
+                                );
                             }
                         }
                         report.quarantined.push(QuarantineEvent {
@@ -844,7 +773,6 @@ async fn extract_span<C: LlmClient>(
 
     let mut contents: Vec<String> = Vec::new();
     let mut topics_acc: Vec<String> = Vec::new();
-    let mut module_acc: Option<String> = None;
     let mut is_code_acc = false;
     let mut needs_review = false;
     let mut notes: Vec<String> = Vec::new();
@@ -853,7 +781,7 @@ async fn extract_span<C: LlmClient>(
     // for near-duplicate reuse across chunk boundaries.
     let mut saved_diagrams: Vec<([u8; 64], String)> = Vec::new();
 
-        for chunk in chunks {
+    for chunk in chunks {
         let images: Vec<String> = chunk
             .iter()
             .map(|(_, p)| p.b64.clone())
@@ -871,7 +799,7 @@ async fn extract_span<C: LlmClient>(
             })
             .collect();
 
-        let system = extraction_system_prompt(config, span, &config.allowed_topics);
+        let system = extraction_system_prompt(config, span);
         let mut last_error = String::new();
         let mut accepted: Option<(Vec<AiQuestion>, bool)> = None; // (items, salvaged_truncated)
 
@@ -916,7 +844,13 @@ async fn extract_span<C: LlmClient>(
                     continue;
                 }
             };
-            report.record_timing("extraction", "api_call", Some(span_pages[0].0 + 1), Some(span.number), api_start.elapsed().as_millis() as u64);
+            report.record_timing(
+                "extraction",
+                "api_call",
+                Some(span_pages[0].0 + 1),
+                Some(span.number),
+                api_start.elapsed().as_millis() as u64,
+            );
             let content = match llm::message_content(&resp) {
                 Ok(c) => c,
                 Err(e) => {
@@ -1000,7 +934,13 @@ async fn extract_span<C: LlmClient>(
             // ── Diagram boxes: Rust audits every crop the AI proposed ─────
             let audit_start = Instant::now();
             let (bad, box_issues) = audit_diagram_boxes(chunk, &page_items.items);
-            report.record_timing("diagram_processing", "crop_audit", Some(span_pages[0].0 + 1), Some(span.number), audit_start.elapsed().as_millis() as u64);
+            report.record_timing(
+                "diagram_processing",
+                "crop_audit",
+                Some(span_pages[0].0 + 1),
+                Some(span.number),
+                audit_start.elapsed().as_millis() as u64,
+            );
             if !box_issues.is_empty() {
                 let answer_grid_only = page_items.items.iter().all(|item| {
                     validate::is_answer_grid_request(item.content.as_deref().unwrap_or(""))
@@ -1039,7 +979,9 @@ async fn extract_span<C: LlmClient>(
         let (items, salvaged) = match accepted {
             Some(v) => v,
             None => {
-                report.anomalies.push(format!("fatal_error: {}", last_error));
+                report
+                    .anomalies
+                    .push(format!("fatal_error: {}", last_error));
                 return (None, report);
             }
         };
@@ -1067,15 +1009,18 @@ async fn extract_span<C: LlmClient>(
                         }
                     }
                 }
-                report.record_timing("diagram_processing", "save_diagrams", Some(span_pages[0].0 + 1), Some(span.number), diagram_save_start.elapsed().as_millis() as u64);
+                report.record_timing(
+                    "diagram_processing",
+                    "save_diagrams",
+                    Some(span_pages[0].0 + 1),
+                    Some(span.number),
+                    diagram_save_start.elapsed().as_millis() as u64,
+                );
             }
             item_content = item_content.replace("[DIAGRAM_PLACEHOLDER]", "");
 
             if let Some(t) = item.topics {
                 topics_acc.extend(value_to_topics(&t));
-            }
-            if module_acc.is_none() {
-                module_acc = item.module;
             }
             if item.is_code == Some(true) {
                 is_code_acc = true;
@@ -1143,20 +1088,14 @@ async fn extract_span<C: LlmClient>(
     // Topic containment: exact-match against the allow-list (deterministic).
     topics_acc.sort();
     topics_acc.dedup();
-    let topics_valid: Vec<String> = topics_acc
-        .into_iter()
-        .filter(|t| config.allowed_topics.is_empty() || config.allowed_topics.contains(t))
-        .collect();
-
-    let module = canonical_module(config, module_acc.as_deref(), &topics_valid);
 
     (
         Some(BuiltQuestion {
             question_number: span.number,
             content,
             marks,
-            topics: topics_valid,
-            module,
+            topics: topics_acc,
+            module: config.module_name.clone(),
             is_code: config.subject == "Computer Science" && is_code_acc,
             needs_review,
             notes,
@@ -1425,7 +1364,7 @@ async fn extract_fallback_page<C: LlmClient>(
 RULES:
 - If this page starts a NEW question (has its own printed whole-question number), return ONE item:
   {{ "question_number": <whole number printed>, "content": "<full transcription>", "marks": int|null,
-     "topics": array from {topics:?} only, "module": string, "is_code": bool,
+     "topics": array, "module": "{module}", "is_code": bool,
      "diagram_bboxes": [[x,y,w,h]...] relative 0.0-1.0, "bbox_page_indexes": [0,...] }}
 - If this page is a CONTINUATION of the previous question, is blank, or contains no question, return {{"items": []}}.
 - Transcribe fully (never summarize). Preserve punctuation. `**[X marks]**` after each marked sub-part. Math in $...$/$$...$$. Markdown tables for text tables; \begin{{array}} only for matrices. Code in backticks, never math mode. Escape LaTeX backslashes (\\frac).
@@ -1434,7 +1373,7 @@ RULES:
 - STRUCTURED TABLES WITH HEADERS (trace tables, function tables, working grids) are question content even when EMPTY — transcribe them as Markdown tables, NEVER as diagram boxes. Diagram boxes are ONLY for figures that cannot be typed (graphs, circuits, line drawings), one box per figure; blank, empty-grid, and duplicate boxes are rejected by the parser and cost a repair round.
 - Exclude headers/footers ("Question X continued", "Turn over", totals footers), plain ruled answer lines, "BLANK PAGE".
 - Content must end with terminal punctuation or a mark tag."#,
-        topics = config.allowed_topics,
+        module = config.module_name,
     );
 
     let mut last_error = String::new();
@@ -1556,14 +1495,11 @@ RULES:
         }
         item_content = item_content.replace("[DIAGRAM_PLACEHOLDER]", "");
 
-        let topics: Vec<String> = item
+        let topics = item
             .topics
             .as_ref()
             .map(value_to_topics)
-            .unwrap_or_default()
-            .into_iter()
-            .filter(|t| config.allowed_topics.is_empty() || config.allowed_topics.contains(t))
-            .collect();
+            .unwrap_or_default();
 
         let built = BuiltQuestion {
             question_number: number,
@@ -1577,7 +1513,7 @@ RULES:
                 .and_then(validate::value_to_marks)
                 .unwrap_or(1)
                 .max(1),
-            module: canonical_module(config, item.module.as_deref(), &topics),
+            module: config.module_name.clone(),
             topics,
             is_code: config.subject == "Computer Science" && item.is_code == Some(true),
             needs_review: true,
@@ -1885,7 +1821,12 @@ mod tests {
     }
 
     fn config() -> PipelineConfig {
-        let mut c = PipelineConfig::new("test-model".into(), "Unit".into(), "Mathematics".into());
+        let mut c = PipelineConfig::new(
+            "test-model".into(),
+            "Unit".into(),
+            "Mathematics".into(),
+            "Algebra".into(),
+        );
         c.allowed_topics = vec!["Proof".into(), "Integration".into()];
         c.max_repairs = 2;
         c

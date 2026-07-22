@@ -5,6 +5,7 @@ import { Button } from "@/components/ui/button";
 import { invoke } from "@tauri-apps/api/core";
 import { open, save } from "@tauri-apps/plugin-dialog";
 import { toast } from "sonner";
+import { TaxonomyManager } from "./TaxonomyManager";
 
 // Mirrors the serde camelCase report structs in src-tauri/src/backup.rs
 interface ExportReport {
@@ -409,6 +410,8 @@ export function Settings() {
           </div>
         )}
       </div>
+
+      <TaxonomyManager />
 
       <div className="w-full max-w-md flex flex-col gap-4 rounded-2xl border border-destructive/30 bg-destructive/5 p-6 shadow-sm mb-12">
         <h2 className="text-sm font-bold text-destructive flex items-center gap-2">

@@ -8,6 +8,7 @@ import { Settings } from "@/components/settings/Settings";
 import { type QuestionCardProps } from "@/components/repository/QuestionCard";
 import { type WorksheetItemData } from "@/components/worksheet/WorksheetItem";
 import { UploadCounter, useUploadCounter } from "@/components/UploadCounter";
+import { TaxonomyProvider } from "@/lib/TaxonomyContext";
 import { cn } from "@/lib/utils";
 
 export type SelectedQuestion = Omit<QuestionCardProps, "onAddToWorksheet">;
@@ -56,8 +57,9 @@ function App() {
   }
 
   return (
-    <div className="flex h-screen w-full overflow-hidden bg-background text-foreground">
-      {/* ── Left: tabbed main area ── */}
+    <TaxonomyProvider>
+      <div className="flex h-screen w-full overflow-hidden bg-background text-foreground">
+        {/* ── Left: tabbed main area ── */}
       <div className="flex flex-col flex-1 min-w-0 overflow-hidden">
 
         {/* Tab bar */}
@@ -119,7 +121,8 @@ function App() {
 
       {/* Global toast notifications */}
       <Toaster theme="dark" richColors position="bottom-right" />
-    </div>
+      </div>
+    </TaxonomyProvider>
   );
 }
 

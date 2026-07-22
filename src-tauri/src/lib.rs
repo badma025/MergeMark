@@ -15,6 +15,7 @@ mod geometry;
 mod json_salvage;
 mod llm;
 mod pipeline;
+mod taxonomy;
 mod validate;
 
 pub struct AppState {
@@ -81,7 +82,20 @@ pub fn run() {
             commands::cancel_import,
             commands::generate_worksheet_from_pdf,
             commands::get_usage_status,
-            commands::set_byok_key
+            commands::set_byok_key,
+            commands::export_flashcards,
+            commands::import_flashcards,
+            taxonomy::get_taxonomy_tree,
+            taxonomy::add_subject,
+            taxonomy::rename_subject,
+            taxonomy::delete_subject,
+            taxonomy::add_module,
+            taxonomy::rename_module,
+            taxonomy::delete_module,
+            taxonomy::add_topic,
+            taxonomy::rename_topic,
+            taxonomy::delete_topic,
+            commands::generate_topics_for_module
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

@@ -11,7 +11,7 @@ import rehypeKatex from "rehype-katex";
 import remarkGfm from "remark-gfm";
 import { cn } from "@/lib/utils";
 import { convertFileSrc } from "@tauri-apps/api/core";
-import { TOPICS_BY_SUBJECT } from "@/lib/taxonomy";
+import { useTaxonomy } from "@/lib/TaxonomyContext";
 
 /**
  * Regex that matches display-worthy LaTeX operators.
@@ -207,18 +207,19 @@ export interface QuestionCardProps {
 export function QuestionCard({
   id,
   subject,
-  topics,
+  module,
   marks,
   content,
-  mathSnippet,
-  answerContent,
   isCode,
+  mathSnippet,
+  topics,
+  answerContent,
   className,
-  module,
   onAddToWorksheet,
-  onDelete,
   onUpdate,
+  onDelete,
 }: QuestionCardProps) {
+  const { topicsBySubject } = useTaxonomy();
   const [isEditing, setIsEditing] = useState(false);
   const [isShowingAnswer, setIsShowingAnswer] = useState(false);
   let parsedTopics: string[] = [];
@@ -486,7 +487,7 @@ export function QuestionCard({
               <div className="flex flex-wrap items-center gap-1.5">
                 {(() => {
                   if (subject === "All") return [];
-                  const subjectMods = TOPICS_BY_SUBJECT[subject] || {};
+                  const subjectMods = topicsBySubject[subject] || {};
                   return Object.values(subjectMods).flat();
                 })().map((topic) => {
                   const isSelected = editTopics.includes(topic);

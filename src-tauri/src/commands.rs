@@ -4,7 +4,7 @@ use crate::pipeline::{
 };
 use crate::AppState;
 use serde::{Deserialize, Serialize};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 use tauri::{Emitter, Manager, State};
 
 // ── Shared data model ─────────────────────────────────────────────────────────
@@ -97,261 +97,6 @@ impl Progress for TauriProgress {
             serde_json::json!({ "page": 0, "total": 0, "message": message }),
         );
     }
-}
-
-// ── Topic allow-lists (single source of truth for prompts + containment) ──────
-
-const _EDEXCEL_MATHS_PURE: &[&str] = &[
-    "Proof",
-    "Algebra and functions",
-    "Coordinate geometry in the (x, y) plane",
-    "Sequences and series",
-    "Trigonometry",
-    "Exponentials and logarithms",
-    "Differentiation",
-    "Integration",
-    "Numerical methods",
-    "Vectors",
-];
-const _EDEXCEL_MATHS_STATS: &[&str] = &[
-    "Statistical sampling",
-    "Data presentation and interpretation",
-    "Probability",
-    "Statistical distributions",
-    "Statistical hypothesis testing",
-];
-const _EDEXCEL_MATHS_MECH: &[&str] = &[
-    "Quantities and units in mechanics",
-    "Kinematics",
-    "Forces and Newton's laws",
-    "Moments",
-];
-const EDEXCEL_MATHS_TOPICS: &[&str] = &[
-    "Proof",
-    "Algebra and functions",
-    "Coordinate geometry in the (x, y) plane",
-    "Sequences and series",
-    "Trigonometry",
-    "Exponentials and logarithms",
-    "Differentiation",
-    "Integration",
-    "Numerical methods",
-    "Vectors",
-    "Statistical sampling",
-    "Data presentation and interpretation",
-    "Probability",
-    "Statistical distributions",
-    "Statistical hypothesis testing",
-    "Quantities and units in mechanics",
-    "Kinematics",
-    "Forces and Newton's laws",
-    "Moments",
-];
-
-const _FM_CORE_PURE: &[&str] = &[
-    "Complex numbers",
-    "Argand diagrams",
-    "Series",
-    "Roots of polynomials",
-    "Volumes of revolution",
-    "Matrices",
-    "Linear transformations",
-    "Proof by induction",
-    "Vectors",
-    "Differential equations",
-    "Polar coordinates",
-    "Hyperbolic functions",
-    "Maclaurin series",
-    "Methods in calculus",
-];
-const _FM_FM1: &[&str] = &[
-    "Momentum and impulse",
-    "Work, energy and power",
-    "Elastic strings and springs",
-    "Elastic collisions in one dimension",
-    "Elastic collisions in two dimensions",
-];
-const _FM_FS1: &[&str] = &[
-    "Discrete probability distributions",
-    "Poisson distribution",
-    "Geometric and negative binomial",
-    "Hypothesis testing",
-    "Central Limit Theorem",
-    "Chi-squared tests",
-    "Probability generating functions",
-    "Quality of tests",
-];
-const _FM_FP1: &[&str] = &[
-    "Vectors (Cross product & planes)",
-    "Conic sections",
-    "Inequalities",
-    "t-formulae",
-    "Taylor series",
-    "Numerical methods (Further)",
-    "Reducible differential equations",
-];
-const _FM_D1: &[&str] = &[
-    "Algorithms",
-    "Graphs and networks",
-    "Algorithms on graphs",
-    "Route inspection",
-    "Travelling Salesperson Problem",
-    "Linear programming",
-    "Simplex algorithm",
-];
-const _FM_FP2: &[&str] = &[
-    "Number theory",
-    "Groups",
-    "Further calculus",
-    "Further matrix algebra",
-    "Further complex numbers",
-    "Maclaurin series",
-];
-const _FM_FM2: &[&str] = &[
-    "Circular motion",
-    "Centres of mass of plane figures",
-    "Further centres of mass",
-    "Kinematics",
-    "Dynamics",
-];
-const _FM_FS2: &[&str] = &[
-    "Linear regression",
-    "Continuous probability distributions",
-    "Correlation",
-    "Hypothesis testing",
-];
-const _FM_DM2: &[&str] = &[
-    "Transportation problems",
-    "Allocation (assignment) problems",
-    "Flows in networks",
-    "Dynamic programming",
-    "Game theory",
-    "Recurrence relations",
-    "Decision analysis",
-];
-const FURTHER_MATHS_TOPICS: &[&str] = &[
-    "Complex numbers",
-    "Argand diagrams",
-    "Series",
-    "Roots of polynomials",
-    "Volumes of revolution",
-    "Matrices",
-    "Linear transformations",
-    "Proof by induction",
-    "Vectors",
-    "Differential equations",
-    "Polar coordinates",
-    "Hyperbolic functions",
-    "Maclaurin series",
-    "Methods in calculus",
-    "Momentum and impulse",
-    "Work, energy and power",
-    "Elastic strings and springs",
-    "Elastic collisions in one dimension",
-    "Elastic collisions in two dimensions",
-    "Discrete probability distributions",
-    "Poisson distribution",
-    "Geometric and negative binomial",
-    "Hypothesis testing",
-    "Central Limit Theorem",
-    "Chi-squared tests",
-    "Probability generating functions",
-    "Quality of tests",
-    "Vectors (Cross product & planes)",
-    "Conic sections",
-    "Inequalities",
-    "t-formulae",
-    "Taylor series",
-    "Numerical methods (Further)",
-    "Reducible differential equations",
-    "Algorithms",
-    "Graphs and networks",
-    "Algorithms on graphs",
-    "Route inspection",
-    "Travelling Salesperson Problem",
-    "Linear programming",
-    "Simplex algorithm",
-    "Number theory",
-    "Groups",
-    "Further calculus",
-    "Further matrix algebra",
-    "Further complex numbers",
-    "Circular motion",
-    "Centres of mass of plane figures",
-    "Further centres of mass",
-    "Kinematics",
-    "Dynamics",
-    "Linear regression",
-    "Continuous probability distributions",
-    "Correlation",
-    "Transportation problems",
-    "Allocation (assignment) problems",
-    "Flows in networks",
-    "Dynamic programming",
-    "Game theory",
-    "Recurrence relations",
-    "Decision analysis",
-];
-const GCSE_MATHS_TOPICS: &[&str] = &[
-    "Number",
-    "Algebra",
-    "Ratio, proportion and rates of change",
-    "Geometry and measures",
-    "Probability",
-    "Statistics",
-];
-const GCSE_FM_TOPICS: &[&str] = &[
-    "Number",
-    "Algebra",
-    "Coordinate Geometry",
-    "Calculus",
-    "Matrix Transformations",
-    "Geometry",
-];
-const _PHYSICS_TOPICS: &[&str] = &[
-    "Measurements and their errors",
-    "Particles and radiation",
-    "Waves",
-    "Mechanics and materials",
-    "Electricity",
-    "Further mechanics",
-    "Thermal physics",
-    "Fields and their consequences",
-    "Nuclear physics",
-    "Telescopes",
-    "Classification of stars",
-    "Cosmology",
-];
-const _CS_TOPICS: &[&str] = &[
-    "Fundamentals of programming",
-    "Fundamentals of data structures",
-    "Fundamentals of algorithms",
-    "Theory of computation",
-    "Fundamentals of data representation",
-    "Fundamentals of computer systems",
-    "Computer organisation and architecture",
-    "Consequences of uses of computing",
-    "Communication and networking",
-    "Fundamentals of databases",
-    "Big Data",
-    "Fundamentals of functional programming",
-];
-
-fn allowed_topics_for_subject(subject: &str) -> Vec<String> {
-    let slice: &[&str] = match subject {
-        "A Level Mathematics (Edexcel)" | "A Level Mathematics" | "Mathematics" => {
-            EDEXCEL_MATHS_TOPICS
-        }
-        "A Level Further Mathematics (Edexcel)"
-        | "A Level Further Mathematics"
-        | "Further Mathematics" => FURTHER_MATHS_TOPICS,
-        "GCSE Mathematics (Edexcel)" | "GCSE Mathematics" => GCSE_MATHS_TOPICS,
-        "GCSE Further Mathematics (AQA)" | "GCSE Further Mathematics" => GCSE_FM_TOPICS,
-        // "Physics" => PHYSICS_TOPICS,
-        // "Computer Science" => CS_TOPICS,
-        _ => &[],
-    };
-    slice.iter().map(|s| s.to_string()).collect()
 }
 
 // ── Helper: shared question-classification + DB-insert logic (legacy path) ────
@@ -1256,15 +1001,41 @@ pub async fn parse_pdf_vision(
 
     let diagrams_dir = app.path().app_data_dir().map(|d| d.join("diagrams")).ok();
 
+    // ── Fetch Taxonomy ───────────────────────────────────────────
+    let pool = state.db.lock().await;
+    let module_id = module_override
+        .clone()
+        .ok_or_else(|| "A module must be selected.".to_string())?;
+
+    let module_name: (String,) = sqlx::query_as("SELECT name FROM modules WHERE id = ?")
+        .bind(&module_id)
+        .fetch_optional(&*pool)
+        .await
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "Selected module not found in database.".to_string())?;
+
+    let topics_rows: Vec<(String,)> = sqlx::query_as("SELECT name FROM topics WHERE module_id = ?")
+        .bind(&module_id)
+        .fetch_all(&*pool)
+        .await
+        .map_err(|e| e.to_string())?;
+    let allowed_topics = topics_rows.into_iter().map(|(n,)| n).collect();
+
+    let subject_name: (String,) = sqlx::query_as("SELECT name FROM subjects WHERE id = ?")
+        .bind(&subject)
+        .fetch_optional(&*pool)
+        .await
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "Selected subject not found in database.".to_string())?;
+    drop(pool);
+
     let mut config = PipelineConfig::new(
         model_name.clone(),
         paper_name.trim().to_string(),
-        subject.clone(),
+        subject_name.0,
+        module_name.0,
     );
-    config.module_override = module_override
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty());
-    config.allowed_topics = allowed_topics_for_subject(&subject);
+    config.allowed_topics = allowed_topics;
     config.diagrams_dir = diagrams_dir;
     config.max_repairs = 2;
     config.max_output_tokens = 16384;
@@ -1596,6 +1367,7 @@ pub async fn parse_mark_scheme_vision(
     let mut config = PipelineConfig::new(
         model_name.clone(),
         paper_name.trim().to_string(),
+        "MarkScheme".into(),
         "MarkScheme".into(),
     );
     config.diagrams_dir = diagrams_dir;
@@ -2057,4 +1829,254 @@ pub async fn set_byok_key(
         .await
         .map_err(|e| format!("DB write failed: {e}"))?;
     Ok(())
+}
+
+// ── Flashcards Export & Import ────────────────────────────────────────────────
+
+#[tauri::command]
+pub async fn export_flashcards(
+    app: tauri::AppHandle,
+    question_ids: Vec<String>,
+    file_name: String,
+) -> Result<String, String> {
+    let state: State<'_, AppState> = app.state();
+    let pool = state.db.lock().await;
+
+    let download_dir = app.path().download_dir().map_err(|e| e.to_string())?;
+
+    let sanitized: String = file_name
+        .chars()
+        .map(|c| {
+            if c.is_alphanumeric() || c == ' ' || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>()
+        .trim()
+        .to_string();
+
+    let base_name = if sanitized.is_empty() {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        format!("flashcards_{}", now)
+    } else {
+        sanitized.replace(' ', "_")
+    };
+
+    let base_name = {
+        let mut candidate = base_name.clone();
+        let mut counter = 1u32;
+        while download_dir.join(format!("{}.csv", candidate)).exists() {
+            candidate = format!("{}_{}", base_name, counter);
+            counter += 1;
+        }
+        candidate
+    };
+
+    let file_path = download_dir.join(format!("{}.csv", base_name));
+
+    // Write CSV using csv crate
+    let mut wtr = csv::WriterBuilder::new()
+        .from_path(&file_path)
+        .map_err(|e| e.to_string())?;
+
+    for id in question_ids {
+        let q = sqlx::query_as::<_, Question>("SELECT * FROM questions WHERE id = ?")
+            .bind(id)
+            .fetch_optional(&*pool)
+            .await
+            .map_err(|e| e.to_string())?;
+
+        if let Some(q) = q {
+            let mut front = q.content;
+            if !q.math_snippet.is_empty() {
+                front = format!("{}\n\n{}", front, q.math_snippet);
+            }
+            let back = q.answer_content.unwrap_or_default();
+
+            let mut tags = vec![q.subject.clone()];
+            if let Some(m) = &q.module {
+                if m != "Unknown" && m != "General" {
+                    tags.push(m.clone());
+                }
+            }
+            if let Some(t) = &q.topics {
+                if let Ok(parsed) = serde_json::from_str::<Vec<String>>(t) {
+                    tags.extend(parsed);
+                }
+            }
+            let tags_str = tags.join(" ");
+
+            wtr.write_record(&[&front, &back, &tags_str])
+                .map_err(|e| e.to_string())?;
+        }
+    }
+
+    wtr.flush().map_err(|e| e.to_string())?;
+
+    Ok(file_path.to_string_lossy().to_string())
+}
+
+#[tauri::command]
+pub async fn import_flashcards(app: tauri::AppHandle, file_path: String) -> Result<usize, String> {
+    let state: State<'_, AppState> = app.state();
+    let pool = state.db.lock().await;
+
+    // Determine delimiter (tab for .txt/.tsv, comma otherwise)
+    let is_tsv =
+        file_path.to_lowercase().ends_with(".txt") || file_path.to_lowercase().ends_with(".tsv");
+    let delimiter = if is_tsv { b'\t' } else { b',' };
+
+    let mut rdr = csv::ReaderBuilder::new()
+        .has_headers(false)
+        .delimiter(delimiter)
+        .from_path(&file_path)
+        .map_err(|e| e.to_string())?;
+
+    let mut count = 0;
+
+    for result in rdr.records() {
+        let record = match result {
+            Ok(r) => r,
+            Err(_) => continue, // Skip malformed rows
+        };
+
+        let front = record.get(0).unwrap_or("").to_string();
+        let back = record.get(1).unwrap_or("").to_string();
+        let tags = record.get(2).unwrap_or("").to_string();
+
+        if front.trim().is_empty() {
+            continue;
+        }
+
+        let id = uuid::Uuid::new_v4().to_string();
+        let subject = "Imported".to_string();
+        let subtopic = "General".to_string();
+        let marks = 1;
+        let is_code = false;
+
+        // Parse tags as topics if available
+        let mut topics = Vec::new();
+        for tag in tags.split_whitespace() {
+            topics.push(tag.to_string());
+        }
+        let topics_json = if topics.is_empty() {
+            None
+        } else {
+            serde_json::to_string(&topics).ok()
+        };
+
+        sqlx::query(
+            "INSERT INTO questions (id, subject, subtopic, marks, content, math_snippet, is_code, answer_content, topics, paper_name, question_number, module)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+        )
+        .bind(&id)
+        .bind(&subject)
+        .bind(&subtopic)
+        .bind(marks)
+        .bind(&front)
+        .bind("")
+        .bind(is_code)
+        .bind(if back.is_empty() { None } else { Some(back) })
+        .bind(topics_json)
+        .bind("Imported File")
+        .bind(None::<i64>)
+        .bind(None::<String>)
+        .execute(&*pool)
+        .await
+        .map_err(|e| e.to_string())?;
+
+        count += 1;
+    }
+
+    Ok(count)
+}
+
+#[tauri::command]
+pub async fn generate_topics_for_module(
+    app: tauri::AppHandle,
+    module_id: String,
+    api_key: String,
+    base_url: String,
+    model_name: String,
+) -> Result<Vec<String>, String> {
+    use crate::llm::{LlmClient, LlmConfig, ReqwestLlm};
+    use crate::AppState;
+    use serde_json::json;
+    use tauri::Manager;
+
+    let state: tauri::State<'_, AppState> = app.state();
+    let pool = state.db.lock().await;
+
+    // Fetch the module name and subject name
+    let module: Option<(String, String)> = sqlx::query_as(
+        "SELECT modules.name, subjects.name FROM modules JOIN subjects ON modules.subject_id = subjects.id WHERE modules.id = ?"
+    )
+    .bind(&module_id)
+    .fetch_optional(&*pool)
+    .await
+    .map_err(|e| e.to_string())?;
+
+    let (module_name, subject_name) = module.ok_or_else(|| "Module not found".to_string())?;
+
+    // Drop the lock before await
+    drop(pool);
+
+    let config = LlmConfig {
+        base_url,
+        api_key,
+        model: model_name.clone(),
+        timeout: crate::billing::REQUEST_TIMEOUT,
+    };
+    let client = ReqwestLlm::new(config);
+
+    let system_prompt = "You are an educational taxonomy assistant. Your job is to output a JSON array of curriculum topics for a given module and subject. Output ONLY a valid JSON array of strings.";
+    let user_prompt = format!("Subject: {}\nModule: {}\n\nAct strictly according to the official syllabus and textbook chapters for this specific subject and module. Provide an exhaustive list of core topics covered in this module as a JSON array of strings.\n\nCRITICAL INSTRUCTIONS:\n- Output ONLY the exact, short, high-level chapter names (e.g. \"Complex Numbers\", \"Matrices\", \"Proof by Induction\").\n- Do NOT include parentheses, subtopics, or any explanatory descriptions.\n- Output nothing but the JSON array.", subject_name, module_name);
+
+    let request_body = json!({
+        "model": model_name,
+        "messages": [
+            { "role": "system", "content": system_prompt },
+            { "role": "user", "content": user_prompt }
+        ],
+        "temperature": 0.2
+    });
+
+    let result = client
+        .chat(&request_body)
+        .await
+        .map_err(|e| format!("LLM request failed: {:?}", e))?;
+
+    let content = crate::llm::message_content(&result)
+        .map_err(|e| format!("Failed to extract content: {:?}", e))?;
+
+    let mut json_str = content.trim();
+    
+    // Find the first '[' and last ']' to extract the JSON array robustly
+    if let (Some(start), Some(end)) = (json_str.find('['), json_str.rfind(']')) {
+        if start <= end {
+            json_str = &json_str[start..=end];
+        }
+    }
+
+    let topics: Vec<String> = serde_json::from_str(json_str)
+        .map_err(|e| format!("Failed to parse JSON array from LLM. Raw content: {}\nError: {}", content, e))?;
+
+    // Save topics to DB
+    let pool = state.db.lock().await;
+    for topic_name in &topics {
+        let id = uuid::Uuid::new_v4().to_string();
+        let _ = sqlx::query("INSERT INTO topics (id, module_id, name) VALUES (?, ?, ?)")
+            .bind(&id)
+            .bind(&module_id)
+            .bind(topic_name)
+            .execute(&*pool)
+            .await;
+    }
+
+    Ok(topics)
 }

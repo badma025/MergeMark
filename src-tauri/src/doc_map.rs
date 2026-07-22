@@ -160,7 +160,9 @@ pub fn scan_text_layer(page_texts: &[String]) -> TextScan {
             // Has substantial text but no footer - ambiguous (needs vision)
             page_reliability[page] = PageReliability::Ambiguous;
         } else {
-            page_reliability[page] = PageReliability::NonQuestion;
+            // Short text or scanned header (e.g., "PMT") without explicit blank/instruction match.
+            // Mark as Ambiguous so vision structure pass runs.
+            page_reliability[page] = PageReliability::Ambiguous;
         }
     }
     TextScan {

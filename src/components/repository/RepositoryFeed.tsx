@@ -9,7 +9,7 @@ import { cn } from "@/lib/utils";
 import { QuestionCard, type QuestionCardProps } from "./QuestionCard";
 import { AddQuestionModal } from "./AddQuestionModal";
 import { ManagePapersModal } from "./ManagePapersModal";
-import { SUBJECTS, TOPICS_BY_SUBJECT, ALL_TOPICS } from "@/lib/taxonomy";
+import { useTaxonomy } from "@/lib/TaxonomyContext";
 
 // ── Component ─────────────────────────────────────────────────────────────────
 
@@ -27,6 +27,12 @@ export function RepositoryFeed({ isActive = true, onAddToWorksheet }: Repository
   const [selectedTopics, setSelectedTopics] = useState<string[]>([]);
   const [questions, setQuestions] = useState<Omit<QuestionCardProps, "onAddToWorksheet" | "onDelete">[]>([]);
   const [loading, setLoading] = useState(true);
+  const { subjects, topicsBySubject } = useTaxonomy();
+  const subjectNames = subjects.map(s => s.name);
+  const ALL_TOPICS = Array.from(new Set(
+    Object.values(topicsBySubject)
+      .flatMap(subjectMods => Object.values(subjectMods).flat())
+  ));
 
   useEffect(() => {
     if (isActive) {
@@ -104,7 +110,7 @@ export function RepositoryFeed({ isActive = true, onAddToWorksheet }: Repository
         matchesModuleFilter = qMod === selectedModule;
       } else {
         // Fallback to topics if no explicit module is provided
-        const moduleTopics = (TOPICS_BY_SUBJECT[q.subject] || {})[selectedModule] || [];
+        const moduleTopics = (topicsBySubject[q.subject] || {})[selectedModule] || [];
         if (selectedTopics.length === 0) {
           let qTopics: string[] = [];
           try {
@@ -177,7 +183,7 @@ export function RepositoryFeed({ isActive = true, onAddToWorksheet }: Repository
         
         {/* Subject Filter */}
         <div className="mt-3 flex flex-wrap gap-1.5 border-b border-border/50 pb-3">
-          {["All", ...SUBJECTS].map((subject) => {
+          {["All", ...subjectNames].map((subject) => {
             const isSelected = selectedSubject === subject;
             return (
               <Badge
@@ -204,7 +210,7 @@ export function RepositoryFeed({ isActive = true, onAddToWorksheet }: Repository
         {/* Module Filter */}
         {selectedSubject !== "All" && (
           <div className="mt-3 flex flex-wrap gap-1.5 border-b border-border/50 pb-3">
-            {["All", ...Object.keys(TOPICS_BY_SUBJECT[selectedSubject] || {})].map((mod) => {
+            {["All", ...Object.keys(topicsBySubject[selectedSubject] || {})].map((mod) => {
               const isSelected = selectedModule === mod;
               return (
                 <Badge
@@ -232,7 +238,7 @@ export function RepositoryFeed({ isActive = true, onAddToWorksheet }: Repository
         <div className="mt-3 flex flex-wrap gap-1.5 max-h-[4.5rem] overflow-y-auto">
           {(() => {
             if (selectedSubject === "All") return ALL_TOPICS;
-            const subjectMods = TOPICS_BY_SUBJECT[selectedSubject] || {};
+            const subjectMods = topicsBySubject[selectedSubject] || {};
             if (selectedModule === "All") {
               return Object.values(subjectMods).flat();
             }
