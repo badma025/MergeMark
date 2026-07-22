@@ -1333,7 +1333,7 @@ async fn extract_span<C: LlmClient>(
             if let Some(t) = item.topics {
                 for topic in value_to_topics(&t) {
                     if config.allowed_topics.is_empty() || config.allowed_topics.contains(&topic) {
-                        topics_acc.insert(topic);
+                        topics_acc.push(topic);
                     }
                 }
             }
