@@ -133,15 +133,16 @@ export function RichTextEditor({ markdown, onChange, placeholder, className }: R
               });
             },
             imagePreviewHandler: async (imageSource: string) => {
-              if (imageSource && (imageSource.match(/^[a-zA-Z]:[\\/]/) || imageSource.startsWith("/"))) {
+              const src = decodeURIComponent(imageSource);
+              if (src && (/^[a-zA-Z]:[\\/]/.test(src) || src.startsWith("/"))) {
                 try {
-                  return convertFileSrc(imageSource);
+                  return convertFileSrc(src);
                 } catch (e) {
-                  return imageSource;
+                  return src;
                 }
               }
-              return imageSource;
-            }
+              return Promise.resolve(src);
+            },
           }),
           tablePlugin(),
           codeBlockPlugin({ defaultCodeBlockLanguage: 'txt' }),

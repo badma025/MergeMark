@@ -304,6 +304,7 @@ fn structure_system_prompt() -> String {
 
 RULES:
 - "question_numbers_visible": WHOLE question numbers only. AQA Computer Science prints "0 1" for Q1, "0 2" for Q2, ... "0 1 . 1" means Q1 part 1 so visible number is 1. "03.1" counts as 3. Sub-part letters (a)(b)(c) alone are NOT question numbers, but "0 1" spaced format IS a question number.
+- MULTIPLE CHOICE: Whole-numbered multiple-choice questions (e.g. 1, 2, 3, 4, 5) are INDEPENDENT questions. If a page has 5 MCQs, you MUST list all 5 numbers (e.g. [1, 2, 3, 4, 5]). Do not bundle them.
 - "total_marks_footer": only if a line like "(Total for Question 5 is 8 marks)" is printed on this page. Format: [5, 8]. Otherwise null.
 - page_role: COVER (front cover / candidate details), INSTRUCTIONS (rubric, formula sheet given to candidates), BLANK (empty or "BLANK PAGE"), ANSWER_BOOKLET (empty lined/dotted student writing space), REFERENCE (stand-alone reference/formula table), otherwise QUESTION.
 - Output ONLY the JSON object. No commentary."#
@@ -312,7 +313,7 @@ RULES:
 
 fn extraction_system_prompt(config: &PipelineConfig, span: &QuestionSpan) -> String {
     let topics_instruction = if config.allowed_topics.is_empty() {
-        "- \"topics\": array. At least one. Never invent topics.".to_string()
+        "- \"topics\": array. MUST be empty []. Do NOT invent topics.".to_string()
     } else {
         format!(
             "- \"topics\": array. At least one. Select ONLY from this exact list: {:?}. Never invent topics.",
