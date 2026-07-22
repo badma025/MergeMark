@@ -545,6 +545,78 @@ pub fn decode_page_image(b64: &str) -> Option<image::DynamicImage> {
     image::load_from_memory(&bytes).ok()
 }
 
+// ── Vertical page band crop (Phase 1) ─────────────────────────────────────
+//
+// When a page contains multiple questions (MCQs, short-answer bands, or a
+// footer that sits above the next question's heading), the document map
+// records a vertical y_frac range for the question on that page. We do NOT
+// physically crop in Phase 1 (we use prompt-level band hints + diagram-bbox
+// y-range validation instead, which avoids coordinate-shift complexity
+// across audit/save/dedupe). This helper is retained for a future Phase 2
+// optimization and is currently unused.
+#[allow(dead_code)]
+pub struct PageBand {
+    /// New base64 JPEG (no data-URL prefix) of the cropped region.
+    pub b64: String,
+    /// Pixel y-offset within the source image where the crop begins.
+    pub y_offset_px: u32,
+    /// Height of the cropped region in pixels.
+    pub height_px: u32,
+    /// Fractional y-offset within the source image (convenience).
+    pub y_offset_frac: f32,
+}
+
+/// Crop a page image to a vertical band. Returns None if the band is
+/// degenerate (empty or outside the page). `start_frac`/`end_frac` are
+/// clamped to [0,1] and padded by a small margin to avoid chopping the
+/// top/bottom lines of the question.
+#[allow(dead_code)]
+pub fn crop_page_vertical(b64: &str, start_frac: f32, end_frac: f32) -> Option<PageBand> {
+    use base64::Engine;
+    let img = decode_page_image(b64)?;
+    let (w, h) = img.dimensions();
+    if w < 2 || h < 2 {
+        return None;
+    }
+    // Pad by ~0.005 of the page (a few lines) so descenders/headings aren't
+    // clipped, and clamp into [0,1].
+    let pad = 0.005_f32;
+    let s = (start_frac - pad).clamp(0.0, 1.0);
+    let e = (end_frac + pad).clamp(0.0, 1.0);
+    if e - s < 0.01 {
+        return None;
+    }
+    let y0 = (s * h as f32).round() as u32;
+    let y1 = (e * h as f32).round() as u32;
+    let y0 = y0.min(h.saturating_sub(1));
+    let y1 = y1.min(h).max(y0 + 1);
+    let band_h = y1 - y0;
+
+    let mut owned = img;
+    let cropped_rgba = image::imageops::crop(&mut owned, 0, y0, w, band_h).to_image();
+    let cropped = image::DynamicImage::ImageRgba8(cropped_rgba).to_rgb8();
+
+    // Re-encode as JPEG at high quality (matching what the frontend sends).
+    // We use JPEG rather than PNG here because the result goes straight
+    // to the vision API as an image_url payload and JPEG is ~4x smaller
+    // at equivalent visual fidelity for text+line-art pages.
+    let mut buf = std::io::Cursor::new(Vec::with_capacity((w as usize * band_h as usize) / 8));
+    {
+        use image::codecs::jpeg::JpegEncoder;
+        use image::ImageEncoder;
+        let enc = JpegEncoder::new_with_quality(&mut buf, 92);
+        enc.write_image(&cropped, w, band_h, image::ExtendedColorType::Rgb8).ok()?;
+    }
+    let out_b64 = base64::engine::general_purpose::STANDARD.encode(buf.into_inner());
+
+    Some(PageBand {
+        b64: out_b64,
+        y_offset_px: y0,
+        height_px: band_h,
+        y_offset_frac: s,
+    })
+}
+
 /// Strip a data-URL prefix, if present.
 pub fn strip_data_url(b64: &str) -> &str {
     if b64.starts_with("data:image") {

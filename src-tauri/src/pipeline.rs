@@ -289,6 +289,68 @@ fn cancelled(cancel: &AtomicBool) -> Result<(), String> {
     }
 }
 
+/// Phase 1: heuristic used in fallback mode to decide whether a chunk
+/// that arrived with the same question_number as the last built card is
+/// truly a continuation, or a new short-answer/MCQ question that the
+/// model mislabeled. Returns true when the new content strongly "looks
+/// like" the start of a different question.
+fn looks_like_new_question(prev_content: &str, new_content: &str) -> bool {
+    let new = new_content.trim_start();
+    let prev = prev_content;
+
+    // Need a regex cache for these checks (one-time cost).
+    use std::sync::OnceLock;
+    static RE_SECTION_A: OnceLock<regex::Regex> = OnceLock::new();
+    static RE_STARTS_W_ONE_MARK: OnceLock<regex::Regex> = OnceLock::new();
+    static RE_HAS_BOLD_HEADER: OnceLock<regex::Regex> = OnceLock::new();
+    static RE_QUESTION_NUM_START: OnceLock<regex::Regex> = OnceLock::new();
+
+    // (a) resets part labels: new content begins with (a) / **(a)** and the
+    //     previous content already advanced to (b) or later.
+    let re_section_a = RE_SECTION_A.get_or_init(|| {
+        regex::Regex::new(r"(?i)^\s*\*?\*?\s*[\(\[]\s*a\s*[\)\]]").unwrap()
+    });
+    if re_section_a.is_match(new) {
+        // Did previous content ever get to (b), (c), ..., (i), (ii)?
+        for lbl in ["b", "c", "d", "e", "f", "g", "h", "i", "j"] {
+            let pat = format!(r"(?i)\({}\)", lbl);
+            if let Ok(re) = regex::Regex::new(&pat) {
+                if re.is_match(prev) {
+                    return true;
+                }
+            }
+        }
+    }
+
+    // (b) new content has a marks tag within the first 80 chars AND a
+    //     period/question structure, suggesting a 1-mark question.
+    let first_eighty: String = new.chars().take(80).collect();
+    let re_marks = RE_STARTS_W_ONE_MARK.get_or_init(|| {
+        regex::Regex::new(r"(?i)\[\s*\d{1,2}\s*marks?\s*\]").unwrap()
+    });
+    if re_marks.is_match(&first_eighty) && first_eighty.chars().filter(|c| c.is_alphabetic()).count() > 20 {
+        return true;
+    }
+
+    // (c) new content begins with a bold heading ("**5.**" / "**Question 5**" / "**5**").
+    let re_bold = RE_HAS_BOLD_HEADER.get_or_init(|| {
+        regex::Regex::new(r"^\s*\*\*\s*(?:question\s*)?\d{1,2}\s*[\.\)\]]?\s*\*\*").unwrap()
+    });
+    if re_bold.is_match(new) {
+        return true;
+    }
+
+    // (d) new content starts with a clear question number: "5.", "5)", "Q5".
+    let re_num = RE_QUESTION_NUM_START.get_or_init(|| {
+        regex::Regex::new(r"(?m)^\s*(?:Q(?:uestion)?\.?\s*)?0*[1-9]\d{0,2}\s*[\.\)\]]").unwrap()
+    });
+    if re_num.is_match(new) {
+        return true;
+    }
+
+    false
+}
+
 /// Phase 0: recognize sentinel b64 values that the frontend uses to
 /// signal "this page has no renderable image". These must NEVER be sent to
 /// the vision API as base64 JPEG — the previous code sent the literal
@@ -311,17 +373,67 @@ fn structure_system_prompt() -> String {
 
 {
   "question_numbers_visible": [ints],
+  "question_y_fracs": [[y_start, y_end], ...],
   "total_marks_footer": [question_number, marks] or null,
+  "total_marks_footer_y": number or null,
   "page_role": "QUESTION" | "COVER" | "INSTRUCTIONS" | "BLANK" | "ANSWER_BOOKLET" | "REFERENCE"
 }
 
+All y values are fractions of page HEIGHT (0.0 = very top of printable area, 1.0 = very bottom). Measure by looking at where the question's TEXT starts and ends on the page.
+
 RULES:
-- "question_numbers_visible": WHOLE question numbers only. AQA Computer Science prints "0 1" for Q1, "0 2" for Q2, ... "0 1 . 1" means Q1 part 1 so visible number is 1. "03.1" counts as 3. Sub-part letters (a)(b)(c) alone are NOT question numbers, but "0 1" spaced format IS a question number.
-- MULTIPLE CHOICE: Whole-numbered multiple-choice questions (e.g. 1, 2, 3, 4, 5) are INDEPENDENT questions. If a page has 5 MCQs, you MUST list all 5 numbers (e.g. [1, 2, 3, 4, 5]). Do not bundle them.
-- "total_marks_footer": only if a line like "(Total for Question 5 is 8 marks)" is printed on this page. Format: [5, 8]. Otherwise null.
-- page_role: COVER (front cover / candidate details), INSTRUCTIONS (rubric, formula sheet given to candidates), BLANK (empty or "BLANK PAGE"), ANSWER_BOOKLET (empty lined/dotted student writing space), REFERENCE (stand-alone reference/formula table), otherwise QUESTION.
-- Output ONLY the JSON object. No commentary."#
+- "question_numbers_visible": WHOLE question numbers only. List them in TOP-TO-BOTTOM order as they appear on the page. AQA prints "0 1" for Q1, "0 2" for Q2 — those are question numbers 1, 2. "03.1" means sub-part 1 of Q3 so the visible whole number is 3. Sub-part letters (a)(b)(c) and decimal labels alone are NOT whole question numbers.
+- MULTIPLE CHOICE / SHORT-ANSWER PAGES: when multiple independent questions share ONE page (MCQs, 1- or 2-mark questions), list EVERY question number that appears — e.g. [1,2,3,4,5] for 5 MCQs. Do NOT bundle them. This is the most important rule on dense pages.
+- "question_y_fracs": array of the SAME LENGTH as question_numbers_visible. Each entry is [y_start, y_end] for that question's vertical extent on THIS page:
+    * y_start: fraction where the question (including its number/bold heading) begins, e.g. 0.05 for a question at the top.
+    * y_end: fraction where the question ends (including all sub-parts and working space, but NOT the "Total for Question N is M marks" line which belongs to the footer).
+    * For a question that runs off the BOTTOM of the page (continues next page), set y_end to ~0.98 (bottom of page).
+    * For a question that starts ABOVE this page (continues from a previous page), set y_start to 0.0 (top of page).
+    * Be precise — within 0.02. These y fractions are used to clip the page image so the transcriber only sees one question at a time. The penalty for a clip that is too tight is a truncated question; the penalty for a clip that is too loose is a question welded to its neighbor. Aim to leave ~0.01 padding above the question and ~0.01 below it.
+- "total_marks_footer": only if a line like "(Total for Question 5 is 8 marks)" or "[Total: 8]" is printed on this page. Format: [5, 8]. Otherwise null.
+- "total_marks_footer_y": if you returned a total_marks_footer, the y-fraction of that footer line on the page.
+- page_role: COVER (front cover / candidate details), INSTRUCTIONS (rubric, formula sheet), BLANK (empty or "BLANK PAGE"), ANSWER_BOOKLET (empty lined/dotted student writing space), REFERENCE (formula / data sheet), otherwise QUESTION.
+- Output ONLY the JSON object. No commentary. No markdown."#
         .to_string()
+}
+
+/// Phase 1: describe the vertical clip for each page (if any) in the
+/// user-facing transcription prompt. This is the CHEAP alternative to
+/// physically cropping the page image: we tell the model exactly which
+/// portion of each page contains Question N so it ignores neighbouring
+/// questions. Combined with the hard `question_number` validator (which
+/// rejects content addressed to another question number) and the
+/// diagram-bbox y-range check, this produces the same correctness
+/// guarantees as pixel-cropping without the complexity of shifting
+/// coordinates through audit/save/dedupe.
+#[allow(dead_code)]
+fn page_band_note(span: &QuestionSpan, page_index_in_span: usize, total_pages_in_span: usize) -> Option<String> {
+    let is_first = page_index_in_span == 0;
+    let is_last = page_index_in_span + 1 == total_pages_in_span;
+    // Only emit a note when there's a clip on this page (otherwise the
+    // page is full-width / full-height and the existing rules apply).
+    let start_clip = if is_first { span.start_y_frac } else { None };
+    let end_clip = if is_last { span.end_y_frac } else { None };
+    if start_clip.is_none() && end_clip.is_none() {
+        return None;
+    }
+    let mut note = String::from(
+        "IMPORTANT: this page image contains parts of MULTIPLE questions. Transcribe ONLY the content belonging to Question N that sits between these vertical positions (fraction of page height from the top, 0.0=top, 1.0=bottom):\n",
+    );
+    if let Some(s) = start_clip {
+        note.push_str(&format!("- Start reading {:.0}% of the way DOWN from the top of the page.\n", s * 100.0));
+    } else {
+        note.push_str("- Start reading from the very top of the page.\n");
+    }
+    if let Some(e) = end_clip {
+        note.push_str(&format!("- STOP at about {:.0}% of the way down the page. Ignore everything below that line — it belongs to the next question.\n", e * 100.0));
+    } else {
+        note.push_str("- Continue reading to the bottom of the page (the question continues onto the next page).\n");
+    }
+    note.push_str(
+        "If the heading for a different question number appears in this band, stop transcribing before that heading.\n",
+    );
+    Some(note)
 }
 
 fn extraction_system_prompt(config: &PipelineConfig, span: &QuestionSpan) -> String {
@@ -350,7 +462,7 @@ EVERY item MUST have:
 - "module": string — output EXACTLY '{module}'.
 - "is_code": boolean (true only for code/pseudocode questions).
 - "diagram_captions": array of captions, one per figure box, or empty string; "diagram_kinds": array of semantic kinds such as graph, schema, flowchart, circuit, or multi-panel, one per box. Decide whether each exhibit is a figure before proposing geometry.
-- "diagram_bboxes": array of [x, y, w, h] boxes with RELATIVE 0.0-1.0 coordinates, one per visual exhibit. Box EVERY figure the paper draws — graphs, networks, trees, circuits — INCLUDING anything the paper labels as a Figure (e.g. "Figure 6"): printed relation/database schemas, algorithm screens, and grids that are part of the question exhibit are figures, return them as boxes, not as text. One box per WHOLE figure including its labels/caption, never two boxes on one figure. Do NOT box plain question text, tables you transcribed as Markdown (STRUCTURED TABLES rule above), or EMPTY student answer grids. The parser crop-checks every box. Include the complete semantic figure extent, including captions and disconnected components, rather than tight-boxing one shape.
+- "diagram_bboxes": array of [x, y, w, h] boxes with RELATIVE 0.0-1.0 coordinates, one per visual exhibit. IMPORTANT: coordinates are ALWAYS relative to the FULL page image (0,0 at the top-left corner of the page, 1,1 at the bottom-right), EVEN when the prompt tells you to only transcribe between certain y-percentages (multi-question pages). The y-band is only a hint for what to TRANSCRIBE — never shift or rescale bbox coordinates to match the band. Box EVERY figure the paper draws — graphs, networks, trees, circuits — INCLUDING anything the paper labels as a Figure (e.g. "Figure 6"): printed relation/database schemas, algorithm screens, and grids that are part of the question exhibit are figures, return them as boxes, not as text. One box per WHOLE figure including its labels/caption, never two boxes on one figure. Do NOT box plain question text, tables you transcribed as Markdown (STRUCTURED TABLES rule above), or EMPTY student answer grids. The parser crop-checks every box (and rejects boxes whose center falls outside the question's band on multi-question pages). Include the complete semantic figure extent, including captions and disconnected components, rather than tight-boxing one shape.
 The parser crop-checks every box: blank boxes, empty ruled grids, and duplicate boxes are rejected and cost you a repair round.
 - "bbox_page_indexes": array with the SAME LENGTH as diagram_bboxes — the 0-based index of the page image each box refers to.
 - Insert the exact token [DIAGRAM_PLACEHOLDER] in "content" where each diagram belongs chronologically.
@@ -439,7 +551,9 @@ pub async fn run_question_pipeline<C: LlmClient, P: Progress>(
         let unknown_role = |i: usize| ValidatedPageStructure {
             page: i,
             questions: Vec::new(),
+            question_y: Vec::new(),
             footer: None,
+            footer_y: None,
             role: doc_map::PageRole::Unknown,
         };
         for (bi, batch) in pages.chunks(config.parallelism.max(1)).enumerate() {
@@ -554,7 +668,9 @@ pub async fn run_question_pipeline<C: LlmClient, P: Progress>(
             structures.push(ValidatedPageStructure {
                 page: i,
                 questions: Vec::new(),
+                question_y: Vec::new(),
                 footer: None,
+                footer_y: None,
                 role,
             });
         }
@@ -659,19 +775,55 @@ pub async fn run_question_pipeline<C: LlmClient, P: Progress>(
                 }
                 match outcome {
                     Some(ExtractedFallback::Question(q)) => {
-                        next_allowed = q.question_number + 1;
-                        // A repeated number on the next page = continuation in
-                        // disguise: stitch, don't duplicate.
-                        if let Some(prev) = built.last_mut() {
-                            if prev.question_number == q.question_number {
-                                prev.content = format!("{}\n\n{}", prev.content, q.content);
-                                prev.marks = validate::sum_inline_marks(&prev.content)
-                                    .max(prev.marks.max(0) as u32)
-                                    as i32;
-                                continue;
-                            }
-                        }
-                        built.push(q);
+                        // Phase 1: same-number stitch hardening. In fallback
+                        // mode two consecutive pages can come back with the
+                        // same question_number when (a) it's truly a
+                        // continuation OR (b) the model hallucinated a
+                        // duplicate number, OR (c) two short-answer
+                        // questions on one page collapsed to one card.
+                        // Before welding them together, look for strong
+                        // signals of a NEW question in `q.content` and
+                        // refuse to stitch when they fire:
+                        //   * content starts with a part-label resetting
+                        //     to (a) after we've already seen (b)/(c) on
+                        //     the previous card,
+                        //   * content begins with a bold/emphasized
+                        //     question-number heading,
+                        //   * content carries its own terminal [N marks]
+                        //     tag very early on (suggesting a new short
+                        //     question rather than a continuation).
+                        // If any signal fires, treat the new chunk as
+                        // question_number+1 and flag it for review.
+                        let (qnum, should_stitch, q_for_push) =
+                            if let Some(prev) = built.last_mut() {
+                                if prev.question_number == q.question_number {
+                                    if looks_like_new_question(&prev.content, &q.content) {
+                                        // New short question mislabeled with
+                                        // the previous number: bump by 1
+                                        // and mark needs_review.
+                                        let mut new_q = q.clone();
+                                        new_q.question_number = prev.question_number + 1;
+                                        new_q.needs_review = true;
+                                        new_q.notes.push(
+                                            "fallback: same-number page looked like a new question — number bumped; verify".to_string()
+                                        );
+                                        (new_q.question_number, false, new_q)
+                                    } else {
+                                        // Genuine continuation.
+                                        prev.content = format!("{}\n\n{}", prev.content, q.content);
+                                        prev.marks = validate::sum_inline_marks(&prev.content)
+                                            .max(prev.marks.max(0) as u32)
+                                            as i32;
+                                        continue;
+                                    }
+                                } else {
+                                    (q.question_number, false, q)
+                                }
+                            } else {
+                                (q.question_number, false, q)
+                            };
+                        next_allowed = qnum + 1;
+                        built.push(q_for_push);
                     }
                     Some(ExtractedFallback::SkipPage) => {}
                     None => {
@@ -831,17 +983,51 @@ async fn extract_span<C: LlmClient>(
 
     for chunk in chunks {
         // Phase 0: filter out sentinel b64 values before they reach the
-        // model. Previously "TEXT_ONLY" was 8 non-empty ASCII bytes and was
-        // therefore sent as a base64 JPEG to the vision API, producing
-        // garbage images attached to multi-page chunk requests. Any
-        // recognized sentinel is dropped here so the request only ever
-        // carries real JPEG payloads (real pages have kilobytes of base64
-        // so this exact-match check is safe).
-        let images: Vec<String> = chunk
-            .iter()
-            .map(|(_, p)| p.b64.clone())
-            .filter(|b| !is_sentinel_b64(b))
-            .collect();
+        // model. We build THREE parallel structures here:
+        //   * `images`  — Vec<String> sent to the API (no sentinels)
+        //   * `local_to_chunk` — maps image-index-as-seen-by-model → index
+        //     into `chunk` (so bbox_page_indexes returned by the model can
+        //     be resolved back to the correct PageInput for audit/save).
+        //   * `page_bands` — parallel to `chunk`: Option<(low_y, high_y)>
+        //     giving the vertical band of THIS span on each chunk page
+        //     (None = full page). Used by audit_diagram_boxes to reject
+        //     bboxes whose center-y falls outside the question's band —
+        //     the deterministic safety net for the prompt-level band hints.
+        let mut images: Vec<String> = Vec::new();
+        let mut local_to_chunk: Vec<usize> = Vec::new();
+        let mut page_bands: Vec<Option<(f32, f32)>> = Vec::with_capacity(chunk.len());
+        for (local_idx, (global_pi, _p)) in chunk.iter().enumerate() {
+            let is_first_page_of_span = *global_pi == span.start_page;
+            let is_last_page_of_span = *global_pi == span.end_page;
+            let (s, e) = if is_first_page_of_span && is_last_page_of_span {
+                (span.start_y_frac, span.end_y_frac)
+            } else if is_first_page_of_span {
+                (span.start_y_frac, None)
+            } else if is_last_page_of_span {
+                (None, span.end_y_frac)
+            } else {
+                (None, None)
+            };
+            let b64 = &_p.b64;
+            if is_sentinel_b64(b64) {
+                // Sentinel page: model won't see this image, so there's
+                // nothing to band-check (the model can't return a bbox
+                // referencing a page we didn't send). Mark it as a band
+                // of 0→1 (full image in case it's ever referenced) but
+                // DON'T push to images.
+                page_bands.push(Some((s.unwrap_or(0.0), e.unwrap_or(1.0))));
+                continue;
+            }
+            images.push(b64.clone());
+            local_to_chunk.push(local_idx);
+            // If either clip is present, store the band; missing sides
+            // default to page edge (0.0 top / 1.0 bottom).
+            if s.is_some() || e.is_some() {
+                page_bands.push(Some((s.unwrap_or(0.0), e.unwrap_or(1.0))));
+            } else {
+                page_bands.push(None);
+            }
+        }
         let raw_text: String = chunk
             .iter()
             .enumerate()
@@ -853,6 +1039,60 @@ async fn extract_span<C: LlmClient>(
                 }
             })
             .collect();
+
+        // Phase 1: vertical-band notes for multi-question pages. For each
+        // page in this chunk, if the span's y clips apply on that page
+        // (first page of the span gets start_y_frac; last page of the span
+        // gets end_y_frac) emit a concrete "read between X% and Y%" hint.
+        // Pages fully interior to the span get no hint (full page).
+        let mut band_notes = String::new();
+        for (model_idx, &chunk_idx) in local_to_chunk.iter().enumerate() {
+            let (global_pi, _p) = chunk[chunk_idx];
+            let is_first_page_of_span = global_pi == span.start_page;
+            let is_last_page_of_span = global_pi == span.end_page;
+            let (s, e) = if is_first_page_of_span && is_last_page_of_span {
+                (span.start_y_frac, span.end_y_frac)
+            } else if is_first_page_of_span {
+                (span.start_y_frac, None)
+            } else if is_last_page_of_span {
+                (None, span.end_y_frac)
+            } else {
+                (None, None)
+            };
+            if s.is_some() || e.is_some() {
+                use std::fmt::Write;
+                let _ = write!(
+                    &mut band_notes,
+                    "\n\nPage {} of the attached images (original page {}): ",
+                    model_idx + 1,
+                    global_pi + 1
+                );
+                match (s, e) {
+                    (Some(a), Some(b)) => {
+                        let _ = write!(
+                            &mut band_notes,
+                            "Question {} begins at about {:.0}% down and ends at about {:.0}% down. Transcribe ONLY between those lines.",
+                            span.number, a * 100.0, b * 100.0,
+                        );
+                    }
+                    (Some(a), None) => {
+                        let _ = write!(
+                            &mut band_notes,
+                            "Question {} begins at about {:.0}% down the page. Transcribe from there to the bottom (it continues onto the next page).",
+                            span.number, a * 100.0,
+                        );
+                    }
+                    (None, Some(b)) => {
+                        let _ = write!(
+                            &mut band_notes,
+                            "Question {} continues from the previous page and ends at about {:.0}% down this page. Do NOT transcribe anything below that line (it is the next question).",
+                            span.number, b * 100.0,
+                        );
+                    }
+                    (None, None) => {}
+                }
+            }
+        }
 
         let system = extraction_system_prompt(config, span);
         let mut last_error = String::new();
@@ -868,8 +1108,9 @@ async fn extract_span<C: LlmClient>(
                 )
             };
             let user_text = format!(
-                "Transcribe Question {} from the attached page image(s).{}{}",
+                "Transcribe Question {} from the attached page image(s).{}{}{}",
                 span.number,
+                band_notes,
                 if raw_text.is_empty() {
                     String::new()
                 } else {
@@ -988,7 +1229,12 @@ async fn extract_span<C: LlmClient>(
 
             // ── Diagram boxes: Rust audits every crop the AI proposed ─────
             let audit_start = Instant::now();
-            let (bad, box_issues) = audit_diagram_boxes(chunk, &page_items.items);
+            let (bad, box_issues) = audit_diagram_boxes(
+                chunk,
+                &page_items.items,
+                &local_to_chunk,
+                &page_bands,
+            );
             report.record_timing(
                 "diagram_processing",
                 "crop_audit",
@@ -1045,16 +1291,26 @@ async fn extract_span<C: LlmClient>(
             let mut item_content = item.content.unwrap_or_default();
 
             // Cropping: sanitizer + blank guard, fully deterministic.
+            // IMPORTANT: bbox_page_indexes returned by the model refer to
+            // the `images` vector we sent (sentinels filtered out). We
+            // must translate through local_to_chunk to find the correct
+            // PageInput inside `chunk` (which may contain sentinel pages
+            // the model never saw).
             if let Some(bboxes) = &item.diagram_bboxes {
                 let indexes = item.bbox_page_indexes.clone().unwrap_or_default();
                 let diagram_save_start = Instant::now();
                 for (bi, bbox) in bboxes.iter().enumerate() {
-                    let page_idx = indexes
+                    let model_idx = indexes
                         .get(bi)
                         .and_then(value_to_usize)
-                        .filter(|&k| k < chunk.len())
+                        .filter(|&k| k < local_to_chunk.len())
                         .unwrap_or(0);
-                    let page = chunk[page_idx].1;
+                    let chunk_idx = local_to_chunk[model_idx];
+                    if chunk_idx >= chunk.len() {
+                        report.crop_rejections += 1;
+                        continue;
+                    }
+                    let page = chunk[chunk_idx].1;
                     let link = save_diagram(page, bbox, config, &mut saved_diagrams, &mut report);
                     if let Some(link) = link {
                         if item_content.contains("[DIAGRAM_PLACEHOLDER]") {
@@ -1210,8 +1466,22 @@ fn validate_span_items(page: &AiQuestionPage, span: &QuestionSpan) -> Vec<String
 }
 
 /// PVRV "Validate" for diagram proposals: every box the AI drew is pushed
-/// through the Rust guard chain (sanitizer → blank guard → empty-answer-grid
-/// guard → duplicate-signature guard) BEFORE the response is accepted.
+/// through the Rust guard chain BEFORE the response is accepted.
+///
+/// Guard chain:
+///   1. well-formed 4-number bbox
+///   2. page index in range (using `local_to_chunk` to map model-visible
+///      image indices back to `chunk` indices, since sentinel pages are
+///      filtered before sending)
+///   3. y-band check: the box's CENTER y must lie within this question's
+///      vertical band on that page (±3% slack), otherwise the AI is boxing
+///      a figure that belongs to a neighboring question
+///   4. crop sanity (degenerate / blank / answer-grid)
+///   5. near-duplicate signature check
+///
+/// `page_bands` is parallel to `chunk`; entries are `Some((low, high))`
+/// when the page was given a vertical band hint. A None entry means the
+/// whole page belongs to this span (no y-band restriction).
 ///
 /// Returns the indices of offending boxes `(item_idx, bbox_idx)` plus a
 /// quoted feedback message per violation for the repair loop. The AI draws
@@ -1219,10 +1489,13 @@ fn validate_span_items(page: &AiQuestionPage, span: &QuestionSpan) -> Vec<String
 fn audit_diagram_boxes(
     chunk: &[(usize, &PageInput)],
     items: &[AiQuestion],
+    local_to_chunk: &[usize],
+    page_bands: &[Option<(f32, f32)>],
 ) -> (Vec<(usize, usize)>, Vec<String>) {
     let mut bad: Vec<(usize, usize)> = Vec::new();
     let mut issues: Vec<String> = Vec::new();
-    // Page images decode lazily so text-only items cost nothing.
+    // Page images decode lazily so text-only items cost nothing. Indexed
+    // by CHUNK position (not model-local image index).
     let mut decoded: Vec<Option<Option<image::DynamicImage>>> = vec![None; chunk.len()];
     let mut accepted_sigs: Vec<[u8; 64]> = Vec::new();
 
@@ -1240,20 +1513,53 @@ fn audit_diagram_boxes(
                 ));
                 continue;
             }
-            let page_idx = indexes.get(bi).and_then(value_to_usize).unwrap_or(0);
-            if page_idx >= chunk.len() {
+            let model_idx = indexes.get(bi).and_then(value_to_usize).unwrap_or(0);
+            if model_idx >= local_to_chunk.len() {
                 bad.push((ii, bi));
                 issues.push(format!(
                     "{label}: bbox_page_indexes entry {} is out of range ({} page image(s) were sent) — renumber or drop this box",
-                    page_idx,
-                    chunk.len()
+                    model_idx,
+                    local_to_chunk.len()
                 ));
                 continue;
             }
-            if decoded[page_idx].is_none() {
-                decoded[page_idx] = Some(geometry::decode_page_image(&chunk[page_idx].1.b64));
+            let chunk_idx = local_to_chunk[model_idx];
+            if chunk_idx >= chunk.len() {
+                bad.push((ii, bi));
+                issues.push(format!(
+                    "{label}: internal page-index translation failed for page {} — drop this box",
+                    model_idx
+                ));
+                continue;
             }
-            let img = match &decoded[page_idx] {
+            // Coordinates are still relative to the FULL page image
+            // (we explicitly do NOT physically crop in Phase 1), so the
+            // bbox [x,y,w,h] the model returns is in full-page space.
+            let (_x, y, w, h) = (bbox[0], bbox[1], bbox[2], bbox[3]);
+            let cy = y + h / 2.0;
+
+            // ── Y-band check: reject boxes outside this question's band.
+            if let Some((low, high)) = page_bands.get(chunk_idx).copied().flatten() {
+                // Allow ±3% slack so a figure's caption that dips just
+                // below the band isn't rejected.
+                const BAND_SLACK: f32 = 0.03;
+                if cy < low - BAND_SLACK || cy > high + BAND_SLACK {
+                    bad.push((ii, bi));
+                    issues.push(format!(
+                        "{label}: the box's center is at {:.0}% down the page, outside Question N's vertical band ({:.0}%–{:.0}%) — this figure belongs to a different question. Either move the box inside the band or delete the box AND its [DIAGRAM_PLACEHOLDER]",
+                        cy * 100.0,
+                        low * 100.0,
+                        high * 100.0,
+                    ));
+                    continue;
+                }
+            }
+
+            if decoded[chunk_idx].is_none() {
+                decoded[chunk_idx] =
+                    Some(geometry::decode_page_image(&chunk[chunk_idx].1.b64));
+            }
+            let img = match &decoded[chunk_idx] {
                 Some(Some(i)) => i,
                 // Cannot judge an undecodable page here; the save-time guard
                 // still applies, so nothing bad can reach disk.
@@ -1447,12 +1753,16 @@ RULES:
         );
         // Phase 0: never pass sentinel b64 values as images. Build a
         // (possibly-empty) image slice from the page; `chat_body` will
-        // produce a text-only body when no images are supplied.
-        let page_images: Vec<String> = if is_sentinel_b64(&page.b64) {
-            vec![]
-        } else {
-            vec![page.b64.clone()]
-        };
+        // produce a text-only body when no images are supplied. Mirror
+        // the mapped path's local_to_chunk so audit/save can resolve
+        // bbox_page_indexes correctly even when sentinels are filtered.
+        let fb_chunk: [(usize, &PageInput); 1] = [(page_idx, page)];
+        let (page_images, local_to_chunk, page_bands): (Vec<String>, Vec<usize>, Vec<Option<(f32, f32)>>) =
+            if is_sentinel_b64(&page.b64) {
+                (vec![], vec![], vec![None])
+            } else {
+                (vec![page.b64.clone()], vec![0usize], vec![None])
+            };
         let body = llm::chat_body(
             &config.model,
             &system,
@@ -1522,8 +1832,16 @@ RULES:
         }
 
         // ── Diagram boxes: same Rust audit as the mapped path ─────────────
-        let (bad, box_issues) =
-            audit_diagram_boxes(&[(page_idx, page)], std::slice::from_ref(&item));
+        // Fallback mode has no document map, so we pass the pre-built
+        // local→chunk map (empty when the page was a sentinel, identity
+        // otherwise) and no y bands — the page is shown in full and any
+        // figure on it is fair game.
+        let (bad, box_issues) = audit_diagram_boxes(
+            &fb_chunk,
+            std::slice::from_ref(&item),
+            &local_to_chunk,
+            &page_bands,
+        );
         if !box_issues.is_empty() {
             last_error = box_issues.join("; ");
             report.repairs += 1;
@@ -2202,7 +2520,10 @@ mod tests {
             ]),
             ..Default::default()
         };
-        let (bad, issues) = audit_diagram_boxes(&chunk, &[item]);
+        // Tests send no sentinel pages, so identity map + no bands.
+        let l2c: Vec<usize> = (0..chunk.len()).collect();
+        let bands: Vec<Option<(f32, f32)>> = vec![None; chunk.len()];
+        let (bad, issues) = audit_diagram_boxes(&chunk, &[item], &l2c, &bands);
         assert!(bad.contains(&(0, 0)), "trace-table box must be rejected");
         assert!(
             bad.contains(&(0, 2)),
@@ -2228,6 +2549,8 @@ mod tests {
             number: 30,
             start_page: 0,
             end_page: 0,
+            start_y_frac: None,
+            end_y_frac: None,
             expected_marks: Some(6),
             reliable_pages: vec![],
             ambiguous_pages: vec![],
@@ -2261,6 +2584,8 @@ mod tests {
             number: 30,
             start_page: 0,
             end_page: 0,
+            start_y_frac: None,
+            end_y_frac: None,
             expected_marks: Some(6),
             reliable_pages: vec![],
             ambiguous_pages: vec![],
@@ -2335,5 +2660,53 @@ mod tests {
         assert_eq!(report.diagrams_saved, 1, "still exactly one PNG written");
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn looks_like_new_question_detects_part_reset_and_bold_headings() {
+        // Continuation: still on part (b) advancing to (c) — NOT a new question.
+        assert!(
+            !looks_like_new_question(
+                "(a) One thing. **[2 marks]**\n\n(b) Another thing. **[3 marks]**",
+                "(c) Final part. **[2 marks]**",
+            ),
+            "advancing (a)→(b)→(c) is a continuation"
+        );
+
+        // Part reset: previous already reached (b), new starts (a) → new question.
+        assert!(
+            looks_like_new_question(
+                "(a) First. **[1 mark]**\n\n(b) Second. **[1 mark]**",
+                "(a) Reset to a. **[1 mark]**",
+            ),
+            "(a) after (b) must fire new-question heuristic"
+        );
+
+        // Bold heading at the start.
+        assert!(
+            looks_like_new_question(
+                "previous content here **[3 marks]**",
+                "**5.** Give two reasons. **[2 marks]**",
+            ),
+            "bold heading indicates a new question"
+        );
+
+        // Plain "5." at line start.
+        assert!(
+            looks_like_new_question(
+                "previous content **[2 marks]**",
+                "5. Start of question five. **[2 marks]**",
+            ),
+            "leading number+dash indicates a new question"
+        );
+
+        // New question starting with "Q3" prefix.
+        assert!(
+            looks_like_new_question(
+                "previous content",
+                "Q3) Transcribe this question. **[4 marks]**",
+            ),
+            "Q-prefix heading indicates a new question"
+        );
     }
 }
