@@ -189,7 +189,7 @@ export function AddQuestionModal({ open, onOpenChange, onSuccess }: AddQuestionM
           </div>
 
           {/* Content Editors */}
-          <div className="grid grid-cols-1 md:grid-cols-2 gap-4 flex-1 min-h-[300px]">
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-4 flex-1 min-h-[300px] px-1 pb-1">
             <div className="flex flex-col gap-2 h-full">
               <div>
                 <label className="text-sm font-semibold text-foreground">Question Content:</label>

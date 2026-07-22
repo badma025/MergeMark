@@ -66,6 +66,9 @@ pub fn chat_body(
         content.push(serde_json::json!({ "type": "text", "text": t }));
     }
     for img in images {
+        if img == "SKIP" || img == "TEXT_ONLY" {
+            continue;
+        }
         let b64 = crate::geometry::strip_data_url(img);
         content.push(serde_json::json!({
             "type": "image_url",

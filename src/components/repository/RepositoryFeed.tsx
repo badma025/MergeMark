@@ -87,7 +87,8 @@ export function RepositoryFeed({ isActive = true, onAddToWorksheet }: Repository
       q.content.toLowerCase().includes(term) ||
       q.mathSnippet.toLowerCase().includes(term);
 
-    const matchesSubject = selectedSubject === "All" || q.subject === selectedSubject;
+    const resolvedSubject = subjects.find(s => s.id === q.subject)?.name || q.subject;
+    const matchesSubject = selectedSubject === "All" || resolvedSubject === selectedSubject;
 
     let matchesTopicFilter = true;
     if (selectedTopics.length > 0) {
@@ -110,7 +111,8 @@ export function RepositoryFeed({ isActive = true, onAddToWorksheet }: Repository
         matchesModuleFilter = qMod === selectedModule;
       } else {
         // Fallback to topics if no explicit module is provided
-        const moduleTopics = (topicsBySubject[q.subject] || {})[selectedModule] || [];
+        const resolvedSubject = subjects.find(s => s.id === q.subject)?.name || q.subject;
+        const moduleTopics = (topicsBySubject[resolvedSubject] || {})[selectedModule] || [];
         if (selectedTopics.length === 0) {
           let qTopics: string[] = [];
           try {

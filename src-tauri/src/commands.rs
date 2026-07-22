@@ -606,7 +606,7 @@ pub async fn compile_worksheet(
 
         if let Some(question) = q {
             question_num += 1;
-            let mut content = question.content.trim().to_string();
+            let mut content = crate::validate::sanitize_markdown_math(&question.content);
             content = content.replace("\r\n", "\n");
 
             // Format markdown to LaTeX
@@ -746,7 +746,8 @@ pub async fn compile_worksheet(
                 question_num, question.marks
             ));
 
-            if let Some(mut ans_content) = question.answer_content {
+            if let Some(raw_ans) = question.answer_content {
+                let mut ans_content = crate::validate::sanitize_markdown_math(&raw_ans);
                 ans_content = ans_content.replace("\r\n", "\n");
                 ans_content = bold_re
                     .replace_all(&ans_content, r"\textbf{${1}}")
@@ -1109,7 +1110,7 @@ pub async fn parse_pdf_vision(
             "#,
         )
         .bind(&id)
-        .bind(&subject)
+        .bind(&config.subject)
         .bind(&subtopic)
         .bind(&topics_json)
         .bind(q.marks)
@@ -1131,7 +1132,7 @@ pub async fn parse_pdf_vision(
 
         final_questions.push(Question {
             id,
-            subject: subject.clone(),
+            subject: config.subject.clone(),
             subtopic,
             marks: q.marks,
             content: q.content,
@@ -1892,11 +1893,11 @@ pub async fn export_flashcards(
             .map_err(|e| e.to_string())?;
 
         if let Some(q) = q {
-            let mut front = q.content;
+            let mut front = crate::validate::sanitize_markdown_math(&q.content);
             if !q.math_snippet.is_empty() {
-                front = format!("{}\n\n{}", front, q.math_snippet);
+                front = format!("{}\n\n{}", front, crate::validate::sanitize_markdown_math(&q.math_snippet));
             }
-            let back = q.answer_content.unwrap_or_default();
+            let back = crate::validate::sanitize_markdown_math(&q.answer_content.unwrap_or_default());
 
             let mut tags = vec![q.subject.clone()];
             if let Some(m) = &q.module {

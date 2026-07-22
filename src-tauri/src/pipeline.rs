@@ -311,6 +311,15 @@ RULES:
 }
 
 fn extraction_system_prompt(config: &PipelineConfig, span: &QuestionSpan) -> String {
+    let topics_instruction = if config.allowed_topics.is_empty() {
+        "- \"topics\": array. At least one. Never invent topics.".to_string()
+    } else {
+        format!(
+            "- \"topics\": array. At least one. Select ONLY from this exact list: {:?}. Never invent topics.",
+            config.allowed_topics
+        )
+    };
+
     format!(
         r#"You are a precise mathematical OCR engine. Output ONLY a valid JSON object of the form {{"items": [ ... ]}}.
 
@@ -323,7 +332,7 @@ EVERY item MUST have:
 - "content": FULL transcription (never a summary). Preserve all punctuation. Separate sub-parts (a), (b), (c) with double newlines. Append the mark tag `**[X marks]**` to every sub-part that shows a mark allocation. Transcribe every sentence, including instructions to the candidate that belong to the question. Do NOT include: page headers/footers ("Question X continued", "Turn over"), the "(Total for Question X is Y marks)" footer, plain ruled answer lines, or "BLANK PAGE".
 - STRUCTURED TABLES WITH HEADERS — trace tables, function tables, working grids — ARE question content even when the body cells are EMPTY. If the text says Complete the trace table, Complete the table, or show the results of executing, NEVER return a diagram box for that grid, even when the question mentions another Figure; transcribe every row and pre-filled cell as Markdown. Transcribe them as Markdown tables in "content" (keeping every header and any pre-filled cells), NEVER as diagram boxes.
 - "marks": integer total for this question's visible part, or null if unknown.
-- "topics": array. At least one. Never invent topics.
+{topics_instruction}
 - "module": string — output EXACTLY '{module}'.
 - "is_code": boolean (true only for code/pseudocode questions).
 - "diagram_captions": array of captions, one per figure box, or empty string; "diagram_kinds": array of semantic kinds such as graph, schema, flowchart, circuit, or multi-panel, one per box. Decide whether each exhibit is a figure before proposing geometry.
@@ -334,6 +343,7 @@ The parser crop-checks every box: blank boxes, empty ruled grids, and duplicate 
 
 FORMATTING RULES:
 - OMIT the leading question number at the very start of the question text (e.g. if the text reads "17 Here is triangle ABC.", you MUST output "Here is triangle ABC." without the "17").
+- OMIT trailing answer line units, symbols, and answer templates at the very end of the question (e.g. "..................... %", "£ .....................", "..................... cm", or "............ $\\le t <$ ............"). Do NOT transcribe the answer blanks or the mathematical operators embedded within them.
 - Wrap inline math in single $...$. Use $$...$$ ONLY for display equations on their own line.
 - Tables of text/data: standard Markdown tables. Pure mathematical matrices or Simplex tableaus: LaTeX \begin{{array}} inside $$...$$. Never put $ inside array environments.
 - Multiple-choice options: `a) ...`, `b) ...` separated by double newlines, WITHOUT the question number prefix.
@@ -344,6 +354,7 @@ FORMATTING RULES:
         number = span.number,
         paper = config.paper_name,
         module = config.module_name,
+        topics_instruction = topics_instruction,
     )
 }
 
@@ -430,20 +441,29 @@ pub async fn run_question_pipeline<C: LlmClient, P: Progress>(
             let futs: Vec<_> = batch
                 .iter()
                 .map(|page| {
+                    let is_skip = page.b64 == "SKIP";
+                    let is_text_only = page.b64 == "TEXT_ONLY";
+                    
+                    if is_skip {
+                        return futures_util::future::Either::Left(async move {
+                            Ok(r#"{"questions":[]}"#.to_string())
+                        });
+                    }
+
                     let body = llm::chat_body(
                         &config.model,
                         &system_structure,
-                        std::slice::from_ref(&page.b64),
-                        None,
+                        if is_text_only { &[] } else { std::slice::from_ref(&page.b64) },
+                        if is_text_only { Some(page.text.as_str()) } else { None },
                         200,
                     );
-                    async move {
+                    futures_util::future::Either::Right(async move {
                         match client.chat(&body).await {
                             Ok(resp) => llm::message_content(&resp)
                                 .map_err(|e| format!("bad response shape ({})", e)),
                             Err(e) => Err(format!("API failure ({})", e)),
                         }
-                    }
+                    })
                 })
                 .collect();
             let results = futures_util::future::join_all(futs).await;
@@ -1371,7 +1391,7 @@ RULES:
 - AQA decimal sub-parts: render '03.1'-style part numbers as (a), (b), (c) — positional: .1 -> a, .2 -> b — and update inline cross-references. The whole decimal run on this page is ONE item with its integer question number.
 - Anything the paper labels as a Figure ("Figure 6" — printed schemas, algorithm screens, grids that are part of the question exhibit) MUST be returned as a diagram box, never as transcribed text.
 - STRUCTURED TABLES WITH HEADERS (trace tables, function tables, working grids) are question content even when EMPTY — transcribe them as Markdown tables, NEVER as diagram boxes. Diagram boxes are ONLY for figures that cannot be typed (graphs, circuits, line drawings), one box per figure; blank, empty-grid, and duplicate boxes are rejected by the parser and cost a repair round.
-- Exclude headers/footers ("Question X continued", "Turn over", totals footers), plain ruled answer lines, "BLANK PAGE".
+- Exclude headers/footers ("Question X continued", "Turn over", totals footers), plain ruled answer lines, answer line templates with operators (e.g. "............ $\\le t <$ ............"), "BLANK PAGE".
 - Content must end with terminal punctuation or a mark tag."#,
         module = config.module_name,
     );

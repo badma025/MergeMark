@@ -1,6 +1,6 @@
 import { useState } from "react";
 import { Toaster } from "sonner";
-import { LayoutGrid, UploadCloud, Settings as SettingsIcon } from "lucide-react";
+import { LayoutGrid, UploadCloud, Settings as SettingsIcon, BookOpen } from "lucide-react";
 import { RepositoryFeed } from "@/components/repository/RepositoryFeed";
 import { WorksheetBuilder } from "@/components/worksheet/WorksheetBuilder";
 import { IngestionDropzone } from "@/components/ingestion/IngestionDropzone";
@@ -10,14 +10,16 @@ import { type WorksheetItemData } from "@/components/worksheet/WorksheetItem";
 import { UploadCounter, useUploadCounter } from "@/components/UploadCounter";
 import { TaxonomyProvider } from "@/lib/TaxonomyContext";
 import { cn } from "@/lib/utils";
+import { FlashcardsTab } from "@/components/flashcards/FlashcardsTab";
 
 export type SelectedQuestion = Omit<QuestionCardProps, "onAddToWorksheet">;
 
-type Tab = "repository" | "ingestion" | "settings";
+type Tab = "repository" | "ingestion" | "settings" | "flashcards";
 
 const TABS: { id: Tab; label: string; icon: React.ElementType }[] = [
   { id: "repository", label: "Repository", icon: LayoutGrid },
   { id: "ingestion", label: "Import PDF", icon: UploadCloud },
+  { id: "flashcards", label: "Flashcards", icon: BookOpen },
   { id: "settings", label: "Settings", icon: SettingsIcon },
 ];
 
@@ -64,7 +66,7 @@ function App() {
 
         {/* Tab bar */}
         <nav
-          className="flex items-center gap-1 border-b border-border px-4 pt-4 bg-background/80 backdrop-blur-sm"
+          className="flex items-end gap-1 border-b border-border px-4 pt-4 bg-background/80 backdrop-blur-sm"
           aria-label="Main navigation"
         >
           <div className="flex items-center mr-8 pb-2 pt-1">
@@ -105,6 +107,9 @@ function App() {
           </div>
           <div className={cn("absolute inset-0 flex flex-col min-h-0 overflow-hidden bg-background", activeTab === "ingestion" ? "z-10 opacity-100 pointer-events-auto" : "z-0 opacity-0 pointer-events-none")}>
             <IngestionDropzone isActive={activeTab === "ingestion"} onSuccess={() => setActiveTab("repository")} />
+          </div>
+          <div className={cn("absolute inset-0 flex flex-col min-h-0 overflow-hidden bg-background", activeTab === "flashcards" ? "z-10 opacity-100 pointer-events-auto" : "z-0 opacity-0 pointer-events-none")}>
+            <FlashcardsTab selectedQuestions={selectedQuestions} />
           </div>
           <div className={cn("absolute inset-0 flex flex-col min-h-0 overflow-hidden bg-background", activeTab === "settings" ? "z-10 opacity-100 pointer-events-auto" : "z-0 opacity-0 pointer-events-none")}>
             <Settings />

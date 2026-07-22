@@ -298,19 +298,25 @@ pub fn build_hybrid_map(
     let mut valid_spans = Vec::new();
     let mut prev_num = 0u32;
     let mut prev_end = 0usize;
-    for span in spans {
+    for mut span in spans {
         if span.number <= prev_num {
             anomalies.push(format!("non-monotonic question number {} after {}", span.number, prev_num));
             continue;
         }
-        if span.start_page > span.end_page || span.end_page >= num_pages {
+        if span.end_page >= num_pages {
             anomalies.push(format!("invalid page range for Q{}", span.number));
             continue;
         }
-        // Check for backward jumps
-        if span.start_page < prev_end && span.start_page + 1 < prev_end {
-            anomalies.push(format!("backward jump in Q{} start_page {} < prev_end {}", span.number, span.start_page, prev_end));
+        // Force start_page to be prev_end to prevent gaps and backward overlaps, except for the first question
+        if prev_num > 0 {
+            if span.start_page != prev_end {
+                anomalies.push(format!("adjusting Q{} start_page from {} to prev_end {}", span.number, span.start_page, prev_end));
+            }
+            span.start_page = prev_end;
+        } else {
+            span.start_page = span.start_page.min(span.end_page);
         }
+        
         prev_num = span.number;
         prev_end = span.end_page;
         valid_spans.push(span);
@@ -331,7 +337,7 @@ fn build_spans_from_vision(
     ambiguous_pages: &[usize],
     _num_pages: usize,
 ) -> Vec<QuestionSpan> {
-    let mut last_seen: std::collections::BTreeMap<u32, (usize, Option<u32>)> = 
+    let mut vision_bounds: std::collections::BTreeMap<u32, (usize, usize, Option<u32>)> = 
         std::collections::BTreeMap::new();
     let mut prev_max = 0u32;
     
@@ -344,33 +350,30 @@ fn build_spans_from_vision(
                 return Vec::new(); // Hallucination signal
             }
             prev_max = prev_max.max(q);
-            let e = last_seen.entry(q).or_insert((p.page, None));
-            e.0 = p.page;
+            let e = vision_bounds.entry(q).or_insert((p.page, p.page, None));
+            e.1 = p.page; // Update end page
         }
         if let Some((q, m)) = p.footer {
-            let e = last_seen.entry(q).or_insert((p.page, None));
-            e.0 = p.page;
-            e.1 = Some(m);
+            let e = vision_bounds.entry(q).or_insert((p.page, p.page, None));
+            e.1 = p.page; // Update end page
+            e.2 = Some(m);
         }
     }
-    // We do NOT require last_seen.len() >= 2 here, because
-    // this is a hybrid map and the rest might be reliable pages.
-    if last_seen.is_empty() {
+    
+    if vision_bounds.is_empty() {
         return Vec::new();
     }
     
     let mut spans = Vec::new();
-    let mut next_start = 0usize;
-    for (q, (end, marks)) in last_seen.iter() {
+    for (q, (start, end, marks)) in vision_bounds.iter() {
         spans.push(QuestionSpan {
             number: *q,
-            start_page: next_start.min(*end),
+            start_page: *start,
             end_page: *end,
             expected_marks: *marks,
             reliable_pages: Vec::new(),
             ambiguous_pages: vec![*end], // Vision pages are ambiguous by definition
         });
-        next_start = end + 1;
     }
     spans
 }

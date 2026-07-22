@@ -284,12 +284,74 @@ pub fn clean_question_content(content: &str) -> String {
     for p in patterns {
         cleaned = re(p).replace_all(&cleaned, "").into_owned();
     }
+    
+    // Strip trailing inequality answer templates (e.g., "$... \le t < ...$ [2 marks]") while preserving the marks
+    let ineq_re = regex::Regex::new(r"(?im)^[\s\.\$]*(?:\\\\?leq?|\\\\?geq?|<|>)\s*[a-zA-Z]\s*(?:\\\\?leq?|\\\\?geq?|<|>)\s*(.*?)\s*\$?\s*$").unwrap();
+    cleaned = ineq_re.replace_all(&cleaned, "$1").into_owned();
+
+    // Strip trailing equality answer templates (e.g., "$... x = ...$ [2 marks]")
+    let eq_re = regex::Regex::new(r"(?im)^[\s\.\$]*[a-zA-Z]\s*=\s*(.*?)\s*\$?\s*$").unwrap();
+    cleaned = eq_re.replace_all(&cleaned, "$1").into_owned();
+
     // Collapse runs of 3+ newlines left by removals.
     let collapse = re(r"\n{3,}");
     let collapsed = collapse.replace_all(&cleaned, "\n\n").trim().to_string();
     // Source lines are meaningful — don't let Markdown reflow them into a
     // single blob (schemas, algorithms, multi-part stems).
-    harden_line_breaks(&collapsed)
+    let hardened = harden_line_breaks(&collapsed);
+    
+    // Automatically close any unclosed $ or $$ tags to prevent MDX parser crashes
+    sanitize_markdown_math(&hardened)
+}
+
+/// Automatically close missing inline `$` and block `$$` tags.
+pub fn sanitize_markdown_math(text: &str) -> String {
+    let mut in_block = false;
+    let mut lines = Vec::new();
+
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed == "$$" {
+            in_block = !in_block;
+            lines.push(line.to_string());
+            continue;
+        }
+
+        if in_block {
+            lines.push(line.to_string());
+            continue;
+        }
+
+        let mut inline_count = 0;
+        let chars: Vec<char> = line.chars().collect();
+        let mut i = 0;
+        while i < chars.len() {
+            if chars[i] == '$' {
+                let escaped = i > 0 && chars[i-1] == '\\';
+                let double = i + 1 < chars.len() && chars[i+1] == '$';
+                if !escaped {
+                    if double {
+                        i += 1;
+                    } else {
+                        inline_count += 1;
+                    }
+                }
+            }
+            i += 1;
+        }
+
+        if inline_count % 2 != 0 {
+            lines.push(format!("{}$", line));
+        } else {
+            lines.push(line.to_string());
+        }
+    }
+
+    if in_block {
+        lines.push("$$".to_string());
+    }
+
+    lines.join("\n")
 }
 
 // ── Figure/diagram referral consistency ─────────────────────────────────────

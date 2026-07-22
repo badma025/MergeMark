@@ -217,9 +217,30 @@ export function IngestionDropzone({ isActive = false, onSuccess }: IngestionDrop
         for (let i = 1; i <= numPages; i++) {
           try {
             const page = await pdf.getPage(i);
-            // 1.0 keeps mathematical text legible while substantially reducing GPU work
-            // and the base64 payload sent to the vision API.
-            const viewport = page.getViewport({ scale: 1.0 });
+            
+            // Optimization 2 & 3: Pre-fetch text and operators to avoid unnecessary GPU rendering
+            const textContent = await page.getTextContent();
+            const rawText = textContent.items.map((item: any) => item.str).join("").trim();
+            
+            // Skip empty pages or pages that just say "BLANK PAGE"
+            if (!rawText || rawText.replace(/\s+/g, "").toUpperCase() === "BLANKPAGE") {
+              pages.push("SKIP");
+              continue;
+            }
+
+            // Check if page contains embedded raster images
+            // OPS.paintImageXObject (85) and OPS.paintJpegXObject (82)
+            const opList = await page.getOperatorList();
+            const ops: any = pdfjsLib.OPS;
+            const hasImages = opList.fnArray.some(fn => fn === ops.paintImageXObject || fn === ops.paintJpegXObject || fn === ops.paintXObject);
+            
+            if (!hasImages) {
+              pages.push("TEXT_ONLY");
+              continue;
+            }
+
+            // Optimization 1: Downscale the canvas to reduce image token payload
+            const viewport = page.getViewport({ scale: 0.6 });
             const canvas = document.createElement("canvas");
             const context = canvas.getContext("2d");
             if (context) {
@@ -232,7 +253,8 @@ export function IngestionDropzone({ isActive = false, onSuccess }: IngestionDrop
               pages.push(dataUrl.split(",")[1]);
             }
           } catch (pageErr) {
-            console.error(`Error rendering page ${i}:`, pageErr);
+            console.error(`Error processing page ${i}:`, pageErr);
+            pages.push("SKIP"); // Skip corrupted pages gracefully
           }
         }
         pdfBase64Pages = pages;

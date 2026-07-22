@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useState, useRef } from "react";
 import "katex/dist/katex.min.css";
 import { RichTextEditor } from "./RichTextEditor";
 import { Badge } from "@/components/ui/badge";
@@ -9,7 +9,7 @@ import ReactMarkdown from "react-markdown";
 import remarkMath from "remark-math";
 import rehypeKatex from "rehype-katex";
 import remarkGfm from "remark-gfm";
-import { cn } from "@/lib/utils";
+import { cn, sanitizeMarkdownMath } from "@/lib/utils";
 import { convertFileSrc } from "@tauri-apps/api/core";
 import { useTaxonomy } from "@/lib/TaxonomyContext";
 
@@ -181,7 +181,8 @@ export function preprocessMath(raw: string, isCode?: boolean, subject?: string):
   s = s.replace(/\x00BLOCK(\d+)\x00/g, (_m, idx) => blocks[Number(idx)]);
 
   // Collapse 3+ blank lines to 2
-  return s.replace(/\n{3,}/g, "\n\n").trim();
+  const result = s.replace(/\n{3,}/g, "\n\n").trim();
+  return sanitizeMarkdownMath(result);
 }
 
 
@@ -219,7 +220,8 @@ export function QuestionCard({
   onUpdate,
   onDelete,
 }: QuestionCardProps) {
-  const { topicsBySubject } = useTaxonomy();
+  const { subjects, topicsBySubject } = useTaxonomy();
+  const displaySubject = subjects.find(s => s.id === subject)?.name || subject;
   const [isEditing, setIsEditing] = useState(false);
   const [isShowingAnswer, setIsShowingAnswer] = useState(false);
   let parsedTopics: string[] = [];
@@ -259,9 +261,12 @@ export function QuestionCard({
   const [editAnswerContent, setEditAnswerContent] = useState(strippedAnswerContent);
   const [editTopics, setEditTopics] = useState<string[]>(parsedTopics);
 
+  const lastCloseTime = useRef(0);
+
   function handleSave(e?: React.MouseEvent) {
     e?.stopPropagation();
     onUpdate?.(id, editContent, editMarks, editAnswerContent || undefined, editTopics, module);
+    lastCloseTime.current = Date.now();
     setIsEditing(false);
   }
 
@@ -271,12 +276,14 @@ export function QuestionCard({
     setEditMarks(marks);
     setEditAnswerContent(strippedAnswerContent);
     setEditTopics(parsedTopics);
+    lastCloseTime.current = Date.now();
     setIsEditing(false);
   }
 
   return (
     <article
       onClick={() => {
+        if (isEditing || Date.now() - lastCloseTime.current < 300) return;
         setEditContent(displayContent);
         setEditMarks(marks);
         setEditAnswerContent(strippedAnswerContent);
@@ -337,7 +344,7 @@ export function QuestionCard({
         <Badge
           className="text-xs font-medium tracking-wide bg-zinc-800 text-zinc-50 hover:bg-zinc-800/90 dark:bg-zinc-200 dark:text-zinc-900 dark:hover:bg-zinc-200/90"
         >
-          {subject}
+          {displaySubject}
         </Badge>
         {module && module !== "General" && module !== "Unknown" && (
           <Badge
@@ -407,7 +414,7 @@ export function QuestionCard({
                 }
               }}
             >
-              {preprocessMath(displayContent, isCode, subject)}
+              {preprocessMath(displayContent, isCode, displaySubject)}
           </ReactMarkdown>
         </div>
 
@@ -455,7 +462,7 @@ export function QuestionCard({
                 }
               }}
             >
-              {preprocessMath(answerContent ?? "", isCode, subject)}
+              {preprocessMath(answerContent ?? "", isCode, displaySubject)}
           </ReactMarkdown>
         </div>
       </div>
@@ -486,8 +493,8 @@ export function QuestionCard({
               <label className="text-sm font-semibold text-foreground">Topics:</label>
               <div className="flex flex-wrap items-center gap-1.5">
                 {(() => {
-                  if (subject === "All") return [];
-                  const subjectMods = topicsBySubject[subject] || {};
+                  if (displaySubject === "All") return [];
+                  const subjectMods = topicsBySubject[displaySubject] || {};
                   return Object.values(subjectMods).flat();
                 })().map((topic) => {
                   const isSelected = editTopics.includes(topic);
@@ -516,7 +523,7 @@ export function QuestionCard({
             </div>
 
             {/* Content Editors */}
-            <div className="grid grid-cols-1 md:grid-cols-2 gap-4 flex-1 min-h-[300px]">
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-4 flex-1 min-h-[300px] px-1 pb-1">
               <div className="flex flex-col gap-2 h-full">
                 <div>
                   <label className="text-sm font-semibold text-foreground">Question Content:</label>
