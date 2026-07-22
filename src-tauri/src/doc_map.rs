@@ -514,15 +514,35 @@ fn append_text_only_short_answer_spans(
             if existing_numbers.contains(&h.number) {
                 continue;
             }
-            // Skip if this heading falls inside an existing span that
-            // covers this page (cross-page questions reliably caught by
-            // footers already own their pixels).
-            if spans.iter().any(|s| {
-                s.start_page <= page && page <= s.end_page && s.number != h.number
-            }) {
-                // Heuristic: if an existing span covers this page, the
-                // heading is either a cross-reference or a sub-part
-                // marker — skip to avoid carving off a false positive.
+            // Skip if this heading falls INSIDE another span's vertical
+            // band on this page (cross-page long questions). The previous
+            // over-broad check skipped the heading whenever any span
+            // "covered" the page at all, which lost MCQs that sit below
+            // a long question's last-page footer on the same page.
+            let inside_other_span = spans.iter().any(|s| {
+                if s.number == h.number {
+                    return false;
+                }
+                if page < s.start_page || page > s.end_page {
+                    return false;
+                }
+                // Compute the band this span actually occupies on `page`.
+                let lo = if page == s.start_page {
+                    s.start_y_frac.unwrap_or(0.0)
+                } else {
+                    0.0
+                };
+                let hi = if page == s.end_page {
+                    s.end_y_frac.unwrap_or(1.0)
+                } else {
+                    1.0
+                };
+                // Heading is inside the span if its y sits within [lo, hi).
+                h.y_frac >= lo - 0.02 && h.y_frac < hi
+            });
+            if inside_other_span {
+                // Likely a cross-reference or a sub-part marker inside a
+                // long question's band — don't carve out a new span.
                 continue;
             }
             let end_y = if idx + 1 < headings.len() {
