@@ -889,7 +889,7 @@ pub async fn run_question_pipeline<C: LlmClient, P: Progress>(
                         || !map.non_question_pages.contains(&pi)
                         || structures
                             .get(pi)
-                            .map(|s| s.role == doc_map::PageRole::Blank)
+                            .map(|s| s.role == doc_map::PageRole::Blank || !s.questions.is_empty())
                             .unwrap_or(false)
                 })
                 .map(|pi| (pi, &pages[pi]))
