@@ -609,12 +609,16 @@ pub async fn run_question_pipeline<C: LlmClient, P: Progress>(
                     // question_y_fracs add ~80-120 tokens per MCQ page,
                     // so dense 5-question pages were truncating mid-JSON
                     // and being treated as unknown-role.
+                    // Phase 2: raised from 750 to 1500. Physics papers
+                    // with many figures and complex y_frac arrays were
+                    // still truncating — 10 out of 44 pages in one test
+                    // got EOF-parsing errors at 750.
                     let body = llm::chat_body(
                         &config.model,
                         &system_structure,
                         img_slice,
                         text_opt,
-                        750,
+                        1500,
                     );
                     futures_util::future::Either::Right(async move {
                         match client.chat(&body).await {

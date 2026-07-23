@@ -811,6 +811,17 @@ fn build_spans_from_vision(
     //     are 3,4,5 is almost certainly a misread).
     //   * a page that produces zero plausible numbers doesn't blow up
     //     the map — it's simply skipped.
+    //
+    // Phase 2: MAX_SPAN_GAP caps how far a single question's span can
+    // stretch between non-adjacent pages. The vision structure pass
+    // reports EVERY number it sees — including AQA margin numbers
+    // ("0 1"), page headers ("Question 1 continued"), answer booklet
+    // page numbers, and cross-references ("see your answer to Q1").
+    // Without a gap cap, Q1's span stretches across the entire paper
+    // (pages 0–24), cascading all subsequent spans forward via the
+    // monotonicity validator. A gap of >8 pages between confirmed
+    // occurrences strongly signals a spurious reference.
+    const MAX_SPAN_GAP: usize = 8;
     let mut running_max = 0u32;
     for p in structures {
         if !eligible_pages.contains(&p.page) {
@@ -850,8 +861,11 @@ fn build_spans_from_vision(
                 marks: None,
             });
             if p.page < e.first_page {
-                e.first_page = p.page;
-                e.first_y = y0;
+                // Don't extend backward across a large gap.
+                if e.first_page - p.page <= MAX_SPAN_GAP {
+                    e.first_page = p.page;
+                    e.first_y = y0;
+                }
             } else if p.page == e.first_page {
                 // Keep the tightest (highest) y on the first page.
                 e.first_y = match (e.first_y, y0) {
@@ -861,8 +875,13 @@ fn build_spans_from_vision(
                 };
             }
             if p.page > e.last_page {
-                e.last_page = p.page;
-                e.last_y = y1;
+                // Don't extend forward across a large gap — the later
+                // occurrence is likely a margin number, page header,
+                // or cross-reference rather than actual question content.
+                if p.page - e.last_page <= MAX_SPAN_GAP {
+                    e.last_page = p.page;
+                    e.last_y = y1;
+                }
             } else if p.page == e.last_page {
                 // Keep the tightest (lowest) y on the last page.
                 e.last_y = match (e.last_y, y1) {
@@ -1224,6 +1243,9 @@ pub fn build_map_from_structure(
     // Record per-question running bounds. Phase 1c: same per-page
     // plausible-number filter as build_spans_from_vision, so an outlier
     // on a single page can't kill the whole structure map.
+    // Phase 2: same MAX_SPAN_GAP cap to prevent margin numbers from
+    // stretching a question across the entire paper.
+    const MAX_SPAN_GAP: usize = 8;
     let mut bounds: std::collections::BTreeMap<u32, VisionBounds> =
         std::collections::BTreeMap::new();
     let mut running_max = 0u32;
@@ -1259,8 +1281,10 @@ pub fn build_map_from_structure(
                 marks: None,
             });
             if p.page < e.first_page {
-                e.first_page = p.page;
-                e.first_y = y0;
+                if e.first_page - p.page <= MAX_SPAN_GAP {
+                    e.first_page = p.page;
+                    e.first_y = y0;
+                }
             } else if p.page == e.first_page {
                 e.first_y = match (e.first_y, y0) {
                     (Some(a), Some(b)) => Some(a.min(b)),
@@ -1268,8 +1292,10 @@ pub fn build_map_from_structure(
                 };
             }
             if p.page > e.last_page {
-                e.last_page = p.page;
-                e.last_y = y1;
+                if p.page - e.last_page <= MAX_SPAN_GAP {
+                    e.last_page = p.page;
+                    e.last_y = y1;
+                }
             } else if p.page == e.last_page {
                 e.last_y = match (e.last_y, y1) {
                     (Some(a), Some(b)) => Some(a.max(b)),
