@@ -382,7 +382,7 @@ fn structure_system_prompt() -> String {
 All y values are fractions of page HEIGHT (0.0 = very top of printable area, 1.0 = very bottom). Measure by looking at where the question's TEXT starts and ends on the page.
 
 RULES:
-- "question_numbers_visible": WHOLE question numbers only. List them in TOP-TO-BOTTOM order as they appear on the page. AQA prints "0 1" for Q1, "0 2" for Q2 — those are question numbers 1, 2. "03.1" means sub-part 1 of Q3 so the visible whole number is 3. Sub-part letters (a)(b)(c) and decimal labels alone are NOT whole question numbers.
+- "question_numbers_visible": WHOLE question numbers only. List them in TOP-TO-BOTTOM order as they appear on the page. AQA prints "0 1" for Q1, "0 2" for Q2 — those are question numbers 1, 2. "03.1" means sub-part 1 of Q3 so the visible whole number is 3. AQA also prints SPACED sub-parts: "01 5" means Question 1, sub-part 5 — the whole number is 1 (NOT 1.5, NOT 15). NEVER return decimals or concatenate spaced digits. Sub-part letters (a)(b)(c) and decimal labels alone are NOT whole question numbers.
 - MULTIPLE CHOICE / SHORT-ANSWER PAGES: when multiple independent questions share ONE page (MCQs, 1- or 2-mark questions), list EVERY question number that appears — e.g. [1,2,3,4,5] for 5 MCQs. Do NOT bundle them. This is the most important rule on dense pages.
 - "question_y_fracs": array of the SAME LENGTH as question_numbers_visible. Each entry is [y_start, y_end] for that question's vertical extent on THIS page:
     * y_start: fraction where the question (including its number/bold heading) begins, e.g. 0.05 for a question at the top.
@@ -474,7 +474,7 @@ FORMATTING RULES:
 - Tables of text/data: standard Markdown tables. Pure mathematical matrices or Simplex tableaus: LaTeX \begin{{array}} inside $$...$$. Never put $ inside array environments.
 - Multiple-choice options: `a) ...`, `b) ...` separated by double newlines, WITHOUT the question number prefix.
 - Code/pseudocode/SQL/identifiers: Markdown backticks, NEVER LaTeX math mode.
-- AQA decimal sub-parts: render '02.1'-style parts as (a), (b), (c) — positionally: .1 -> a, .2 -> b — and update inline cross-references accordingly. Whole-numbered MCQs are independent questions, never decimals.
+- AQA decimal sub-parts: render '02.1'-style parts as (a), (b), (c) — positionally: .1 -> a, .2 -> b — and update inline cross-references accordingly. AQA also uses SPACED sub-parts: "01 5" means Question 1, sub-part 5 — render as (e). The whole question number is ALWAYS the integer before the space/dot. NEVER return decimals like 1.5 for spaced sub-parts. Whole-numbered MCQs are independent questions, never decimals.
 - JSON ESCAPING: backslashes in LaTeX MUST be escaped (\\frac, \\theta). Unescaped backslashes break the parser and your work is discarded.
 - The content MUST end with terminal punctuation or a mark tag. Never stop mid-sentence."#,
         number = span.number,
@@ -803,67 +803,51 @@ pub async fn run_question_pipeline<C: LlmClient, P: Progress>(
                 // Sequential assembly enforces monotonic numbering: a page
                 // that came back backwards under the shared batch bound is
                 // re-asked alone with the true bound.
-                if let Some(ExtractedFallback::Question(q)) = &outcome {
-                    if q.question_number + 1 < next_allowed {
-                        let (redo, redo_local) =
-                            extract_fallback_page(client, config, &pages[i], i, next_allowed).await;
-                        report.absorb(redo_local);
-                        outcome = redo;
+                if let Some(questions) = &outcome {
+                    if let Some(first_q) = questions.first() {
+                        if first_q.question_number + 1 < next_allowed {
+                            let (redo, redo_local) =
+                                extract_fallback_page(client, config, &pages[i], i, next_allowed).await;
+                            report.absorb(redo_local);
+                            outcome = redo;
+                        }
                     }
                 }
                 match outcome {
-                    Some(ExtractedFallback::Question(q)) => {
-                        // Phase 1: same-number stitch hardening. In fallback
-                        // mode two consecutive pages can come back with the
-                        // same question_number when (a) it's truly a
-                        // continuation OR (b) the model hallucinated a
-                        // duplicate number, OR (c) two short-answer
-                        // questions on one page collapsed to one card.
-                        // Before welding them together, look for strong
-                        // signals of a NEW question in `q.content` and
-                        // refuse to stitch when they fire:
-                        //   * content starts with a part-label resetting
-                        //     to (a) after we've already seen (b)/(c) on
-                        //     the previous card,
-                        //   * content begins with a bold/emphasized
-                        //     question-number heading,
-                        //   * content carries its own terminal [N marks]
-                        //     tag very early on (suggesting a new short
-                        //     question rather than a continuation).
-                        // If any signal fires, treat the new chunk as
-                        // question_number+1 and flag it for review.
-                        let (qnum, _should_stitch, q_for_push) =
-                            if let Some(prev) = built.last_mut() {
-                                if prev.question_number == q.question_number {
-                                    if looks_like_new_question(&prev.content, &q.content) {
-                                        // New short question mislabeled with
-                                        // the previous number: bump by 1
-                                        // and mark needs_review.
-                                        let mut new_q = q.clone();
-                                        new_q.question_number = prev.question_number + 1;
-                                        new_q.needs_review = true;
-                                        new_q.notes.push(
-                                            "fallback: same-number page looked like a new question — number bumped; verify".to_string()
-                                        );
-                                        (new_q.question_number, false, new_q)
+                    Some(questions) => {
+                        // Phase 2: process EVERY question extracted from this page.
+                        // Dense MCQ pages can return 4+ questions — each gets
+                        // stitched or pushed independently.
+                        for q in questions {
+                            let (qnum, _should_stitch, q_for_push) =
+                                if let Some(prev) = built.last_mut() {
+                                    if prev.question_number == q.question_number {
+                                        if looks_like_new_question(&prev.content, &q.content) {
+                                            let mut new_q = q.clone();
+                                            new_q.question_number = prev.question_number + 1;
+                                            new_q.needs_review = true;
+                                            new_q.notes.push(
+                                                "fallback: same-number page looked like a new question — number bumped; verify".to_string()
+                                            );
+                                            (new_q.question_number, false, new_q)
+                                        } else {
+                                            // Genuine continuation — weld content.
+                                            prev.content = format!("{}\n\n{}", prev.content, q.content);
+                                            prev.marks = validate::sum_inline_marks(&prev.content)
+                                                .max(prev.marks.max(0) as u32)
+                                                as i32;
+                                            continue;
+                                        }
                                     } else {
-                                        // Genuine continuation.
-                                        prev.content = format!("{}\n\n{}", prev.content, q.content);
-                                        prev.marks = validate::sum_inline_marks(&prev.content)
-                                            .max(prev.marks.max(0) as u32)
-                                            as i32;
-                                        continue;
+                                        (q.question_number, false, q)
                                     }
                                 } else {
                                     (q.question_number, false, q)
-                                }
-                            } else {
-                                (q.question_number, false, q)
-                            };
-                        next_allowed = qnum + 1;
-                        built.push(q_for_push);
+                                };
+                            next_allowed = qnum + 1;
+                            built.push(q_for_push);
+                        }
                     }
-                    Some(ExtractedFallback::SkipPage) => {}
                     None => {
                         report.quarantined.push(QuarantineEvent {
                             scope: "question-page".to_string(),
@@ -873,7 +857,6 @@ pub async fn run_question_pipeline<C: LlmClient, P: Progress>(
                         });
                     }
                 }
-            }
         }
     } else {
         report.questions_expected = map.spans.len();
@@ -1743,21 +1726,23 @@ fn save_diagram(
     Some(link)
 }
 
-enum ExtractedFallback {
-    Question(BuiltQuestion),
-    /// Page held no NEW question (continuation/blank) — not an error.
-    SkipPage,
-}
-
 /// Fallback: no map — per-page extraction, AI proposes the number but it
 /// must be plausible and non-decreasing (monotonicity enforced).
+///
+/// Phase 2: returns ALL items extracted from the page, not just the first.
+/// Dense MCQ / short-answer pages (AQA Section B) can have 4+ questions per
+/// page — the previous `.next().unwrap()` silently discarded all but the first.
+/// Returns:
+///   - `Some(vec![])` — skip page (continuation / blank / no new questions)
+///   - `Some(vec![q1, q2, ...])` — one or more questions extracted
+///   - `None` — quarantine (all repair attempts exhausted)
 async fn extract_fallback_page<C: LlmClient>(
     client: &C,
     config: &PipelineConfig,
     page: &PageInput,
     page_idx: usize,
     next_allowed: u32,
-) -> (Option<ExtractedFallback>, ImportReport) {
+) -> (Option<Vec<BuiltQuestion>>, ImportReport) {
     // Own, local report: pages now run in parallel batches.
     let mut report = ImportReport::default();
     let max_attempts = 1 + config.max_repairs;
@@ -1765,13 +1750,14 @@ async fn extract_fallback_page<C: LlmClient>(
         r#"You are a precise mathematical OCR engine. Output ONLY a valid JSON object {{"items": [ ... ]}}.
 
 RULES:
-- If this page starts a NEW question (has its own printed whole-question number), return ONE item:
+- If this page contains NEW question(s) (each with its own printed whole-question number), return ONE item per question:
   {{ "question_number": <whole number printed>, "content": "<full transcription>", "marks": int|null,
      "topics": array, "module": "{module}", "is_code": bool,
      "diagram_bboxes": [[x,y,w,h]...] relative 0.0-1.0, "bbox_page_indexes": [0,...] }}
-- If this page is a CONTINUATION of the previous question, is blank, or contains no question, return {{"items": []}}.
+- MULTIPLE QUESTIONS ON ONE PAGE: when a page has several independent short-answer or multiple-choice questions (e.g. AQA Section B with 4 MCQs), return an item for EACH question. Do NOT bundle them into one item.
+- If this page is a CONTINUATION of the previous question, is blank, or contains no new question, return {{"items": []}}.
 - Transcribe fully (never summarize). Preserve punctuation. `**[X marks]**` after each marked sub-part. Math in $...$/$$...$$. Markdown tables for text tables; \begin{{array}} only for matrices. Code in backticks, never math mode. Escape LaTeX backslashes (\\frac).
-- AQA decimal sub-parts: render '03.1'-style part numbers as (a), (b), (c) — positional: .1 -> a, .2 -> b — and update inline cross-references. The whole decimal run on this page is ONE item with its integer question number.
+- AQA decimal sub-parts: render '03.1'-style part numbers as (a), (b), (c) — positional: .1 -> a, .2 -> b — and update inline cross-references. AQA also uses SPACED sub-parts: \"01 5\" means Question 1, sub-part 5 — render as (e). The whole question number is ALWAYS the integer (never a decimal like 1.5). The whole decimal run on this page is ONE item with its integer question number.
 - Anything the paper labels as a Figure ("Figure 6" — printed schemas, algorithm screens, grids that are part of the question exhibit) MUST be returned as a diagram box, never as transcribed text.
 - STRUCTURED TABLES WITH HEADERS (trace tables, function tables, working grids) are question content even when EMPTY — transcribe them as Markdown tables, NEVER as diagram boxes. Diagram boxes are ONLY for figures that cannot be typed (graphs, circuits, line drawings), one box per figure; blank, empty-grid, and duplicate boxes are rejected by the parser and cost a repair round.
 - Exclude headers/footers ("Question X continued", "Turn over", totals footers), plain ruled answer lines, answer line templates with operators (e.g. "............ $\\le t <$ ............"), "BLANK PAGE".
@@ -1782,7 +1768,7 @@ RULES:
     let mut last_error = String::new();
     for attempt in 1..=max_attempts {
         let user_text = format!(
-            "Extract the NEW question on this page (page {}), or return an empty items array if it is a continuation.{}",
+            "Extract ALL NEW questions on this page (page {}), returning one item per question. Return an empty items array if the page is a continuation or blank.{}",
             page_idx + 1,
             if attempt == 1 {
                 String::new()
@@ -1836,58 +1822,95 @@ RULES:
             }
         };
         if page_out.items.is_empty() {
-            return (Some(ExtractedFallback::SkipPage), report);
+            return (Some(vec![]), report);
         }
-        let mut item = page_out.items.into_iter().next().unwrap();
-        let number = item
-            .question_number
-            .as_ref()
-            .and_then(validate::value_to_question_number);
-        let number = match number {
-            Some(n) if n >= next_allowed.saturating_sub(1) => n,
-            _ => {
-                last_error = format!(
-                    "implausible or backwards question number; expected ≥ {}",
-                    next_allowed
-                );
-                continue;
-            }
-        };
 
-        // Figure-reference consistency (same rule as the mapped path;
-        // non-fatal on the final attempt — noted, not quarantined).
-        let fig_errors = validate::diagram_consistency_errors(
-            item.content.as_deref().unwrap_or(""),
-            item.diagram_bboxes.as_ref().map(|b| b.len()).unwrap_or(0),
-        );
-        if !fig_errors.is_empty() {
+        // Phase 2: validate ALL items' question numbers. Each must be plausible
+        // (≥ next_allowed - 1) and the sequence must be non-decreasing within
+        // the page. Collect validated numbers parallel to items.
+        let mut item_numbers: Vec<u32> = Vec::with_capacity(page_out.items.len());
+        let mut number_valid = true;
+        for (idx, item) in page_out.items.iter().enumerate() {
+            let number = item
+                .question_number
+                .as_ref()
+                .and_then(validate::value_to_question_number);
+            match number {
+                Some(n) if n >= next_allowed.saturating_sub(1) => {
+                    // Check non-decreasing within page
+                    if let Some(&prev) = item_numbers.last() {
+                        if n < prev {
+                            last_error = format!(
+                                "item {} has question_number {} which is less than item {}'s {} — question numbers must be non-decreasing within a page",
+                                idx + 1, n, idx, prev
+                            );
+                            number_valid = false;
+                            break;
+                        }
+                    }
+                    item_numbers.push(n);
+                }
+                Some(n) => {
+                    last_error = format!(
+                        "item {} has backwards question number {} (expected ≥ {})",
+                        idx + 1, n, next_allowed
+                    );
+                    number_valid = false;
+                    break;
+                }
+                None => {
+                    last_error = format!(
+                        "item {} has an implausible question_number ({}); expected a whole number ≥ {}",
+                        idx + 1,
+                        item.question_number.as_ref().map(|v| v.to_string()).unwrap_or_default(),
+                        next_allowed
+                    );
+                    number_valid = false;
+                    break;
+                }
+            }
+        }
+        if !number_valid {
+            report.repairs += 1;
+            continue;
+        }
+
+        // Phase 2: figure-reference consistency check on each item
+        let mut all_fig_errors: Vec<String> = Vec::new();
+        for (idx, item) in page_out.items.iter().enumerate() {
+            let fig_errors = validate::diagram_consistency_errors(
+                item.content.as_deref().unwrap_or(""),
+                item.diagram_bboxes.as_ref().map(|b| b.len()).unwrap_or(0),
+            );
+            for e in fig_errors {
+                all_fig_errors.push(format!("item {}: {}", idx + 1, e));
+            }
+        }
+        if !all_fig_errors.is_empty() {
             report.repairs += 1;
             if attempt < max_attempts {
-                last_error = fig_errors.join("; ");
+                last_error = all_fig_errors.join("; ");
                 continue;
             }
             report.anomalies.push(format!(
                 "page {}: figure/diagram inconsistency kept after repair budget — {}",
                 page_idx + 1,
-                fig_errors.join("; ")
+                all_fig_errors.join("; ")
             ));
         }
 
-        // ── Diagram boxes: same Rust audit as the mapped path ─────────────
-        // Fallback mode has no document map, so we pass the pre-built
-        // local→chunk map (empty when the page was a sentinel, identity
-        // otherwise) and no y bands — the page is shown in full and any
-        // figure on it is fair game.
+        // Phase 2: diagram audit on ALL items at once (not just the first)
         let (bad, box_issues) = audit_diagram_boxes(
             &fb_chunk,
-            std::slice::from_ref(&item),
+            &page_out.items,
             &local_to_chunk,
             &page_bands,
         );
+        let mut items = page_out.items;
         if !box_issues.is_empty() {
-            last_error = box_issues.join("; ");
             report.repairs += 1;
             if attempt < max_attempts {
+                last_error = box_issues.join("; ");
                 continue;
             }
             report.anomalies.push(format!(
@@ -1896,53 +1919,69 @@ RULES:
                 bad.len(),
                 box_issues.join("; ")
             ));
-            let mut one = [item];
-            prune_bad_diagram_boxes(&mut one, &bad, &mut report);
-            item = one.into_iter().next().unwrap();
+            prune_bad_diagram_boxes(&mut items, &bad, &mut report);
         }
 
-        let mut item_content = item.content.take().unwrap_or_default();
+        // Phase 2: process EVERY item — build a BuiltQuestion for each
+        let mut built_questions: Vec<BuiltQuestion> = Vec::with_capacity(items.len());
         let mut saved_diagrams: Vec<([u8; 64], String)> = Vec::new();
-        if let Some(bboxes) = &item.diagram_bboxes {
-            for bbox in bboxes {
-                if let Some(link) =
-                    save_diagram(page, bbox, config, &mut saved_diagrams, &mut report)
-                {
-                    if item_content.contains("[DIAGRAM_PLACEHOLDER]") {
-                        item_content = item_content.replacen("[DIAGRAM_PLACEHOLDER]", &link, 1);
-                    } else {
-                        item_content.push_str(&link);
+
+        for (idx, mut item) in items.into_iter().enumerate() {
+            let number = item_numbers[idx];
+            let mut item_content = item.content.take().unwrap_or_default();
+
+            // Save diagrams for this item
+            if let Some(bboxes) = &item.diagram_bboxes {
+                let indexes = item.bbox_page_indexes.clone().unwrap_or_default();
+                for (bi, bbox) in bboxes.iter().enumerate() {
+                    // Resolve the page index through local_to_chunk
+                    let model_idx = indexes
+                        .get(bi)
+                        .and_then(value_to_usize)
+                        .filter(|&k| k < local_to_chunk.len())
+                        .unwrap_or(0);
+                    let _chunk_idx = local_to_chunk[model_idx];
+                    if let Some(link) =
+                        save_diagram(page, bbox, config, &mut saved_diagrams, &mut report)
+                    {
+                        if item_content.contains("[DIAGRAM_PLACEHOLDER]") {
+                            item_content = item_content.replacen("[DIAGRAM_PLACEHOLDER]", &link, 1);
+                        } else {
+                            item_content.push_str(&link);
+                        }
                     }
                 }
             }
-        }
-        item_content = item_content.replace("[DIAGRAM_PLACEHOLDER]", "");
+            item_content = item_content.replace("[DIAGRAM_PLACEHOLDER]", "");
 
-        let topics = item
-            .topics
-            .as_ref()
-            .map(value_to_topics)
-            .unwrap_or_default();
-
-        let built = BuiltQuestion {
-            question_number: number,
-            content: validate::normalize_decimal_parts(
-                &validate::clean_question_content(&item_content),
-                number,
-            ),
-            marks: item
-                .marks
+            let topics = item
+                .topics
                 .as_ref()
-                .and_then(validate::value_to_marks)
-                .unwrap_or(1)
-                .max(1),
-            module: config.module_name.clone(),
-            topics,
-            is_code: config.subject == "Computer Science" && item.is_code == Some(true),
-            needs_review: true,
-            notes: vec!["extracted without document map (fallback mode)".to_string()],
-        };
-        return (Some(ExtractedFallback::Question(built)), report);
+                .map(value_to_topics)
+                .unwrap_or_default();
+
+            let built = BuiltQuestion {
+                question_number: number,
+                content: validate::normalize_decimal_parts(
+                    &validate::clean_question_content(&item_content),
+                    number,
+                ),
+                marks: item
+                    .marks
+                    .as_ref()
+                    .and_then(validate::value_to_marks)
+                    .unwrap_or(1)
+                    .max(1),
+                module: config.module_name.clone(),
+                topics,
+                is_code: config.subject == "Computer Science" && item.is_code == Some(true),
+                needs_review: true,
+                notes: vec!["extracted without document map (fallback mode)".to_string()],
+            };
+            built_questions.push(built);
+        }
+
+        return (Some(built_questions), report);
     }
     (None, report)
 }

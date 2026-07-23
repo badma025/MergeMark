@@ -180,8 +180,13 @@ fn paper_total_regex() -> regex::Regex {
 ///   * part labels (a)/(b)/(i) — those never begin with 1+ digits at line
 ///     start followed by a period/closing paren without a letter.
 fn question_heading_regex() -> regex::Regex {
+    // Phase 2: added `0\s*` to tolerate AQA's spaced margin padding
+    // (e.g. "0 7" for question 7, where the zero and the significant digit
+    // are separated by whitespace). The `\s*` quantifier accepts zero spaces
+    // (normal "07" or "7") or one+ spaces ("0 7"), so Edexcel-style headings
+    // ("1.", "2)") continue to match unchanged.
     regex::Regex::new(
-        r"(?m)(?:^|\n)\s*(?:\*\*)?(?:Q(?:uestion)?\.?\s*)?0*([1-9]\d{0,2})(?:\*\*)?\s*(?:[\.\)\]\-–—]|\s+)(?:\D|$)",
+        r"(?m)(?:^|\n)\s*(?:\*\*)?(?:Q(?:uestion)?\.?\s*)?0\s*([1-9]\d{0,2})(?:\*\*)?\s*(?:[\.\)\]\-–—]|\s+)(?:\D|$)",
     )
     .unwrap()
 }
@@ -231,6 +236,17 @@ pub fn scan_text_layer(page_texts: &[String]) -> TextScan {
     // questions" / "instructions" / "glossary" AND a short page, and match
     // them only at line start. The line-end anchor (\s|$|:) keeps us from
     // matching partial words like "instructional".
+    // Phase 2: image-only PDF detection. When the entire text layer across
+    // all pages totals fewer than 100 characters, the PDF is almost certainly
+    // a scanned/image-only document with no usable text layer. In that case,
+    // pages with empty text must NOT be classified as NonQuestion — they are
+    // Ambiguous so the structure pass sends their images to the vision model.
+    // Without this, every page becomes NonQuestion, the structure pass
+    // short-circuits to synthetic BLANK responses, vision never runs, and the
+    // document map is empty — the "Blank Page Trap" that kills AQA Physics.
+    let total_text_len: usize = page_texts.iter().map(|t| t.len()).sum();
+    let is_image_only_pdf = total_text_len < 100;
+
     let instr_re = regex::Regex::new(
         r"(?i)(?:^|\n)\s*(?:instructions?\s*(?:to\s+candidates?)?|answer\s+all\s+questions|glossary)(?:\s|$|:)",
     ).unwrap();
@@ -327,7 +343,15 @@ pub fn scan_text_layer(page_texts: &[String]) -> TextScan {
         let ref_hit = ref_re.is_match(text) || is_formulae_sheet;
 
         if blank_re.is_match(text) || text.trim().is_empty() {
-            page_reliability[page] = PageReliability::NonQuestion;
+            // Phase 2: image-only PDF override. Empty text in a scanned PDF
+            // doesn't mean "not a question page" — it means "no text layer".
+            // Mark as Ambiguous so vision structure pass actually runs on these
+            // pages instead of short-circuiting to synthetic BLANK.
+            if is_image_only_pdf {
+                page_reliability[page] = PageReliability::Ambiguous;
+            } else {
+                page_reliability[page] = PageReliability::NonQuestion;
+            }
         } else if has_footer {
             page_reliability[page] = PageReliability::Reliable;
         } else if (instr_hit || ref_hit) && !has_question_signal && (is_short_rubric || is_formulae_sheet) {
@@ -1006,7 +1030,9 @@ fn estimate_first_question_start(page_texts: &[String], first_footer_page: usize
         r"(?i)\binstructions\b|\binformation\b|answer all questions|formulae|\bglossary\b",
     )
     .unwrap();
-    let margin_re = regex::Regex::new(r"(?m)^\s*0?1\s*$").unwrap();
+    // Phase 2: tolerate AQA's spaced margin marker "0 1" in addition to the
+    // compact "01" / bare "1" forms already accepted.
+    let margin_re = regex::Regex::new(r"(?m)^\s*0\s*1\s*$").unwrap();
     let mut start = 0usize;
     for p in 0..first_footer_page {
         let text = &page_texts[p];
