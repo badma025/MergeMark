@@ -495,7 +495,7 @@ pub async fn parse_pdf(app: tauri::AppHandle, file_path: String) -> Result<usize
     let raw_text = tokio::task::spawn_blocking(move || -> Result<String, String> {
         let lower = path_clone.to_lowercase();
         if lower.ends_with(".pdf") {
-            pdf_extract::extract_text(&path_clone)
+            pdf_extract::extract_text_encrypted(&path_clone, "")
                 .map_err(|e| format!("PDF extraction failed: {}", e))
         } else {
             std::fs::read_to_string(&path_clone).map_err(|e| format!("Failed to read file: {}", e))
@@ -927,10 +927,13 @@ fn extract_page_texts(file_path: &str, num_pages: usize) -> Vec<String> {
     if !file_path.to_lowercase().ends_with(".pdf") {
         return texts;
     }
-    let doc = match pdf_extract::Document::load(file_path) {
+    let mut doc = match pdf_extract::Document::load(file_path) {
         Ok(d) => d,
         Err(_) => return texts,
     };
+    if doc.is_encrypted() {
+        let _ = doc.decrypt("");
+    }
     for page_idx in 0..num_pages {
         let mut output = HybridTextOutput::new();
         if pdf_extract::output_doc_page(&doc, &mut output, (page_idx + 1) as u32).is_ok() {
@@ -1039,7 +1042,14 @@ pub async fn parse_pdf_vision(
     config.allowed_topics = allowed_topics;
     config.diagrams_dir = diagrams_dir;
     config.max_repairs = 2;
-    config.max_output_tokens = 16384;
+    // Phase 0: questions now get the same output budget as mark schemes.
+    // Long physics questions with sub-parts (a)–(f), derivations, graph
+    // descriptions, and circuit analysis routinely hit the previous 16k
+    // cap, triggering truncation-salvage + repair retries that doubled
+    // latency and quarantined questions. 32k gives a healthy headroom at
+    // modest cost (output tokens are the expensive part, but a truncated
+    // question that requires a full retry is far more expensive).
+    config.max_output_tokens = 32768;
     config.parallelism = std::env::var("MERGEMARK_PARALLELISM")
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
@@ -1302,7 +1312,7 @@ pub async fn parse_mark_scheme_vision(
             if !path_clone.to_lowercase().ends_with(".pdf") {
                 return vec![String::new(); num_pages];
             }
-            match pdf_extract::extract_text_by_pages(&path_clone) {
+            match pdf_extract::extract_text_by_pages_encrypted(&path_clone, "") {
                 Ok(pages) => {
                     let re_lines = regex::Regex::new(r"_+|-+").unwrap();
                     let mut out: Vec<String> = pages
@@ -1346,7 +1356,7 @@ pub async fn parse_mark_scheme_vision(
             _ => {
                 let path_clone = file_path.clone();
                 tokio::task::spawn_blocking(move || {
-                    pdf_extract::extract_text(&path_clone)
+                    pdf_extract::extract_text_encrypted(&path_clone, "")
                         .map_err(|e| format!("PDF extraction failed: {}", e))
                 })
                 .await
@@ -1662,8 +1672,8 @@ pub async fn generate_worksheet_from_pdf(
     let extracted_text = tokio::task::spawn_blocking(move || -> Result<String, String> {
         let lower = path_clone.to_lowercase();
         if lower.ends_with(".pdf") {
-            pdf_extract::extract_text(&path_clone)
-                .map_err(|e| format!("PDF extraction failed: {e}"))
+            pdf_extract::extract_text_encrypted(&path_clone, "")
+                .map_err(|e| format!("PDF extraction failed: {}", e))
         } else {
             std::fs::read_to_string(&path_clone).map_err(|e| format!("Failed to read file: {e}"))
         }

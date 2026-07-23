@@ -52,8 +52,21 @@ pub fn value_to_marks(v: &serde_json::Value) -> Option<i32> {
 }
 
 /// Tolerant coercion of a model-supplied question number to a *plausible*
-/// whole question number. Rejects: missing, zero, > 60, and multi-part
-/// decimals like "03.1" (which digit-mashing used to turn into "31").
+/// whole question number.
+///
+/// Phase 1: accepts the many numbering styles boards use:
+///   * integer JSON numbers: 1, 2, 3
+///   * plain digit strings: "1", "12"
+///   * zero-padded / AQA spaced: "01", "0 1", "0 10"
+///   * suffixed: "1." "1)" "1]" "1–" (en-dash) "1-"
+///   * prefixed: "Q1" "Q.1" "Q 1" "Question 1" "QUESTION 3"
+///
+/// Still rejects:
+///   * zero, numbers > 200 (raised from 60 so IB / CIE papers with many
+///     structured questions don't false-negative — a 200-question paper
+///     is implausible at A-Level),
+///   * decimals like "03.1" / "3.5 V" / "1,2" (sub-parts and quantities),
+///   * floats (3.7).
 pub fn value_to_question_number(v: &serde_json::Value) -> Option<u32> {
     let raw: Option<u64> = match v {
         serde_json::Value::Number(n) => n
@@ -69,28 +82,84 @@ pub fn value_to_question_number(v: &serde_json::Value) -> Option<u32> {
                 })
             }),
         serde_json::Value::String(s) => {
-            let t = s.trim();
-            if t.contains('.') || t.contains(',') {
-                // "03.1" or "1,2" are sub-part styles — refuse to guess.
-                None
-            } else {
-                // AQA prints "0 1" / "0 2" (space between 0 and number).
-                // Strip all whitespace so "0 1" → "01" → 1, while still
-                // rejecting non-numeric strings like "Question 1".
-                let compact: String = t.chars().filter(|c| !c.is_whitespace()).collect();
-                if compact.is_empty() {
-                    None
-                } else {
-                    compact.parse::<u64>().ok()
-                }
-            }
+            parse_question_number_string(s.trim())
         }
         _ => None,
     };
     match raw {
-        Some(n) if (1..=60).contains(&n) => Some(n as u32),
+        Some(n) if (1..=200).contains(&n) => Some(n as u32),
         _ => None,
     }
+}
+
+/// Helper: parse a question-number string tolerantly. Returns None on any
+/// ambiguity that looks like a sub-part or a quantity rather than a whole
+/// question.
+fn parse_question_number_string(t: &str) -> Option<u64> {
+    // Fast path: all digits (possibly with whitespace) after stripping
+    // leading zeros. That preserves the existing AQA "0 1" → 1 behaviour.
+    let stripped_ws: String = t.chars().filter(|c| !c.is_whitespace()).collect();
+
+    // Strip a leading Q / Q. / Question / QUESTION prefix (case insensitive).
+    let lower = stripped_ws.to_ascii_lowercase();
+    let without_prefix = lower
+        .strip_prefix("question")
+        .map(|s| s.trim_start_matches('.'))
+        .unwrap_or(&lower)
+        .trim_start_matches('q')
+        .trim_start_matches('.');
+
+    // Strip a single trailing sentence / bracket / dash character.
+    // "1." → "1", "1)" → "1", "1]" → "1", "1–" → "1", "1-" → "1"
+    let mut chars: Vec<char> = without_prefix.chars().collect();
+    // Allow one trailing en-dash/em-dash/hyphen/closing-paren/bracket/full-stop.
+    while let Some(&last) = chars.last() {
+        if matches!(last, '.' | ')' | ']' | '-' | '–' | '—' | ':' | '}') {
+            chars.pop();
+        } else {
+            break;
+        }
+    }
+    let cleaned: String = chars.into_iter().collect();
+
+    // Reject if any internal non-digit character remains (filters "3.5",
+    // "03.1", "1,2", "1(a)", etc.). Internal dots/commas/parens are never
+    // part of a whole-question number.
+    if cleaned.is_empty() {
+        return None;
+    }
+    if !cleaned.chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+
+    // Reject strings that look like they started with a decimal part
+    // (e.g. original t was "03.1" — we stripped the trailing '.' above
+    // leaving "03.1" with an internal '.' → already rejected above; an
+    // additional belt-and-braces check on the original form: if the raw
+    // string had an interior '.' or ',' that wasn't a trailing sentence
+    // punctuation, refuse).
+    if t.contains('.') || t.contains(',') {
+        // Count how many '.'/',' appear inside the stripped (non-ws) form,
+        // ignoring trailing punctuation we already trimmed.
+        let interior = t.trim().trim_end_matches(|c: char| {
+            c.is_whitespace() || matches!(c, '.' | ')' | ']' | '-' | '–' | '—')
+        });
+        // If a '.' remains after trimming trailing punctuation and there
+        // are digits both sides (i.e. not "Q.1" which we already handled
+        // by stripping the leading 'q' + '.'), treat as sub-part.
+        let interior_stripped = interior.trim_start_matches(|c: char| {
+            c.is_whitespace()
+                || matches!(
+                    c,
+                    'q' | 'Q' | 'u' | 'e' | 's' | 't' | 'i' | 'o' | 'n' | '.'
+                )
+        });
+        if interior_stripped.contains('.') || interior_stripped.contains(',') {
+            return None;
+        }
+    }
+
+    cleaned.parse::<u64>().ok()
 }
 
 // ── Truncation detection ────────────────────────────────────────────────────
@@ -701,7 +770,7 @@ mod tests {
         assert_eq!(value_to_question_number(&serde_json::json!("12")), Some(12));
         assert_eq!(value_to_question_number(&serde_json::json!("03.1")), None); // not "31"!
         assert_eq!(value_to_question_number(&serde_json::json!(0)), None);
-        assert_eq!(value_to_question_number(&serde_json::json!(99)), None);
+        assert_eq!(value_to_question_number(&serde_json::json!(201)), None); // >200
         assert_eq!(value_to_question_number(&serde_json::json!(3.7)), None);
     }
 
@@ -714,6 +783,24 @@ mod tests {
         assert_eq!(value_to_question_number(&serde_json::json!("01")), Some(1));
         // Still reject decimals
         assert_eq!(value_to_question_number(&serde_json::json!("0 1.1")), None);
+    }
+
+    #[test]
+    fn question_number_accepts_phase1_formats() {
+        // Dot/paren/bracket/dash suffixes used by every board.
+        assert_eq!(value_to_question_number(&serde_json::json!("1.")), Some(1));
+        assert_eq!(value_to_question_number(&serde_json::json!("1)")), Some(1));
+        assert_eq!(value_to_question_number(&serde_json::json!("5]")), Some(5));
+        assert_eq!(value_to_question_number(&serde_json::json!("12-")), Some(12));
+        // Q-prefixes.
+        assert_eq!(value_to_question_number(&serde_json::json!("Q1")), Some(1));
+        assert_eq!(value_to_question_number(&serde_json::json!("Q.3")), Some(3));
+        assert_eq!(value_to_question_number(&serde_json::json!("Q 7")), Some(7));
+        assert_eq!(value_to_question_number(&serde_json::json!("Question 4")), Some(4));
+        assert_eq!(value_to_question_number(&serde_json::json!("QUESTION 10")), Some(10));
+        // Quantities with units must still be rejected (the "3.5 V" case).
+        assert_eq!(value_to_question_number(&serde_json::json!("3.5 V")), None);
+        assert_eq!(value_to_question_number(&serde_json::json!("1,2")), None);
     }
 
     #[test]
