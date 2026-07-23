@@ -236,17 +236,6 @@ pub fn scan_text_layer(page_texts: &[String]) -> TextScan {
     // questions" / "instructions" / "glossary" AND a short page, and match
     // them only at line start. The line-end anchor (\s|$|:) keeps us from
     // matching partial words like "instructional".
-    // Phase 2: image-only PDF detection. When the entire text layer across
-    // all pages totals fewer than 100 characters, the PDF is almost certainly
-    // a scanned/image-only document with no usable text layer. In that case,
-    // pages with empty text must NOT be classified as NonQuestion — they are
-    // Ambiguous so the structure pass sends their images to the vision model.
-    // Without this, every page becomes NonQuestion, the structure pass
-    // short-circuits to synthetic BLANK responses, vision never runs, and the
-    // document map is empty — the "Blank Page Trap" that kills AQA Physics.
-    let total_text_len: usize = page_texts.iter().map(|t| t.len()).sum();
-    let is_image_only_pdf = total_text_len < 100;
-
     let instr_re = regex::Regex::new(
         r"(?i)(?:^|\n)\s*(?:instructions?\s*(?:to\s+candidates?)?|answer\s+all\s+questions|glossary)(?:\s|$|:)",
     ).unwrap();
@@ -342,16 +331,18 @@ pub fn scan_text_layer(page_texts: &[String]) -> TextScan {
         let instr_hit = instr_re.is_match(text);
         let ref_hit = ref_re.is_match(text) || is_formulae_sheet;
 
-        if blank_re.is_match(text) || text.trim().is_empty() {
-            // Phase 2: image-only PDF override. Empty text in a scanned PDF
-            // doesn't mean "not a question page" — it means "no text layer".
-            // Mark as Ambiguous so vision structure pass actually runs on these
-            // pages instead of short-circuiting to synthetic BLANK.
-            if is_image_only_pdf {
-                page_reliability[page] = PageReliability::Ambiguous;
-            } else {
-                page_reliability[page] = PageReliability::NonQuestion;
-            }
+        if blank_re.is_match(text) {
+            // Explicit "BLANK PAGE" marker — definitely not a question page.
+            page_reliability[page] = PageReliability::NonQuestion;
+        } else if text.trim().is_empty() {
+            // Phase 2b: empty text layer could mean "genuinely blank page" OR
+            // "question page in an image-only PDF". We can't tell without the
+            // image, so mark as Ambiguous and let the vision structure pass
+            // determine the role. This prevents the structure pass from
+            // short-circuiting to synthetic BLANK on image-only PDFs where
+            // only SOME pages have empty text (e.g. AQA Physics 2021 where
+            // cover pages have text but question pages don't).
+            page_reliability[page] = PageReliability::Ambiguous;
         } else if has_footer {
             page_reliability[page] = PageReliability::Reliable;
         } else if (instr_hit || ref_hit) && !has_question_signal && (is_short_rubric || is_formulae_sheet) {
