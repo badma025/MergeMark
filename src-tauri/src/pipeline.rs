@@ -801,6 +801,13 @@ pub async fn run_question_pipeline<C: LlmClient, P: Progress>(
                 extract_batch_start.elapsed().as_millis() as u64,
             );
             for (&i, (mut outcome, local)) in batch.iter().zip(results) {
+                // Phase 2b: extract error reason BEFORE absorbing (local is consumed)
+                let fallback_error = local
+                    .anomalies
+                    .iter()
+                    .rev()
+                    .find(|a| a.contains("quarantine:"))
+                    .and_then(|a| a.split_once("quarantine: ").map(|(_, e)| e.to_string()));
                 report.absorb(local);
                 report.pages_processed += 1;
                 // Sequential assembly enforces monotonic numbering: a page
@@ -856,7 +863,9 @@ pub async fn run_question_pipeline<C: LlmClient, P: Progress>(
                             scope: "question-page".to_string(),
                             page: Some(i + 1),
                             question_number: None,
-                            reason: "page failed validation and repair attempts".to_string(),
+                            reason: fallback_error.clone().unwrap_or_else(|| {
+                                "page failed validation and repair attempts".to_string()
+                            }),
                         });
                     }
                 }
@@ -1997,6 +2006,15 @@ RULES:
         }
 
         return (Some(built_questions), report);
+    }
+    // Phase 2b: include the last error in the report so the quarantine event
+    // can surface the actual validation failure reason (not just a generic message)
+    if !last_error.is_empty() {
+        report.anomalies.push(format!(
+            "page {} quarantine: {}",
+            page_idx + 1,
+            last_error
+        ));
     }
     (None, report)
 }
