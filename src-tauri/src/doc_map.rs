@@ -180,13 +180,10 @@ fn paper_total_regex() -> regex::Regex {
 ///   * part labels (a)/(b)/(i) — those never begin with 1+ digits at line
 ///     start followed by a period/closing paren without a letter.
 fn question_heading_regex() -> regex::Regex {
-    // Phase 2: added `0\s*` to tolerate AQA's spaced margin padding
-    // (e.g. "0 7" for question 7, where the zero and the significant digit
-    // are separated by whitespace). The `\s*` quantifier accepts zero spaces
-    // (normal "07" or "7") or one+ spaces ("0 7"), so Edexcel-style headings
-    // ("1.", "2)") continue to match unchanged.
+    // Tolerates AQA's spaced margin padding (e.g. "0 7" for question 7, "1 0" for 10).
+    // The digits may be separated by space. 
     regex::Regex::new(
-        r"(?m)(?:^|\n)\s*(?:\*\*)?(?:Q(?:uestion)?\.?\s*)?0\s*([1-9]\d{0,2})(?:\*\*)?\s*(?:[\.\)\]\-–—]|\s+)(?:\D|$)",
+        r"(?m)(?:^|\n)\s*(?:\*\*)?(?:Q(?:uestion)?\.?\s*)?0*\s*([1-9](?:\s*\d){0,2})(?:\*\*)?\s*(?:[\.\)\]\-–—]|\s+)(?:\D|$)",
     )
     .unwrap()
 }
@@ -244,8 +241,8 @@ pub fn scan_text_layer(page_texts: &[String]) -> TextScan {
     // Without this, every page becomes NonQuestion, the structure pass
     // short-circuits to synthetic BLANK responses, vision never runs, and the
     // document map is empty — the "Blank Page Trap" that kills AQA Physics.
-    let total_text_len: usize = page_texts.iter().map(|t| t.len()).sum();
-    let is_image_only_pdf = total_text_len < 100;
+    let total_text_len: usize = page_texts.iter().map(|t| t.trim().len()).sum();
+    let is_image_only = total_text_len < 100;
 
     let instr_re = regex::Regex::new(
         r"(?i)(?:^|\n)\s*(?:instructions?\s*(?:to\s+candidates?)?|answer\s+all\s+questions|glossary)(?:\s|$|:)",
@@ -307,9 +304,16 @@ pub fn scan_text_layer(page_texts: &[String]) -> TextScan {
         for cap in heading_re.captures_iter(text) {
             let full = cap.get(0).unwrap();
             let y_frac = (full.start() as f32 / page_len).clamp(0.0, 1.0);
-            if let Ok(n) = cap[1].parse::<u32>() {
+            let cleaned_num = cap[1].replace(" ", "");
+            if let Ok(n) = cleaned_num.parse::<u32>() {
                 if n > 0 && n <= 200 {
-                    headings.push(QuestionHeading { page, number: n, y_frac });
+                    // Prevent page numbers at the very bottom of the page (e.g. "2 5 IB/M/...")
+                    // from being misclassified as questions. Real question headings always have
+                    // the actual question text following them.
+                    let chars_remaining = text.len() - full.end();
+                    if chars_remaining > 30 {
+                        headings.push(QuestionHeading { page, number: n, y_frac });
+                    }
                 }
             }
         }
@@ -342,16 +346,10 @@ pub fn scan_text_layer(page_texts: &[String]) -> TextScan {
         let instr_hit = instr_re.is_match(text);
         let ref_hit = ref_re.is_match(text) || is_formulae_sheet;
 
-        if blank_re.is_match(text) || text.trim().is_empty() {
-            // Phase 2: image-only PDF override. Empty text in a scanned PDF
-            // doesn't mean "not a question page" — it means "no text layer".
-            // Mark as Ambiguous so vision structure pass actually runs on these
-            // pages instead of short-circuiting to synthetic BLANK.
-            if is_image_only_pdf {
-                page_reliability[page] = PageReliability::Ambiguous;
-            } else {
-                page_reliability[page] = PageReliability::NonQuestion;
-            }
+        if is_image_only {
+            page_reliability[page] = PageReliability::Ambiguous;
+        } else if blank_re.is_match(text) || text.trim().is_empty() {
+            page_reliability[page] = PageReliability::NonQuestion;
         } else if has_footer {
             page_reliability[page] = PageReliability::Reliable;
         } else if (instr_hit || ref_hit) && !has_question_signal && (is_short_rubric || is_formulae_sheet) {
@@ -411,40 +409,14 @@ fn build_spans_from_reliable_pages(
         } else {
             for (i, f) in footers.iter().enumerate() {
                 let end_page = f.page;
-                let prev_footer_page = if i == 0 { None } else { Some(footers[i - 1].page) };
-                let mut start_page = if i == 0 {
+                let start_page = if i == 0 {
                     estimate_first_question_start_reliable(&scan.page_reliability, end_page)
                 } else {
-                    mid_page_start(&footers[i - 1], f)
+                    detect_page_split(&footers[i - 1], f, &scan.headings)
                 };
                 if start_page > end_page || end_page >= num_pages {
                     anomalies.push(format!("inconsistent span for Q{}", f.question));
                     continue;
-                }
-
-                // Phase 1 (weld-bug fix): a long-standing bug set start_page to
-                // prev.page unconditionally ("Q_N always starts on the page where
-                // Q_{N-1}'s footer sits"). That's correct only when Q_N's heading
-                // appears on prev.page. When prev.page shows only the tail of
-                // Q_{N-1} and Q_N starts LATER (e.g. prev footer is page 2 but Q3
-                // heading is on page 3), we must not drag prev.page into Q_N's
-                // span. If Q_N has a heading anywhere strictly AFTER prev.page
-                // and at/before end_page, start there instead.
-                if let Some(pfp) = prev_footer_page {
-                    let mut heading_page: Option<usize> = None;
-                    for h in &scan.headings {
-                        if h.number == f.question && h.page > pfp && h.page <= end_page {
-                            heading_page = Some(match heading_page {
-                                Some(cur) => cur.min(h.page),
-                                None => h.page,
-                            });
-                        }
-                    }
-                    if let Some(hp) = heading_page {
-                        if hp > start_page {
-                            start_page = hp;
-                        }
-                    }
                 }
 
                 // Phase 1: infer vertical clips from headings + footer position.
@@ -745,6 +717,7 @@ pub fn build_hybrid_map(
     let mut valid_spans = Vec::new();
     let mut prev_num = 0u32;
     let mut prev_end_page = 0usize;
+    println!("DEBUG SPANS BEFORE VALIDATION: {:#?}", spans);
     for mut span in spans {
         if span.number <= prev_num {
             anomalies.push(format!(
@@ -1014,12 +987,16 @@ fn merge_spans(
     text_spans
 }
 
-/// When question N-1's footer and question N's footer are on the same page,
-/// N both starts and ends there (one-page question). Otherwise N starts on
-/// the page where N-1's footer is, since questions often start on the same page
-/// the previous question ended.
-fn mid_page_start(prev: &Footer, _cur: &Footer) -> usize {
-    prev.page
+/// Determine whether Question N starts on the same page where Question N-1 ended,
+/// or on the next page. If we find a heading for Question N on N-1's footer page
+/// that is *below* N-1's footer (y_frac > prev.y_frac), they share the page.
+fn detect_page_split(prev: &Footer, cur: &Footer, headings: &[QuestionHeading]) -> usize {
+    for h in headings {
+        if h.number == cur.question && h.page == prev.page && h.y_frac > prev.y_frac {
+            return prev.page;
+        }
+    }
+    prev.page + 1
 }
 
 /// Find where question 1 plausibly starts: scan pages before its footer for
@@ -1032,7 +1009,7 @@ fn estimate_first_question_start(page_texts: &[String], first_footer_page: usize
     .unwrap();
     // Phase 2: tolerate AQA's spaced margin marker "0 1" in addition to the
     // compact "01" / bare "1" forms already accepted.
-    let margin_re = regex::Regex::new(r"(?m)^\s*0\s*1\s*$").unwrap();
+    let margin_re = regex::Regex::new(r"(?m)^\s*0?\s*1\s*$").unwrap();
     let mut start = 0usize;
     for p in 0..first_footer_page {
         let text = &page_texts[p];
@@ -1372,7 +1349,7 @@ mod tests {
         let t = texts(&[
             "Centre Number\nInstructions\nAnswer ALL questions",
             "1. Question one text (a) part - this page contains enough text to be considered ambiguous instead of non-question. Let's pad it out with some more text to be absolutely sure it exceeds one hundred characters.",
-            "middle of Q1 (Total for Question 1 is 5 marks)\n3. second question",
+            "middle of Q1 (Total for Question 1 is 5 marks)\n3. second question - adding some more text to ensure chars_remaining > 30 passes",
             "second continues (Total for Question 2 is 6 marks)",
             "TOTAL FOR PAPER IS 11 MARKS",
         ]);

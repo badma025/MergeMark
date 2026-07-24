@@ -11,13 +11,6 @@ import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/u
 import { Button } from "@/components/ui/button";
 import { useTaxonomy } from "@/lib/TaxonomyContext";
 
-import * as pdfjsLib from "pdfjs-dist";
-
-pdfjsLib.GlobalWorkerOptions.workerSrc = new URL(
-  "pdfjs-dist/build/pdf.worker.mjs",
-  import.meta.url
-).toString();
-
 export interface Quarantine { scope: string; page?: number; questionNumber?: number; reason: string }
 export interface TimingEntry {
   stage: string;
@@ -197,136 +190,7 @@ export function IngestionDropzone({ isActive = false, onSuccess }: IngestionDrop
     setIsProcessing(true);
     setProgressMsg("");
     try {
-      let pdfBase64Pages: string[] | undefined = undefined;
-      
-      if (filePath.toLowerCase().endsWith(".pdf")) {
-        const assetUrl = convertFileSrc(filePath);
-        const response = await fetch(assetUrl);
-        const arrayBuffer = await response.arrayBuffer();
 
-        const pdf = await pdfjsLib.getDocument({
-          data: arrayBuffer,
-          standardFontDataUrl: `https://unpkg.com/pdfjs-dist@${pdfjsLib.version}/standard_fonts/`,
-          cMapUrl: `https://unpkg.com/pdfjs-dist@${pdfjsLib.version}/cmaps/`,
-          cMapPacked: true,
-          wasmUrl: `https://unpkg.com/pdfjs-dist@${pdfjsLib.version}/wasm/`,
-        }).promise;
-        const pages: string[] = [];
-        const numPages = pdf.numPages;
-
-        // Phase 0 render settings:
-        //  * RENDER_SCALE  = 2.0  → ~200 DPI on a standard A4 page (72 DPI CSS
-        //    pixel * 2 ≈ 144 DPI; pdf.js points are 1/72" so scale 2.0 gives
-        //    144 DPI rendered pixels — enough for the vision model and for
-        //    in-app diagram crops. Diagram crops from this buffer are ~2×
-        //    sharper than the previous 0.6-scale (0.6 → 2.0 = 3.3× linear
-        //    resolution, ~11× pixel count).
-        //  * JPEG_QUALITY = 0.92 → visually lossless for text+line art;
-        //    avoids the 0.82 JPEG mush on fine lines and subscripts.
-        //  * Every non-blank page is rasterized. Previously the code sent the
-        //    sentinel "TEXT_ONLY" for pages without embedded raster images,
-        //    but PDF vector graphics (diagrams, circuits, graphs) are drawn
-        //    as PATH operators — not images — so those pages were sent
-        //    without a picture. The model then never saw the figure.
-        const RENDER_SCALE = 2.0;
-        const JPEG_QUALITY = 0.92;
-        // Sentinel strings the Rust pipeline recognises (must stay in sync
-        // with pipeline.rs::is_sentinel_page).
-        const SKIP = "__SKIP__";
-        const ops: any = pdfjsLib.OPS;
-        // Vector-path operator set — any one of these on a page means the
-        // page has drawn lines/curves (graphs, circuits, force diagrams,
-        // geometry figures) and must be rendered as an image.
-        const VECTOR_PATH_OPS = new Set<number>([
-          ops.constructPath,         // 64
-          ops.closePath,             // 67
-          ops.stroke,                // 68
-          ops.fill,                  // 69
-          ops.eoFill,                // 70
-          ops.fillStroke,            // 75
-          ops.eoFillStroke,          // 76
-          ops.rectangle,             // 65
-          ops.moveTo,                // 30
-          ops.lineTo,                // 31
-          ops.curveTo,               // 32
-          ops.curveTo2,              // 33
-          ops.curveTo3,              // 34
-          ops.appendRectangle,       // 35
-        ]);
-
-        for (let i = 1; i <= numPages; i++) {
-          try {
-            const page = await pdf.getPage(i);
-
-            // Blank-page detection: treat pages with effectively no text
-            // content as skipped — no need to send an image to the model.
-            const textContent = await page.getTextContent();
-            const rawText = textContent.items.map((item: any) => item.str).join("").trim();
-            const isBlank =
-              !rawText || rawText.replace(/\s+/g, "").toUpperCase() === "BLANKPAGE";
-
-            // Decide whether the page has any visual content beyond plain
-            // text: either embedded raster images OR vector path operators.
-            const opList = await page.getOperatorList();
-            const hasRasterImage = opList.fnArray.some(
-              (fn: number) =>
-                fn === ops.paintImageXObject ||
-                fn === ops.paintJpegXObject ||
-                fn === ops.paintXObject ||
-                fn === ops.paintInlineImageXObject ||
-                fn === ops.paintInlineImageXObjectGroup ||
-                fn === ops.paintImageMaskXObject ||
-                fn === ops.paintImageMaskXObjectGroup,
-            );
-            const hasVectorPaths = opList.fnArray.some((fn: number) =>
-              VECTOR_PATH_OPS.has(fn),
-            );
-
-            if (isBlank) {
-              pages.push(SKIP);
-              continue;
-            }
-
-            // Always render the page. Text-only (no image, no paths) pages
-            // could in principle skip rendering, but pdf.js's operator list
-            // misses some vector primitives (e.g. shading patterns, Type 3
-            // fonts drawn as paths) and the token cost of a 200 DPI JPEG is
-            // small compared to the cost of misclassifying a figure page as
-            // text-only. Physics papers in particular draw nearly every
-            // diagram as paths; we can't afford to miss them.
-            const viewport = page.getViewport({ scale: RENDER_SCALE });
-            const canvas = document.createElement("canvas");
-            const context = canvas.getContext("2d", { alpha: false });
-            if (!context) {
-              pages.push(SKIP);
-              continue;
-            }
-            // Round to integer pixels to avoid subpixel bleed.
-            canvas.width = Math.ceil(viewport.width);
-            canvas.height = Math.ceil(viewport.height);
-            context.fillStyle = "white";
-            context.fillRect(0, 0, canvas.width, canvas.height);
-            // We already filled the canvas with opaque white above, which
-            // is the pdf.js-portable way to ensure transparent objects
-            // composite onto white (they would otherwise JPEG-encode to
-            // black). `intent: "display"` uses the device pixel ratio
-            // without printing overprint effects.
-            await page.render({
-              canvasContext: context,
-              canvas,
-              viewport,
-              intent: "display",
-            }).promise;
-            const dataUrl = canvas.toDataURL("image/jpeg", JPEG_QUALITY);
-            const b64 = dataUrl.split(",")[1];
-            pages.push(b64);
-          } catch (pageErr) {
-            console.error(`Error processing page ${i}:`, pageErr);
-            pages.push("__SKIP__");
-          }
-        }
-        pdfBase64Pages = pages;
-      }
 
       if (importMode === "mark_scheme") {
         // Use the DB-selected paper name so MS questions match the QP that was already imported.
@@ -337,7 +201,6 @@ export function IngestionDropzone({ isActive = false, onSuccess }: IngestionDrop
         const mappings = await invoke<ProposedMapping[]>("parse_mark_scheme_vision", {
           filePath,
           apiKey,
-          pdfBase64Pages,
           baseUrl,
           modelName,
           paperName: effectivePaperName,
@@ -347,7 +210,6 @@ export function IngestionDropzone({ isActive = false, onSuccess }: IngestionDrop
         const questions = await invoke<any[]>("parse_pdf_vision", { 
           filePath, 
           apiKey,
-          pdfBase64Pages,
           baseUrl,
           modelName,
           subject,

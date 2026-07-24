@@ -87,7 +87,11 @@ pub fn value_to_question_number(v: &serde_json::Value) -> Option<u32> {
                         // real physics quantities rarely land exactly on those.
                         let frac = (f.fract() * 10.0).round();
                         if (1.0..=9.0).contains(&frac) {
-                            Some(f.trunc() as u64)
+                            if (f.fract() * 10.0 - frac).abs() < 1e-4 {
+                                Some(f.trunc() as u64)
+                            } else {
+                                None
+                            }
                         } else {
                             None
                         }
@@ -812,7 +816,7 @@ mod tests {
         assert_eq!(value_to_question_number(&serde_json::json!("03.1")), None); // not "31"!
         assert_eq!(value_to_question_number(&serde_json::json!(0)), None);
         assert_eq!(value_to_question_number(&serde_json::json!(201)), None); // >200
-        assert_eq!(value_to_question_number(&serde_json::json!(3.7)), None);
+        assert_eq!(value_to_question_number(&serde_json::json!(3.7)), Some(3)); // AQA spaced sub-part
     }
 
     #[test]

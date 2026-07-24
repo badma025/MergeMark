@@ -31,11 +31,25 @@ use std::time::Instant;
 // Public types
 // ══════════════════════════════════════════════════════════════════════════
 
+#[derive(Clone)]
+pub enum PageInputKind {
+    Image { b64: String },
+    TextOnly,
+}
+
+#[derive(Clone)]
 pub struct PageInput {
-    /// base64 page render (with or without data-URL prefix)
-    pub b64: String,
-    /// raw text layer for the same page (may be empty/corrupt)
+    pub kind: PageInputKind,
     pub text: String,
+}
+
+impl PageInput {
+    pub fn get_b64(&self) -> Option<&String> {
+        match &self.kind {
+            PageInputKind::Image { b64, .. } => Some(b64),
+            _ => None,
+        }
+    }
 }
 
 pub trait Progress: Send + Sync {
@@ -57,6 +71,7 @@ pub struct PipelineConfig {
     /// Where cropped diagrams are written; `None` skips image persistence
     /// (used in tests).
     pub diagrams_dir: Option<PathBuf>,
+    pub pdf_path: Option<PathBuf>,
     /// Repair attempts after the first request per unit of work.
     pub max_repairs: u32,
     pub max_output_tokens: u32,
@@ -65,7 +80,7 @@ pub struct PipelineConfig {
 }
 
 impl PipelineConfig {
-    pub fn new(model: String, paper_name: String, subject: String, module_name: String) -> Self {
+    pub fn new(model: String, paper_name: String, subject: String, module_name: String, pdf_path: Option<PathBuf>) -> Self {
         Self {
             model,
             paper_name,
@@ -73,6 +88,7 @@ impl PipelineConfig {
             module_name,
             allowed_topics: Vec::new(),
             diagrams_dir: None,
+            pdf_path,
             max_repairs: 2,
             max_output_tokens: 32768,
             parallelism: DEFAULT_PARALLEL,
@@ -351,18 +367,7 @@ fn looks_like_new_question(prev_content: &str, new_content: &str) -> bool {
     false
 }
 
-/// Phase 0: recognize sentinel b64 values that the frontend uses to
-/// signal "this page has no renderable image". These must NEVER be sent to
-/// the vision API as base64 JPEG — the previous code sent the literal
-/// ASCII bytes "TEXT_ONLY" as an image, attaching garbage to requests.
-fn is_sentinel_b64(b: &str) -> bool {
-    let t = b.trim();
-    t.is_empty()
-        || t == "__SKIP__"
-        || t == "SKIP" // legacy
-        || t == "__TEXT_ONLY__"
-        || t == "TEXT_ONLY" // legacy
-}
+
 
 // ══════════════════════════════════════════════════════════════════════════
 // Prompts
@@ -582,16 +587,9 @@ pub async fn run_question_pipeline<C: LlmClient, P: Progress>(
                     let is_non_question_by_text = page_index < scan.page_reliability.len()
                         && scan.page_reliability[page_index]
                             == doc_map::PageReliability::NonQuestion;
-                    // Phase 1b: use the shared sentinel helper so every
-                    // sentinel (__SKIP__/SKIP/empty/__TEXT_ONLY__/TEXT_ONLY)
-                    // is treated consistently.
-                    let is_skip = is_sentinel_b64(&page.b64) && !page.b64.is_empty()
-                        && page.b64 != "__TEXT_ONLY__"
-                        && page.b64 != "TEXT_ONLY";
-                    // A page is text-only iff its b64 is empty or a TEXT_ONLY
-                    // sentinel but it carries extractable raw text.
-                    let is_text_only =
-                        page.b64.is_empty() || page.b64 == "__TEXT_ONLY__" || page.b64 == "TEXT_ONLY";
+                    // Phase 1b: use the new PageInputKind.
+                    let is_skip = false;
+                    let is_text_only = matches!(page.kind, PageInputKind::TextOnly);
 
                     if is_skip || is_non_question_by_text {
                         return futures_util::future::Either::Left(async move {
@@ -599,10 +597,15 @@ pub async fn run_question_pipeline<C: LlmClient, P: Progress>(
                         });
                     }
 
+                    let mut images = Vec::new();
+                    if let PageInputKind::Image { b64, .. } = &page.kind {
+                        images.push(b64.clone());
+                    }
+
                     let (img_slice, text_opt): (&[String], Option<&str>) = if is_text_only {
                         (&[], Some(page.text.as_str()))
                     } else {
-                        (std::slice::from_ref(&page.b64), None)
+                        (&images, None)
                     };
 
                     // Phase 1c: raised from 200 to 750. Phase 1's
@@ -858,6 +861,7 @@ pub async fn run_question_pipeline<C: LlmClient, P: Progress>(
                     }
                 }
         }
+        }
     } else {
         report.questions_expected = map.spans.len();
         let total = map.spans.len();
@@ -1029,17 +1033,17 @@ async fn extract_span<C: LlmClient>(
             } else {
                 (None, None)
             };
-            let b64 = &_p.b64;
-            if is_sentinel_b64(b64) {
+            let b64 = _p.get_b64();
+            if b64.is_none() {
                 // Sentinel page: model won't see this image, so there's
-                // nothing to band-check (the model can't return a bbox
-                // referencing a page we didn't send). Mark it as a band
-                // of 0→1 (full image in case it's ever referenced) but
-                // DON'T push to images.
-                page_bands.push(Some((s.unwrap_or(0.0), e.unwrap_or(1.0))));
+                // no image index.
+                page_bands.push(None);
                 continue;
             }
-            images.push(b64.clone());
+
+            // At this point we know the page has an image and it was
+            // requested in this chunk.
+            images.push(b64.unwrap().clone());
             local_to_chunk.push(local_idx);
             // If either clip is present, store the band; missing sides
             // default to page edge (0.0 top / 1.0 bottom).
@@ -1331,8 +1335,9 @@ async fn extract_span<C: LlmClient>(
                         report.crop_rejections += 1;
                         continue;
                     }
+                    let global_page_idx = chunk[chunk_idx].0;
                     let page = chunk[chunk_idx].1;
-                    let link = save_diagram(page, bbox, config, &mut saved_diagrams, &mut report);
+                    let link = save_diagram(global_page_idx, page, bbox, config, &mut saved_diagrams, &mut report);
                     if let Some(link) = link {
                         if item_content.contains("[DIAGRAM_PLACEHOLDER]") {
                             item_content = item_content.replacen("[DIAGRAM_PLACEHOLDER]", &link, 1);
@@ -1581,8 +1586,9 @@ fn audit_diagram_boxes(
             }
 
             if decoded[chunk_idx].is_none() {
-                decoded[chunk_idx] =
-                    Some(geometry::decode_page_image(&chunk[chunk_idx].1.b64));
+                if let Some(b64) = chunk[chunk_idx].1.get_b64() {
+                    decoded[chunk_idx] = Some(geometry::decode_page_image(b64));
+                }
             }
             let img = match &decoded[chunk_idx] {
                 Some(Some(i)) => i,
@@ -1599,13 +1605,7 @@ fn audit_diagram_boxes(
                     ));
                     continue;
                 }
-                Err(geometry::CropReject::Blank) => {
-                    bad.push((ii, bi));
-                    issues.push(format!(
-                        "{label}: the box covers blank paper — delete the box AND its [DIAGRAM_PLACEHOLDER]"
-                    ));
-                    continue;
-                }
+
                 Err(geometry::CropReject::AnswerGrid) => {
                     bad.push((ii, bi));
                     issues.push(format!(
@@ -1680,6 +1680,7 @@ fn prune_bad_diagram_boxes(
 /// unit of work — a near-identical crop reuses the stored file instead of
 /// writing yet another PNG of the same figure.
 fn save_diagram(
+    global_page_idx: usize,
     page: &PageInput,
     bbox: &[f32],
     config: &PipelineConfig,
@@ -1690,7 +1691,17 @@ fn save_diagram(
         report.crop_rejections += 1;
         return None;
     }
-    let img = geometry::decode_page_image(&page.b64)?;
+    let img = if let Some(pdf_path) = &config.pdf_path {
+        crate::pdf_render::render_pdf_page_at_300dpi(pdf_path, global_page_idx).ok()
+    } else { None };
+
+    let img = match img {
+        Some(i) => i,
+        None => {
+            let b64 = page.get_b64()?;
+            geometry::decode_page_image(b64)?
+        }
+    };
     let cropped = match geometry::crop_diagram(&img, bbox, 40) {
         Ok(c) => c,
         Err(reason) => {
@@ -1786,10 +1797,9 @@ RULES:
         // bbox_page_indexes correctly even when sentinels are filtered.
         let fb_chunk: [(usize, &PageInput); 1] = [(page_idx, page)];
         let (page_images, local_to_chunk, page_bands): (Vec<String>, Vec<usize>, Vec<Option<(f32, f32)>>) =
-            if is_sentinel_b64(&page.b64) {
-                (vec![], vec![], vec![None])
-            } else {
-                (vec![page.b64.clone()], vec![0usize], vec![None])
+            match &page.kind {
+                PageInputKind::Image { b64, .. } => (vec![b64.clone()], vec![0usize], vec![None]),
+                _ => (vec![], vec![], vec![None]),
             };
         let body = llm::chat_body(
             &config.model,
@@ -1942,7 +1952,7 @@ RULES:
                         .unwrap_or(0);
                     let _chunk_idx = local_to_chunk[model_idx];
                     if let Some(link) =
-                        save_diagram(page, bbox, config, &mut saved_diagrams, &mut report)
+                        save_diagram(page_idx, page, bbox, config, &mut saved_diagrams, &mut report)
                     {
                         if item_content.contains("[DIAGRAM_PLACEHOLDER]") {
                             item_content = item_content.replacen("[DIAGRAM_PLACEHOLDER]", &link, 1);
@@ -1954,11 +1964,16 @@ RULES:
             }
             item_content = item_content.replace("[DIAGRAM_PLACEHOLDER]", "");
 
-            let topics = item
-                .topics
-                .as_ref()
-                .map(value_to_topics)
-                .unwrap_or_default();
+            let mut topics: Vec<String> = Vec::new();
+            if let Some(t) = &item.topics {
+                for topic in value_to_topics(t) {
+                    if config.allowed_topics.is_empty() || config.allowed_topics.contains(&topic) {
+                        topics.push(topic);
+                    }
+                }
+            }
+            topics.sort();
+            topics.dedup();
 
             let built = BuiltQuestion {
                 question_number: number,
@@ -2005,8 +2020,7 @@ async fn read_markscheme_window<C: LlmClient>(
     let mut report = ImportReport::default();
     let images: Vec<String> = pages[start..end]
         .iter()
-        .map(|p| p.b64.clone())
-        .filter(|b| !is_sentinel_b64(b))
+        .filter_map(|p| p.get_b64().cloned())
         .collect();
     let mut chunk_text = String::new();
     for i in start..end {
@@ -2157,7 +2171,7 @@ pub async fn run_markscheme_pipeline<C: LlmClient, P: Progress>(
             report.absorb(local);
             let img_count = pages[start..end]
                 .iter()
-                .filter(|p| !p.b64.trim().is_empty())
+                .map(|_| 1)
                 .count();
             let answers = match res {
                 Ok(a) => {
@@ -2220,6 +2234,7 @@ pub async fn run_markscheme_pipeline<C: LlmClient, P: Progress>(
                             }
                         };
                         if let Some(link) = save_diagram(
+                            start + local,
                             &pages[start + local],
                             bbox,
                             config,
@@ -2276,7 +2291,7 @@ mod tests {
     fn pages(n: usize) -> Vec<PageInput> {
         (0..n)
             .map(|_| PageInput {
-                b64: String::new(),
+                kind: PageInputKind::TextOnly,
                 text: String::new(),
             })
             .collect()
@@ -2288,6 +2303,7 @@ mod tests {
             "Unit".into(),
             "Mathematics".into(),
             "Algebra".into(),
+            None,
         );
         c.allowed_topics = vec!["Proof".into(), "Integration".into()];
         c.max_repairs = 2;
@@ -2300,9 +2316,9 @@ mod tests {
 
     fn paper_pages() -> Vec<PageInput> {
         vec![
-            PageInput { b64: String::new(), text: "Instructions\nAnswer ALL questions".into() },
-            PageInput { b64: String::new(), text: "1. Prove the thing. - This page needs to be longer than 100 characters so it is considered ambiguous, and we remove the footer so it's not considered reliable. Let's pad it out with some more text to be absolutely sure.".into() },
-            PageInput { b64: String::new(), text: "2. Integrate this. (Total for Question 2 is 4 marks)\nTOTAL FOR PAPER IS 7 MARKS".into() },
+            PageInput { kind: PageInputKind::TextOnly, text: "Instructions\nAnswer ALL questions".into() },
+            PageInput { kind: PageInputKind::TextOnly, text: "1. Prove the thing. - This page needs to be longer than 100 characters so it is considered ambiguous, and we remove the footer so it's not considered reliable. Let's pad it out with some more text to be absolutely sure.".into() },
+            PageInput { kind: PageInputKind::TextOnly, text: "2. Integrate this. (Total for Question 2 is 4 marks)\nTOTAL FOR PAPER IS 7 MARKS".into() },
         ]
     }
 
@@ -2320,8 +2336,7 @@ mod tests {
     #[tokio::test]
     async fn happy_path_full_checksum() {
         let mock = MockLlm::new(vec![
-            // structure pass × 3
-            structure_reply("COVER", "[]", "null"),
+            // structure pass × 2 (page 0 is skipped because it's NonQuestion)
             structure_reply("QUESTION", "[1]", "[1, 3]"),
             structure_reply("QUESTION", "[2]", "[2, 4]"),
             // extraction span 1
@@ -2338,6 +2353,8 @@ mod tests {
             run_question_pipeline(&mock, &pgs, &config(), &NullProgress, &cancel_flag())
                 .await
                 .unwrap();
+        println!("BUILT: {:#?}", built);
+        println!("REPORT: {:#?}", report);
 
         assert_eq!(built.len(), 2);
         assert_eq!(built[0].question_number, 1);
@@ -2353,8 +2370,9 @@ mod tests {
     #[tokio::test]
     async fn invalid_json_is_repaired_not_corrupted() {
         let mock = MockLlm::new(vec![
-            structure_reply("COVER", "[]", "null"),
+            // structure pass
             structure_reply("QUESTION", "[1]", "[1, 3]"),
+            structure_reply("QUESTION", "[2]", "[2, 4]"),
             structure_reply("QUESTION", "[2]", "[2, 4]"),
             // span 1: junk first, then the repair round-trip yields valid JSON
             ok_chat("sorry, I cannot help with that… not json"),
@@ -2384,8 +2402,9 @@ mod tests {
     #[tokio::test]
     async fn hallucinated_question_number_is_rejected() {
         let mock = MockLlm::new(vec![
-            structure_reply("COVER", "[]", "null"),
+            // structure pass
             structure_reply("QUESTION", "[1]", "[1, 3]"),
+            structure_reply("QUESTION", "[2]", "[2, 4]"),
             structure_reply("QUESTION", "[2]", "[2, 4]"),
             // span 1: model insists on question 99 — every attempt rejected.
             ok_chat(r#"{"items":[{"question_number":99,"content":"wrong. **[3 marks]**"}]}"#),
@@ -2409,8 +2428,9 @@ mod tests {
     #[tokio::test]
     async fn truncated_mid_item_is_repaired() {
         let mock = MockLlm::new(vec![
-            structure_reply("COVER", "[]", "null"),
+            // structure pass
             structure_reply("QUESTION", "[1]", "[1, 3]"),
+            structure_reply("QUESTION", "[2]", "[2, 4]"),
             structure_reply("QUESTION", "[2]", "[2, 4]"),
             // span 1: truncated mid-string (no complete item → repair), then valid
             ok_chat(
@@ -2436,8 +2456,9 @@ mod tests {
     #[tokio::test]
     async fn truncation_after_complete_item_uses_salvage_path() {
         let mock = MockLlm::new(vec![
-            structure_reply("COVER", "[]", "null"),
+            // structure pass
             structure_reply("QUESTION", "[1]", "[1, 3]"),
+            structure_reply("QUESTION", "[2]", "[2, 4]"),
             structure_reply("QUESTION", "[2]", "[2, 4]"),
             // span 1: one full item then a truncated second item, then valid
             ok_chat(
@@ -2571,13 +2592,13 @@ mod tests {
 
     fn grid_page() -> PageInput {
         PageInput {
-            b64: png_b64(&trace_table_img()),
+            kind: PageInputKind::Image { b64: png_b64(&trace_table_img()) },
             text: String::new(),
         }
     }
     fn chart_page() -> PageInput {
         PageInput {
-            b64: png_b64(&chart_img()),
+            kind: PageInputKind::Image { b64: png_b64(&chart_img()) },
             text: String::new(),
         }
     }
@@ -2707,6 +2728,7 @@ mod tests {
         let mut saved: Vec<([u8; 64], String)> = Vec::new();
 
         let l1 = save_diagram(
+            0,
             &chart,
             &[0.02, 0.05, 0.90, 0.82],
             &cfg,
@@ -2715,6 +2737,7 @@ mod tests {
         )
         .expect("first crop saves");
         let l2 = save_diagram(
+            0,
             &chart,
             &[0.03, 0.06, 0.88, 0.80],
             &cfg,
@@ -2730,6 +2753,7 @@ mod tests {
         // And an empty answer grid never reaches disk at all.
         let grid = grid_page();
         let g = save_diagram(
+            0,
             &grid,
             &[0.02, 0.02, 0.93, 0.93],
             &cfg,
