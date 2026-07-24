@@ -1337,7 +1337,8 @@ async fn extract_span<C: LlmClient>(
                     }
                     let global_page_idx = chunk[chunk_idx].0;
                     let page = chunk[chunk_idx].1;
-                    let link = save_diagram(global_page_idx, page, bbox, config, &mut saved_diagrams, &mut report);
+                    let ignore_grid = validate::figure_references(&item_content) > 0 && !validate::is_answer_grid_request(&item_content);
+                    let link = save_diagram(global_page_idx, page, bbox, config, &mut saved_diagrams, &mut report, ignore_grid);
                     if let Some(link) = link {
                         if item_content.contains("[DIAGRAM_PLACEHOLDER]") {
                             item_content = item_content.replacen("[DIAGRAM_PLACEHOLDER]", &link, 1);
@@ -1596,7 +1597,10 @@ fn audit_diagram_boxes(
                 // still applies, so nothing bad can reach disk.
                 _ => continue,
             };
-            let cropped = match geometry::crop_diagram(img, bbox, 40) {
+            let content = item.content.as_deref().unwrap_or("");
+            let ignore_grid = validate::figure_references(content) > 0 && !validate::is_answer_grid_request(content);
+
+            let cropped = match geometry::crop_diagram(img, bbox, 40, ignore_grid) {
                 Ok(c) => c,
                 Err(geometry::CropReject::BadBox) => {
                     bad.push((ii, bi));
@@ -1686,6 +1690,7 @@ fn save_diagram(
     config: &PipelineConfig,
     saved: &mut Vec<([u8; 64], String)>,
     report: &mut ImportReport,
+    ignore_grid: bool,
 ) -> Option<String> {
     if bbox.len() != 4 {
         report.crop_rejections += 1;
@@ -1702,7 +1707,7 @@ fn save_diagram(
             geometry::decode_page_image(b64)?
         }
     };
-    let cropped = match geometry::crop_diagram(&img, bbox, 40) {
+    let cropped = match geometry::crop_diagram(&img, bbox, 40, ignore_grid) {
         Ok(c) => c,
         Err(reason) => {
             report.crop_rejections += 1;
@@ -1824,7 +1829,18 @@ RULES:
         };
         let page_out = match parse_llm_json::<AiQuestionPage>(&content) {
             ParseOutcome::Clean(v) => v,
-            ParseOutcome::Salvaged { value, .. } => value,
+            ParseOutcome::Salvaged { value, dropped_tail } => {
+                report.salvage_events += 1;
+                // Phase 2: truncation check. If the page response was cut off,
+                // we must retry to avoid dropping questions.
+                if dropped_tail {
+                    last_error = "response was truncated; items may be missing".to_string();
+                    if attempt < max_attempts {
+                        continue;
+                    }
+                }
+                value
+            }
             ParseOutcome::Malformed { error } => {
                 last_error = format!("invalid JSON: {}", error);
                 report.repairs += 1;
@@ -1951,8 +1967,9 @@ RULES:
                         .filter(|&k| k < local_to_chunk.len())
                         .unwrap_or(0);
                     let _chunk_idx = local_to_chunk[model_idx];
+                    let ignore_grid = validate::figure_references(&item_content) > 0 && !validate::is_answer_grid_request(&item_content);
                     if let Some(link) =
-                        save_diagram(page_idx, page, bbox, config, &mut saved_diagrams, &mut report)
+                        save_diagram(page_idx, page, bbox, config, &mut saved_diagrams, &mut report, ignore_grid)
                     {
                         if item_content.contains("[DIAGRAM_PLACEHOLDER]") {
                             item_content = item_content.replacen("[DIAGRAM_PLACEHOLDER]", &link, 1);
@@ -2233,6 +2250,7 @@ pub async fn run_markscheme_pipeline<C: LlmClient, P: Progress>(
                                 0
                             }
                         };
+                        let ignore_grid = validate::figure_references(&md) > 0;
                         if let Some(link) = save_diagram(
                             start + local,
                             &pages[start + local],
@@ -2240,6 +2258,7 @@ pub async fn run_markscheme_pipeline<C: LlmClient, P: Progress>(
                             config,
                             &mut saved_diagrams,
                             &mut report,
+                            ignore_grid,
                         ) {
                             if md.contains("[DIAGRAM_PLACEHOLDER]") {
                                 md = md.replacen("[DIAGRAM_PLACEHOLDER]", &link, 1);
