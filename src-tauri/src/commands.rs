@@ -981,27 +981,38 @@ pub async fn parse_pdf_vision(
         .cancel_flag
         .store(false, std::sync::atomic::Ordering::Relaxed);
 
-    let pdf_pages = match pdf_base64_pages {
-        Some(p) if !p.is_empty() => p,
-        _ => return Err("No rasterized PDF pages provided.".into()),
+    let pages: Vec<PageInput> = match pdf_base64_pages.filter(|p| !p.is_empty()) {
+        Some(pdf_pages) => {
+            let num_pages = pdf_pages.len();
+            let path_clone = file_path.clone();
+            let page_texts = tokio::task::spawn_blocking(move || extract_page_texts(&path_clone, num_pages))
+                .await
+                .map_err(|e| format!("Thread-pool error: {}", e))?;
+            
+            pdf_pages
+                .into_iter()
+                .enumerate()
+                .map(|(i, b64)| PageInput {
+                    kind: if b64.is_empty() {
+                        crate::pipeline::PageInputKind::TextOnly
+                    } else {
+                        crate::pipeline::PageInputKind::Image { b64 }
+                    },
+                    text: page_texts.get(i).cloned().unwrap_or_default(),
+                })
+                .collect()
+        },
+        None => {
+            if file_path.to_lowercase().ends_with(".pdf") {
+                let path_clone = file_path.clone();
+                tokio::task::spawn_blocking(move || crate::pdf_render::render_pdf_pages(std::path::Path::new(&path_clone)))
+                    .await
+                    .map_err(|e| format!("Thread-pool error: {}", e))??
+            } else {
+                return Err("No rasterized PDF pages provided and file is not a PDF.".into());
+            }
+        }
     };
-    let num_pages = pdf_pages.len();
-
-    // Per-page raw text (for the document map + OCR hints), off the async loop.
-    let path_clone = file_path.clone();
-    let page_texts =
-        tokio::task::spawn_blocking(move || extract_page_texts(&path_clone, num_pages))
-            .await
-            .map_err(|e| format!("Thread-pool error: {}", e))?;
-
-    let pages: Vec<PageInput> = pdf_pages
-        .into_iter()
-        .enumerate()
-        .map(|(i, b64)| PageInput {
-            b64,
-            text: page_texts.get(i).cloned().unwrap_or_default(),
-        })
-        .collect();
 
     let diagrams_dir = app.path().app_data_dir().map(|d| d.join("diagrams")).ok();
 
@@ -1038,6 +1049,7 @@ pub async fn parse_pdf_vision(
         paper_name.trim().to_string(),
         subject_name.0,
         module_name.0,
+        Some(std::path::PathBuf::from(&file_path)),
     );
     config.allowed_topics = allowed_topics;
     config.diagrams_dir = diagrams_dir;
@@ -1333,10 +1345,19 @@ pub async fn parse_mark_scheme_vision(
             .into_iter()
             .enumerate()
             .map(|(i, b64)| PageInput {
-                b64,
+                kind: if b64.is_empty() {
+                    crate::pipeline::PageInputKind::TextOnly
+                } else {
+                    crate::pipeline::PageInputKind::Image { b64 }
+                },
                 text: texts.get(i).cloned().unwrap_or_default(),
             })
             .collect()
+    } else if file_path.to_lowercase().ends_with(".pdf") {
+        let path_clone = file_path.clone();
+        tokio::task::spawn_blocking(move || crate::pdf_render::render_pdf_pages(std::path::Path::new(&path_clone)))
+            .await
+            .map_err(|e| format!("Thread-pool error: {}", e))??
     } else if is_image {
         use base64::Engine;
         let image_bytes = tokio::fs::read(&file_path)
@@ -1344,7 +1365,7 @@ pub async fn parse_mark_scheme_vision(
             .map_err(|e| format!("Failed to read image: {}", e))?;
         let b64 = base64::engine::general_purpose::STANDARD.encode(&image_bytes);
         vec![PageInput {
-            b64,
+            kind: crate::pipeline::PageInputKind::Image { b64 },
             text: String::new(),
         }]
     } else {
@@ -1368,7 +1389,7 @@ pub async fn parse_mark_scheme_vision(
             return Err("File is empty or contains only unextractable images.".to_string());
         }
         vec![PageInput {
-            b64: String::new(),
+            kind: crate::pipeline::PageInputKind::TextOnly,
             text,
         }]
     };
@@ -1380,6 +1401,7 @@ pub async fn parse_mark_scheme_vision(
         paper_name.trim().to_string(),
         "MarkScheme".into(),
         "MarkScheme".into(),
+        Some(std::path::PathBuf::from(&file_path)),
     );
     config.diagrams_dir = diagrams_dir;
     config.max_repairs = 2;

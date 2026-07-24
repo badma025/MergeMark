@@ -282,40 +282,6 @@ fn is_safe_expansion(
     true
 }
 
-/// Variance/luma check — true when a crop is blank or an empty student grid.
-pub fn is_blank_or_grid(img: &image::DynamicImage) -> bool {
-    use image::GenericImageView;
-    let (width, height) = img.dimensions();
-    if width == 0 || height == 0 {
-        return true;
-    }
-
-    let mut sum = 0.0_f64;
-    let mut sum_sq = 0.0_f64;
-    let mut count = 0.0_f64;
-    let mut non_white_count = 0.0_f64;
-
-    for (_, _, pixel) in img.pixels() {
-        let luma = pixel[0] as f64 * 0.299 + pixel[1] as f64 * 0.587 + pixel[2] as f64 * 0.114;
-        sum += luma;
-        sum_sq += luma * luma;
-        count += 1.0;
-        if luma < 180.0 {
-            non_white_count += 1.0;
-        }
-    }
-
-    if count == 0.0 {
-        return true;
-    }
-
-    let mean = sum / count;
-    let variance = (sum_sq / count) - (mean * mean);
-    let non_white_ratio = non_white_count / count;
-
-    variance < 5.0 || non_white_ratio < 0.0001
-}
-
 /// Structural empty-answer-grid detector.
 ///
 /// `is_blank_or_grid` misses ruled student answer grids (AQA trace tables,
@@ -469,8 +435,6 @@ pub fn signature_distance(a: &[u8; 64], b: &[u8; 64]) -> u32 {
 pub enum CropReject {
     /// bbox failed the sanitizer / out of bounds / implausible
     BadBox,
-    /// blank or near-empty crop (luma variance guard)
-    Blank,
     /// ruled empty student answer grid (trace table, working grid)
     AnswerGrid,
 }
@@ -526,9 +490,7 @@ pub fn crop_diagram(
 
     let mut owned = img.clone();
     let cropped = image::imageops::crop(&mut owned, safe_x, safe_y, safe_w, safe_h).to_image();
-    if is_blank_or_grid(&image::DynamicImage::ImageRgba8(cropped.clone())) {
-        return Err(CropReject::Blank);
-    }
+
     let gray = image::DynamicImage::ImageRgba8(cropped.clone()).to_luma8();
     if looks_like_answer_grid(&gray) {
         return Err(CropReject::AnswerGrid);

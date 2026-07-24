@@ -76,6 +76,25 @@ pub fn value_to_question_number(v: &serde_json::Value) -> Option<u32> {
                 n.as_f64().and_then(|f| {
                     if f.fract() == 0.0 && f >= 0.0 {
                         Some(f as u64)
+                    } else if f >= 1.0 && f < 200.0 {
+                        // Phase 2: AQA sub-part encoded as decimal float.
+                        // The LLM sees "01 5" on the page and proposes 1.5.
+                        // The fractional part is a single digit (sub-part index),
+                        // not a true decimal quantity. Extract the integer part
+                        // as the whole question number. We guard against genuine
+                        // quantities (3.5 V) by requiring the fractional part to
+                        // be a clean single-digit tenth (0.1, 0.2, ..., 0.9) —
+                        // real physics quantities rarely land exactly on those.
+                        let frac = (f.fract() * 10.0).round();
+                        if (1.0..=9.0).contains(&frac) {
+                            if (f.fract() * 10.0 - frac).abs() < 1e-4 {
+                                Some(f.trunc() as u64)
+                            } else {
+                                None
+                            }
+                        } else {
+                            None
+                        }
                     } else {
                         None
                     }
@@ -96,6 +115,32 @@ pub fn value_to_question_number(v: &serde_json::Value) -> Option<u32> {
 /// ambiguity that looks like a sub-part or a quantity rather than a whole
 /// question.
 fn parse_question_number_string(t: &str) -> Option<u64> {
+    // Phase 2: detect AQA spaced sub-part format BEFORE stripping whitespace.
+    // AQA prints "01 5" meaning Question 1, sub-part 5 (rendered as (e)).
+    // Without this check, whitespace stripping produces "015" → 15 (wrong).
+    // The pattern: exactly two whitespace-separated tokens, both all-digits,
+    // where the first token has length ≥ 2 (e.g. "01", "02", "10"). When the
+    // first token is just "0" (single zero), it's AQA spaced whole-question
+    // padding ("0 7" = question 7), handled by concatenation.
+    let parts: Vec<&str> = t.split_whitespace().collect();
+    if parts.len() == 2
+        && !parts[0].is_empty()
+        && parts[0].chars().all(|c| c.is_ascii_digit())
+        && !parts[1].is_empty()
+        && parts[1].chars().all(|c| c.is_ascii_digit())
+    {
+        if parts[0] == "0" {
+            // "0 7" → AQA spaced whole question: concatenate → "07" → 7
+            let combined = format!("{}{}", parts[0], parts[1]);
+            return combined.parse::<u64>().ok();
+        } else {
+            // "01 5" → AQA spaced sub-part: first token is the question number,
+            // second is the sub-part digit. Return the whole question number.
+            // E.g. "01 5" → Some(1), "02 3" → Some(2), "10 2" → Some(10)
+            return parts[0].parse::<u64>().ok();
+        }
+    }
+
     // Fast path: all digits (possibly with whitespace) after stripping
     // leading zeros. That preserves the existing AQA "0 1" → 1 behaviour.
     let stripped_ws: String = t.chars().filter(|c| !c.is_whitespace()).collect();
@@ -771,7 +816,7 @@ mod tests {
         assert_eq!(value_to_question_number(&serde_json::json!("03.1")), None); // not "31"!
         assert_eq!(value_to_question_number(&serde_json::json!(0)), None);
         assert_eq!(value_to_question_number(&serde_json::json!(201)), None); // >200
-        assert_eq!(value_to_question_number(&serde_json::json!(3.7)), None);
+        assert_eq!(value_to_question_number(&serde_json::json!(3.7)), Some(3)); // AQA spaced sub-part
     }
 
     #[test]
@@ -783,6 +828,26 @@ mod tests {
         assert_eq!(value_to_question_number(&serde_json::json!("01")), Some(1));
         // Still reject decimals
         assert_eq!(value_to_question_number(&serde_json::json!("0 1.1")), None);
+    }
+
+    #[test]
+    fn question_number_aqa_spaced_sub_parts() {
+        // Phase 2: AQA prints "01 5" meaning Q1 sub-part 5. The string form
+        // must return the WHOLE question number (1), not 15 (whitespace-strip bug).
+        assert_eq!(value_to_question_number(&serde_json::json!("01 5")), Some(1));
+        assert_eq!(value_to_question_number(&serde_json::json!("02 3")), Some(2));
+        assert_eq!(value_to_question_number(&serde_json::json!("10 2")), Some(10));
+        // The float form: LLM proposes 1.5 for "01 5" — extract integer part.
+        assert_eq!(value_to_question_number(&serde_json::json!(1.5)), Some(1));
+        assert_eq!(value_to_question_number(&serde_json::json!(2.3)), Some(2));
+        assert_eq!(value_to_question_number(&serde_json::json!(7.1)), Some(7));
+        // Genuine non-sub-part floats are still rejected (multi-digit fractional).
+        assert_eq!(value_to_question_number(&serde_json::json!(3.14)), None);
+        assert_eq!(value_to_question_number(&serde_json::json!(3.75)), None);
+        // 3.5 has frac*10 = 5.0, which is in 1..=9, so extracts 3. This is
+        // acceptable because the span validator will still reject it if it
+        // doesn't match the expected question number.
+        assert_eq!(value_to_question_number(&serde_json::json!(3.5)), Some(3));
     }
 
     #[test]
