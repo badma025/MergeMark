@@ -27,6 +27,10 @@ pub struct Question {
     pub question_number: Option<i64>,
     #[sqlx(default)]
     pub module: Option<String>,
+    #[sqlx(default)]
+    pub needs_review: bool,
+    #[sqlx(default)]
+    pub answer_stale: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -525,6 +529,38 @@ pub async fn parse_pdf(app: tauri::AppHandle, file_path: String) -> Result<usize
     let pool = state.db.lock().await;
 
     insert_questions_from_text(&*pool, &cleaned, &classifier).await
+}
+
+#[tauri::command]
+pub async fn export_worksheet_markdown(
+    app: tauri::AppHandle,
+    question_ids: Vec<String>,
+) -> Result<String, String> {
+    let state: State<'_, AppState> = app.state();
+    let pool = state.db.lock().await;
+
+    let mut markdown = String::new();
+    let mut total_marks = 0;
+
+    for (i, id) in question_ids.iter().enumerate() {
+        let question: Option<Question> = sqlx::query_as("SELECT * FROM questions WHERE id = ?")
+            .bind(id)
+            .fetch_optional(&*pool)
+            .await
+            .map_err(|e| format!("Database error: {}", e))?;
+
+        if let Some(q) = question {
+            total_marks += q.marks;
+            markdown.push_str(&format!("### Question {}\n\n", i + 1));
+            markdown.push_str(&q.content);
+            markdown.push_str(&format!("\n\n**[{} marks]**\n\n---\n\n", q.marks));
+        }
+    }
+
+    let mut header = format!("# Worksheet\n\n**Total Marks:** {}\n\n---\n\n", total_marks);
+    header.push_str(&markdown);
+
+    Ok(header)
 }
 
 #[tauri::command]
@@ -1119,8 +1155,8 @@ pub async fn parse_pdf_vision(
         let db_start = Instant::now();
         sqlx::query(
             r#"
-            INSERT INTO questions (id, subject, subtopic, topics, marks, content, math_snippet, is_code, paper_name, question_number, module)
-            VALUES (?, ?, ?, ?, ?, ?, '', ?, ?, ?, ?)
+            INSERT INTO questions (id, subject, subtopic, topics, marks, content, math_snippet, is_code, paper_name, question_number, module, needs_review, answer_stale)
+            VALUES (?, ?, ?, ?, ?, ?, '', ?, ?, ?, ?, ?, 0)
             ON CONFLICT(paper_name, question_number) DO UPDATE SET
                 subject = excluded.subject,
                 subtopic = excluded.subtopic,
@@ -1128,7 +1164,8 @@ pub async fn parse_pdf_vision(
                 marks = excluded.marks,
                 content = excluded.content,
                 is_code = excluded.is_code,
-                module = COALESCE(excluded.module, questions.module)
+                module = COALESCE(excluded.module, questions.module),
+                needs_review = excluded.needs_review
             "#,
         )
         .bind(&id)
@@ -1141,6 +1178,7 @@ pub async fn parse_pdf_vision(
         .bind(&config.paper_name)
         .bind(q.question_number as i64)
         .bind(&q.module)
+        .bind(q.needs_review)
         .execute(&*pool)
         .await
         .map_err(|e| format!("DB upsert failed for question {}: {}", q.question_number, e))?;
@@ -1165,6 +1203,8 @@ pub async fn parse_pdf_vision(
             paper_name: config.paper_name.clone(),
             question_number: Some(q.question_number as i64),
             module: Some(q.module),
+            needs_review: q.needs_review,
+            answer_stale: false,
         });
     }
 
@@ -1498,7 +1538,7 @@ pub async fn commit_mark_schemes(
     let pool = state.db.lock().await;
 
     for mapping in mappings {
-        sqlx::query("UPDATE questions SET answer_content = ? WHERE id = ?")
+        sqlx::query("UPDATE questions SET answer_content = ?, answer_stale = CASE WHEN answer_content IS NOT NULL THEN 1 ELSE 0 END WHERE id = ?")
             .bind(mapping.proposed_answer)
             .bind(mapping.question_id)
             .execute(&*pool)
@@ -1506,6 +1546,20 @@ pub async fn commit_mark_schemes(
             .map_err(|e| format!("DB update error: {}", e))?;
     }
 
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn mark_question_verified(
+    id: String,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    let pool = state.db.lock().await;
+    sqlx::query("UPDATE questions SET needs_review = 0, answer_stale = 0 WHERE id = ?")
+        .bind(id)
+        .execute(&*pool)
+        .await
+        .map_err(|e| format!("Failed to verify question: {}", e))?;
     Ok(())
 }
 

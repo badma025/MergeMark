@@ -22,7 +22,7 @@
         "enable": true,
         "scope": ["$APPDATA/**/*", "$RESOURCE/**/*"]
       },
-      "csp": null
+      "csp": "default-src 'self' tauri: http://localhost:11434 https://api.openai.com https://api.anthropic.com https://generativelanguage.googleapis.com; img-src 'self' tauri: asset: data: blob:; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-eval' 'unsafe-inline'; worker-src 'self' blob:;"
     }
   },
   "bundle": {

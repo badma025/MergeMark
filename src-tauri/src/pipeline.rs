@@ -2269,9 +2269,9 @@ pub async fn run_markscheme_pipeline<C: LlmClient, P: Progress>(
                     }
                 }
                 md = md.replace("[DIAGRAM_PLACEHOLDER]", "");
-                // Uniform part labels + preserved source lines in answers, too.
                 md = validate::normalize_decimal_parts(&md, q_num);
                 md = validate::harden_line_breaks(&md);
+                md = validate::normalize_mark_scheme_chunk(&md);
 
                 // Dedupe/stitch: containment-based, not a brittle prefix fingerprint.
                 if let Some(existing) = drafts.iter_mut().find(|d| d.question_number == q_num) {
@@ -2753,6 +2753,7 @@ mod tests {
             &cfg,
             &mut saved,
             &mut report,
+            false,
         )
         .expect("first crop saves");
         let l2 = save_diagram(
@@ -2762,6 +2763,7 @@ mod tests {
             &cfg,
             &mut saved,
             &mut report,
+            false,
         )
         .expect("duplicate crop resolves to the same link");
 
@@ -2778,6 +2780,7 @@ mod tests {
             &cfg,
             &mut saved,
             &mut report,
+            false,
         );
         assert!(g.is_none(), "answer grid rejected at save");
         assert!(report.crop_rejections >= 1);

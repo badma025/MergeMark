@@ -4,14 +4,17 @@ import { RichTextEditor } from "./RichTextEditor";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/ui/dialog";
-import { Plus, Trash2, Pencil, ZoomIn, X } from "lucide-react";
+import { Plus, Trash2, Pencil, AlertTriangle, ShieldCheck } from "lucide-react";
 import ReactMarkdown from "react-markdown";
 import remarkMath from "remark-math";
 import rehypeKatex from "rehype-katex";
 import remarkGfm from "remark-gfm";
 import { cn, sanitizeMarkdownMath } from "@/lib/utils";
-import { convertFileSrc } from "@tauri-apps/api/core";
+import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 import { useTaxonomy } from "@/lib/TaxonomyContext";
+import { toast } from "sonner";
+import Zoom from "react-medium-image-zoom";
+import "react-medium-image-zoom/dist/styles.css";
 
 /**
  * Regex that matches display-worthy LaTeX operators.
@@ -36,42 +39,27 @@ function fixSlashes(s: string): string {
 function DiagramImg({
   src,
   alt,
-  onOpen,
 }: {
   src: string;
   alt: string;
-  onOpen: (src: string, alt: string) => void;
 }) {
   const isLocal = /^[a-zA-Z]:[\\/]/.test(src) || src.startsWith("/");
   const resolved = isLocal ? convertFileSrc(src) : src;
   return (
     <div className="relative group/diag my-4">
-      <img
-        src={resolved}
-        alt={alt}
-        className="max-w-full rounded-md cursor-zoom-in ring-1 ring-border/60 hover:ring-primary/40 transition-shadow"
-        onClick={(e) => {
-          e.stopPropagation();
-          onOpen(src, alt);
-        }}
-        onError={(e) => {
-          console.error("Failed to load diagram:", src, resolved);
-          const target = e.target as HTMLImageElement;
-          target.style.opacity = "0.5";
-          target.title = `Failed to load: ${src}`;
-        }}
-      />
-      <button
-        type="button"
-        onClick={(e) => {
-          e.stopPropagation();
-          onOpen(src, alt);
-        }}
-        className="absolute top-2 right-2 bg-black/70 text-white rounded-md p-1.5 opacity-0 group-hover/diag:opacity-100 transition-opacity"
-        aria-label="Enlarge diagram"
-      >
-        <ZoomIn className="size-3.5" />
-      </button>
+      <Zoom classDialog="custom-zoom-dark" zoomMargin={40}>
+        <img
+          src={resolved}
+          alt={alt}
+          className="max-w-full rounded-md cursor-zoom-in ring-1 ring-border/60 hover:ring-primary/40 transition-shadow"
+          onError={(e) => {
+            console.error("Failed to load diagram:", src, resolved);
+            const target = e.target as HTMLImageElement;
+            target.style.opacity = "0.5";
+            target.title = `Failed to load: ${src}`;
+          }}
+        />
+      </Zoom>
     </div>
   );
 }
@@ -250,33 +238,39 @@ export interface QuestionCardProps {
   answerContent?: string;
   className?: string;
   module?: string;
+  /** Set by the pipeline when extraction anomalies occurred — shows REVIEW badge */
+  needsReview?: boolean;
+  /** Set when a mark scheme is re-imported over an existing answer — shows STALE ANSWER banner */
+  answerStale?: boolean;
   onAddToWorksheet?: (id: string) => void;
   onDelete?: (id: string) => void;
   onUpdate?: (id: string, newContent: string, newMarks: number, newAnswerContent?: string, newTopics?: string[], newModule?: string) => void;
 }
 
-export function QuestionCard({
-  id,
-  subject,
-  module,
-  marks,
-  content,
-  isCode,
-  mathSnippet,
-  topics,
-  answerContent,
-  className,
-  onAddToWorksheet,
-  onUpdate,
-  onDelete,
-}: QuestionCardProps) {
+export function QuestionCard(props: QuestionCardProps) {
+  const {
+    id,
+    subject,
+    module,
+    marks,
+    content,
+    isCode,
+    topics,
+    answerContent,
+    className,
+    needsReview: initialNeedsReview,
+    answerStale: initialAnswerStale,
+    onAddToWorksheet,
+    onUpdate,
+    onDelete,
+  } = props;
   const { subjects, topicsBySubject } = useTaxonomy();
   const displaySubject = subjects.find(s => s.id === subject)?.name || subject;
   const [isEditing, setIsEditing] = useState(false);
   const [isShowingAnswer, setIsShowingAnswer] = useState(false);
-  // Phase 0: lightbox state for diagram zoom.
-  const [zoomed, setZoomed] = useState<{ src: string; alt: string } | null>(null);
-  let parsedTopics: string[] = [];
+  const [needsReview, setNeedsReview] = useState(!!initialNeedsReview);
+  const [answerStale, setAnswerStale] = useState(!!initialAnswerStale);
+    let parsedTopics: string[] = [];
   try {
     if (topics) {
       parsedTopics = JSON.parse(topics);
@@ -289,24 +283,8 @@ export function QuestionCard({
   let displayContent = stripAnswerSpaces(content ?? "");
   const strippedAnswerContent = stripAnswerSpaces(answerContent ?? "");
   
-  const snippet = (mathSnippet || "").trim();
-  if (snippet !== "") {
-    const contentTrim = displayContent.trimEnd();
-    if (contentTrim.endsWith(snippet)) {
-      displayContent = contentTrim.substring(0, contentTrim.length - snippet.length).trimEnd();
-    }
-    if (isCode) {
-      displayContent += `\n\n\`\`\`\n${snippet}\n\`\`\``;
-    } else {
-      if (snippet.startsWith("$$") && snippet.endsWith("$$")) {
-        displayContent += `\n\n${snippet}`;
-      } else if (snippet.startsWith("$") && snippet.endsWith("$") && !snippet.includes("\n")) {
-        displayContent += `\n\n${snippet}`;
-      } else {
-        displayContent += `\n\n$$\n${snippet}\n$$`;
-      }
-    }
-  }
+  // Task 4: math_snippet logic removed — content is the single source of truth.
+  // The DB migration sets math_snippet = '' for all existing rows.
 
   const [editContent, setEditContent] = useState(displayContent);
   const [editMarks, setEditMarks] = useState(marks);
@@ -372,6 +350,32 @@ export function QuestionCard({
             <Pencil className="size-3.5" />
           </button>
         )}
+        {!isEditing && needsReview && (
+          <button
+            type="button"
+            onClick={async (e) => {
+              e.stopPropagation();
+              try {
+                await invoke("mark_question_verified", { id });
+                setNeedsReview(false);
+                setAnswerStale(false);
+                toast.success("Question marked as verified");
+              } catch (e: any) {
+                toast.error(e.toString());
+              }
+            }}
+            aria-label={`Mark question ${id} as verified`}
+            className={cn(
+              "flex items-center justify-center rounded-md p-1.5",
+              "text-emerald-600/60 transition-all duration-150",
+              "hover:bg-emerald-500/10 hover:text-emerald-500 hover:opacity-100",
+              "focus-visible:opacity-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-500/60"
+            )}
+            title="Mark as Verified"
+          >
+            <ShieldCheck className="size-3.5" />
+          </button>
+        )}
         <button
           id={`delete-question-${id}`}
           type="button"
@@ -391,8 +395,24 @@ export function QuestionCard({
         </button>
       </div>
 
+      {/* ── Stale Answer Warning Banner ── */}
+      {answerStale && (
+        <div className="flex items-center gap-2 bg-amber-500/10 border border-amber-500/20 text-amber-700 dark:text-amber-400 p-2.5 rounded-lg text-sm -mx-1 mt-1 mb-2">
+          <AlertTriangle className="size-4 shrink-0" />
+          <div className="flex-1">
+            <strong>Stale Answer:</strong> This mark scheme answer may be out of date compared to the recently updated question content.
+          </div>
+        </div>
+      )}
+
       {/* ── Badge row ── */}
       <div className="flex flex-wrap items-center gap-2 pr-7">
+        {needsReview && (
+          <Badge className="text-xs font-semibold tracking-wide bg-amber-500/15 text-amber-700 dark:text-amber-400 border-amber-500/30 hover:bg-amber-500/25 cursor-help" title="Extracted with vision fallback or low confidence">
+            <AlertTriangle className="size-3 mr-1 inline" />
+            REVIEW
+          </Badge>
+        )}
         <Badge
           className="text-xs font-medium tracking-wide bg-zinc-800 text-zinc-50 hover:bg-zinc-800/90 dark:bg-zinc-200 dark:text-zinc-900 dark:hover:bg-zinc-200/90"
         >
@@ -441,7 +461,6 @@ export function QuestionCard({
                   <DiagramImg
                     src={props.src}
                     alt={props.alt || "Diagram"}
-                    onOpen={(s, a) => setZoomed({ src: s, alt: a })}
                   />
                 );
               },
@@ -470,7 +489,6 @@ export function QuestionCard({
                   <DiagramImg
                     src={props.src}
                     alt={props.alt || "Diagram"}
-                    onOpen={(s, a) => setZoomed({ src: s, alt: a })}
                   />
                 );
               },
@@ -604,44 +622,7 @@ export function QuestionCard({
         </Button>
       </div>
 
-      {/* ── Diagram zoom lightbox (Phase 0) ── */}
-      <Dialog
-        open={!!zoomed}
-        onOpenChange={(o) => {
-          if (!o) setZoomed(null);
-        }}
-      >
-        <DialogContent
-          className="max-w-[95vw] max-h-[95vh] w-auto h-auto p-0 border-0 bg-transparent shadow-none"
-          onClick={(e) => {
-            e.stopPropagation();
-            setZoomed(null);
-          }}
-          showCloseButton={false}
-        >
-          <div className="relative">
-            <button
-              type="button"
-              onClick={(e) => {
-                e.stopPropagation();
-                setZoomed(null);
-              }}
-              className="absolute -top-2 -right-2 bg-black/80 text-white rounded-full p-1.5 hover:bg-black z-10"
-              aria-label="Close"
-            >
-              <X className="size-4" />
-            </button>
-            {zoomed && (
-              <img
-                src={/^[a-zA-Z]:[\\/]|^\//.test(zoomed.src) ? convertFileSrc(zoomed.src) : zoomed.src}
-                alt={zoomed.alt}
-                className="max-w-[95vw] max-h-[90vh] object-contain rounded-lg"
-                onClick={(e) => e.stopPropagation()}
-              />
-            )}
-          </div>
-        </DialogContent>
-      </Dialog>
+      
     </article>
   );
 }

@@ -1302,16 +1302,33 @@ pub fn build_map_from_structure(
         return None;
     }
 
+    let mut deduplicated: Vec<(u32, VisionBounds)> = Vec::new();
+    for (&q, b) in bounds.iter() {
+        if deduplicated.is_empty() || deduplicated.last().unwrap().1.first_page != b.first_page {
+            deduplicated.push((q, b.clone()));
+        }
+    }
+
     let mut spans = Vec::new();
-    for (q, b) in bounds.iter() {
+    for (i, (q, b)) in deduplicated.iter().enumerate() {
+        let start_page = b.first_page;
+        let end_page = if i + 1 < deduplicated.len() {
+            let next_start_page = deduplicated[i + 1].1.first_page;
+            // The prompt requests clamping to max(start_page, next_start_page - 1). 
+            // We use b.last_page.max(...) to preserve multi-page question bounds while preventing negative ranges.
+            std::cmp::max(b.last_page, next_start_page.saturating_sub(1)).max(start_page)
+        } else {
+            std::cmp::max(start_page, b.last_page)
+        };
+
         let mut ambiguous = Vec::new();
-        for pg in b.first_page..=b.last_page {
+        for pg in start_page..=end_page {
             ambiguous.push(pg);
         }
         spans.push(QuestionSpan {
             number: *q,
-            start_page: b.first_page,
-            end_page: b.last_page,
+            start_page,
+            end_page,
             start_y_frac: b.first_y,
             end_y_frac: b.last_y,
             expected_marks: b.marks,

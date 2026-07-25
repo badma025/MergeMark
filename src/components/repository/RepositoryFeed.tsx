@@ -5,6 +5,13 @@ import { toast } from "sonner";
 import { Input } from "@/components/ui/input";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
 import { cn } from "@/lib/utils";
 import { QuestionCard, type QuestionCardProps } from "./QuestionCard";
 import { AddQuestionModal } from "./AddQuestionModal";
@@ -25,6 +32,7 @@ export function RepositoryFeed({ isActive = true, onAddToWorksheet }: Repository
   const [selectedSubject, setSelectedSubject] = useState<string>("All");
   const [selectedModule, setSelectedModule] = useState<string>("All");
   const [selectedTopics, setSelectedTopics] = useState<string[]>([]);
+  const [reviewFilter, setReviewFilter] = useState<"All" | "Clean" | "Needs review">("All");
   const [questions, setQuestions] = useState<Omit<QuestionCardProps, "onAddToWorksheet" | "onDelete">[]>([]);
   const [loading, setLoading] = useState(true);
   const { subjects, topicsBySubject } = useTaxonomy();
@@ -129,7 +137,14 @@ export function RepositoryFeed({ isActive = true, onAddToWorksheet }: Repository
       }
     }
 
-    return matchesSearch && matchesTopicFilter && matchesSubject && matchesModuleFilter;
+    let matchesReviewFilter = true;
+    if (reviewFilter === "Clean") {
+      matchesReviewFilter = !q.needsReview && !q.answerStale;
+    } else if (reviewFilter === "Needs review") {
+      matchesReviewFilter = !!q.needsReview || !!q.answerStale;
+    }
+
+    return matchesSearch && matchesTopicFilter && matchesSubject && matchesModuleFilter && matchesReviewFilter;
   });
 
   function handleAdd(id: string) {
@@ -160,10 +175,27 @@ export function RepositoryFeed({ isActive = true, onAddToWorksheet }: Repository
             />
           </div>
           
-          <div className="flex items-center gap-6">
-            <span className="text-sm text-muted-foreground whitespace-nowrap">
-              Total Questions: <span className="font-semibold text-foreground">{questions.length}</span>
+          <div className="flex items-center gap-4">
+            <span className="text-sm text-muted-foreground whitespace-nowrap hidden md:inline-block">
+              Total Questions: <span className="font-semibold text-foreground">{filtered.length}</span>
             </span>
+            <div className="w-[140px]">
+              <Select
+                value={reviewFilter}
+                onValueChange={(v) => {
+                  if (v) setReviewFilter(v as "All" | "Clean" | "Needs review");
+                }}
+              >
+                <SelectTrigger className="h-8 text-xs font-semibold bg-muted/40">
+                  <SelectValue placeholder="Filter..." />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="All">All Items</SelectItem>
+                  <SelectItem value="Clean">Clean</SelectItem>
+                  <SelectItem value="Needs review">Needs review</SelectItem>
+                </SelectContent>
+              </Select>
+            </div>
             <Button
               onClick={() => setShowAddModal(true)}
               size="sm"
