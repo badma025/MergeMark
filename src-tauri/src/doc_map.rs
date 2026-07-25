@@ -716,8 +716,6 @@ pub fn build_hybrid_map(
     // because their y fractions encode the vertical ordering.
     let mut valid_spans = Vec::new();
     let mut prev_num = 0u32;
-    let mut prev_end_page = 0usize;
-    println!("DEBUG SPANS BEFORE VALIDATION: {:#?}", spans);
     for mut span in spans {
         if span.number <= prev_num {
             anomalies.push(format!(
@@ -730,32 +728,10 @@ pub fn build_hybrid_map(
             anomalies.push(format!("invalid page range for Q{}", span.number));
             continue;
         }
-        if prev_num > 0 {
-            if span.start_page < prev_end_page {
-                // Span starts on a page before the previous span's end:
-                // only allowed when both share the same page (y-clip
-                // case). Otherwise clamp to prev_end.
-                if span.start_page == span.end_page && span.end_page == prev_end_page {
-                    // Same-page question (MCQ/short-answer): keep y-clip
-                    // and don't adjust page.
-                } else {
-                    anomalies.push(format!(
-                        "adjusting Q{} start_page from {} to prev_end {}",
-                        span.number, span.start_page, prev_end_page
-                    ));
-                    span.start_page = prev_end_page;
-                    span.start_y_frac = None;
-                }
-            } else if span.start_page > prev_end_page {
-                // Gap (e.g. non-question pages between). Allow: the span
-                // starts on the page it says it starts on.
-            }
-        } else {
-            span.start_page = span.start_page.min(span.end_page);
-        }
+        
+        span.start_page = span.start_page.min(span.end_page);
 
         prev_num = span.number;
-        prev_end_page = prev_end_page.max(span.end_page);
         valid_spans.push(span);
     }
     
@@ -809,65 +785,68 @@ fn build_spans_from_vision(
     //   * a page that produces zero plausible numbers doesn't blow up
     //     the map — it's simply skipped.
     let mut running_max = 0u32;
+    let mut raw_detections = Vec::new();
     for p in structures {
+        if p.page == 0 {
+            continue;
+        }
         if !eligible_pages.contains(&p.page) {
             continue;
         }
-        // Filter per-page numbers.
-        let mut accepted: Vec<(usize, u32)> = Vec::new();
         for (qi, &q) in p.questions.iter().enumerate() {
-            if q == 0 || q > 200 {
+            if q == 0 || q > 50 {
                 continue;
             }
-            // Reject wild jumps backward (>30 drop) or forward (>30 above
-            // running max) UNLESS the number is within 5 of another
-            // accepted number on the same page (which suggests a real
-            // MCQ run rather than an outlier).
-            let backward_jump = running_max > 0 && q + 30 < running_max;
-            let forward_jump = q > running_max + 30 && running_max > 0;
-            if backward_jump || forward_jump {
-                // Keep it only if a sibling on the same page is within 5
-                // of it (signals a contiguous block that simply follows
-                // a gap in the structure pass, not a hallucination).
-                let sibling_close = accepted.iter().any(|(_, qn)| qn.abs_diff(q) <= 5);
-                if !sibling_close {
-                    continue;
-                }
+            if q as usize == p.page + 1 {
+                continue; // Page Number Heuristic Filter
             }
-            accepted.push((qi, q));
+            let y_fracs = p.question_y.get(qi).copied().unwrap_or((None, None));
+            raw_detections.push((p.page, qi, q, y_fracs));
         }
-        for (qi, q) in accepted {
-            running_max = running_max.max(q);
-            let (y0, y1) = p.question_y.get(qi).copied().unwrap_or((None, None));
-            let e = vision_bounds.entry(q).or_insert_with(|| VisionBounds {
-                first_page: p.page,
-                last_page: p.page,
-                first_y: None,
-                last_y: None,
-                marks: None,
-            });
-            if p.page < e.first_page {
-                e.first_page = p.page;
-                e.first_y = y0;
-            } else if p.page == e.first_page {
-                // Keep the tightest (highest) y on the first page.
-                e.first_y = match (e.first_y, y0) {
-                    (None, Some(v)) => Some(v),
-                    (Some(a), Some(b)) => Some(a.min(b)),
-                    (a, _) => a,
-                };
-            }
-            if p.page > e.last_page {
-                e.last_page = p.page;
-                e.last_y = y1;
-            } else if p.page == e.last_page {
-                // Keep the tightest (lowest) y on the last page.
-                e.last_y = match (e.last_y, y1) {
-                    (None, Some(v)) => Some(v),
-                    (Some(a), Some(b)) => Some(a.max(b)),
-                    (a, _) => a,
-                };
-            }
+    }
+
+    let mut expected_max_q = 0u32;
+    let mut filtered_detections = Vec::new();
+    for det in raw_detections {
+        let q = det.2;
+        // Accept the next logical question, allowing for small gaps, or same question.
+        if q >= expected_max_q && q <= expected_max_q + 4 {
+            filtered_detections.push(det);
+            expected_max_q = expected_max_q.max(q);
+        }
+    }
+
+    for (page, qi, q, (y0, y1)) in filtered_detections {
+        running_max = running_max.max(q);
+        let e = vision_bounds.entry(q).or_insert_with(|| VisionBounds {
+            first_page: page,
+            last_page: page,
+            first_y: None,
+            last_y: None,
+            marks: None,
+        });
+        if page < e.first_page {
+            e.first_page = page;
+            e.first_y = y0;
+        } else if page == e.first_page {
+            e.first_y = match (e.first_y, y0) {
+                (Some(a), Some(b)) => Some(a.min(b)),
+                (a, b) => a.or(b),
+            };
+        }
+        if page > e.last_page {
+            e.last_page = page;
+            e.last_y = y1;
+        } else if page == e.last_page {
+            e.last_y = match (e.last_y, y1) {
+                (Some(a), Some(b)) => Some(a.max(b)),
+                (a, b) => a.or(b),
+            };
+        }
+    }
+    for p in structures {
+        if !eligible_pages.contains(&p.page) {
+            continue;
         }
         if let Some((q, m)) = p.footer {
             // Phase 1c: only trust the footer if its question number is
@@ -894,8 +873,20 @@ fn build_spans_from_vision(
         return Vec::new();
     }
 
+    let vision_bounds_vec: Vec<(u32, VisionBounds)> = vision_bounds.into_iter().collect();
+
     let mut spans = Vec::new();
-    for (q, b) in vision_bounds.iter() {
+    for i in 0..vision_bounds_vec.len() {
+        let (q, ref b) = vision_bounds_vec[i];
+        let start_page = b.first_page;
+        let end_page = if i + 1 < vision_bounds_vec.len() {
+            let next_start_page = vision_bounds_vec[i + 1].1.first_page;
+            // Strict math clamp to prevent empty spans while preserving b.last_page overlap
+            std::cmp::max(start_page.max(b.last_page), next_start_page.saturating_sub(1))
+        } else {
+            std::cmp::max(start_page, b.last_page)
+        };
+
         // Same-page multi-question sanity: if first_y is above last_y but
         // first_page == last_page, we keep both clips (a vertical band).
         let (start_y, end_y) = if b.first_page == b.last_page {
@@ -904,15 +895,15 @@ fn build_spans_from_vision(
             (b.first_y, b.last_y)
         };
         let mut vision_covered = Vec::new();
-        for pg in b.first_page..=b.last_page {
+        for pg in start_page..=end_page {
             if eligible_pages.contains(&pg) {
                 vision_covered.push(pg);
             }
         }
         spans.push(QuestionSpan {
-            number: *q,
-            start_page: b.first_page,
-            end_page: b.last_page,
+            number: q,
+            start_page,
+            end_page,
             start_y_frac: start_y,
             end_y_frac: end_y,
             expected_marks: b.marks,
@@ -1230,56 +1221,66 @@ pub fn build_map_from_structure(
     let mut bounds: std::collections::BTreeMap<u32, VisionBounds> =
         std::collections::BTreeMap::new();
     let mut running_max = 0u32;
+    let mut raw_detections = Vec::new();
     for p in pages {
-        // Skip non-question pages when building bounds (matches the
-        // hybrid path's behaviour).
+        if p.page == 0 {
+            continue;
+        }
         if !p.role.is_question_content() {
             continue;
         }
-        let mut accepted: Vec<(usize, u32)> = Vec::new();
         for (qi, &q) in p.questions.iter().enumerate() {
             if q == 0 || q > 200 {
                 continue;
             }
-            let backward_jump = running_max > 0 && q + 30 < running_max;
-            let forward_jump = q > running_max + 30 && running_max > 0;
-            if backward_jump || forward_jump {
-                let sibling_close = accepted.iter().any(|(_, qn)| qn.abs_diff(q) <= 5);
-                if !sibling_close {
-                    continue;
-                }
+            if q as usize == p.page + 1 {
+                continue; // Page Number Heuristic Filter
             }
-            accepted.push((qi, q));
+            let y_fracs = p.question_y.get(qi).copied().unwrap_or((None, None));
+            raw_detections.push((p.page, qi, q, y_fracs));
         }
-        for (qi, q) in accepted {
-            running_max = running_max.max(q);
-            let (y0, y1) = p.question_y.get(qi).copied().unwrap_or((None, None));
-            let e = bounds.entry(q).or_insert_with(|| VisionBounds {
-                first_page: p.page,
-                last_page: p.page,
-                first_y: None,
-                last_y: None,
-                marks: None,
-            });
-            if p.page < e.first_page {
-                e.first_page = p.page;
-                e.first_y = y0;
-            } else if p.page == e.first_page {
-                e.first_y = match (e.first_y, y0) {
-                    (Some(a), Some(b)) => Some(a.min(b)),
-                    (a, b) => a.or(b),
-                };
-            }
-            if p.page > e.last_page {
-                e.last_page = p.page;
-                e.last_y = y1;
-            } else if p.page == e.last_page {
-                e.last_y = match (e.last_y, y1) {
-                    (Some(a), Some(b)) => Some(a.max(b)),
-                    (a, b) => a.or(b),
-                };
-            }
+    }
+
+    let mut expected_max_q = 0u32;
+    let mut filtered_detections = Vec::new();
+    for det in raw_detections {
+        let q = det.2;
+        // Accept the next logical question, allowing for small gaps, or same question.
+        if q >= expected_max_q && q <= expected_max_q + 4 {
+            filtered_detections.push(det);
+            expected_max_q = expected_max_q.max(q);
         }
+    }
+
+    for (page, qi, q, (y0, y1)) in filtered_detections {
+        running_max = running_max.max(q);
+        let e = bounds.entry(q).or_insert_with(|| VisionBounds {
+            first_page: page,
+            last_page: page,
+            first_y: None,
+            last_y: None,
+            marks: None,
+        });
+        if page < e.first_page {
+            e.first_page = page;
+            e.first_y = y0;
+        } else if page == e.first_page {
+            e.first_y = match (e.first_y, y0) {
+                (Some(a), Some(b)) => Some(a.min(b)),
+                (a, b) => a.or(b),
+            };
+        }
+        if page > e.last_page {
+            e.last_page = page;
+            e.last_y = y1;
+        } else if page == e.last_page {
+            e.last_y = match (e.last_y, y1) {
+                (Some(a), Some(b)) => Some(a.max(b)),
+                (a, b) => a.or(b),
+            };
+        }
+    }
+    for p in pages {
         if let Some((q, m)) = p.footer {
             // Only trust the footer if its question number is plausible
             // (within range of the running sequence or already in bounds).
@@ -1302,21 +1303,16 @@ pub fn build_map_from_structure(
         return None;
     }
 
-    let mut deduplicated: Vec<(u32, VisionBounds)> = Vec::new();
-    for (&q, b) in bounds.iter() {
-        if deduplicated.is_empty() || deduplicated.last().unwrap().1.first_page != b.first_page {
-            deduplicated.push((q, b.clone()));
-        }
-    }
+    let bounds_vec: Vec<(u32, VisionBounds)> = bounds.into_iter().collect();
 
     let mut spans = Vec::new();
-    for (i, (q, b)) in deduplicated.iter().enumerate() {
+    for i in 0..bounds_vec.len() {
+        let (q, ref b) = bounds_vec[i];
         let start_page = b.first_page;
-        let end_page = if i + 1 < deduplicated.len() {
-            let next_start_page = deduplicated[i + 1].1.first_page;
-            // The prompt requests clamping to max(start_page, next_start_page - 1). 
-            // We use b.last_page.max(...) to preserve multi-page question bounds while preventing negative ranges.
-            std::cmp::max(b.last_page, next_start_page.saturating_sub(1)).max(start_page)
+        let end_page = if i + 1 < bounds_vec.len() {
+            let next_start_page = bounds_vec[i + 1].1.first_page;
+            // Strict math clamp to prevent empty spans while preserving b.last_page overlap
+            std::cmp::max(start_page.max(b.last_page), next_start_page.saturating_sub(1))
         } else {
             std::cmp::max(start_page, b.last_page)
         };
@@ -1326,7 +1322,7 @@ pub fn build_map_from_structure(
             ambiguous.push(pg);
         }
         spans.push(QuestionSpan {
-            number: *q,
+            number: q,
             start_page,
             end_page,
             start_y_frac: b.first_y,
@@ -1421,16 +1417,16 @@ mod tests {
         };
         let pages = vec![
             mk(0, vec![], None, PageRole::Cover),
-            mk(1, vec![1], None, PageRole::Question),
-            mk(2, vec![1, 2], Some((1, 5)), PageRole::Question),
-            mk(3, vec![2], Some((2, 6)), PageRole::Question),
+            mk(2, vec![1], None, PageRole::Question),
+            mk(3, vec![1, 2], Some((1, 5)), PageRole::Question),
+            mk(4, vec![2], Some((2, 6)), PageRole::Question),
         ];
-        let map = build_map_from_structure(&pages, 4).unwrap();
+        let map = build_map_from_structure(&pages, 5).unwrap();
         assert_eq!(map.spans.len(), 2);
         assert_eq!(map.spans[0].number, 1);
-        assert_eq!(map.spans[0].end_page, 2);
+        assert_eq!(map.spans[0].end_page, 3);
         assert_eq!(map.spans[0].expected_marks, Some(5));
-        assert_eq!(map.spans[1].start_page, 2);
+        assert_eq!(map.spans[1].start_page, 3);
         assert_eq!(map.non_question_pages, vec![0]);
     }
 

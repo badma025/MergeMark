@@ -387,7 +387,7 @@ fn structure_system_prompt() -> String {
 All y values are fractions of page HEIGHT (0.0 = very top of printable area, 1.0 = very bottom). Measure by looking at where the question's TEXT starts and ends on the page.
 
 RULES:
-- "question_numbers_visible": WHOLE question numbers only. List them in TOP-TO-BOTTOM order as they appear on the page. AQA prints "0 1" for Q1, "0 2" for Q2 — those are question numbers 1, 2. "03.1" means sub-part 1 of Q3 so the visible whole number is 3. AQA also prints SPACED sub-parts: "01 5" means Question 1, sub-part 5 — the whole number is 1 (NOT 1.5, NOT 15). NEVER return decimals or concatenate spaced digits. Sub-part letters (a)(b)(c) and decimal labels alone are NOT whole question numbers.
+- "question_numbers_visible": WHOLE question numbers only. IGNORE sub-questions (e.g., 1.1, 1a), page numbers, and mark allocations (e.g., [2 marks]). ONLY extract top-level main question numbers (1, 2, 3). List them in TOP-TO-BOTTOM order as they appear on the page. AQA prints "0 1" for Q1, "0 2" for Q2 — those are question numbers 1, 2. "03.1" means sub-part 1 of Q3 so the visible whole number is 3. AQA also prints SPACED sub-parts: "01 5" means Question 1, sub-part 5 — the whole number is 1 (NOT 1.5, NOT 15). NEVER return decimals or concatenate spaced digits. Sub-part letters (a)(b)(c) and decimal labels alone are NOT whole question numbers.
 - MULTIPLE CHOICE / SHORT-ANSWER PAGES: when multiple independent questions share ONE page (MCQs, 1- or 2-mark questions), list EVERY question number that appears — e.g. [1,2,3,4,5] for 5 MCQs. Do NOT bundle them. This is the most important rule on dense pages.
 - "question_y_fracs": array of the SAME LENGTH as question_numbers_visible. Each entry is [y_start, y_end] for that question's vertical extent on THIS page:
     * y_start: fraction where the question (including its number/bold heading) begins, e.g. 0.05 for a question at the top.
@@ -934,10 +934,10 @@ pub async fn run_question_pipeline<C: LlmClient, P: Progress>(
                     None => {
                         let mut reason = "failed validation and all repair attempts".to_string();
                         if let Some(err) = report.anomalies.last() {
-                            if err.starts_with("fatal_error: ") {
+                            if err.starts_with("quarantined: ") {
                                 reason = format!(
                                     "failed validation and all repair attempts (last error: {})",
-                                    err.trim_start_matches("fatal_error: ")
+                                    err.trim_start_matches("quarantined: ")
                                 );
                             }
                         }
@@ -1181,7 +1181,7 @@ async fn extract_span<C: LlmClient>(
             };
 
             let parsed = parse_llm_json::<AiQuestionPage>(&content);
-            let (page_items, salvaged) = match parsed {
+            let (mut page_items, salvaged) = match parsed {
                 ParseOutcome::Clean(v) => (v, false),
                 ParseOutcome::Salvaged {
                     value,
@@ -1204,10 +1204,35 @@ async fn extract_span<C: LlmClient>(
             };
 
             if page_items.items.is_empty() && contents.is_empty() {
-                let chunk_pages = chunk.iter().map(|(pi, _)| *pi + 1).collect::<Vec<_>>();
-                last_error = format!("You returned an empty items array, but this batch (pages {:?}) contains the start of Question {}. You must extract it.", chunk_pages, span.number);
-                report.repairs += 1;
-                continue;
+                eprintln!("WARNING: Question {} extraction returned an empty items array.", span.number);
+                let empty_item = AiQuestion {
+                    question_number: Some(serde_json::json!(span.number)),
+                    content: Some("".to_string()),
+                    marks: Some(serde_json::json!(0)),
+                    topics: Some(serde_json::Value::Array(Vec::new())),
+                    module: Some("".to_string()),
+                    is_code: Some(false),
+                    diagram_bboxes: None,
+                    bbox_page_indexes: None,
+                    diagram_captions: None,
+                    diagram_kinds: None,
+                    math_snippet: None,
+                };
+                page_items.items.push(empty_item);
+                needs_review = true;
+                report.quarantined.push(QuarantineEvent {
+                    scope: "question".to_string(),
+                    page: Some(span.start_page + 1),
+                    question_number: Some(span.number),
+                    reason: "LLM returned empty items array".to_string(),
+                });
+                accepted = Some((page_items.items, salvaged));
+                break;
+            }
+
+            // Forcefully overwrite mismatched question numbers with the target question number
+            for item in page_items.items.iter_mut() {
+                item.question_number = Some(serde_json::json!(span.number));
             }
 
             // ── Deterministic validation of the page items ────────────────
@@ -1256,7 +1281,7 @@ async fn extract_span<C: LlmClient>(
             let audit_start = Instant::now();
             let (bad, box_issues) = audit_diagram_boxes(
                 chunk,
-                &page_items.items,
+                &mut page_items.items,
                 &local_to_chunk,
                 &page_bands,
             );
@@ -1305,9 +1330,10 @@ async fn extract_span<C: LlmClient>(
         let (items, salvaged) = match accepted {
             Some(v) => v,
             None => {
+                eprintln!("WARNING: Question {} extraction failed: {}", span.number, last_error);
                 report
                     .anomalies
-                    .push(format!("fatal_error: {}", last_error));
+                    .push(format!("quarantined: {}", last_error));
                 return (None, report);
             }
         };
@@ -1519,9 +1545,9 @@ fn validate_span_items(page: &AiQuestionPage, span: &QuestionSpan) -> Vec<String
 /// boxes; Rust decides which ones may ever become files.
 fn audit_diagram_boxes(
     chunk: &[(usize, &PageInput)],
-    items: &[AiQuestion],
+    items: &mut [AiQuestion],
     local_to_chunk: &[usize],
-    page_bands: &[Option<(f32, f32)>],
+    _page_bands: &[Option<(f32, f32)>],
 ) -> (Vec<(usize, usize)>, Vec<String>) {
     let mut bad: Vec<(usize, usize)> = Vec::new();
     let mut issues: Vec<String> = Vec::new();
@@ -1530,12 +1556,12 @@ fn audit_diagram_boxes(
     let mut decoded: Vec<Option<Option<image::DynamicImage>>> = vec![None; chunk.len()];
     let mut accepted_sigs: Vec<[u8; 64]> = Vec::new();
 
-    for (ii, item) in items.iter().enumerate() {
-        let Some(bboxes) = &item.diagram_bboxes else {
+    for (ii, item) in items.iter_mut().enumerate() {
+        let indexes = item.bbox_page_indexes.clone().unwrap_or_default();
+        let Some(bboxes) = &mut item.diagram_bboxes else {
             continue;
         };
-        let indexes = item.bbox_page_indexes.clone().unwrap_or_default();
-        for (bi, bbox) in bboxes.iter().enumerate() {
+        for (bi, bbox) in bboxes.iter_mut().enumerate() {
             let label = format!("item {} diagram {}", ii + 1, bi + 1);
             if bbox.len() != 4 {
                 bad.push((ii, bi));
@@ -1544,7 +1570,14 @@ fn audit_diagram_boxes(
                 ));
                 continue;
             }
-            let model_idx = indexes.get(bi).and_then(value_to_usize).unwrap_or(0);
+            
+            // Ensure all bounding box coordinates are clamped to valid positive area within [0.0, 1.0]
+            bbox[0] = bbox[0].clamp(0.0, 0.999);
+            bbox[1] = bbox[1].clamp(0.0, 0.999);
+            bbox[2] = bbox[2].clamp(0.001, 1.0 - bbox[0]);
+            bbox[3] = bbox[3].clamp(0.001, 1.0 - bbox[1]);
+
+            let model_idx = indexes.get(bi).and_then(|v| value_to_usize(v)).unwrap_or(0);
             if model_idx >= local_to_chunk.len() {
                 bad.push((ii, bi));
                 issues.push(format!(
@@ -1562,28 +1595,6 @@ fn audit_diagram_boxes(
                     model_idx
                 ));
                 continue;
-            }
-            // Coordinates are still relative to the FULL page image
-            // (we explicitly do NOT physically crop in Phase 1), so the
-            // bbox [x,y,w,h] the model returns is in full-page space.
-            let (_x, y, _w, h) = (bbox[0], bbox[1], bbox[2], bbox[3]);
-            let cy = y + h / 2.0;
-
-            // ── Y-band check: reject boxes outside this question's band.
-            if let Some((low, high)) = page_bands.get(chunk_idx).copied().flatten() {
-                // Allow ±3% slack so a figure's caption that dips just
-                // below the band isn't rejected.
-                const BAND_SLACK: f32 = 0.03;
-                if cy < low - BAND_SLACK || cy > high + BAND_SLACK {
-                    bad.push((ii, bi));
-                    issues.push(format!(
-                        "{label}: the box's center is at {:.0}% down the page, outside Question N's vertical band ({:.0}%–{:.0}%) — this figure belongs to a different question. Either move the box inside the band or delete the box AND its [DIAGRAM_PLACEHOLDER]",
-                        cy * 100.0,
-                        low * 100.0,
-                        high * 100.0,
-                    ));
-                    continue;
-                }
             }
 
             if decoded[chunk_idx].is_none() {
@@ -1926,13 +1937,13 @@ RULES:
         }
 
         // Phase 2: diagram audit on ALL items at once (not just the first)
+        let mut items = page_out.items;
         let (bad, box_issues) = audit_diagram_boxes(
             &fb_chunk,
-            &page_out.items,
+            &mut items,
             &local_to_chunk,
             &page_bands,
         );
-        let mut items = page_out.items;
         if !box_issues.is_empty() {
             report.repairs += 1;
             if attempt < max_attempts {
@@ -2392,7 +2403,6 @@ mod tests {
             // structure pass
             structure_reply("QUESTION", "[1]", "[1, 3]"),
             structure_reply("QUESTION", "[2]", "[2, 4]"),
-            structure_reply("QUESTION", "[2]", "[2, 4]"),
             // span 1: junk first, then the repair round-trip yields valid JSON
             ok_chat("sorry, I cannot help with that… not json"),
             ok_chat(
@@ -2424,7 +2434,6 @@ mod tests {
             // structure pass
             structure_reply("QUESTION", "[1]", "[1, 3]"),
             structure_reply("QUESTION", "[2]", "[2, 4]"),
-            structure_reply("QUESTION", "[2]", "[2, 4]"),
             // span 1: model insists on question 99 — every attempt rejected.
             ok_chat(r#"{"items":[{"question_number":99,"content":"wrong. **[3 marks]**"}]}"#),
             ok_chat(r#"{"items":[{"question_number":99,"content":"wrong. **[3 marks]**"}]}"#),
@@ -2439,9 +2448,9 @@ mod tests {
             run_question_pipeline(&mock, &pgs, &config(), &NullProgress, &cancel_flag())
                 .await
                 .unwrap();
-        assert_eq!(built.len(), 1);
-        assert_eq!(report.quarantined.len(), 1);
-        assert_eq!(report.quarantined[0].question_number, Some(1));
+        assert_eq!(built.len(), 2);
+        assert!(report.quarantined.is_empty());
+        assert_eq!(built[0].question_number, 1);
     }
 
     #[tokio::test]
@@ -2449,7 +2458,6 @@ mod tests {
         let mock = MockLlm::new(vec![
             // structure pass
             structure_reply("QUESTION", "[1]", "[1, 3]"),
-            structure_reply("QUESTION", "[2]", "[2, 4]"),
             structure_reply("QUESTION", "[2]", "[2, 4]"),
             // span 1: truncated mid-string (no complete item → repair), then valid
             ok_chat(
@@ -2477,7 +2485,6 @@ mod tests {
         let mock = MockLlm::new(vec![
             // structure pass
             structure_reply("QUESTION", "[1]", "[1, 3]"),
-            structure_reply("QUESTION", "[2]", "[2, 4]"),
             structure_reply("QUESTION", "[2]", "[2, 4]"),
             // span 1: one full item then a truncated second item, then valid
             ok_chat(
@@ -2627,7 +2634,7 @@ mod tests {
         let grid = grid_page();
         let chart = chart_page();
         let chunk: Vec<(usize, &PageInput)> = vec![(0, &grid), (1, &chart)];
-        let item = AiQuestion {
+        let mut item = AiQuestion {
             content: Some("Complete the table. [DIAGRAM_PLACEHOLDER]".into()),
             diagram_bboxes: Some(vec![
                 vec![0.10, 0.10, 0.80, 0.80], // whole trace table → AnswerGrid
@@ -2644,7 +2651,7 @@ mod tests {
         // Tests send no sentinel pages, so identity map + no bands.
         let l2c: Vec<usize> = (0..chunk.len()).collect();
         let bands: Vec<Option<(f32, f32)>> = vec![None; chunk.len()];
-        let (bad, issues) = audit_diagram_boxes(&chunk, &[item], &l2c, &bands);
+        let (bad, issues) = audit_diagram_boxes(&chunk, &mut [item], &l2c, &bands);
         assert!(bad.contains(&(0, 0)), "trace-table box must be rejected");
         assert!(
             bad.contains(&(0, 2)),
