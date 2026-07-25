@@ -1150,6 +1150,35 @@ pub fn validate_structure_proposal(
         question_y.push((None, None));
     }
 
+    // Deterministic anti-merge pass: the structure prompt asks for
+    // non-overlapping, ascending bands, but a model that ignores that
+    // instruction would otherwise hand two questions crops that both
+    // contain the boundary — exactly the "subquestions muddled between
+    // main questions" failure. Repair overlaps here instead of trusting
+    // the prompt: questions are in top-to-bottom order, so band i must
+    // end no lower than band i+1 starts. On overlap we cut both at the
+    // midpoint of the disputed strip.
+    for i in 0..question_y.len().saturating_sub(1) {
+        let (_, end_i) = question_y[i];
+        let (start_next, _) = question_y[i + 1];
+        if let (Some(e), Some(s)) = (end_i, start_next) {
+            if e > s {
+                let mid = (e + s) / 2.0;
+                question_y[i].1 = Some(mid);
+                question_y[i + 1].0 = Some(mid);
+                violations.push(format!(
+                    "page {}: questions {} and {} had overlapping y-bands ({:.3} > {:.3}) — split at {:.3}",
+                    page + 1,
+                    questions.get(i).copied().unwrap_or(0),
+                    questions.get(i + 1).copied().unwrap_or(0),
+                    e,
+                    s,
+                    mid
+                ));
+            }
+        }
+    }
+
     let footer = proposal.total_marks_footer.and_then(|pair| {
         if pair.len() == 2 {
             let q = crate::validate::value_to_question_number(&pair[0]);
@@ -1403,6 +1432,47 @@ mod tests {
         let t = texts(&["garbled !@#$%^", "more garbled"]);
         let map = build_hybrid_map(&t, &[], 2);
         assert!(map.spans.is_empty());
+    }
+
+    #[test]
+    fn overlapping_y_bands_are_split_not_merged() {
+        // Model claims Q3 runs to 0.62 while Q4 starts at 0.55 — the
+        // disputed strip would put Q4's first sub-parts inside Q3's crop.
+        let proposal = PageStructureProposal {
+            question_numbers_visible: vec![serde_json::json!(3), serde_json::json!(4)],
+            question_y_fracs: Some(vec![
+                vec![serde_json::json!(0.05), serde_json::json!(0.62)],
+                vec![serde_json::json!(0.55), serde_json::json!(0.97)],
+            ]),
+            total_marks_footer: None,
+            total_marks_footer_y: None,
+            page_role: Some("QUESTION".to_string()),
+        };
+        let (v, violations) = validate_structure_proposal(0, proposal, 1);
+        assert_eq!(v.questions, vec![3, 4]);
+        let end_q3 = v.question_y[0].1.unwrap();
+        let start_q4 = v.question_y[1].0.unwrap();
+        assert!(end_q3 <= start_q4, "bands must not overlap: {end_q3} > {start_q4}");
+        assert!((end_q3 - 0.585).abs() < 1e-4, "expected midpoint split, got {end_q3}");
+        assert!(violations.iter().any(|s| s.contains("overlapping y-bands")));
+    }
+
+    #[test]
+    fn non_overlapping_y_bands_are_left_alone() {
+        let proposal = PageStructureProposal {
+            question_numbers_visible: vec![serde_json::json!(1), serde_json::json!(2)],
+            question_y_fracs: Some(vec![
+                vec![serde_json::json!(0.04), serde_json::json!(0.40)],
+                vec![serde_json::json!(0.45), serde_json::json!(0.96)],
+            ]),
+            total_marks_footer: None,
+            total_marks_footer_y: None,
+            page_role: Some("QUESTION".to_string()),
+        };
+        let (v, violations) = validate_structure_proposal(0, proposal, 1);
+        assert_eq!(v.question_y[0].1, Some(0.40));
+        assert_eq!(v.question_y[1].0, Some(0.45));
+        assert!(!violations.iter().any(|s| s.contains("overlapping")));
     }
 
     #[test]
