@@ -19,6 +19,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { toast } from "sonner";
 import { FileText, Clock, Hash, Loader2 } from "lucide-react";
 import { Button } from "@/components/ui/button";
+import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogDescription, DialogFooter } from "@/components/ui/dialog";
 import { WorksheetItem, type WorksheetItemData } from "./WorksheetItem";
 import { cn } from "@/lib/utils";
 
@@ -62,6 +63,7 @@ export function WorksheetBuilder({ selectedQuestions, onRemove, onReorder }: Wor
   const estMinutes = totalMarks; // 1 min per mark heuristic
   const [isCompiling, setIsCompiling] = useState(false);
   const [fileName, setFileName] = useState("");
+  const [showPdfLatexError, setShowPdfLatexError] = useState(false);
 
   const sensors = useSensors(
     useSensor(PointerSensor, { activationConstraint: { distance: 4 } }),
@@ -92,12 +94,43 @@ export function WorksheetBuilder({ selectedQuestions, onRemove, onReorder }: Wor
         duration: 8000,
       });
     } catch (err) {
-      toast.error("Compilation failed", {
-        description: String(err),
-        duration: 8000,
-      });
+      if (err === "PDFLATEX_NOT_FOUND") {
+        setShowPdfLatexError(true);
+      } else {
+        toast.error("Compilation failed", {
+          description: String(err),
+          duration: 8000,
+        });
+      }
     } finally {
       setIsCompiling(false);
+    }
+  }
+
+  async function handleExportMarkdown() {
+    const ids = selectedQuestions.map((q) => q.id);
+    try {
+      const markdown = await invoke<string>("export_worksheet_markdown", {
+        questionIds: ids,
+      });
+      const name = fileName.trim() || "worksheet";
+      
+      const blob = new Blob([markdown], { type: "text/markdown;charset=utf-8" });
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement("a");
+      link.href = url;
+      link.download = `${name}.md`;
+      document.body.appendChild(link);
+      link.click();
+      document.body.removeChild(link);
+      URL.revokeObjectURL(url);
+      
+      toast.success("Markdown exported!");
+      setShowPdfLatexError(false);
+    } catch (err) {
+      toast.error("Markdown export failed", {
+        description: String(err)
+      });
     }
   }
 
@@ -211,6 +244,25 @@ export function WorksheetBuilder({ selectedQuestions, onRemove, onReorder }: Wor
           )}
         </Button>
       </div>
+      
+      <Dialog open={showPdfLatexError} onOpenChange={setShowPdfLatexError}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>LaTeX Compilation Failed</DialogTitle>
+            <DialogDescription>
+              We couldn't find <strong>pdflatex</strong> on your system. MergeMark uses MiKTeX to compile worksheets into high-quality PDFs.
+            </DialogDescription>
+          </DialogHeader>
+          <div className="text-sm text-muted-foreground my-2 space-y-2">
+            <p>To compile to PDF, please install MiKTeX from <a href="https://miktex.org/download" target="_blank" rel="noreferrer" className="text-primary hover:underline">miktex.org</a> and restart MergeMark.</p>
+            <p>Alternatively, you can export the raw Markdown and use your own workflow.</p>
+          </div>
+          <DialogFooter className="mt-4">
+            <Button variant="outline" onClick={() => setShowPdfLatexError(false)}>Cancel</Button>
+            <Button onClick={handleExportMarkdown}>Export as Markdown</Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
     </aside>
   );
 }

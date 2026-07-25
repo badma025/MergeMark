@@ -35,7 +35,9 @@ pub async fn init_db(app_data_dir: PathBuf) -> Result<SqlitePool, sqlx::Error> {
             topics TEXT,
             paper_name TEXT DEFAULT '',
             question_number INTEGER,
-            module TEXT
+            module TEXT,
+            needs_review BOOLEAN NOT NULL DEFAULT 0,
+            answer_stale BOOLEAN NOT NULL DEFAULT 0
         );
         "#
     )
@@ -56,6 +58,17 @@ pub async fn init_db(app_data_dir: PathBuf) -> Result<SqlitePool, sqlx::Error> {
         .execute(&pool)
         .await;
     let _ = sqlx::query("ALTER TABLE questions ADD COLUMN module TEXT")
+        .execute(&pool)
+        .await;
+    let _ = sqlx::query("ALTER TABLE questions ADD COLUMN needs_review BOOLEAN NOT NULL DEFAULT 0")
+        .execute(&pool)
+        .await;
+    let _ = sqlx::query("ALTER TABLE questions ADD COLUMN answer_stale BOOLEAN NOT NULL DEFAULT 0")
+        .execute(&pool)
+        .await;
+
+    // Task 4: Legacy cleanup
+    let _ = sqlx::query("UPDATE questions SET math_snippet = '' WHERE math_snippet IS NOT NULL AND math_snippet != ''")
         .execute(&pool)
         .await;
 

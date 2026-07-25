@@ -798,6 +798,19 @@ pub fn is_duplicate_answer(existing: &str, new: &str) -> bool {
     hits as f64 >= 0.85 * shorter.len() as f64
 }
 
+// ── Mark Scheme Normalization (Task 2) ──────────────────────────────────────
+
+pub fn normalize_mark_scheme_chunk(chunk: &str) -> String {
+    let re_examiner_codes = regex::Regex::new(r"(?i)[\s,;]*(?:[\[(]?\b(?:d?(?:[mab]1?|ft|oe|cao|aef|awrt|dep|indep|allow|condone|ignore|accept|or\s+equivalent|award))[\](,)]*)+\s*$").unwrap();
+    let mut lines: Vec<String> = chunk.lines().map(|line| {
+        let cleaned = re_examiner_codes.replace_all(line, "");
+        cleaned.trim().to_string()
+    }).collect();
+    
+    lines.retain(|line| !line.is_empty());
+    lines.join("\n")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

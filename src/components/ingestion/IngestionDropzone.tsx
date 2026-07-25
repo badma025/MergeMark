@@ -1,5 +1,5 @@
 import { useState, useCallback, useRef, useEffect } from "react";
-import { invoke, convertFileSrc } from "@tauri-apps/api/core";
+import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { ReviewSyncModal, type ProposedMapping } from "./ReviewSyncModal";
 import { open } from "@tauri-apps/plugin-dialog";
@@ -25,6 +25,7 @@ export interface ImportReport {
   pagesTotal: number;
   questionsExpected: number;
   questionsExtracted: number;
+  questionsSkipped: number;
   marksChecksumOk: boolean | null;
   quarantined: Quarantine[];
   repairs: number;
@@ -624,6 +625,7 @@ export function IngestionDropzone({ isActive = false, onSuccess }: IngestionDrop
                       
                       <p className="text-sm text-muted-foreground mb-4">
                         {r.questionsExtracted}/{r.questionsExpected} questions extracted.
+                        {r.questionsSkipped > 0 && ` (${r.questionsSkipped} skipped because they were already extracted).`}
                         {r.marksChecksumOk === false && " Marks don't match the printed paper total."}
                       </p>
 

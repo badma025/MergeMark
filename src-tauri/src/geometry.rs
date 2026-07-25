@@ -316,8 +316,8 @@ pub fn looks_like_answer_grid(gray: &image::GrayImage) -> bool {
         return false;
     }
 
-    let w_thresh = (w as f64 * 0.55) as u32;
-    let h_thresh = (h as f64 * 0.55) as u32;
+    let w_thresh = (w as f64 * 0.75) as u32;
+    let h_thresh = (h as f64 * 0.65) as u32;
 
     let mut line_rows: Vec<u32> = Vec::new();
     for y in 0..h {
@@ -345,7 +345,9 @@ pub fn looks_like_answer_grid(gray: &image::GrayImage) -> bool {
         }
     }
 
-    if line_rows.len() < 4 || line_cols.len() < 2 {
+    // Grids have many rows. Most physics diagrams have few full-width wires.
+    // Raise from 4 to 6 rows to protect complex circuits/schematics.
+    if line_rows.len() < 6 || line_cols.len() < 2 {
         return false;
     }
 
@@ -360,7 +362,22 @@ pub fn looks_like_answer_grid(gray: &image::GrayImage) -> bool {
         }
         prev = Some(y);
     }
-    if bands.is_empty() {
+    if bands.len() < 4 {
+        return false;
+    }
+
+    // Check for regularity: grids have uniform row heights.
+    // Physics diagrams with "wires" (line_rows) usually have varying spacing.
+    let heights: Vec<u32> = bands.iter().map(|(a, b)| b - a).collect();
+    let avg = heights.iter().sum::<u32>() as f32 / heights.len() as f32;
+    let mut variance = 0.0;
+    for &h in &heights {
+        variance += (h as f32 - avg).powi(2);
+    }
+    let std_dev = (variance / heights.len() as f32).sqrt();
+    // A regular grid will have very low std_dev relative to average height.
+    // If std_dev is > 15% of average height, it's likely a varied diagram, not a grid.
+    if std_dev > 0.15 * avg {
         return false;
     }
 
@@ -447,6 +464,7 @@ pub fn crop_diagram(
     img: &image::DynamicImage,
     bbox: &[f32],
     padding: u32,
+    ignore_grid: bool,
 ) -> Result<image::RgbaImage, CropReject> {
     use image::GenericImageView;
     let (img_w, img_h) = img.dimensions();
@@ -491,9 +509,11 @@ pub fn crop_diagram(
     let mut owned = img.clone();
     let cropped = image::imageops::crop(&mut owned, safe_x, safe_y, safe_w, safe_h).to_image();
 
-    let gray = image::DynamicImage::ImageRgba8(cropped.clone()).to_luma8();
-    if looks_like_answer_grid(&gray) {
-        return Err(CropReject::AnswerGrid);
+    if !ignore_grid {
+        let gray = image::DynamicImage::ImageRgba8(cropped.clone()).to_luma8();
+        if looks_like_answer_grid(&gray) {
+            return Err(CropReject::AnswerGrid);
+        }
     }
     Ok(cropped)
 }
@@ -690,7 +710,7 @@ mod tests {
             &[f32::NAN, 0.0, 1.0, 1.0][..],
             &[0.1, 0.1, 0.3, 0.3][..],
         ] {
-            let _ = crop_diagram(&img, b, 40); // must not panic
+            let _ = crop_diagram(&img, b, 40, false); // must not panic
         }
     }
 
@@ -791,13 +811,17 @@ mod tests {
         let img = image::DynamicImage::ImageLuma8(page_grid);
         // Box around the whole trace table (relative coords) → AnswerGrid.
         assert_eq!(
-            crop_diagram(&img, &[0.1, 0.1, 0.8, 0.8], 0),
+            crop_diagram(&img, &[0.1, 0.1, 0.8, 0.8], 0, false),
             Err(CropReject::AnswerGrid)
         );
 
         let chart_page = image::DynamicImage::ImageLuma8(simple_chart());
-        let r = crop_diagram(&chart_page, &[0.0, 0.1, 1.0, 0.7], 0);
+        let r = crop_diagram(&chart_page, &[0.0, 0.1, 1.0, 0.7], 0, false);
         assert!(r.is_ok());
+
+        // Test the bypass
+        let r_bypass = crop_diagram(&img, &[0.1, 0.1, 0.8, 0.8], 0, true);
+        assert!(r_bypass.is_ok(), "bypass must allow grid through");
     }
 
     #[test]

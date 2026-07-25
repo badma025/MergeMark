@@ -175,6 +175,6 @@ export function RichTextEditor({ markdown, onChange, placeholder, className }: R
   );
 }
 
-function ThrowError({ error }: { error: Error }) {
+function ThrowError({ error }: { error: Error }): never {
   throw error;
 }
