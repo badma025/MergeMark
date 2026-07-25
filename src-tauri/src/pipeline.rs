@@ -374,7 +374,7 @@ fn looks_like_new_question(prev_content: &str, new_content: &str) -> bool {
 // ══════════════════════════════════════════════════════════════════════════
 
 fn structure_system_prompt() -> String {
-    r#"You are an exam-document layout analyzer. Look at ONE page and report ONLY structural facts as a JSON object:
+    r#"You are an exam-document layout analyzer. Your single most important job is to draw the EXACT boundary between one top-level question and the next, so that no sub-part is ever assigned to the wrong parent question. Look at ONE page and report ONLY structural facts as a JSON object:
 
 {
   "question_numbers_visible": [ints],
@@ -386,16 +386,41 @@ fn structure_system_prompt() -> String {
 
 All y values are fractions of page HEIGHT (0.0 = very top of printable area, 1.0 = very bottom). Measure by looking at where the question's TEXT starts and ends on the page.
 
+═══ PRIME DIRECTIVE: ONE BAND = ONE MAIN QUESTION ═══
+Each [y_start, y_end] band is used to CROP the page for a transcriber that is told "everything in this band is Question N". So a band MUST contain ALL sub-parts of its own main question and ZERO content from any other main question. Bands on one page MUST NOT OVERLAP and MUST be in strictly increasing y order (band[i] y_end <= band[i+1] y_start). A band that swallows even one line of the next question welds two questions together — the worst failure this system can produce.
+
+═══ SCANNING PROCEDURE (follow in order) ═══
+1. Sweep the page top-to-bottom and note the y of EVERY printed question label: whole numbers (1, 2, 3 / "0 1" / "17") AND sub-part labels ((a), (b), (i), 3.2, "01 5", "2 (b) (ii)").
+2. For each label decide its PARENT main number. A sub-part label inherits the main number of the nearest whole-number heading ABOVE it, UNLESS the label itself prints a main number ("03.2" -> parent 3, "2(b)" -> parent 2). A printed main number always beats the "nearest heading above" heuristic.
+3. Group labels by parent main number.
+4. For each group: y_start = top of its FIRST element on this page, y_end = bottom of its LAST element on this page.
+5. Verify: groups do not overlap and ascend in y. If two groups overlap you mis-assigned a sub-part in step 2 — redo step 2.
+
+═══ WHERE EXACTLY DOES A QUESTION END? ═══
+Walk down from the question's start until you hit the FIRST of these terminators and put y_end just ABOVE it:
+  * the heading of the next main question (its number, or its first sub-part label such as "0 4 . 1" / "4 (a)");
+  * the "(Total for Question N is M marks)" / "[Total: 8]" footer (that footer belongs to the footer fields, not to the band);
+  * a horizontal rule or shaded separator bar the paper uses between questions;
+  * the bottom of the printable area (question continues on the next page).
+Answer lines, dotted rules and blank working space BEFORE the terminator still belong to question N — include them. Never let y_end reach or pass the next question's heading.
+
+═══ MOST COMMON ERRORS TO AVOID ═══
+- Treating a sub-part label like "(c)" or "03.4" as the start of a NEW main question. It is not; it extends the CURRENT question's band.
+- Cutting question N at its last visible text while the next heading sits just below it, leaving that heading inside N's band. Cut ABOVE the next heading, always.
+- Merging two adjacent main questions into one band because they look visually continuous. Two printed whole numbers = two entries, always.
+- Assuming a page holds only one question. Re-scan the bottom third: short questions often start there.
+
 RULES:
-- "question_numbers_visible": WHOLE question numbers only. IGNORE sub-questions (e.g., 1.1, 1a), page numbers, and mark allocations (e.g., [2 marks]). ONLY extract top-level main question numbers (1, 2, 3). List them in TOP-TO-BOTTOM order as they appear on the page. AQA prints "0 1" for Q1, "0 2" for Q2 — those are question numbers 1, 2. "03.1" means sub-part 1 of Q3 so the visible whole number is 3. AQA also prints SPACED sub-parts: "01 5" means Question 1, sub-part 5 — the whole number is 1 (NOT 1.5, NOT 15). NEVER return decimals or concatenate spaced digits. Sub-part letters (a)(b)(c) and decimal labels alone are NOT whole question numbers.
-- MULTIPLE CHOICE / SHORT-ANSWER PAGES: when multiple independent questions share ONE page (MCQs, 1- or 2-mark questions), list EVERY question number that appears — e.g. [1,2,3,4,5] for 5 MCQs. Do NOT bundle them. This is the most important rule on dense pages.
+- "question_numbers_visible": WHOLE question numbers only, each listed AT MOST ONCE, in TOP-TO-BOTTOM order. IGNORE sub-questions (e.g. 1.1, 1a), page numbers and mark allocations (e.g. [2 marks]) as separate entries — they only widen their PARENT's band. AQA prints "0 1" for Q1, "0 2" for Q2 — those are question numbers 1, 2. "03.1" means sub-part 1 of Q3 so the visible whole number is 3. AQA also prints SPACED sub-parts: "01 5" means Question 1, sub-part 5 — the whole number is 1 (NOT 1.5, NOT 15). NEVER return decimals or concatenate spaced digits. Sub-part letters (a)(b)(c) and decimal labels alone are NOT whole question numbers.
+- A question continuing from the previous page whose sub-parts carry on here is still ONE entry: its whole number with y_start = 0.0.
+- MULTIPLE CHOICE / SHORT-ANSWER PAGES: when several independent questions share ONE page (MCQs, 1- or 2-mark questions), list EVERY question number that appears — e.g. [1,2,3,4,5] for 5 MCQs — each with its own tight, non-overlapping band. Do NOT bundle them. This is the most important rule on dense pages.
 - "question_y_fracs": array of the SAME LENGTH as question_numbers_visible. Each entry is [y_start, y_end] for that question's vertical extent on THIS page:
     * y_start: fraction where the question (including its number/bold heading) begins, e.g. 0.05 for a question at the top.
-    * y_end: fraction where the question ends (including all sub-parts and working space, but NOT the "Total for Question N is M marks" line which belongs to the footer).
-    * For a question that runs off the BOTTOM of the page (continues next page), set y_end to ~0.98 (bottom of page).
-    * For a question that starts ABOVE this page (continues from a previous page), set y_start to 0.0 (top of page).
-    * Be precise — within 0.02. These y fractions are used to clip the page image so the transcriber only sees one question at a time. The penalty for a clip that is too tight is a truncated question; the penalty for a clip that is too loose is a question welded to its neighbor. Aim to leave ~0.01 padding above the question and ~0.01 below it.
-- "total_marks_footer": only if a line like "(Total for Question 5 is 8 marks)" or "[Total: 8]" is printed on this page. Format: [5, 8]. Otherwise null.
+    * y_end: fraction where the question ends — including ALL of its OWN sub-parts and working space, but NOT the "Total for Question N is M marks" line and NOT one pixel of the next question.
+    * For a question that runs off the BOTTOM of the page (continues next page), set y_end to ~0.98.
+    * For a question that starts ABOVE this page (continues from a previous page), set y_start to 0.0.
+    * Be precise — within 0.02. Too tight truncates a question; too loose welds it to its neighbour. Leave ~0.01 padding, and when the gap between question N's last line and question N+1's heading is under 0.02, put the boundary at the MIDPOINT of that gap and give BOTH bands that same value (touching, never overlapping).
+- "total_marks_footer": only if a line like "(Total for Question 5 is 8 marks)" or "[Total: 8]" is printed on this page. Format: [5, 8]. Otherwise null. This footer also CONFIRMS a boundary: everything below it belongs to the next question.
 - "total_marks_footer_y": if you returned a total_marks_footer, the y-fraction of that footer line on the page.
 - page_role: COVER (front cover / candidate details), INSTRUCTIONS (rubric, formula sheet), BLANK (empty or "BLANK PAGE"), ANSWER_BOOKLET (empty lined/dotted student writing space), REFERENCE (formula / data sheet), otherwise QUESTION.
 - Output ONLY the JSON object. No commentary. No markdown."#
@@ -436,7 +461,7 @@ fn page_band_note(span: &QuestionSpan, page_index_in_span: usize, total_pages_in
         note.push_str("- Continue reading to the bottom of the page (the question continues onto the next page).\n");
     }
     note.push_str(
-        "If the heading for a different question number appears in this band, stop transcribing before that heading.\n",
+        "If the heading of a different main question (or a sub-part label printed with a different main number) appears inside this band, STOP transcribing at that heading — those sub-parts belong to another question and must never be merged into this one.\n",
     );
     Some(note)
 }
@@ -452,15 +477,30 @@ fn extraction_system_prompt(config: &PipelineConfig, span: &QuestionSpan) -> Str
     };
 
     format!(
-        r#"You are a precise mathematical OCR engine. Output ONLY a valid JSON object of the form {{"items": [ ... ]}}.
+        r#"You are a precise mathematical OCR engine transcribing exactly ONE exam question. Output ONLY a valid JSON object of the form {{"items": [ ... ]}}.
 
-CONTEXT: The page image(s) belong to Question {number} of the paper '{paper}'. They may also show the tail of the previous question or the head of the next one. Transcribe ONLY content that belongs to Question {number}. If nothing on these pages belongs to Question {number}, return {{"items": []}}.
+CONTEXT: The page image(s) show Question {number} of the paper '{paper}'. They may ALSO show the tail of the previous question or the head of the next one. Transcribe ONLY content that belongs to Question {number}. If nothing on these pages belongs to Question {number}, return {{"items": []}}.
 
-Normally there is exactly ONE item. Return more than one ONLY if Question {number} visibly consists of independent numbered tasks on these pages.
+═══ ABSOLUTE RULE — QUESTION ISOLATION (highest priority, overrides everything below) ═══
+You are transcribing Question {number} and NOTHING ELSE. Sub-parts belonging to a different main question must NEVER appear in your output, not even one line of them.
+1. OWNERSHIP TEST — before transcribing any line, ask: "which main question owns this line?" A sub-part label ((a), (b), (i), 4.2, "0 4 . 3", "5 (b) (ii)") belongs to the main question printed in the label itself, or, when the label prints no main number, to the nearest whole-number heading ABOVE it. If the owner is not {number}, DROP the line. When you cannot prove a line belongs to {number}, DROP it.
+2. HARD STOP — while reading downward, the moment you meet ANY of these, stop transcribing immediately and never resume on that page:
+   * a printed whole question number other than {number} (e.g. "{number} " followed later by the next integer, "0 5", "17");
+   * a sub-part label whose printed main number is not {number} (e.g. "04.1" when you are extracting Question 3);
+   * a "(Total for Question {number} is M marks)" / "[Total: M]" footer for Question {number} — that footer marks the END of your question;
+   * a separator rule/shaded bar introducing a new question.
+3. HARD START — skip everything above the start of Question {number}. Trailing sub-parts, answer lines or figures of the PREVIOUS question that appear at the top of the page are NOT yours, even if they flow visually into your question.
+4. SUB-PART CONTINUITY — Question {number} may span several pages; its sub-parts continue in order ((a), (b), (c) ... never resetting). If a page begins with "(d)" and Question {number}'s previous page ended at "(c)", that "(d)" is yours. But if lettering RESTARTS at (a) after a totals footer, that (a) belongs to the NEXT question — drop it.
+5. NEVER renumber, merge or "helpfully" include a neighbouring question's parts to make the item look complete. A short, correctly-isolated item is always better than a merged one. Merged questions are rejected outright.
+6. If a y-band hint ("transcribe only between X% and Y% down the page") is given in the user message, treat it as authoritative for WHAT to transcribe, in addition to rules 1-4.
+
+SELF-CHECK BEFORE OUTPUT: re-read your "content". Every sub-part label in it must belong to Question {number}. Any label that came after a totals footer, or that printed a different main number, must be deleted. Confirm your content contains no second main-question heading.
+
+Normally there is exactly ONE item. Return more than one ONLY if Question {number} visibly consists of independent numbered tasks on these pages. NEVER return an item for a question number other than {number}.
 
 EVERY item MUST have:
 - "question_number": {number} (integer, exactly).
-- "content": FULL transcription (never a summary). Preserve all punctuation. Separate sub-parts (a), (b), (c) with double newlines. Append the mark tag `**[X marks]**` to every sub-part that shows a mark allocation. Transcribe every sentence, including instructions to the candidate that belong to the question. Do NOT include: page headers/footers ("Question X continued", "Turn over"), the "(Total for Question X is Y marks)" footer, plain ruled answer lines, or "BLANK PAGE".
+- "content": FULL transcription of Question {number} only (never a summary). Preserve all punctuation. Separate sub-parts (a), (b), (c) with double newlines, keeping them in printed order. Append the mark tag `**[X marks]**` to every sub-part that shows a mark allocation. Transcribe every sentence, including instructions to the candidate that belong to this question. Do NOT include: any text belonging to another question, page headers/footers ("Question X continued", "Turn over"), the "(Total for Question X is Y marks)" footer, plain ruled answer lines, or "BLANK PAGE".
 - STRUCTURED TABLES WITH HEADERS — trace tables, function tables, working grids — ARE question content even when the body cells are EMPTY. If the text says Complete the trace table, Complete the table, or show the results of executing, NEVER return a diagram box for that grid, even when the question mentions another Figure; transcribe every row and pre-filled cell as Markdown. Transcribe them as Markdown tables in "content" (keeping every header and any pre-filled cells), NEVER as diagram boxes.
 - "marks": integer total for this question's visible part, or null if unknown.
 {topics_instruction}
@@ -1096,7 +1136,7 @@ async fn extract_span<C: LlmClient>(
                     (Some(a), Some(b)) => {
                         let _ = write!(
                             &mut band_notes,
-                            "Question {} begins at about {:.0}% down and ends at about {:.0}% down. Transcribe ONLY between those lines.",
+                            "Question {} begins at about {:.0}% down and ends at about {:.0}% down. Transcribe ONLY between those lines — content above or below belongs to a DIFFERENT main question and must not appear in your output.",
                             span.number, a * 100.0, b * 100.0,
                         );
                     }
@@ -1782,6 +1822,7 @@ RULES:
      "topics": array, "module": "{module}", "is_code": bool,
      "diagram_bboxes": [[x,y,w,h]...] relative 0.0-1.0, "bbox_page_indexes": [0,...] }}
 - MULTIPLE QUESTIONS ON ONE PAGE: when a page has several independent short-answer or multiple-choice questions (e.g. AQA Section B with 4 MCQs), return an item for EACH question. Do NOT bundle them into one item.
+- QUESTION ISOLATION (highest priority): never place sub-parts of two different main questions in one item. A sub-part label ((a), (b), (i), "04.2") belongs to the main number printed in the label, or else to the nearest whole-number heading ABOVE it. A "(Total for Question N is M marks)" footer, or a new whole question number, ENDS that question — everything after it starts a new item. If sub-part lettering restarts at (a), a new main question has begun. When unsure which question owns a line, start a new item rather than merging.
 - If this page is a CONTINUATION of the previous question, is blank, or contains no new question, return {{"items": []}}.
 - Transcribe fully (never summarize). Preserve punctuation. `**[X marks]**` after each marked sub-part. Math in $...$/$$...$$. Markdown tables for text tables; \begin{{array}} only for matrices. Code in backticks, never math mode. Escape LaTeX backslashes (\\frac).
 - AQA decimal sub-parts: render '03.1'-style part numbers as (a), (b), (c) — positional: .1 -> a, .2 -> b — and update inline cross-references. AQA also uses SPACED sub-parts: \"01 5\" means Question 1, sub-part 5 — render as (e). The whole question number is ALWAYS the integer (never a decimal like 1.5). The whole decimal run on this page is ONE item with its integer question number.
