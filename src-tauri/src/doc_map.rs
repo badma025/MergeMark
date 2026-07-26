@@ -312,18 +312,54 @@ pub fn scan_text_layer(page_texts: &[String]) -> TextScan {
         }
 
         // Collect question headings, including MCQ / short-answer pages.
+        // PHASE FIX: multi-layer filter prevents false positives from marks tags,
+        // quantity strings, sub-part formats, and page numbers.
         for cap in heading_re.captures_iter(text) {
             let full = cap.get(0).unwrap();
+            let raw_num_str = cap.get(1).unwrap().as_str();
+
+            // --- FILTER 1: Spaced sub-part format ("01 5" -> Q1, never 15) ---
+            let trimmed_raw = raw_num_str.trim();
+            let tokens: Vec<&str> = trimmed_raw.split_whitespace().collect();
+            let (question_num_str, is_spaced_subpart) = if tokens.len() == 2
+                && tokens[0].chars().all(|c| c.is_ascii_digit())
+                && tokens[1].chars().all(|c| c.is_ascii_digit())
+            {
+                // AQA "01 5" = Q1 sub-part 5. Only the first token is the heading.
+                (tokens[0], true)
+            } else {
+                (trimmed_raw, false)
+            };
+
+            // --- FILTER 2: Marks-tag proximity ("[30 marks]" must not become Q30) ---
+            let context = if full.start() > 20 {
+                text[full.start() - 20..full.end().min(text.len())].to_string()
+            } else {
+                text[..full.end().min(text.len())].to_string()
+            };
+            let near_marks_tag = regex::Regex::new(r"(?i)\[\s*\d+\s*marks?").unwrap().is_match(&context);
+            if near_marks_tag && tokens.len() <= 1 && !is_spaced_subpart {
+                continue; // Skip number that is clearly a mark allocation.
+            }
+
+            // --- FILTER 3: Clean, parse, and range-check ---
+            let cleaned_num = question_num_str.replace(" ", "");
             let y_frac = (full.start() as f32 / page_len).clamp(0.0, 1.0);
-            let cleaned_num = cap[1].replace(" ", "");
             if let Ok(n) = cleaned_num.parse::<u32>() {
-                if n > 0 && n <= 200 {
-                    // Prevent page numbers at the very bottom of the page (e.g. "2 5 IB/M/...")
-                    // from being misclassified as questions. Real question headings always have
-                    // the actual question text following them.
+                if n > 0 && n <= 50 { // Plausible exam range; dense papers rarely exceed 50.
                     let chars_remaining = text.len() - full.end();
                     if chars_remaining > 30 {
-                        headings.push(QuestionHeading { page, number: n, y_frac });
+                        // --- FILTER 4: Reject quantity/unit patterns ---
+                        let after_heading = text[full.end()..(full.end() + 40).min(text.len())].to_string();
+                        let quantity_indicators = ["kg", "g ", "m ", "cm", "mm", "V ", "N ", "J ", "Pa", "Hz"];
+                        let is_quantity = quantity_indicators.iter().any(|ind| after_heading.contains(ind));
+
+                        // --- FILTER 5: Page-number guard (only if very little text after) ---
+                        let is_likely_page_number = (n as usize) == page + 1;
+
+                        if !is_quantity && !(is_likely_page_number && chars_remaining < 60) {
+                            headings.push(QuestionHeading { page, number: n, y_frac });
+                        }
                     }
                 }
             }
@@ -723,30 +759,24 @@ pub fn build_hybrid_map(
     // 5. Vision-fallback pages are the ones we actually fed to build_spans_from_vision.
     let vision_fallback_pages = vision_pages.clone();
     
-    // Validate final spans for monotonicity. Phase 1: with y-clips, multiple
-    // questions can legitimately share a single page (MCQs / short answer).
-    // We only force start_page = prev_end when spans are on *different*
-    // pages AND there's a genuine gap; same-page spans are left alone
-    // because their y fractions encode the vertical ordering.
+    // Validate final spans for monotonicity. Loose guard: backward = always bad;
+    // gap > 40 = almost certainly hallucinated outlier; everything else allowed.
+    // Dense MCQ pages (8, 9, 10, 11) must not trigger false jump alarms.
     let mut valid_spans = Vec::new();
     let mut expected_max_q = 0u32;
     
     for mut span in spans {
-        if expected_max_q == 0 && span.number > 5 {
-            anomalies.push(format!("dropped initial hallucination Q{}", span.number));
+        if expected_max_q > 0 && span.number < expected_max_q {
+            anomalies.push(format!("dropped backwards question Q{} (expected >= {})", span.number, expected_max_q));
             continue;
         }
-        if span.number <= expected_max_q {
-            anomalies.push(format!("dropped backwards/duplicate Q{}", span.number));
-            continue;
-        }
-        if span.number > expected_max_q + 15 && expected_max_q != 0 {
-            anomalies.push(format!("dropped hallucinated jump to Q{}", span.number));
+        if expected_max_q > 0 && span.number > expected_max_q + 40 {
+            anomalies.push(format!("dropped likely hallucinated jump to Q{} (gap from {} exceeds 40)", span.number, expected_max_q));
             continue;
         }
         
         span.start_page = span.start_page.min(span.end_page);
-        expected_max_q = span.number;
+        expected_max_q = expected_max_q.max(span.number);
         valid_spans.push(span);
     }
     
@@ -812,9 +842,8 @@ fn build_spans_from_vision(
             if q == 0 || q > 50 {
                 continue;
             }
-            if q as usize == p.page + 1 {
-                continue; // Page Number Heuristic Filter
-            }
+            // Page-number heuristic removed here — rely on loose sequence filter
+            // and heading-level filters to reject false numbers, not page index.
             let y_fracs = p.question_y.get(qi).copied().unwrap_or((None, None));
             raw_detections.push((p.page, qi, q, y_fracs));
         }

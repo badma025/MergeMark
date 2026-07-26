@@ -1268,15 +1268,109 @@ async fn extract_span<C: LlmClient>(
                 return (None, report);
             }
 
-            // Silently drop any collateral questions that don't match the target span
+            // AUDITABLE RETENTION: collect collateral numbers, quote them in repair,
+            // and enforce exactly ONE item per span. Multi-item responses are a
+            // repair trigger, not a silent drop.
+            let mut raw_numbers: Vec<u32> = Vec::new();
+            for item in &page_items.items {
+                if let Some(v) = &item.question_number {
+                    if let Some(n) = crate::validate::value_to_question_number(v) {
+                        raw_numbers.push(n);
+                    }
+                }
+            }
+
+            // Aggregate violation: more than one item = repair trigger.
+            if page_items.items.len() > 1 {
+                let collateral_numbers: Vec<String> = raw_numbers
+                    .iter()
+                    .filter(|&&n| n != span.number)
+                    .map(|n| n.to_string())
+                    .collect();
+                last_error = if collateral_numbers.is_empty() {
+                    format!(
+                        "You returned {} items for Question {}. Return ONLY ONE item. Combine only if they are sub-parts of the SAME question; otherwise delete extra items.",
+                        page_items.items.len(), span.number
+                    )
+                } else {
+                    format!(
+                        "You returned {} items (including questions [{}]) when asked for Question {}. Drop ALL items except the single item for Question {}.",
+                        page_items.items.len(),
+                        collateral_numbers.join(", "),
+                        span.number,
+                        span.number
+                    )
+                };
+                report.repairs += 1;
+                // Even though this is a repair trigger, we still filter so
+                // the validation runs on the target-only subset when only
+                // one target item exists.
+            }
+
+            // Filter to target question only, but quote what was dropped.
+            let dropped_numbers: Vec<String> = raw_numbers
+                .iter()
+                .filter(|&&n| n != span.number)
+                .map(|n| n.to_string())
+                .collect();
             page_items.items.retain(|item| {
                 item.question_number.as_ref()
                     .and_then(crate::validate::value_to_question_number) == Some(span.number)
             });
 
-            // If it extracted collateral data but missed our target entirely, trigger repair
+            // If collateral was found and dropped, include the dropped numbers
+            // in the repair note so the model learns the boundary error.
+            if !dropped_numbers.is_empty() {
+                last_error = format!(
+                    "{} (dropped collateral questions: [{}])",
+                    last_error,
+                    dropped_numbers.join(", ")
+                );
+            }
+
+            // After filtering, enforce single-item output. If multiple items
+            // matched the target (e.g., LLM split Q8 into two items with the same
+            // number), treat the second as a continuation or error.
+            if page_items.items.len() > 1 {
+                // More than one item with the target number: check if second item
+                // looks like a genuine continuation (same number, advancing sub-parts)
+                // or a split/collateral error.
+                if page_items.items.len() == 2 {
+                    let first_content = page_items.items[0].content.as_deref().unwrap_or("");
+                    let second_content = page_items.items[1].content.as_deref().unwrap_or("");
+                    if looks_like_new_question(first_content, second_content) {
+                        // Second item is a new question misnumbered as the target.
+                        last_error = format!(
+                            "You returned 2 items for Question {}. The second item (starting with \"{}\") looks like a DIFFERENT question — delete it.",
+                            span.number,
+                            second_content.chars().take(40).collect::<String>()
+                        );
+                        report.repairs += 1;
+                        continue;
+                    } else {
+                        // Genuine continuation — keep only the first item; discard
+                        // the redundant second item (continuation should extend span,
+                        // not split the item array).
+                        page_items.items.truncate(1);
+                    }
+                } else {
+                    last_error = format!(
+                        "You returned {} items all labeled Question {} — keep only the first and delete the rest.",
+                        page_items.items.len(), span.number
+                    );
+                    report.repairs += 1;
+                    continue;
+                }
+            }
+
+            // If retention emptied the array, repair with enhanced message.
             if page_items.items.is_empty() {
-                last_error = format!("You extracted data, but none of it was Question {}. Please extract Question {} only.", span.number, span.number);
+                last_error = if dropped_numbers.is_empty() {
+                    format!("No content matched Question {}. Please extract ONLY Question {}.", span.number, span.number)
+                } else {
+                    format!("You extracted data for questions [{}], but NONE of it was Question {}. Please extract ONLY Question {}.",
+                        dropped_numbers.join(", "), span.number, span.number)
+                };
                 report.repairs += 1;
                 continue;
             }
@@ -1475,7 +1569,9 @@ async fn extract_span<C: LlmClient>(
     }
 
     // ── Assemble + content-level validation ─────────────────────────────────
-    let mut content = contents.join("\n\n");
+    // ENFORCEMENT: exactly ONE item per span — no concatenation allowed.
+    // The retention logic above guarantees `contents.len() <= 1`.
+    let mut content = contents.into_iter().next().unwrap_or_default();
     content = validate::clean_question_content(&content);
     // One labelling scheme forever: AQA '3 . 1'-style decimals → (a), (b), (c).
     content = validate::normalize_decimal_parts(&content, span.number);
