@@ -1061,6 +1061,7 @@ async fn extract_span<C: LlmClient>(
         let mut images: Vec<String> = Vec::new();
         let mut local_to_chunk: Vec<usize> = Vec::new();
         let mut page_bands: Vec<Option<(f32, f32)>> = Vec::with_capacity(chunk.len());
+        let mut page_crop_offsets: Vec<(f32, f32)> = Vec::with_capacity(chunk.len());
         for (local_idx, (global_pi, _p)) in chunk.iter().enumerate() {
             let is_first_page_of_span = *global_pi == span.start_page;
             let is_last_page_of_span = *global_pi == span.end_page;
@@ -1083,7 +1084,20 @@ async fn extract_span<C: LlmClient>(
 
             // At this point we know the page has an image and it was
             // requested in this chunk.
-            images.push(b64.unwrap().clone());
+            let b64_str = b64.unwrap();
+            let mut final_b64 = b64_str.clone();
+            let mut crop_offset = (0.0_f32, 1.0_f32); // (start_y, height)
+            
+            if s.is_some() || e.is_some() {
+                let s_val = (s.unwrap_or(0.0) - 0.03).max(0.0);
+                let e_val = (e.unwrap_or(1.0) + 0.03).min(1.0);
+                if let Some(cropped) = crate::geometry::crop_page_vertical(b64_str, s_val, e_val) {
+                    final_b64 = cropped.b64;
+                    crop_offset = (cropped.y_offset_frac, cropped.height_frac);
+                }
+            }
+            images.push(final_b64);
+            page_crop_offsets.push(crop_offset);
             local_to_chunk.push(local_idx);
             // If either clip is present, store the band; missing sides
             // default to page edge (0.0 top / 1.0 bottom).
@@ -1245,34 +1259,47 @@ async fn extract_span<C: LlmClient>(
 
             if page_items.items.is_empty() && contents.is_empty() {
                 eprintln!("WARNING: Question {} extraction returned an empty items array.", span.number);
-                let empty_item = AiQuestion {
-                    question_number: Some(serde_json::json!(span.number)),
-                    content: Some("".to_string()),
-                    marks: Some(serde_json::json!(0)),
-                    topics: Some(serde_json::Value::Array(Vec::new())),
-                    module: Some("".to_string()),
-                    is_code: Some(false),
-                    diagram_bboxes: None,
-                    bbox_page_indexes: None,
-                    diagram_captions: None,
-                    diagram_kinds: None,
-                    math_snippet: None,
-                };
-                page_items.items.push(empty_item);
-                needs_review = true;
                 report.quarantined.push(QuarantineEvent {
                     scope: "question".to_string(),
                     page: Some(span.start_page + 1),
                     question_number: Some(span.number),
-                    reason: "LLM returned empty items array".to_string(),
+                    reason: "No content extracted for this span".to_string(),
                 });
-                accepted = Some((page_items.items, salvaged));
-                break;
+                return (None, report);
             }
 
-            // Forcefully overwrite mismatched question numbers with the target question number
+            // Silently drop any collateral questions that don't match the target span
+            page_items.items.retain(|item| {
+                item.question_number.as_ref()
+                    .and_then(crate::validate::value_to_question_number) == Some(span.number)
+            });
+
+            // If it extracted collateral data but missed our target entirely, trigger repair
+            if page_items.items.is_empty() {
+                last_error = format!("You extracted data, but none of it was Question {}. Please extract Question {} only.", span.number, span.number);
+                report.repairs += 1;
+                continue;
+            }
+
+            // Un-shift diagram bounding boxes back to full-page coordinates
             for item in page_items.items.iter_mut() {
-                item.question_number = Some(serde_json::json!(span.number));
+                if let (Some(bboxes), Some(indexes)) = (&mut item.diagram_bboxes, &item.bbox_page_indexes) {
+                    for (i, bbox) in bboxes.iter_mut().enumerate() {
+                        if bbox.len() != 4 {
+                            continue;
+                        }
+                        if let Some(page_idx_val) = indexes.get(i) {
+                            if let Some(page_idx) = page_idx_val.as_u64() {
+                                if let Some(&(start_y, height)) = page_crop_offsets.get(page_idx as usize) {
+                                    if height < 1.0 {
+                                        bbox[1] = start_y + (bbox[1] * height);
+                                        bbox[3] = start_y + (bbox[3] * height);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
             }
 
             // ── Deterministic validation of the page items ────────────────
@@ -2675,7 +2702,7 @@ mod tests {
         let grid = grid_page();
         let chart = chart_page();
         let chunk: Vec<(usize, &PageInput)> = vec![(0, &grid), (1, &chart)];
-        let mut item = AiQuestion {
+        let item = AiQuestion {
             content: Some("Complete the table. [DIAGRAM_PLACEHOLDER]".into()),
             diagram_bboxes: Some(vec![
                 vec![0.10, 0.10, 0.80, 0.80], // whole trace table → AnswerGrid

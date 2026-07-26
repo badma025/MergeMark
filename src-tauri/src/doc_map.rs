@@ -259,6 +259,17 @@ pub fn scan_text_layer(page_texts: &[String]) -> TextScan {
     let marks_re = regex::Regex::new(r"(?i)\[\s*\d+\s*marks?").unwrap();
 
     for (page, text) in page_texts.iter().enumerate() {
+        // Ignore cover page (page 0) and extra back-matter pages
+        let is_cover = page == 0;
+        let is_extra_page = text.contains("Additional page") 
+            || text.contains("There are no questions printed")
+            || text.contains("Copyright information");
+
+        if is_cover || is_extra_page {
+            page_reliability[page] = PageReliability::NonQuestion;
+            continue;
+        }
+
         let page_len = text.len().max(1) as f32;
         let mut has_footer = false;
 
@@ -543,6 +554,9 @@ fn append_text_only_short_answer_spans(
         spans.iter().map(|s| s.number).collect();
 
     for (&page, headings) in &by_page {
+        if page == 0 {
+            continue;
+        }
         // Build horizontal bands: each heading starts a band that ends
         // at the next heading (or 1.0).
         for (idx, h) in headings.iter().enumerate() {
@@ -715,23 +729,24 @@ pub fn build_hybrid_map(
     // pages AND there's a genuine gap; same-page spans are left alone
     // because their y fractions encode the vertical ordering.
     let mut valid_spans = Vec::new();
-    let mut prev_num = 0u32;
+    let mut expected_max_q = 0u32;
+    
     for mut span in spans {
-        if span.number <= prev_num {
-            anomalies.push(format!(
-                "non-monotonic question number {} after {}",
-                span.number, prev_num
-            ));
+        if expected_max_q == 0 && span.number > 5 {
+            anomalies.push(format!("dropped initial hallucination Q{}", span.number));
             continue;
         }
-        if span.end_page >= num_pages {
-            anomalies.push(format!("invalid page range for Q{}", span.number));
+        if span.number <= expected_max_q {
+            anomalies.push(format!("dropped backwards/duplicate Q{}", span.number));
+            continue;
+        }
+        if span.number > expected_max_q + 15 && expected_max_q != 0 {
+            anomalies.push(format!("dropped hallucinated jump to Q{}", span.number));
             continue;
         }
         
         span.start_page = span.start_page.min(span.end_page);
-
-        prev_num = span.number;
+        expected_max_q = span.number;
         valid_spans.push(span);
     }
     
@@ -809,14 +824,14 @@ fn build_spans_from_vision(
     let mut filtered_detections = Vec::new();
     for det in raw_detections {
         let q = det.2;
-        // Accept the next logical question, allowing for small gaps, or same question.
-        if q >= expected_max_q && q <= expected_max_q + 4 {
+        // Accept any ascending number up to 50, allowing for ANY gap size 
+        if q >= expected_max_q && q <= 50 {
             filtered_detections.push(det);
-            expected_max_q = expected_max_q.max(q);
+            expected_max_q = q;
         }
     }
 
-    for (page, qi, q, (y0, y1)) in filtered_detections {
+    for (page, _qi, q, (y0, y1)) in filtered_detections {
         running_max = running_max.max(q);
         let e = vision_bounds.entry(q).or_insert_with(|| VisionBounds {
             first_page: page,
@@ -1274,14 +1289,14 @@ pub fn build_map_from_structure(
     let mut filtered_detections = Vec::new();
     for det in raw_detections {
         let q = det.2;
-        // Accept the next logical question, allowing for small gaps, or same question.
-        if q >= expected_max_q && q <= expected_max_q + 4 {
+        // Accept any ascending number up to 50, allowing for ANY gap size 
+        if q >= expected_max_q && q <= 50 {
             filtered_detections.push(det);
-            expected_max_q = expected_max_q.max(q);
+            expected_max_q = q;
         }
     }
 
-    for (page, qi, q, (y0, y1)) in filtered_detections {
+    for (page, _qi, q, (y0, y1)) in filtered_detections {
         running_max = running_max.max(q);
         let e = bounds.entry(q).or_insert_with(|| VisionBounds {
             first_page: page,
