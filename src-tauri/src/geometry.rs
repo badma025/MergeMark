@@ -546,6 +546,8 @@ pub struct PageBand {
     pub height_px: u32,
     /// Fractional y-offset within the source image (convenience).
     pub y_offset_frac: f32,
+    /// Fractional height of the cropped region relative to source image.
+    pub height_frac: f32,
 }
 
 /// Crop a page image to a vertical band. Returns None if the band is
@@ -596,7 +598,8 @@ pub fn crop_page_vertical(b64: &str, start_frac: f32, end_frac: f32) -> Option<P
         b64: out_b64,
         y_offset_px: y0,
         height_px: band_h,
-        y_offset_frac: s,
+        y_offset_frac: y0 as f32 / h as f32,
+        height_frac: band_h as f32 / h as f32,
     })
 }
 
