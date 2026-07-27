@@ -181,9 +181,20 @@ fn paper_total_regex() -> regex::Regex {
 ///     start followed by a period/closing paren without a letter.
 fn question_heading_regex() -> regex::Regex {
     // Tolerates AQA's spaced margin padding (e.g. "0 7" for question 7, "1 0" for 10).
-    // The digits may be separated by space. 
+    // The digits may be separated by spaces — but ONLY same-line whitespace is
+    // allowed anywhere inside the match. Letting `\s` match \r\n used to glue
+    // a lone number on one line to a single letter on the next ("\n2\r\nF" from
+    // force labels "2F"/"4E" in physics diagrams), injecting phantom headings.
+    //
+    // Two AQA extraction quirks handled here:
+    //   * The "Do not write outside the box" margin boilerplate sometimes
+    //     extraction-glues onto the question line: "box 2 4 In a resistor…".
+    //     An optional literal `box ` prefix recovers those headings.
+    //   * Physics isotopes straight after the number ("3 1 27Mg 12 can decay…")
+    //     start with a digit, so a plain `(?:\D|$)` tail rejects them. Allow a
+    //     trailing isotope (mass number + element symbol) as well.
     regex::Regex::new(
-        r"(?m)(?:^|\n)\s*(?:\*\*)?(?:Q(?:uestion)?\.?\s*)?0*\s*([1-9](?:\s*\d){0,2})(?:\*\*)?\s*(?:[\.\)\]\-–—]|\s+)(?:\D|$)",
+        r"(?m)(?:^|\n)[ \t]*(?:box[ \t]+)?(?:\*\*)?(?:Q(?:uestion)?\.?[ \t]*)?0*[ \t]*([1-9](?:[ \t]*\d){0,2})(?:\*\*)?[ \t]*(?:[\.\)\]\-–—]|[ \t]+)(?:\D|$|\d{1,3}\s*(?:He|Ne|Ar|Kr|Xe|Rn|F|Cl|Br|I|O|S|Se|Te|N|P|As|Sb|C|Si|Ge|Sn|B|Al|Ga|In|Be|Mg|Ca|Sr|Ba|Li|Na|K|Rb|Cs|U|Th|Pu)\b)",
     )
     .unwrap()
 }
@@ -199,6 +210,40 @@ pub struct TextScan {
     /// contains more than one question, which is what drives the sub-page
     /// split when no reliable footers are present.
     pub headings: Vec<QuestionHeading>,
+}
+
+/// Decide whether the deterministic text layer is rich enough to build the
+/// document map WITHOUT the vision structure pass (one AI call per page).
+/// Calibrated against all AQA physics papers ('17–'24): each passes with a
+/// complete ascending heading sequence, while scanned/garbled PDFs fail and
+/// fall back to the vision structure pass.
+pub fn text_layer_map_sufficient(scan: &TextScan, num_pages: usize) -> bool {
+    if num_pages == 0 {
+        return false;
+    }
+    let mut nums: Vec<u32> = scan.headings.iter().map(|h| h.number).collect();
+    nums.sort();
+    nums.dedup();
+    // Need a real paper's worth of questions, starting at Q1.
+    if nums.len() < 6 || nums.first().copied() != Some(1) {
+        return false;
+    }
+    // At most 2 missing numbers inside 1..=max (tolerates a heading lost to
+    // a diagram-only page or extraction quirk; more means the text layer is
+    // too sparse to trust alone). Headings have already been canonicalized
+    // into the longest plausible ordered sequence by scan_text_layer, so a
+    // stray heading cannot inflate this range or the spans built later.
+    let max_q = *nums.last().unwrap();
+    let gaps = (max_q as usize).saturating_sub(nums.len());
+    if gaps > 2 {
+        return false;
+    }
+    // Headings must be spread across the document, not clumped on a couple
+    // of pages (which would indicate a heading-like list, not questions).
+    let pages_with_headings: std::collections::BTreeSet<usize> =
+        scan.headings.iter().map(|h| h.page).collect();
+    let coverage = pages_with_headings.len() as f32 / num_pages as f32;
+    pages_with_headings.len() >= 4 || coverage >= 0.35
 }
 
 /// Scan every page's raw text layer for structural footers AND question
@@ -317,29 +362,61 @@ pub fn scan_text_layer(page_texts: &[String]) -> TextScan {
         for cap in heading_re.captures_iter(text) {
             let full = cap.get(0).unwrap();
             let raw_num_str = cap.get(1).unwrap().as_str();
+            // Safe byte boundaries that are guaranteed to be on valid UTF-8
+            // char boundaries, even when the regex match interacts with
+            // multi-byte Unicode characters (e.g. HAIR SPACE \u{200a}) in the
+            // extracted text layer.
+            let safe_start = text.ceil_char_boundary(full.start());
+            let safe_end = text.ceil_char_boundary(full.end());
             println!("DEBUG: Page {} heading match: {:?}", page, full.as_str());
 
             // --- FILTER 1: Spaced sub-part format ("01 5" -> Q1, never 15) ---
+            // AQA prints sub-parts as "01 5" (zero-padded main number, space,
+            // sub number). But AQA also prints TWO-DIGIT question numbers with
+            // a space between the digits: "1 0" = Q10, "2 5" = Q25, "3 1" = Q31.
+            // Disambiguate:
+            //   * second token "0"  -> must be a two-digit question number
+            //     (sub-part numbers are never 0): "1 0" = Q10.
+            //   * a leading zero ATTACHED to the first token in the raw match
+            //     (i.e. "01 5", zero directly before the digit with no space)
+            //     -> genuine spaced sub-part: keep first token.
+            //   * otherwise ("1 5") -> two-digit question number Q15.
             let trimmed_raw = raw_num_str.trim();
             let tokens: Vec<&str> = trimmed_raw.split_whitespace().collect();
             let (question_num_str, is_spaced_subpart) = if tokens.len() == 2
                 && tokens[0].chars().all(|c| c.is_ascii_digit())
                 && tokens[1].chars().all(|c| c.is_ascii_digit())
             {
-                // AQA "01 5" = Q1 sub-part 5. Only the first token is the heading.
-                (tokens[0], true)
+                let second_is_zero = tokens[1] == "0";
+                // Look at the characters immediately before the capture group
+                // in the full match: "01 5" has a '0' directly attached to the
+                // first digit (no whitespace between them).
+                let group_start = full.as_str().find(raw_num_str).unwrap_or(0);
+                let before = &full.as_str()[..group_start];
+                let attached_leading_zero = before
+                    .chars()
+                    .last()
+                    .map(|c| c == '0')
+                    .unwrap_or(false);
+                if second_is_zero || !attached_leading_zero {
+                    // Two-digit question number ("1 0" -> 10, "1 5" -> 15).
+                    (trimmed_raw, false)
+                } else {
+                    // AQA "01 5" = Q1 sub-part 5. Only the first token is the heading.
+                    (tokens[0], true)
+                }
             } else {
                 (trimmed_raw, false)
             };
 
             // --- FILTER 2: Marks-tag proximity ("[30 marks]" must not become Q30) ---
-            let start_idx = text[..full.start()]
+            let start_idx = text[..safe_start]
                 .char_indices()
                 .rev()
                 .nth(20)
                 .map(|(i, _)| i)
                 .unwrap_or(0);
-            let context = text[start_idx..full.end()].to_string();
+            let context = text[start_idx..safe_end].to_string();
             let near_marks_tag = regex::Regex::new(r"(?i)\[\s*\d+\s*marks?").unwrap().is_match(&context);
             if near_marks_tag && tokens.len() <= 1 && !is_spaced_subpart {
                 continue; // Skip number that is clearly a mark allocation.
@@ -350,35 +427,128 @@ pub fn scan_text_layer(page_texts: &[String]) -> TextScan {
             let y_frac = (full.start() as f32 / page_len).clamp(0.0, 1.0);
             if let Ok(n) = cleaned_num.parse::<u32>() {
                 if n > 0 && n <= 50 { // Plausible exam range; dense papers rarely exceed 50.
-                    let chars_remaining = text.len() - full.end();
+                    let chars_remaining = text.len() - safe_end;
                     if chars_remaining > 30 {
+                        // Edexcel-style heading pattern: "1 A bicycle…"
+                        // A number followed by an uppercase letter then a
+                        // lowercase word is a strong real-question signal.
+                        let matched = full.as_str();
+                        let trailing_char = matched.trim_end().chars().last().unwrap_or(' ');
+                        let next_is_word = text[safe_end..]
+                            .chars()
+                            .skip_while(|c| c.is_whitespace())
+                            .next()
+                            .map(|c| c.is_alphabetic())
+                            .unwrap_or(false);
+                        let edexcel_pattern = trailing_char.is_ascii_uppercase() && next_is_word;
+
+                        let raw_digits = cap.get(1).unwrap().as_str();
+                        let has_space = raw_digits.contains(' ') || raw_digits.contains('\t');
+                        // Leading zero from AQA's margin padding ("0 1", "01")
+                        // — a zero that appears BEFORE the captured digits, not
+                        // one inside the number itself. The old check
+                        // `full.as_str().contains('0')` fired for "10"/"20"/"30",
+                        // letting printed page numbers 10/20/30 through as
+                        // phantom question headings.
+                        let group_off = full.as_str().find(raw_digits).unwrap_or(0);
+                        let has_zero = full.as_str()[..group_off].contains('0');
+                        let has_q = full.as_str().to_lowercase().contains('q');
+                        let has_period = full.as_str().contains('.');
+                        // Margin-marker form: spaced digits ("1 0") or leading
+                        // zero ("0 1"). These are strong question signals that
+                        // survive the quantity check below — physics MCQ pages
+                        // are so dense with units that a 40-char unit scan
+                        // nukes every real heading on the page.
+                        let has_margin_form = has_space || has_zero;
+
                         // --- FILTER 4: Reject quantity/unit patterns ---
-                        let after_heading: String = text[full.end()..].chars().take(40).collect();
-                        let quantity_indicators = ["kg", "g ", "m ", "cm", "mm", "V ", "N ", "J ", "Pa", "Hz"];
-                        let is_quantity = quantity_indicators.iter().any(|ind| after_heading.contains(ind));
+                        // Only fires for BARE numbers (no margin form): a unit
+                        // must begin IMMEDIATELY after the match (within ~6
+                        // chars). The old scan of 40 chars after the heading
+                        // dropped real question headings on unit-dense pages.
+                        let is_quantity = if has_margin_form || edexcel_pattern {
+                            false
+                        } else {
+                            let after: String = text[safe_end..].chars().take(6).collect();
+                            let after_trim = after.trim_start();
+                            let units = ["kg", "g ", "m ", "cm", "mm", "V ", "N ", "J ", "Pa", "Hz", "kJ", "W ", "A ", "C ", "s "];
+                            units.iter().any(|u| after_trim.starts_with(u))
+                        };
 
                         // --- FILTER 5: Page-number guard ---
                         // AQA prints page numbers at the very bottom (y_frac > 0.85). On blank pages, y_frac is 0.0 but text.len() is small.
                         // We avoid dropping real questions by checking AQA's padding conventions (leading zeros, spaces between digits).
                         let is_likely_page_number = (n as usize) == page + 1 || (n as usize) == page || (n as usize) == page + 2;
-                        
-                        let raw_digits = cap.get(1).unwrap().as_str();
-                        let has_space = raw_digits.contains(' ') || raw_digits.contains('\t');
-                        let has_zero = full.as_str().contains('0');
-                        let has_q = full.as_str().to_lowercase().contains('q');
-                        let has_period = full.as_str().contains('.');
-                        let looks_like_real_question = has_space || has_zero || has_q || has_period;
+                        let looks_like_real_question = has_margin_form || has_q || has_period;
 
                         let at_bottom = y_frac > 0.85 && chars_remaining < 150;
-                        let at_top = y_frac < 0.15 && full.end() < 150;
+                        let at_top = y_frac < 0.15 && safe_end < 150;
                         let is_printed_page_number = is_likely_page_number 
                             && !looks_like_real_question 
+                            && !edexcel_pattern
                             && (at_bottom || at_top || text.len() < 300);
+
+                        // --- FILTER 6: bare-number analysis ---
+                        // Real AQA question numbers ALWAYS carry margin form:
+                        // zero padding ("0 8"), spaced digits ("1 2"), a Q
+                        // prefix, or a period ("12."). A BARE number at line
+                        // start is a heading only when the text continues with
+                        // a capitalised word ("12 Charon…"). Everything else
+                        // is physics debris:
+                        //   * "28 °" / "15 °C"   — angles / temperatures
+                        //   * "2 r" / "3 x"      — formula fragments (2πr, ∛x)
+                        //   * "7 ion" / "7 nucleus" — isotope tails (₇Li)
+                        //   * "6 +" / "1 ="      — isotope / equation debris
+                        //   * "20 N"             — quantities
+                        let is_bare = !has_margin_form && !has_q && !has_period;
+                        let mut bare_reject = false;
+                        if is_bare {
+                            if trailing_char.is_ascii_alphabetic() {
+                                // Keep only "12 C" from "12 Charon…": an
+                                // UPPERCASE letter whose word continues.
+                                if !(trailing_char.is_ascii_uppercase() && next_is_word) {
+                                    bare_reject = true;
+                                }
+                            } else if trailing_char == '(' && next_is_word {
+                                // Edexcel can place the first sub-part marker
+                                // immediately after the question number:
+                                // "11 (a) ...". The opening parenthesis is
+                                // part of the heading, not formula debris.
+                                bare_reject = false;
+                            } else if !trailing_char.is_ascii_digit() {
+                                bare_reject = true; // "=", "+", "°", "(" …
+                            }
+                        }
+
+                        // --- FILTER 7: isotope notation AT the heading site ---
+                        // "20 Ne" / "27Al" at line start is a nuclide, not a
+                        // question heading. Only the match + 3 following chars
+                        // are inspected — a page-wide check used to kill real
+                        // headings when the question TEXT mentioned e.g. "10 C".
+                        // Only applies to bare numbers: margin-form headings
+                        // ("0 8 In which…", "3 1 27Mg…") are real questions.
+                        // Convert byte indices to char indices for safe slicing
+                        let match_len_chars = full.as_str().chars().count();
+                        let heading_window: String = text[safe_start..]
+                            .chars()
+                            .take(match_len_chars + 3) // +3 chars after match
+                            .collect();
+                        // A bare Edexcel heading such as "14 Information ..."
+                        // can begin with the one-letter element symbol "I".
+                        // The uppercase-letter + following lowercase-word
+                        // pattern is stronger evidence of a heading than the
+                        // ambiguous one-letter isotope interpretation.
+                        let is_isotope =
+                            is_bare && !edexcel_pattern && heading_is_isotope(n, &heading_window);
+
+                        // Degree symbol: a number immediately followed by "°"
+                        // is an angle/temperature, never a question heading.
+                        let ends_in_degree = trailing_char == '°';
 
                         println!("DEBUG [PAGE NUM FILTER]: match='{:?}', num={}, page={}, is_likely={}, looks_like_real={}, y_frac={}, chars_remaining={}, text_len={}, IS_PRINTED_PAGE={}", 
                             full.as_str(), n, page, is_likely_page_number, looks_like_real_question, y_frac, chars_remaining, text.len(), is_printed_page_number);
 
-                        if !is_quantity && !is_printed_page_number {
+                        if !is_quantity && !is_printed_page_number && !bare_reject && !is_isotope && !ends_in_degree {
                             headings.push(QuestionHeading { page, number: n, y_frac });
                         }
                     }
@@ -433,8 +603,82 @@ pub fn scan_text_layer(page_texts: &[String]) -> TextScan {
         footers,
         paper_total,
         page_reliability,
-        headings,
+        headings: canonicalize_headings(headings),
     }
+}
+
+/// Keep only the longest plausible question-heading sequence.
+///
+/// PDF text layers often contain question-like numbers from answer booklets,
+/// diagrams, and mark annotations after the actual paper. A simple numeric
+/// deduplication cannot distinguish those from real headings: for example,
+/// Q24 between Q7 and Q8 poisons the document map, while repeated Q2/Q3 on
+/// later answer pages expands their spans across the rest of the document.
+///
+/// The real question sequence is ordered in document position and normally
+/// advances by one. A gap of up to three is allowed because the sufficiency
+/// gate already tolerates two missing headings. The longest increasing
+/// subsequence preserves legitimate papers with skipped or missed headings
+/// without assuming a fixed number of questions or an exam board.
+fn canonicalize_headings(mut headings: Vec<QuestionHeading>) -> Vec<QuestionHeading> {
+    if headings.len() < 2 {
+        return headings;
+    }
+
+    headings.sort_by(|a, b| {
+        a.page
+            .cmp(&b.page)
+            .then_with(|| a.y_frac.partial_cmp(&b.y_frac).unwrap_or(std::cmp::Ordering::Equal))
+    });
+
+    // A real paper starts at Q1. Anchor to that heading when present so an
+    // equally long answer-booklet subsequence beginning at Q2/Q3 cannot win
+    // merely because it happens to contain one more noisy tail heading.
+    if let Some(start) = headings.iter().position(|heading| heading.number == 1) {
+        let mut selected = vec![headings[start]];
+        let mut current_number = 1u32;
+        for heading in headings.iter().skip(start + 1) {
+            if heading.number > current_number && heading.number - current_number <= 3 {
+                selected.push(*heading);
+                current_number = heading.number;
+            }
+        }
+        return selected;
+    }
+
+    let mut lengths = vec![1usize; headings.len()];
+    let mut predecessors = vec![None; headings.len()];
+
+    for i in 0..headings.len() {
+        for j in 0..i {
+            let number_gap = headings[i].number.saturating_sub(headings[j].number);
+            if headings[j].number >= headings[i].number || number_gap > 3 {
+                continue;
+            }
+
+            let candidate_length = lengths[j] + 1;
+            if candidate_length > lengths[i] {
+                lengths[i] = candidate_length;
+                predecessors[i] = Some(j);
+            }
+        }
+    }
+
+    let mut end = 0;
+    for i in 1..headings.len() {
+        if lengths[i] > lengths[end] {
+            end = i;
+        }
+    }
+
+    let mut selected = Vec::with_capacity(lengths[end]);
+    let mut current = Some(end);
+    while let Some(index) = current {
+        selected.push(headings[index]);
+        current = predecessors[index];
+    }
+    selected.reverse();
+    selected
 }
 
 /// Build spans from reliable text-layer pages only.
@@ -530,7 +774,7 @@ fn build_spans_from_reliable_pages(
     // for Question"). For any heading whose number isn't already covered
     // by a footer span, carve out a span from that heading's y to the
     // next heading's y on the same page (or end of page).
-    append_text_only_short_answer_spans(scan, &mut spans, &mut anomalies);
+    append_text_only_short_answer_spans(scan, &mut spans, &mut anomalies, false);
 
     (spans, reliable_pages, anomalies)
 }
@@ -600,6 +844,7 @@ fn append_text_only_short_answer_spans(
     scan: &TextScan,
     spans: &mut Vec<QuestionSpan>,
     anomalies: &mut Vec<String>,
+    include_ambiguous: bool,
 ) {
     // Group headings by page.
     let mut by_page: BTreeMap<usize, Vec<QuestionHeading>> = BTreeMap::new();
@@ -611,16 +856,26 @@ fn append_text_only_short_answer_spans(
         headings.dedup_by(|a, b| a.number == b.number && (a.y_frac - b.y_frac).abs() < 0.05);
     }
 
+    let mut ordered_headings = scan.headings.clone();
+    ordered_headings.sort_by(|a, b| {
+        a.page
+            .cmp(&b.page)
+            .then_with(|| a.y_frac.partial_cmp(&b.y_frac).unwrap_or(std::cmp::Ordering::Equal))
+    });
+
     let existing_numbers: std::collections::BTreeSet<u32> =
         spans.iter().map(|s| s.number).collect();
 
     for (&page, headings) in &by_page {
-        if page == 0 || scan.page_reliability[page] != PageReliability::Reliable {
+        if page == 0
+            || scan.page_reliability[page] == PageReliability::NonQuestion
+            || (!include_ambiguous && scan.page_reliability[page] != PageReliability::Reliable)
+        {
             continue;
         }
         // Build horizontal bands: each heading starts a band that ends
         // at the next heading (or 1.0).
-        for (idx, h) in headings.iter().enumerate() {
+        for h in headings.iter() {
             if existing_numbers.contains(&h.number) {
                 continue;
             }
@@ -660,10 +915,22 @@ fn append_text_only_short_answer_spans(
                 // long question's band — don't carve out a new span.
                 continue;
             }
-            let end_y = if idx + 1 < headings.len() {
-                headings[idx + 1].y_frac - 0.005
-            } else {
-                1.0
+
+            let next_heading = ordered_headings
+                .iter()
+                .position(|candidate| {
+                    candidate.page == h.page
+                        && candidate.number == h.number
+                        && (candidate.y_frac - h.y_frac).abs() < 0.0001
+                })
+                .and_then(|position| ordered_headings.get(position + 1));
+            let end_page = match next_heading {
+                Some(next) if next.page > page => next.page.saturating_sub(1),
+                _ => page,
+            };
+            let end_y = match next_heading {
+                Some(next) if next.page == page => Some(next.y_frac - 0.005),
+                _ => None,
             };
             let start_y = h.y_frac - 0.005;
             anomalies.push(format!(
@@ -671,25 +938,21 @@ fn append_text_only_short_answer_spans(
                 h.number,
                 page + 1,
                 start_y,
-                end_y,
+                end_y.unwrap_or(1.0),
             ));
             spans.push(QuestionSpan {
                 number: h.number,
                 start_page: page,
-                end_page: page,
+                end_page,
                 start_y_frac: Some(start_y.clamp(0.0, 1.0)),
-                end_y_frac: Some(end_y.clamp(0.0, 1.0)),
+                end_y_frac: end_y.map(|y| y.clamp(0.0, 1.0)),
                 expected_marks: None,
-                reliable_pages: if scan.page_reliability[page] == PageReliability::Reliable {
-                    vec![page]
-                } else {
-                    vec![]
-                },
-                ambiguous_pages: if scan.page_reliability[page] == PageReliability::Reliable {
-                    vec![]
-                } else {
-                    vec![page]
-                },
+                reliable_pages: (page..=end_page)
+                    .filter(|p| scan.page_reliability[*p] == PageReliability::Reliable)
+                    .collect(),
+                ambiguous_pages: (page..=end_page)
+                    .filter(|p| scan.page_reliability[*p] == PageReliability::Ambiguous)
+                    .collect(),
             });
             println!("DEBUG pushed Q{} to spans from text-heading append", h.number);
         }
@@ -729,8 +992,16 @@ pub fn build_hybrid_map(
     let scan = scan_text_layer(page_texts);
     
     // 1. Build spans from reliable text-layer pages
+    let text_headings_sufficient = text_layer_map_sufficient(&scan, num_pages);
     let (mut spans, _reliable_pages, text_anomalies) = build_spans_from_reliable_pages(&scan, num_pages);
     anomalies.extend(text_anomalies);
+
+    // A sufficient text layer is already the deterministic document map. Use
+    // its page-local headings directly, including ambiguous pages, instead of
+    // sending synthetic empty structures through the vision span builder.
+    if text_headings_sufficient {
+        append_text_only_short_answer_spans(&scan, &mut spans, &mut anomalies, true);
+    }
 
     // Phase 1b: when the text layer gave us NO reliable footers (common on
     // MCQ-heavy papers, scanned PDFs with corrupt text layers, IB/CAIE papers
@@ -740,15 +1011,18 @@ pub fn build_hybrid_map(
     // ("information", "formulae") are actually question pages. In that
     // case feed ALL non-truly-blank pages into the vision span builder so
     // the structure pass's (paid-for) output is not silently discarded.
-    let text_layer_trustworthy = !scan.footers.is_empty()
-        && scan.footers.iter().filter(|f| f.question > 0).count() >= 2;
+    let text_layer_trustworthy = text_headings_sufficient
+        || (!scan.footers.is_empty()
+            && scan.footers.iter().filter(|f| f.question > 0).count() >= 2);
 
     // 2. Identify which pages to feed the vision builder. When the text
     // layer is trustworthy, use only Ambiguous pages (the existing hybrid
     // approach — saves us from merging against pages the text layer
     // already placed). When not, feed every page that has structure data
     // and is not a hard Blank/Cover/etc.
-    let vision_pages: Vec<usize> = if text_layer_trustworthy {
+    let vision_pages: Vec<usize> = if text_headings_sufficient {
+        Vec::new()
+    } else if text_layer_trustworthy {
         (0..num_pages)
             .filter(|&p| scan.page_reliability[p] == PageReliability::Ambiguous)
             .collect()
@@ -867,11 +1141,25 @@ fn is_figure_hallucination(proposed_num: u32, page_text: &str) -> bool {
     total_occurrences > 0 && total_occurrences == veto_occurrences
 }
 
+#[allow(dead_code)]
 fn is_isotope_hallucination(proposed_num: u32, page_text: &str) -> bool {
     // Specifically looking for the pattern: `20 \n 10 Ne` or `20 Ne` or `20 \n Ne`.
     let pattern = format!(r"(?i)\b{}\s*\d*\s*(?:He|Ne|Ar|Kr|Xe|Rn|F|Cl|Br|I|O|S|Se|Te|N|P|As|Sb|C|Si|Ge|Sn|B|Al|Ga|In|Be|Mg|Ca|Sr|Ba|Li|Na|K|Rb|Cs|U|Th|Pu)\b", proposed_num);
     if let Ok(re) = regex::Regex::new(&pattern) {
         return re.is_match(page_text);
+    }
+    false
+}
+
+/// Narrow isotope check used at heading-scan time: only fires when the
+/// isotope pattern appears AT the heading site itself (the match plus a few
+/// following characters), never elsewhere on the page. The page-wide variant
+/// above nuked a real Q1 heading because Q1's question text mentioned a
+/// charge of "10 C".
+fn heading_is_isotope(number: u32, window: &str) -> bool {
+    let pattern = format!(r"(?i)\b{}\s*\d*\s*(?:He|Ne|Ar|Kr|Xe|Rn|F|Cl|Br|I|O|S|Se|Te|N|P|As|Sb|C|Si|Ge|Sn|B|Al|Ga|In|Be|Mg|Ca|Sr|Ba|Li|Na|K|Rb|Cs|U|Th|Pu)\b", number);
+    if let Ok(re) = regex::Regex::new(&pattern) {
+        return re.is_match(window);
     }
     false
 }
@@ -915,21 +1203,6 @@ fn build_spans_from_vision(
             page_detections.push((p.page, qi, q, y_fracs));
         }
 
-        // --- HYBRID FALLBACK: INJECT MISSING TEXT LAYER HEADINGS ---
-        for h in headings {
-            if h.page == p.page && h.number > 0 && h.number <= 100 {
-                let already_detected = page_detections.iter().any(|d| d.2 == h.number);
-                if !already_detected {
-                    // Prevent injecting isotope numbers (e.g. 20 from "20 Ne") 
-                    if is_isotope_hallucination(h.number, &page_texts[p.page]) {
-                        continue;
-                    }
-                    // Inject with qi=999 to indicate it's from the text layer
-                    page_detections.push((h.page, 999, h.number, (Some(h.y_frac), Some(h.y_frac))));
-                }
-            }
-        }
-
         // Ensure they are ordered by question number so expected_max_q evaluates correctly.
         // We do NOT sort by y_frac on the same page because missing bounding boxes (or slightly inaccurate AI coordinates)
         // could cause Q2 to sort before Q1, causing Q1 to be dropped by the monotonicity guard.
@@ -940,23 +1213,73 @@ fn build_spans_from_vision(
         raw_detections.extend(page_detections);
     }
 
+    // --- HYBRID FALLBACK: INJECT TEXT LAYER HEADINGS (standalone pass) ---
+    // Text-layer headings are ground truth and must enter the map EVEN when
+    // the AI structure pass is missing, failed, or hallucinated-free but
+    // sparse. The injection used to live inside the per-structure loop,
+    // which meant a page with no AI structure (or an empty structures vec)
+    // silently lost every text heading on it.
+    for h in headings {
+        if h.number == 0 || h.number > 100 {
+            continue;
+        }
+        if !eligible_pages.contains(&h.page) {
+            continue;
+        }
+        // Isotope numbers (e.g. 20 from "20 Ne") are already filtered at
+        // scan time via heading_is_isotope, which only inspects the heading
+        // site — no page-wide veto here.
+        // Skip if the AI already detected this number on this exact page —
+        // the vision_bounds merge would dedupe anyway, but skipping keeps
+        // the AI's (usually better) y coordinates authoritative.
+        let ai_has_it = raw_detections.iter().any(|d| d.0 == h.page && d.2 == h.number);
+        if ai_has_it {
+            continue;
+        }
+        // Inject with qi=999 to indicate it's from the text layer
+        raw_detections.push((h.page, 999, h.number, (Some(h.y_frac), Some(h.y_frac))));
+    }
+
     let mut expected_max_q = 0u32;
     let mut filtered_detections = Vec::new();
     for det in raw_detections {
         let page = det.0;
+        let qi = det.1;
         let q = det.2;
+        let is_text_layer = qi == 999;
 
         // --- HYBRID RUST VETO CHECK ---
-        if is_figure_hallucination(q, &page_texts[page]) {
+        if !is_text_layer && is_figure_hallucination(q, &page_texts[page]) {
             continue;
         }
 
-        // Accept any ascending number up to 100, allowing for ANY gap size 
-        if q >= expected_max_q && q <= 100 {
+        // --- CROSS-PAGE TEXT CONFIRMATION ---
+        // If the deterministic text-layer scan found question q's heading
+        // ANYWHERE in the document, that placement is ground truth. An AI
+        // detection of the same q on a DIFFERENT page (where the text layer
+        // does not have q) is almost certainly a misread (e.g. the AI read
+        // the printed page number "10" as Q10 on a page where the text layer
+        // only finds Q3 margin markers). Reject it and let the text-layer
+        // placement stand. When the text layer has q NOWHERE (scanned PDF,
+        // OCR gap), the rule stays out of the way and the AI is trusted.
+        if !is_text_layer {
+            let text_has_q_here = headings.iter().any(|h| h.page == page && h.number == q);
+            if !text_has_q_here {
+                let text_has_q_elsewhere = headings.iter().any(|h| h.number == q);
+                if text_has_q_elsewhere {
+                    continue;
+                }
+            }
+        }
+
+        // Accept any ascending number up to 100, allowing for ANY gap size.
+        // Text-layer injected headings (qi == 999) are always accepted — they
+        // come from the deterministic scanner which is our ground truth.
+        if q <= 100 && (q >= expected_max_q || is_text_layer) {
             // Veto page number hallucinations: if the AI proposed a number that equals the printed page number,
             // we strictly require the text layer to confirm it. Since our text layer scanner robustly ignores 
             // printed page numbers (by checking AQA padding conventions), it will only confirm real questions.
-            let is_likely_page_number = (q as usize) == page + 1 || (q as usize) == page || (q as usize) == page + 2;
+            let is_likely_page_number = !is_text_layer && ((q as usize) == page + 1 || (q as usize) == page || (q as usize) == page + 2);
             if is_likely_page_number {
                 let ai_y = det.3.0; // The start y-fraction from the AI
                 let text_layer_confirmed = headings.iter().any(|h| {
@@ -976,7 +1299,9 @@ fn build_spans_from_vision(
             }
 
             filtered_detections.push(det);
-            expected_max_q = q;
+            if q > expected_max_q {
+                expected_max_q = q;
+            }
         }
     }
 
@@ -1018,6 +1343,25 @@ fn build_spans_from_vision(
             // misread "30" from "[30 marks]" on a cover page otherwise
             // poisons bounds for Q30.
             if q > 0 && q <= 200 {
+                // Page-number veto: an AI "footer" whose question number
+                // equals the printed page number is almost always the page
+                // number itself misread as a totals line. Require the text
+                // layer to confirm a heading for q on this page.
+                let is_likely_page_number = (q as usize) == p.page + 1
+                    || (q as usize) == p.page
+                    || (q as usize) == p.page + 2;
+                if is_likely_page_number {
+                    let confirmed = headings.iter().any(|h| h.page == p.page && h.number == q);
+                    if !confirmed {
+                        continue;
+                    }
+                }
+                // Cross-page confirmation: if the text layer placed question
+                // q on a DIFFERENT page, this footer placement is wrong.
+                let text_has_q_here = headings.iter().any(|h| h.page == p.page && h.number == q);
+                if !text_has_q_here && headings.iter().any(|h| h.number == q) {
+                    continue;
+                }
                 let e = vision_bounds.entry(q).or_insert_with(|| VisionBounds {
                     first_page: p.page,
                     last_page: p.page,
@@ -1043,20 +1387,33 @@ fn build_spans_from_vision(
     for i in 0..vision_bounds_vec.len() {
         let (q, ref b) = vision_bounds_vec[i];
         let start_page = b.first_page;
-        let end_page = if i + 1 < vision_bounds_vec.len() {
-            let next_start_page = vision_bounds_vec[i + 1].1.first_page;
+        let next = vision_bounds_vec.get(i + 1);
+        let end_page = if let Some((_, nb)) = next {
+            let next_start_page = nb.first_page;
             // Strict math clamp to prevent empty spans while preserving b.last_page overlap
             std::cmp::max(start_page.max(b.last_page), next_start_page.saturating_sub(1))
         } else {
             std::cmp::max(start_page, b.last_page)
         };
 
-        // Same-page multi-question sanity: if first_y is above last_y but
-        // first_page == last_page, we keep both clips (a vertical band).
-        let (start_y, end_y) = if b.first_page == b.last_page {
-            (b.first_y, b.last_y)
-        } else {
-            (b.first_y, b.last_y)
+        // y-band clips. Text-layer injected detections carry y0 == y1 ==
+        // heading y, so a naive (first_y, last_y) pair produces a DEGENERATE
+        // zero-height band for single-page questions ("transcribe between
+        // 9% and 9%"), which makes the extraction model return empty items.
+        // Rules:
+        //   * start_y = this question's topmost heading y on its first page
+        //     (nudged up slightly so the heading line itself is included).
+        //   * end_y = when the NEXT question starts on the same page as this
+        //     span's end_page, clip just above the next heading. Otherwise the
+        //     question runs to the bottom of its last page -> None ("to
+        //     bottom"), never the last detection's y (which for text-layer
+        //     detections is just the last margin marker, not the content end).
+        let start_y = b.first_y.map(|y| (y - 0.01).clamp(0.0, 1.0));
+        let end_y = match next {
+            Some((_, nb)) if nb.first_page <= end_page => {
+                nb.first_y.map(|y| (y - 0.005).clamp(0.0, 1.0))
+            }
+            _ => None,
         };
         let mut vision_covered = Vec::new();
         for pg in start_page..=end_page {
@@ -1692,5 +2049,333 @@ mod tests {
         assert_eq!(v.footer, Some((3, 8)));
         assert_eq!(v.role, PageRole::Question);
         assert_eq!(violations.len(), 0); // No longer a violation because 03.1 is parsed successfully
+    }
+
+    /// Extract page texts via the production pdfium path and build the
+    /// document map with NO AI structures. Returns None when the PDF is
+    /// missing or unreadable (so tests skip gracefully on CI).
+    fn golden_map(path: &str) -> Option<(Vec<String>, DocumentMap)> {
+        if !std::path::Path::new(path).exists() {
+            eprintln!("{} not found — skipping golden test", path);
+            return None;
+        }
+        let page_inputs = match crate::pdf_render::render_pdf_pages(std::path::Path::new(path)) {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("pdfium load failed for {}: {} — skipping", path, e);
+                return None;
+            }
+        };
+        let pages: Vec<String> = page_inputs.into_iter().map(|p| p.text).collect();
+        let num_pages = pages.len();
+        let map = build_hybrid_map(&pages, &[], num_pages);
+        Some((pages, map))
+    }
+
+    #[test]
+    fn text_layer_sufficiency_gate() {
+        // Garbled / scanned: no headings at all -> insufficient.
+        let garbled = texts(&["garbled !@#$%^", "more garbled"]);
+        let scan = scan_text_layer(&garbled);
+        assert!(!text_layer_map_sufficient(&scan, 2));
+
+        // Sparse: only 3 questions -> insufficient (needs vision fallback).
+        let sparse = texts(&[
+            "Instructions",
+            "1. alpha text padding padding padding padding padding padding padding padding",
+            "2. beta text padding padding padding padding padding padding padding padding",
+            "3. gamma text padding padding padding padding padding padding padding padding",
+        ]);
+        let scan = scan_text_layer(&sparse);
+        assert!(!text_layer_map_sufficient(&scan, 4));
+
+        // Dense but missing Q1 -> insufficient.
+        let no_q1 = texts(&[
+            "Instructions",
+            "2. beta text padding padding padding padding padding padding padding padding",
+            "3. gamma text padding padding padding padding padding padding padding padding",
+            "4. delta text padding padding padding padding padding padding padding padding",
+            "5. epsilon text padding padding padding padding padding padding padding padding",
+            "6. zeta text padding padding padding padding padding padding padding padding",
+            "7. eta text padding padding padding padding padding padding padding padding",
+        ]);
+        let scan = scan_text_layer(&no_q1);
+        assert!(!text_layer_map_sufficient(&scan, 7));
+
+        // Complete ascending run 1..=8 across several pages -> sufficient.
+        let dense = texts(&[
+            "Instructions",
+            "1. alpha text padding padding padding padding padding padding padding padding",
+            "2. beta text padding padding padding padding padding padding padding padding",
+            "3. gamma text padding padding padding padding padding padding padding padding",
+            "4. delta text padding padding padding padding padding padding padding padding",
+            "5. epsilon text padding padding padding padding padding padding padding padding",
+            "6. zeta text padding padding padding padding padding padding padding padding",
+            "7. eta text padding padding padding padding padding padding padding padding",
+            "8. theta text padding padding padding padding padding padding padding padding",
+        ]);
+        let scan = scan_text_layer(&dense);
+        assert!(text_layer_map_sufficient(&scan, 9));
+    }
+
+    #[test]
+    fn edexcel_2023_pdf_uses_ordered_text_headings() {
+        let Some((pages, map)) = golden_map("../'23 edexcel.pdf") else {
+            return;
+        };
+
+        let scan = scan_text_layer(&pages);
+        let numbers: Vec<u32> = scan.headings.iter().map(|h| h.number).collect();
+        assert_eq!(numbers, (1..=18).collect::<Vec<_>>());
+        assert!(text_layer_map_sufficient(&scan, pages.len()));
+
+        let span_numbers: Vec<u32> = map.spans.iter().map(|s| s.number).collect();
+        assert_eq!(span_numbers, (1..=18).collect::<Vec<_>>());
+        assert!(map
+            .spans
+            .iter()
+            .all(|span| span.start_page <= span.end_page));
+        assert!(!map.spans.iter().any(|span| span.number == 24));
+        assert!(map
+            .spans
+            .iter()
+            .all(|span| span.end_page.saturating_sub(span.start_page) <= 4));
+    }
+
+    #[test]
+    fn edexcel_fixture_text_and_image_extraction_integrity() {
+        let years = ["17", "18", "19", "20", "21", "22", "24"];
+        let mut tested = 0usize;
+
+        for year in years {
+            let path = format!("../edexcel/'{} edexcel.pdf", year);
+            assert!(
+                std::path::Path::new(&path).exists(),
+                "missing requested Edexcel fixture: {}",
+                path
+            );
+
+            let page_inputs = crate::pdf_render::render_pdf_pages(std::path::Path::new(&path))
+                .unwrap_or_else(|error| panic!("{} could not be rendered: {}", path, error));
+            assert!(!page_inputs.is_empty(), "{} rendered zero pages", path);
+
+            let text_bytes: usize = page_inputs
+                .iter()
+                .map(|page| page.text.trim().len())
+                .sum();
+            assert!(
+                page_inputs
+                    .iter()
+                    .all(|page| page.text.len() <= 20_000_000),
+                "{} contains an implausibly large page text payload",
+                path,
+            );
+
+            let mut image_pages = 0usize;
+            let mut text_only_pages = 0usize;
+            for (page_index, page) in page_inputs.iter().enumerate() {
+                match &page.kind {
+                    crate::pipeline::PageInputKind::Image { b64 } => {
+                        image_pages += 1;
+                        assert!(
+                            b64.starts_with("data:image/"),
+                            "{} page {} image payload has an invalid data URL",
+                            path,
+                            page_index + 1
+                        );
+                        let decoded = crate::geometry::decode_page_image(b64).unwrap_or_else(|| {
+                            panic!(
+                                "{} page {} image payload could not be decoded",
+                                path,
+                                page_index + 1
+                            )
+                        });
+                        assert!(
+                            decoded.width() >= 100 && decoded.height() >= 100,
+                            "{} page {} image is implausibly small: {}x{}",
+                            path,
+                            page_index + 1,
+                            decoded.width(),
+                            decoded.height()
+                        );
+                    }
+                    crate::pipeline::PageInputKind::TextOnly => {
+                        text_only_pages += 1;
+                        assert!(
+                            !page.text.trim().is_empty(),
+                            "{} page {} is TextOnly but has no extracted text",
+                            path,
+                            page_index + 1
+                        );
+                    }
+                }
+            }
+            assert!(
+                image_pages > 0,
+                "{} produced no page images for image extraction",
+                path
+            );
+
+            // A scanned/image-dominant paper is valid even when its PDF text
+            // layer is sparse. In that mode the text scan must explicitly
+            // decline to build a map, while the image path remains complete.
+            let text_rich = text_bytes >= 1000;
+
+            let page_texts: Vec<String> = page_inputs.iter().map(|page| page.text.clone()).collect();
+            let scan = scan_text_layer(&page_texts);
+            let heading_numbers: Vec<u32> = scan.headings.iter().map(|heading| heading.number).collect();
+            let map = build_hybrid_map(&page_texts, &[], page_inputs.len());
+            if text_rich {
+                assert!(
+                    heading_numbers.len() >= 6,
+                    "{} produced too few canonical text headings: {:?}",
+                    path,
+                    heading_numbers
+                );
+                assert_eq!(
+                    heading_numbers.first().copied(),
+                    Some(1),
+                    "{} text headings do not start at Q1: {:?}",
+                    path,
+                    heading_numbers
+                );
+                assert!(
+                    heading_numbers.windows(2).all(|pair| pair[1] > pair[0]),
+                    "{} text headings are not strictly ordered: {:?}",
+                    path,
+                    heading_numbers
+                );
+                assert!(
+                    text_layer_map_sufficient(&scan, page_inputs.len()),
+                    "{} text layer did not meet document-map sufficiency requirements: {:?}",
+                    path,
+                    heading_numbers
+                );
+
+                let span_numbers: Vec<u32> = map.spans.iter().map(|span| span.number).collect();
+                assert_eq!(
+                    span_numbers, heading_numbers,
+                    "{} map spans do not match canonical text headings",
+                    path
+                );
+            } else {
+                assert!(
+                    text_bytes < 1000,
+                    "{} was not classified consistently as image-dominant",
+                    path
+                );
+                assert!(
+                    !text_layer_map_sufficient(&scan, page_inputs.len()),
+                    "{} sparse text layer incorrectly claimed to be a complete map",
+                    path
+                );
+                assert!(
+                    map.vision_fallback_pages.len() > 0,
+                    "{} image-dominant paper did not retain vision fallback pages",
+                    path
+                );
+            }
+            assert!(
+                map.spans.iter().all(|span| {
+                    span.start_page <= span.end_page
+                        && span.end_page < page_inputs.len()
+                        && span.start_y_frac.map(|y| (0.0..=1.0).contains(&y)).unwrap_or(true)
+                        && span.end_y_frac.map(|y| (0.0..=1.0).contains(&y)).unwrap_or(true)
+                }),
+                "{} contains invalid question span bounds",
+                path
+            );
+
+            eprintln!(
+                "Edexcel {}: pages={}, text_bytes={}, images={}, text_only={}, headings={:?}",
+                year,
+                page_inputs.len(),
+                text_bytes,
+                image_pages,
+                text_only_pages,
+                heading_numbers
+            );
+            tested += 1;
+        }
+
+        assert_eq!(tested, years.len());
+    }
+
+    /// Golden test against every real AQA physics paper in the repo root.
+    /// Exercises the text-layer heading scan + hybrid map with NO AI
+    /// structures — the text layer alone must place every question.
+    /// One single test over all papers: pdfium is not thread-safe, so the
+    /// per-paper tests must not run in parallel. Skips gracefully when a
+    /// PDF is not present (CI).
+    #[test]
+    fn aqa_physics_papers_place_all_questions() {
+        // (year, expected question count). '19 Section B is "Questions 07 to
+        // 31" — 31 questions; '17/'18/'23/'24 have 32; '20/'21/'22 have 31.
+        let cases: &[(&str, usize)] = &[
+            ("17", 32),
+            ("18", 32),
+            ("19", 31),
+            ("20", 31),
+            ("21", 31),
+            ("22", 31),
+            ("23", 32),
+            ("24", 32),
+        ];
+        for (year, expected) in cases {
+            let path = format!("../physics '{}.pdf", year);
+            let Some((pages, map)) = golden_map(&path) else { continue };
+            // The text layer alone must be judged sufficient to skip the
+            // vision structure pass for every one of these papers.
+            let scan = scan_text_layer(&pages);
+            assert!(
+                text_layer_map_sufficient(&scan, pages.len()),
+                "physics '{}: text layer should be sufficient to skip the structure pass",
+                year
+            );
+            let span_nums: Vec<u32> = map.spans.iter().map(|s| s.number).collect();
+            eprintln!("=== physics '{}: {} spans = {:?}", year, span_nums.len(), span_nums);
+            for s in &map.spans {
+                eprintln!(
+                    "  Q{}: pages {}..={} y {:?}..{:?}",
+                    s.number,
+                    s.start_page + 1,
+                    s.end_page + 1,
+                    s.start_y_frac,
+                    s.end_y_frac
+                );
+            }
+            assert_eq!(
+                span_nums.len(),
+                *expected,
+                "physics '{}: expected {} question spans, got {:?}",
+                year,
+                expected,
+                span_nums
+            );
+            for (i, s) in map.spans.iter().enumerate() {
+                assert_eq!(
+                    s.number,
+                    (i + 1) as u32,
+                    "physics '{}: spans must be Q1..Q{} in order, got {:?}",
+                    year,
+                    expected,
+                    span_nums
+                );
+                assert!(s.start_page <= s.end_page, "physics '{}: Q{} inverted pages", year, s.number);
+                // No degenerate zero-height y-band on single-page questions.
+                if s.start_page == s.end_page {
+                    if let (Some(a), Some(b)) = (s.start_y_frac, s.end_y_frac) {
+                        assert!(
+                            b > a + 0.001,
+                            "physics '{}: Q{} degenerate y-band {}..{}",
+                            year,
+                            s.number,
+                            a,
+                            b
+                        );
+                    }
+                }
+            }
+        }
     }
 }

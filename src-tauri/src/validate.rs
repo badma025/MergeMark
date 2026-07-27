@@ -430,8 +430,197 @@ pub fn clean_question_content(content: &str) -> String {
     sanitize_markdown_math(&hardened)
 }
 
-/// Automatically close missing inline `$` and block `$$` tags.
+/// Repair common LLM/PDF LaTeX damage before balancing Markdown delimiters.
+///
+/// This deliberately handles structure rather than trying to be a LaTeX
+/// compiler: malformed prose inside `aligned`, bare display formulas, arrays
+/// outside math mode, and line-oriented trace tables are all common outputs
+/// from PDF transcription and can be repaired without changing ordinary text.
+pub fn repair_latex_syntax(text: &str) -> String {
+    let text = normalize_trace_table(text);
+    let mut out = Vec::new();
+    let mut in_array = false;
+    let mut array_lines: Vec<String> = Vec::new();
+
+    for raw_line in text.lines() {
+        let mut line = raw_line.to_string();
+        let has_aligned = line.contains(r"\begin{aligned}") || line.contains(r"\end{aligned}");
+
+        // `aligned` is a math environment. If an LLM put prose and inline `$`
+        // math inside it, unwrap the environment and turn row separators into
+        // ordinary line breaks instead of emitting invalid nested math.
+        if has_aligned && (line.contains('$') || line.contains(" where ") || line.contains(" is ")) {
+            line = line.replace(r"\begin{aligned}", "");
+            line = line.replace(r"\end{aligned}", "");
+            line = line.replace(r"\ \ ", "\n");
+            line = line.replace(r"\\", "\n");
+            for part in line.split('\n') {
+                if !part.trim().is_empty() {
+                    out.push(part.trim().to_string());
+                }
+            }
+            continue;
+        }
+
+        if line.contains(r"\begin{array}") || line.contains(r"\begin{matrix}") {
+            in_array = true;
+            array_lines.push(line);
+            if array_lines.last().is_some_and(|s| s.contains(r"\end{array}") || s.contains(r"\end{matrix}")) {
+                append_array_block(&mut out, &mut array_lines);
+                in_array = false;
+            }
+            continue;
+        }
+        if in_array {
+            let closes_array = line.contains(r"\end{array}") || line.contains(r"\end{matrix}");
+            array_lines.push(line);
+            if closes_array {
+                append_array_block(&mut out, &mut array_lines);
+                in_array = false;
+            }
+            continue;
+        }
+
+        let trimmed = line.trim();
+        let bare_math = trimmed.starts_with(r"\left")
+            || trimmed.starts_with(r"\frac")
+            || trimmed.starts_with(r"\sqrt")
+            || trimmed.starts_with(r"\begin{array}")
+            || trimmed.starts_with(r"\begin{matrix}");
+        if bare_math && !trimmed.contains('$') {
+            line = format!("$$\n{}\n$$", trimmed);
+        }
+        out.push(line);
+    }
+
+    if in_array && !array_lines.is_empty() {
+        // Complete an accidentally truncated array rather than leaving an
+        // unterminated environment for the Markdown/LaTeX renderer.
+        if !array_lines.iter().any(|line| line.contains(r"\end{array}")) {
+            array_lines.push(r"\end{array}".to_string());
+        }
+        append_array_block(&mut out, &mut array_lines);
+    }
+
+    out.join("\n")
+}
+
+fn append_array_block(out: &mut Vec<String>, lines: &mut Vec<String>) {
+    if lines.is_empty() {
+        return;
+    }
+    let mut block = lines.join("\n");
+    // OCR/LLM output sometimes loses one of the two row-separator slashes
+    // immediately before \hline. Restore it only inside an array block.
+    block = block.replace(r"\ \hline", r"\\ \hline");
+    if !block.trim_start().starts_with("$$") {
+        out.push("$$".to_string());
+    }
+    out.extend(block.lines().map(str::to_string));
+    if !block.trim_end().ends_with("$$") {
+        out.push("$$".to_string());
+    }
+    lines.clear();
+}
+
+fn normalize_trace_table(text: &str) -> String {
+    let lines: Vec<String> = text.lines().map(|line| line.trim().to_string()).collect();
+    let start = match lines.iter().position(|line| line == "N") {
+        Some(start) => start,
+        None => return text.to_string(),
+    };
+    let header_end = match find_trace_header_end(&lines, start) {
+        Some(header_end) => header_end,
+        None => return text.to_string(),
+    };
+    let mut rows: Vec<(String, Vec<String>)> = Vec::new();
+    let mut i = header_end + 1;
+
+    while i < lines.len() {
+        let number = lines[i].trim();
+        if !is_plain_integer(number) {
+            break;
+        }
+        let mut values = Vec::new();
+        i += 1;
+        while i < lines.len() && !is_plain_integer(&lines[i]) {
+            if let Some(value) = clean_table_cell(&lines[i]) {
+                values.push(value);
+            } else if !lines[i].is_empty() && !lines[i].chars().all(|c| c.is_whitespace()) {
+                break;
+            }
+            i += 1;
+        }
+        if values.len() < 3 {
+            break;
+        }
+        rows.push((number.to_string(), values));
+    }
+
+    if rows.len() < 3 {
+        return text.to_string();
+    }
+
+    let mut table = String::from("| N | T / s (1) | T / s (2) | T / s (3) | Mean |\n| --- | ---: | ---: | ---: | ---: |\n");
+    for (number, values) in rows {
+        table.push_str(&format!("| {} |", number));
+        for index in 0..4 {
+            table.push_str(&format!(" {} |", values.get(index).cloned().unwrap_or_default()));
+        }
+        table.push('\n');
+    }
+
+    // The captured block is normally the complete extracted table, often
+    // followed by a duplicated column-wise OCR pass. Replace that noisy block
+    // only when the remainder contains no prose, preserving surrounding text.
+    let remainder_is_table_noise = lines[i..].iter().all(|line| {
+        line.is_empty()
+            || line == "N"
+            || line.contains("T / s")
+            || line.eq_ignore_ascii_case("Mean")
+            || clean_table_cell(line).is_some()
+            || line.chars().all(|c| c.is_whitespace())
+    });
+    if remainder_is_table_noise {
+        let prefix = lines[..start].join("\n");
+        return if prefix.trim().is_empty() {
+            table.trim_end().to_string()
+        } else {
+            format!("{}\n\n{}", prefix, table.trim_end())
+        };
+    }
+    text.to_string()
+}
+
+fn find_trace_header_end(lines: &[String], start: usize) -> Option<usize> {
+    let window_end = (start + 7).min(lines.len());
+    let window = &lines[start..window_end];
+    let has_time = window.iter().any(|line| line.contains("T / s"));
+    let has_mean = window.iter().any(|line| line.eq_ignore_ascii_case("**Mean**") || line.eq_ignore_ascii_case("Mean"));
+    let numeric_headers = window.iter().filter(|line| matches!(line.as_str(), "**1**" | "**2**" | "**3**" | "1" | "2" | "3")).count();
+    if !has_time || !has_mean || numeric_headers < 3 {
+        return None;
+    }
+    window.iter().rposition(|line| line.eq_ignore_ascii_case("**Mean**") || line.eq_ignore_ascii_case("Mean")).map(|offset| start + offset)
+}
+
+fn is_plain_integer(value: &str) -> bool {
+    !value.is_empty() && value.chars().all(|c| c.is_ascii_digit())
+}
+
+fn clean_table_cell(value: &str) -> Option<String> {
+    let value = value.trim().trim_matches('*').trim();
+    if value.parse::<f64>().is_ok() {
+        Some(value.to_string())
+    } else {
+        None
+    }
+}
+
+/// Automatically repair malformed LaTeX and close missing inline `$`/block
+/// `$$` tags.
 pub fn sanitize_markdown_math(text: &str) -> String {
+    let text = repair_latex_syntax(text);
     let mut in_block = false;
     let mut lines = Vec::new();
 
@@ -984,5 +1173,82 @@ mod tests {
 
         let para = "One sentence.\n\nNext paragraph.";
         assert_eq!(harden_line_breaks(para), para);
+    }
+
+    #[test]
+    fn repairs_malformed_aligned_prose_and_bare_formula() {
+        let source = r#"\left(\frac{\gamma RT}{M}\right)^{1/2}
+\begin{aligned} where \\ \\ $\gamma$ is a dimensionless constant that depends on the gas \\ \\ $R$ is the molar gas constant \\ \\ $T$ is the absolute temperature \\ \\ $M$ is the molar mass of the gas. \end{aligned}"#;
+        let repaired = sanitize_markdown_math(source);
+
+        assert!(repaired.contains("$$\n\\left(\\frac"), "{repaired}");
+        assert!(!repaired.contains(r"\begin{aligned}"), "{repaired}");
+        assert!(!repaired.contains(r"\end{aligned}"), "{repaired}");
+        assert!(repaired.contains("$\\gamma$ is a dimensionless"), "{repaired}");
+        assert!(repaired.matches("$$").count() % 2 == 0, "{repaired}");
+    }
+
+    #[test]
+    fn repairs_array_environment_into_display_math() {
+        let source = r#"\begin{array}{|l|l|l|} \hline \text{Gas} & \gamma & M \\ \hline \text{Air} & 1.40 & 29.0 \\ \hline \text{Helium} & 1.67 & 4.00 \\ \hline \end{array}"#;
+        let repaired = sanitize_markdown_math(source);
+
+        assert!(repaired.starts_with("$$\n"), "{repaired}");
+        assert!(repaired.contains(r"\begin{array}"), "{repaired}");
+        assert!(repaired.contains(r"\end{array}"), "{repaired}");
+        assert!(repaired.ends_with("\n$$"), "{repaired}");
+    }
+
+    #[test]
+    fn converts_line_oriented_trace_table_with_headings() {
+        let source = r#"N
+T / s
+**1**
+**2**
+**3**
+**Mean**
+1
+14.7
+14.1
+14.3
+2
+50.3
+49.6
+50.1
+3
+126.6
+126.3
+125.2
+4
+224.4
+224.3
+225.9
+224.9
+5
+356.1
+354.3
+345.6
+352.0
+6
+500.4
+512.7
+499.5
+504.2
+
+N
+1
+2
+3
+4
+5
+6"#;
+        let repaired = sanitize_markdown_math(source);
+
+        assert!(repaired.contains("| N | T / s (1) | T / s (2) | T / s (3) | Mean |"), "{repaired}");
+        assert!(repaired.contains("| --- | ---: | ---: | ---: | ---: |"), "{repaired}");
+        assert!(repaired.contains("| 1 | 14.7 | 14.1 | 14.3 |"), "{repaired}");
+        assert!(repaired.contains("| 6 | 500.4 | 512.7 | 499.5 | 504.2 |"), "{repaired}");
+        assert!(!repaired.contains("**1**\n**2**\n**3**\n**Mean**"), "{repaired}");
+        assert_eq!(sanitize_markdown_math(&repaired), repaired);
     }
 }

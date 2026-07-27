@@ -573,11 +573,17 @@ pub async fn run_question_pipeline<C: LlmClient, P: Progress>(
     // Time the text-layer document map building
     let text_map_start = Instant::now();
     let scan = doc_map::scan_text_layer(&page_texts);
-    let text_map_available = !scan.footers.is_empty()
+    // The vision structure pass (one AI call per page) is skippable when the
+    // text layer alone can build the map: either via reliable footers
+    // (Edexcel-style) or via a sufficiently dense heading sequence (AQA-style,
+    // verified across all '17–'24 physics papers). Scanned/garbled PDFs fail
+    // the check and keep the vision structure pass as before.
+    let text_map_available = (!scan.footers.is_empty()
         && scan
             .page_reliability
             .iter()
-            .all(|r| *r != doc_map::PageReliability::Ambiguous);
+            .all(|r| *r != doc_map::PageReliability::Ambiguous))
+        || doc_map::text_layer_map_sufficient(&scan, pages.len());
     report.record_timing(
         "document_map",
         "text_layer_scan",
@@ -716,6 +722,9 @@ pub async fn run_question_pipeline<C: LlmClient, P: Progress>(
                 });
             }
         }
+    } else {
+        progress.stage("Text layer map is complete — skipping vision structure scan.");
+        report.record_timing("structure", "skipped_text_sufficient", None, None, 0);
     }
 
     // Ensure structures contains an entry for every page even if vision structure pass was skipped
@@ -2458,6 +2467,7 @@ pub async fn run_markscheme_pipeline<C: LlmClient, P: Progress>(
                 md = md.replace("[DIAGRAM_PLACEHOLDER]", "");
                 md = validate::normalize_decimal_parts(&md, q_num);
                 md = validate::harden_line_breaks(&md);
+                md = validate::sanitize_markdown_math(&md);
                 md = validate::normalize_mark_scheme_chunk(&md);
 
                 // Dedupe/stitch: containment-based, not a brittle prefix fingerprint.
