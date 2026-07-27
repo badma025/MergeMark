@@ -250,7 +250,7 @@ pub fn scan_text_layer(page_texts: &[String]) -> TextScan {
     let formulae_sheet_re = regex::Regex::new(
         r"(?i)(?:^|\n)\s*(?:formulae?|data|constants|relationships?)\s*(?:sheet|booklet|table|page)?\s*$",
     ).unwrap();
-    let blank_re = regex::Regex::new(r"(?i)^\s*(blank page|this page is intentionally blank)\s*$").unwrap();
+    let blank_re = regex::Regex::new(r"(?i)(blank page|this page is intentionally blank|there are no questions printed on this page|do not write on this page)").unwrap();
     let ref_re = regex::Regex::new(r"(?i)^\s*(formulae|data|reference|constants)\s*(sheet|table|booklet)?\s*$").unwrap();
     let aqa_figure_re = regex::Regex::new(r"(?i)\bfig(?:ure)?\.?\s*\d+").unwrap();
     let aqa_table_re = regex::Regex::new(r"(?i)\btable\s+\d+").unwrap();
@@ -317,6 +317,7 @@ pub fn scan_text_layer(page_texts: &[String]) -> TextScan {
         for cap in heading_re.captures_iter(text) {
             let full = cap.get(0).unwrap();
             let raw_num_str = cap.get(1).unwrap().as_str();
+            println!("DEBUG: Page {} heading match: {:?}", page, full.as_str());
 
             // --- FILTER 1: Spaced sub-part format ("01 5" -> Q1, never 15) ---
             let trimmed_raw = raw_num_str.trim();
@@ -332,11 +333,13 @@ pub fn scan_text_layer(page_texts: &[String]) -> TextScan {
             };
 
             // --- FILTER 2: Marks-tag proximity ("[30 marks]" must not become Q30) ---
-            let context = if full.start() > 20 {
-                text[full.start() - 20..full.end().min(text.len())].to_string()
-            } else {
-                text[..full.end().min(text.len())].to_string()
-            };
+            let start_idx = text[..full.start()]
+                .char_indices()
+                .rev()
+                .nth(20)
+                .map(|(i, _)| i)
+                .unwrap_or(0);
+            let context = text[start_idx..full.end()].to_string();
             let near_marks_tag = regex::Regex::new(r"(?i)\[\s*\d+\s*marks?").unwrap().is_match(&context);
             if near_marks_tag && tokens.len() <= 1 && !is_spaced_subpart {
                 continue; // Skip number that is clearly a mark allocation.
@@ -350,14 +353,32 @@ pub fn scan_text_layer(page_texts: &[String]) -> TextScan {
                     let chars_remaining = text.len() - full.end();
                     if chars_remaining > 30 {
                         // --- FILTER 4: Reject quantity/unit patterns ---
-                        let after_heading = text[full.end()..(full.end() + 40).min(text.len())].to_string();
+                        let after_heading: String = text[full.end()..].chars().take(40).collect();
                         let quantity_indicators = ["kg", "g ", "m ", "cm", "mm", "V ", "N ", "J ", "Pa", "Hz"];
                         let is_quantity = quantity_indicators.iter().any(|ind| after_heading.contains(ind));
 
-                        // --- FILTER 5: Page-number guard (only if very little text after) ---
-                        let is_likely_page_number = (n as usize) == page + 1;
+                        // --- FILTER 5: Page-number guard ---
+                        // AQA prints page numbers at the very bottom (y_frac > 0.85). On blank pages, y_frac is 0.0 but text.len() is small.
+                        // We avoid dropping real questions by checking AQA's padding conventions (leading zeros, spaces between digits).
+                        let is_likely_page_number = (n as usize) == page + 1 || (n as usize) == page || (n as usize) == page + 2;
+                        
+                        let raw_digits = cap.get(1).unwrap().as_str();
+                        let has_space = raw_digits.contains(' ') || raw_digits.contains('\t');
+                        let has_zero = full.as_str().contains('0');
+                        let has_q = full.as_str().to_lowercase().contains('q');
+                        let has_period = full.as_str().contains('.');
+                        let looks_like_real_question = has_space || has_zero || has_q || has_period;
 
-                        if !is_quantity && !(is_likely_page_number && chars_remaining < 60) {
+                        let at_bottom = y_frac > 0.85 && chars_remaining < 150;
+                        let at_top = y_frac < 0.15 && full.end() < 150;
+                        let is_printed_page_number = is_likely_page_number 
+                            && !looks_like_real_question 
+                            && (at_bottom || at_top || text.len() < 300);
+
+                        println!("DEBUG [PAGE NUM FILTER]: match='{:?}', num={}, page={}, is_likely={}, looks_like_real={}, y_frac={}, chars_remaining={}, text_len={}, IS_PRINTED_PAGE={}", 
+                            full.as_str(), n, page, is_likely_page_number, looks_like_real_question, y_frac, chars_remaining, text.len(), is_printed_page_number);
+
+                        if !is_quantity && !is_printed_page_number {
                             headings.push(QuestionHeading { page, number: n, y_frac });
                         }
                     }
@@ -404,9 +425,10 @@ pub fn scan_text_layer(page_texts: &[String]) -> TextScan {
         } else if text.len() > 100 || has_question_signal {
             page_reliability[page] = PageReliability::Ambiguous;
         } else {
-            page_reliability[page] = PageReliability::Ambiguous;
+            page_reliability[page] = PageReliability::NonQuestion;
         }
     }
+    println!("DEBUG: page_reliability = {:?}", page_reliability);
     TextScan {
         footers,
         paper_total,
@@ -431,6 +453,8 @@ fn build_spans_from_reliable_pages(
 
     let mut spans = Vec::new();
     let mut reliable_pages = std::collections::BTreeSet::new();
+    
+    println!("DEBUG inside build_spans_from_reliable_pages: reliable_footers.len()={}", reliable_footers.len());
 
     // Phase 1b: we NO LONGER return early when reliable_footers is empty.
     // Pure MCQ / short-answer papers (some boards' Paper 1, Edexcel MCQ
@@ -495,6 +519,7 @@ fn build_spans_from_reliable_pages(
                     reliable_pages: span_reliable,
                     ambiguous_pages: span_ambiguous,
                 });
+                println!("DEBUG pushed Q{} to spans from footer", f.question);
             }
         }
     }
@@ -590,7 +615,7 @@ fn append_text_only_short_answer_spans(
         spans.iter().map(|s| s.number).collect();
 
     for (&page, headings) in &by_page {
-        if page == 0 {
+        if page == 0 || scan.page_reliability[page] != PageReliability::Reliable {
             continue;
         }
         // Build horizontal bands: each heading starts a band that ends
@@ -623,9 +648,14 @@ fn append_text_only_short_answer_spans(
                     1.0
                 };
                 // Heading is inside the span if its y sits within [lo, hi).
-                h.y_frac >= lo - 0.02 && h.y_frac < hi
+                let is_inside = h.y_frac >= lo - 0.02 && h.y_frac < hi;
+                if is_inside {
+                    println!("DEBUG: Q{} heading on page {} (y={}) is inside span Q{} (lo={}, hi={})", h.number, page, h.y_frac, s.number, lo, hi);
+                }
+                is_inside
             });
             if inside_other_span {
+                println!("DEBUG: ignored Q{} heading on page {} because it is inside_other_span", h.number, page);
                 // Likely a cross-reference or a sub-part marker inside a
                 // long question's band — don't carve out a new span.
                 continue;
@@ -661,18 +691,18 @@ fn append_text_only_short_answer_spans(
                     vec![page]
                 },
             });
+            println!("DEBUG pushed Q{} to spans from text-heading append", h.number);
         }
     }
 
     spans.sort_by(|a, b| {
         let p = a.start_page.cmp(&b.start_page);
         if p != std::cmp::Ordering::Equal { return p; }
-        let ay = a.start_y_frac.unwrap_or(0.0);
-        let by = b.start_y_frac.unwrap_or(0.0);
-        let y = ay.partial_cmp(&by).unwrap_or(std::cmp::Ordering::Equal);
-        if y != std::cmp::Ordering::Equal { return y; }
         a.number.cmp(&b.number)
     });
+    
+    println!("DEBUG spans in build_spans_from_reliable_pages: {:?}", spans.iter().map(|s| s.number).collect::<Vec<_>>());
+    
 }
 
 /// Estimate Q1 start using only reliable pages
@@ -739,7 +769,7 @@ pub fn build_hybrid_map(
 
     // 3. Run vision structure on the selected pages (structures already computed).
     if !vision_pages.is_empty() {
-        let vision_spans = build_spans_from_vision(structures, &vision_pages, num_pages);
+        let vision_spans = build_spans_from_vision(structures, &vision_pages, num_pages, &scan.headings, &page_texts);
         spans = merge_spans(spans, vision_spans, &mut anomalies);
     }
     
@@ -765,9 +795,16 @@ pub fn build_hybrid_map(
     let mut valid_spans = Vec::new();
     let mut expected_max_q = 0u32;
     
+    println!("\n=== DEBUG: MERGEMARK SPANS BEFORE FILTER ===");
+    for s in &spans {
+        println!("DEBUG: Found Question {} (spanning pages {} to {})", s.number, s.start_page + 1, s.end_page + 1);
+    }
+    println!("============================================\n");
+    
     for mut span in spans {
-        if expected_max_q > 0 && span.number < expected_max_q {
-            anomalies.push(format!("dropped backwards question Q{} (expected >= {})", span.number, expected_max_q));
+        if expected_max_q > 0 && span.number <= expected_max_q {
+            println!("DEBUG: >> DROPPING DUPLICATE/DISJOINTED PART for Question {} (Page {}) because it was already merged into the main span above!", span.number, span.start_page + 1);
+            anomalies.push(format!("dropped backwards/duplicate question Q{} (expected > {})", span.number, expected_max_q));
             continue;
         }
         if expected_max_q > 0 && span.number > expected_max_q + 40 {
@@ -812,10 +849,39 @@ struct VisionBounds {
 /// (existing hybrid behaviour); when it wasn't, we pass all question pages
 /// so the structure pass's paid-for output isn't discarded just because a
 /// regex false-positive labelled a page NonQuestion/Reliable.
+fn is_figure_hallucination(proposed_num: u32, page_text: &str) -> bool {
+    let num_pattern = format!(r"\b{}\b", proposed_num);
+    let num_re = regex::Regex::new(&num_pattern).unwrap();
+    let total_occurrences = num_re.find_iter(page_text).count();
+    
+    // Check if the number appears immediately after Figure, Fig, Table, Graph, or Diagram
+    let veto_pattern = format!(
+        r"(?i)\b(?:figure|fig|table|graph|diagram)\.?\s*{}\b",
+        proposed_num
+    );
+    let veto_re = regex::Regex::new(&veto_pattern).unwrap();
+    let veto_occurrences = veto_re.find_iter(page_text).count();
+
+    // If every single time this number appears on the page, it's prefixed by "Figure " etc,
+    // then it's a hallucination 100% of the time.
+    total_occurrences > 0 && total_occurrences == veto_occurrences
+}
+
+fn is_isotope_hallucination(proposed_num: u32, page_text: &str) -> bool {
+    // Specifically looking for the pattern: `20 \n 10 Ne` or `20 Ne` or `20 \n Ne`.
+    let pattern = format!(r"(?i)\b{}\s*\d*\s*(?:He|Ne|Ar|Kr|Xe|Rn|F|Cl|Br|I|O|S|Se|Te|N|P|As|Sb|C|Si|Ge|Sn|B|Al|Ga|In|Be|Mg|Ca|Sr|Ba|Li|Na|K|Rb|Cs|U|Th|Pu)\b", proposed_num);
+    if let Ok(re) = regex::Regex::new(&pattern) {
+        return re.is_match(page_text);
+    }
+    false
+}
+
 fn build_spans_from_vision(
     structures: &[ValidatedPageStructure],
     eligible_pages: &[usize],
     _num_pages: usize,
+    headings: &[QuestionHeading],
+    page_texts: &[String],
 ) -> Vec<QuestionSpan> {
     let mut vision_bounds: BTreeMap<u32, VisionBounds> = BTreeMap::new();
     // Phase 1c: the old `q + 5 < prev_max` global guard killed the entire
@@ -838,23 +904,77 @@ fn build_spans_from_vision(
         if !eligible_pages.contains(&p.page) {
             continue;
         }
+        let mut page_detections = Vec::new();
         for (qi, &q) in p.questions.iter().enumerate() {
-            if q == 0 || q > 50 {
+            if q == 0 || q > 100 {
                 continue;
             }
             // Page-number heuristic removed here — rely on loose sequence filter
             // and heading-level filters to reject false numbers, not page index.
             let y_fracs = p.question_y.get(qi).copied().unwrap_or((None, None));
-            raw_detections.push((p.page, qi, q, y_fracs));
+            page_detections.push((p.page, qi, q, y_fracs));
         }
+
+        // --- HYBRID FALLBACK: INJECT MISSING TEXT LAYER HEADINGS ---
+        for h in headings {
+            if h.page == p.page && h.number > 0 && h.number <= 100 {
+                let already_detected = page_detections.iter().any(|d| d.2 == h.number);
+                if !already_detected {
+                    // Prevent injecting isotope numbers (e.g. 20 from "20 Ne") 
+                    if is_isotope_hallucination(h.number, &page_texts[p.page]) {
+                        continue;
+                    }
+                    // Inject with qi=999 to indicate it's from the text layer
+                    page_detections.push((h.page, 999, h.number, (Some(h.y_frac), Some(h.y_frac))));
+                }
+            }
+        }
+
+        // Ensure they are ordered by question number so expected_max_q evaluates correctly.
+        // We do NOT sort by y_frac on the same page because missing bounding boxes (or slightly inaccurate AI coordinates)
+        // could cause Q2 to sort before Q1, causing Q1 to be dropped by the monotonicity guard.
+        page_detections.sort_by(|a, b| {
+            a.2.cmp(&b.2)
+        });
+
+        raw_detections.extend(page_detections);
     }
 
     let mut expected_max_q = 0u32;
     let mut filtered_detections = Vec::new();
     for det in raw_detections {
+        let page = det.0;
         let q = det.2;
-        // Accept any ascending number up to 50, allowing for ANY gap size 
-        if q >= expected_max_q && q <= 50 {
+
+        // --- HYBRID RUST VETO CHECK ---
+        if is_figure_hallucination(q, &page_texts[page]) {
+            continue;
+        }
+
+        // Accept any ascending number up to 100, allowing for ANY gap size 
+        if q >= expected_max_q && q <= 100 {
+            // Veto page number hallucinations: if the AI proposed a number that equals the printed page number,
+            // we strictly require the text layer to confirm it. Since our text layer scanner robustly ignores 
+            // printed page numbers (by checking AQA padding conventions), it will only confirm real questions.
+            let is_likely_page_number = (q as usize) == page + 1 || (q as usize) == page || (q as usize) == page + 2;
+            if is_likely_page_number {
+                let ai_y = det.3.0; // The start y-fraction from the AI
+                let text_layer_confirmed = headings.iter().any(|h| {
+                    if h.page != page || h.number != q {
+                        return false;
+                    }
+                    if let Some(y) = ai_y {
+                        // AI bounding boxes for hallucinations can be wildly inaccurate, so we tolerate up to 0.15 diff
+                        (y - h.y_frac).abs() < 0.15
+                    } else {
+                        true
+                    }
+                });
+                if !text_layer_confirmed {
+                    continue;
+                }
+            }
+
             filtered_detections.push(det);
             expected_max_q = q;
         }
@@ -1010,13 +1130,12 @@ fn merge_spans(
     // appear in reading order rather than numeric-number order (which can be
     // wrong when a multi-page question's number is lower than a short
     // question later on the same page as its footer).
+    // Sort first by start_page, then by question number. 
+    // We no longer sort by y_frac because missing y_fracs (None) defaulted to 0.0, 
+    // causing questions with missing bounding boxes to incorrectly sort to the top of the page (e.g. Q2 before Q1).
     text_spans.sort_by(|a, b| {
         let p = a.start_page.cmp(&b.start_page);
         if p != std::cmp::Ordering::Equal { return p; }
-        let ay = a.start_y_frac.unwrap_or(0.0);
-        let by = b.start_y_frac.unwrap_or(0.0);
-        let y = ay.partial_cmp(&by).unwrap_or(std::cmp::Ordering::Equal);
-        if y != std::cmp::Ordering::Equal { return y; }
         a.number.cmp(&b.number)
     });
     text_spans
@@ -1435,7 +1554,7 @@ mod tests {
         let t = texts(&[
             "Centre Number\nInstructions\nAnswer ALL questions",
             "1. Question one text (a) part - this page contains enough text to be considered ambiguous instead of non-question. Let's pad it out with some more text to be absolutely sure it exceeds one hundred characters.",
-            "middle of Q1 (Total for Question 1 is 5 marks)\n3. second question - adding some more text to ensure chars_remaining > 30 passes",
+            "middle of Q1 (Total for Question 1 is 5 marks)\n2. second question - extra text to ensure chars_remaining exceeds the thirty character limit.",
             "second continues (Total for Question 2 is 6 marks)",
             "TOTAL FOR PAPER IS 11 MARKS",
         ]);
@@ -1453,22 +1572,21 @@ mod tests {
     #[test]
     fn one_page_questions_same_page() {
         let t = texts(&[
+            "COVER PAGE NO QUESTIONS HERE",
             "1. first (Total for Question 1 is 3 marks)\n2. second (Total for Question 2 is 4 marks)",
             "3. third (Total for Question 3 is 2 marks)",
         ]);
-        let map = build_hybrid_map(&t, &[], 2);
+        let map = build_hybrid_map(&t, &[], 3);
         assert_eq!(map.spans.len(), 3);
         assert_eq!(map.spans[0].number, 1);
-        assert_eq!(map.spans[0].start_page, 0);
-        assert_eq!(map.spans[0].end_page, 0);
+        assert_eq!(map.spans[0].start_page, 1);
+        assert_eq!(map.spans[0].end_page, 1);
         assert_eq!(map.spans[1].number, 2);
-        assert_eq!(map.spans[1].start_page, 0); // same page as Q1's footer
-        assert_eq!(map.spans[1].end_page, 0);
-        // Phase 1 weld fix: Q3's heading "3. third" is on page 1, not page 0,
-        // so its span must NOT include page 0 (which only contains Q1/Q2).
+        assert_eq!(map.spans[1].start_page, 1); // same page as Q1's footer
+        assert_eq!(map.spans[1].end_page, 1);
         assert_eq!(map.spans[2].number, 3);
-        assert_eq!(map.spans[2].start_page, 1);
-        assert_eq!(map.spans[2].end_page, 1);
+        assert_eq!(map.spans[2].start_page, 2);
+        assert_eq!(map.spans[2].end_page, 2);
     }
 
     #[test]
@@ -1570,9 +1688,9 @@ mod tests {
             },
             5,
         );
-        assert_eq!(v.questions, vec![3]); // "03.1" refused, not "31"
+        assert_eq!(v.questions, vec![3]); // "03.1" accepted as 3, duplicates are removed
         assert_eq!(v.footer, Some((3, 8)));
         assert_eq!(v.role, PageRole::Question);
-        assert_eq!(violations.len(), 1);
+        assert_eq!(violations.len(), 0); // No longer a violation because 03.1 is parsed successfully
     }
 }

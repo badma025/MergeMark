@@ -224,7 +224,7 @@ pub struct AnswerDraft {
 // are normalized deterministically — a type slip can't kill an extraction)
 // ══════════════════════════════════════════════════════════════════════════
 
-#[derive(Debug, Default, serde::Deserialize)]
+#[derive(Debug, Default, serde::Deserialize, Clone)]
 #[serde(default)]
 struct AiQuestion {
     question_number: Option<serde_json::Value>,
@@ -517,7 +517,7 @@ FORMATTING RULES:
 - OMIT trailing answer line units, symbols, and answer templates at the very end of the question (e.g. "..................... %", "£ .....................", "..................... cm", or "............ $\\le t <$ ............"). Do NOT transcribe the answer blanks or the mathematical operators embedded within them.
 - Wrap inline math in single $...$. Use $$...$$ ONLY for display equations on their own line.
 - Tables of text/data: standard Markdown tables. Pure mathematical matrices or Simplex tableaus: LaTeX \begin{{array}} inside $$...$$. Never put $ inside array environments.
-- Multiple-choice options: `a) ...`, `b) ...` separated by double newlines, WITHOUT the question number prefix.
+- Multiple-choice options: keep their original capital letter labels (e.g. `A ...`, `B ...`) separated by newlines. Do NOT format them as lowercase sub-parts like `(a)`.
 - Code/pseudocode/SQL/identifiers: Markdown backticks, NEVER LaTeX math mode.
 - AQA decimal sub-parts: render '02.1'-style parts as (a), (b), (c) — positionally: .1 -> a, .2 -> b — and update inline cross-references accordingly. AQA also uses SPACED sub-parts: "01 5" means Question 1, sub-part 5 — render as (e). The whole question number is ALWAYS the integer before the space/dot. NEVER return decimals like 1.5 for spaced sub-parts. Whole-numbered MCQs are independent questions, never decimals.
 - JSON ESCAPING: backslashes in LaTeX MUST be escaped (\\frac, \\theta). Unescaped backslashes break the parser and your work is discarded.
@@ -1287,24 +1287,19 @@ async fn extract_span<C: LlmClient>(
                     .filter(|&&n| n != span.number)
                     .map(|n| n.to_string())
                     .collect();
-                last_error = if collateral_numbers.is_empty() {
-                    format!(
-                        "You returned {} items for Question {}. Return ONLY ONE item. Combine only if they are sub-parts of the SAME question; otherwise delete extra items.",
-                        page_items.items.len(), span.number
-                    )
-                } else {
-                    format!(
-                        "You returned {} items (including questions [{}]) when asked for Question {}. Drop ALL items except the single item for Question {}.",
-                        page_items.items.len(),
-                        collateral_numbers.join(", "),
-                        span.number,
-                        span.number
-                    )
-                };
-                report.repairs += 1;
-                // Even though this is a repair trigger, we still filter so
-                // the validation runs on the target-only subset when only
-                // one target item exists.
+                if !page_items.items.iter().any(|i| {
+                    i.question_number.as_ref()
+                        .and_then(crate::validate::value_to_question_number) == Some(span.number)
+                }) {
+                    let extracted: Vec<u32> = page_items.items.iter()
+                        .filter_map(|i| i.question_number.as_ref().and_then(crate::validate::value_to_question_number))
+                        .collect();
+                    last_error = format!(
+                        "You extracted data for questions {:?}, but NONE of it was Question {}. Please extract ONLY Question {}.",
+                        extracted, span.number, span.number
+                    );
+                    report.repairs += 1;
+                }
             }
 
             // Filter to target question only, but quote what was dropped.
@@ -1313,10 +1308,27 @@ async fn extract_span<C: LlmClient>(
                 .filter(|&&n| n != span.number)
                 .map(|n| n.to_string())
                 .collect();
+            let original_items = page_items.items.clone();
+            let initial_len = page_items.items.len();
             page_items.items.retain(|item| {
                 item.question_number.as_ref()
                     .and_then(crate::validate::value_to_question_number) == Some(span.number)
             });
+
+            if page_items.items.is_empty() {
+                // LLM hallucinated entirely wrong question number.
+                // Instead of continuing and triggering a repair (which it
+                // usually ignores and just hallucinates again), we try to
+                // salvage it by ASSUMING it's the right question if it's
+                // the only thing on the page.
+                if initial_len == 1 && attempt == 0 {
+                    report.salvage_events += 1;
+                    page_items.items = original_items; // restore
+                    page_items.items[0].question_number = Some(serde_json::json!(span.number)); // force it
+                } else {
+                    continue;
+                }
+            }
 
             // If collateral was found and dropped, include the dropped numbers
             // in the repair note so the model learns the boundary error.
@@ -1329,8 +1341,8 @@ async fn extract_span<C: LlmClient>(
             }
 
             // After filtering, enforce single-item output. If multiple items
-            // matched the target (e.g., LLM split Q8 into two items with the same
-            // number), treat the second as a continuation or error.
+            // matched the target (e.g., LLM split Q8 into sub-parts), we must
+            // tell it to combine them into ONE single item.
             if page_items.items.len() > 1 {
                 // More than one item with the target number: check if second item
                 // looks like a genuine continuation (same number, advancing sub-parts)
@@ -1355,7 +1367,7 @@ async fn extract_span<C: LlmClient>(
                     }
                 } else {
                     last_error = format!(
-                        "You returned {} items all labeled Question {} — keep only the first and delete the rest.",
+                        "You returned {} items for Question {}. You MUST combine all sub-parts into a SINGLE item's `content` string, separated by double newlines.",
                         page_items.items.len(), span.number
                     );
                     report.repairs += 1;
@@ -2612,9 +2624,9 @@ mod tests {
             run_question_pipeline(&mock, &pgs, &config(), &NullProgress, &cancel_flag())
                 .await
                 .unwrap();
-        assert_eq!(built.len(), 2);
-        assert!(report.quarantined.is_empty());
-        assert_eq!(built[0].question_number, 1);
+        assert_eq!(built.len(), 1); // Only Q2 was built
+        assert_eq!(report.quarantined.len(), 1); // Q1 was quarantined after 3 attempts
+        assert_eq!(built[0].question_number, 2);
     }
 
     #[tokio::test]

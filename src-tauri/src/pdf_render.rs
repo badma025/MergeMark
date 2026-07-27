@@ -4,13 +4,21 @@ use crate::pipeline::{PageInput, PageInputKind};
 use base64::Engine;
 use image::{DynamicImage, ImageFormat};
 use std::io::Cursor;
+use std::sync::OnceLock;
+
+static PDFIUM_INSTANCE: OnceLock<Result<Pdfium, String>> = OnceLock::new();
+
+fn get_pdfium() -> Result<&'static Pdfium, String> {
+    PDFIUM_INSTANCE.get_or_init(|| {
+        let bindings = Pdfium::bind_to_system_library()
+            .map_err(|e| format!("Failed to bind to pdfium: {:?}", e))?;
+        Ok(Pdfium::new(bindings))
+    }).as_ref().map_err(|e| e.clone())
+}
 
 #[allow(dead_code)]
 pub fn render_pdf_pages(path: &Path) -> Result<Vec<PageInput>, String> {
-    let pdfium = Pdfium::new(
-        Pdfium::bind_to_system_library()
-            .map_err(|e| format!("Failed to bind to pdfium: {:?}", e))?
-    );
+    let pdfium = get_pdfium()?;
 
     let document = pdfium.load_pdf_from_file(path, None)
         .map_err(|e| format!("Failed to load PDF: {:?}", e))?;
@@ -74,10 +82,7 @@ pub fn render_pdf_pages(path: &Path) -> Result<Vec<PageInput>, String> {
 }
 
 pub fn render_pdf_page_at_300dpi(path: &Path, page_idx: usize) -> Result<image::DynamicImage, String> {
-    let pdfium = Pdfium::new(
-        Pdfium::bind_to_system_library()
-            .map_err(|e| format!("Failed to bind to pdfium: {:?}", e))?
-    );
+    let pdfium = get_pdfium()?;
 
     let document = pdfium.load_pdf_from_file(path, None)
         .map_err(|e| format!("Failed to load PDF: {:?}", e))?;

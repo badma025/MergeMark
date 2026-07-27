@@ -167,13 +167,25 @@ fn parse_question_number_string(t: &str) -> Option<u64> {
     }
     let cleaned: String = chars.into_iter().collect();
 
-    // Reject if any internal non-digit character remains (filters "3.5",
-    // "03.1", "1,2", "1(a)", etc.). Internal dots/commas/parens are never
-    // part of a whole-question number.
-    if cleaned.is_empty() {
-        return None;
-    }
+    // Reject if any internal non-digit character remains, UNLESS it's a single-digit decimal (e.g. "02.1")
+    // or a single letter sub-part (e.g. "2a"). This ensures the items are retained so the pipeline can
+    // properly trigger the "combine sub-parts" repair message.
     if !cleaned.chars().all(|c| c.is_ascii_digit()) {
+        if let Some((int_part, frac_part)) = cleaned.split_once('.') {
+            if !int_part.is_empty() && int_part.chars().all(|c| c.is_ascii_digit()) 
+                && frac_part.len() == 1 && frac_part.chars().all(|c| c.is_ascii_digit()) {
+                return int_part.parse::<u64>().ok();
+            }
+        }
+        // Also tolerate "2a", "2b"
+        if let Some(pos) = cleaned.find(|c: char| !c.is_ascii_digit()) {
+            let int_part = &cleaned[..pos];
+            let rest = &cleaned[pos..];
+            if !int_part.is_empty() && int_part.chars().all(|c| c.is_ascii_digit()) 
+                && rest.len() == 1 && rest.chars().all(|c| c.is_ascii_alphabetic()) {
+                return int_part.parse::<u64>().ok();
+            }
+        }
         return None;
     }
 
@@ -826,7 +838,7 @@ mod tests {
     fn question_number_rejects_decimals_and_junk() {
         assert_eq!(value_to_question_number(&serde_json::json!(7)), Some(7));
         assert_eq!(value_to_question_number(&serde_json::json!("12")), Some(12));
-        assert_eq!(value_to_question_number(&serde_json::json!("03.1")), None); // not "31"!
+        assert_eq!(value_to_question_number(&serde_json::json!("03.1")), Some(3)); // extracts the integer part
         assert_eq!(value_to_question_number(&serde_json::json!(0)), None);
         assert_eq!(value_to_question_number(&serde_json::json!(201)), None); // >200
         assert_eq!(value_to_question_number(&serde_json::json!(3.7)), Some(3)); // AQA spaced sub-part
@@ -839,8 +851,8 @@ mod tests {
         assert_eq!(value_to_question_number(&serde_json::json!("0 5")), Some(5));
         assert_eq!(value_to_question_number(&serde_json::json!(" 0 10 ")), Some(10));
         assert_eq!(value_to_question_number(&serde_json::json!("01")), Some(1));
-        // Still reject decimals
-        assert_eq!(value_to_question_number(&serde_json::json!("0 1.1")), None);
+        // Now extracts integer part for single decimal sub-parts
+        assert_eq!(value_to_question_number(&serde_json::json!("0 1.1")), Some(1));
     }
 
     #[test]
