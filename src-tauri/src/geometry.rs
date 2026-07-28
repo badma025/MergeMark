@@ -91,12 +91,26 @@ pub fn sanitize_bbox(b: &[f32], img_w: u32, img_h: u32) -> Option<PixelRect> {
     // ── 2. Resolve [x, y, w, h] vs [x1, y1, x2, y2] ────────────────────────
     // Primary reading (what the prompt asks for): x, y, w, h.
     // Fall back to the corner reading only when the primary cannot apply.
+    let primary = (fx, fy, fx + fv2, fy + fv3); // (x, y, w, h)
+    let corners = (fx, fy, fv2, fv3); // (x1, y1, x2, y2)
+    let corner_is_in_bounds = fv2 <= 1.0 && fv3 <= 1.0 && fv2 > fx && fv3 > fy;
+    // Some vision providers emit corner coordinates even though the schema
+    // requests width/height. If the width/height reading crosses the page
+    // edge while the corner reading is fully in bounds, prefer the latter.
+    // This preserves figures whose lower edge would otherwise be mistaken for
+    // an exam footer and rejected after clamping.
+    let prefer_corners = corner_is_in_bounds && (primary.2 > 1.0 || primary.3 > 1.0);
     let mut readings: Vec<(f32, f32, f32, f32)> = Vec::with_capacity(2);
-    if b[2] > 0.0 && b[3] > 0.0 {
-        readings.push((fx, fy, fx + fv2, fy + fv3)); // (x, y, w, h)
-    }
-    if fv2 > fx && fv3 > fy {
-        readings.push((fx, fy, fv2, fv3)); // (x1, y1, x2, y2)
+    if prefer_corners {
+        readings.push(corners);
+        readings.push(primary);
+    } else {
+        if b[2] > 0.0 && b[3] > 0.0 {
+            readings.push(primary);
+        }
+        if corner_is_in_bounds || (fv2 > fx && fv3 > fy) {
+            readings.push(corners);
+        }
     }
 
     for (x0, y0, x1, y1) in readings {
@@ -460,11 +474,126 @@ pub enum CropReject {
 /// Applies the sanitizer, padding, the blank guard, and the structural
 /// answer-grid guard. Returns `Err(CropReject)` (never panics) when the
 /// crop is unusable.
+#[allow(dead_code)]
 pub fn crop_diagram(
     img: &image::DynamicImage,
     bbox: &[f32],
     padding: u32,
     ignore_grid: bool,
+) -> Result<image::RgbaImage, CropReject> {
+    crop_diagram_with_options(img, bbox, padding, ignore_grid, false)
+}
+
+/// Return one normalized [x, y, width, height] box enclosing visual option
+/// boxes. Inputs are clamped to the normalized page and malformed entries are
+/// ignored; callers can therefore use this at the JSON boundary safely.
+pub fn union_relative_bboxes(boxes: &[Vec<f32>]) -> Option<Vec<f32>> {
+    let mut min_x = 1.0_f32;
+    let mut min_y = 1.0_f32;
+    let mut max_x = 0.0_f32;
+    let mut max_y = 0.0_f32;
+    let mut valid = false;
+
+    for bbox in boxes {
+        if bbox.len() != 4 || bbox.iter().any(|value| !value.is_finite()) {
+            continue;
+        }
+        let x = bbox[0].clamp(0.0, 1.0);
+        let y = bbox[1].clamp(0.0, 1.0);
+        let right = (bbox[0] + bbox[2]).clamp(0.0, 1.0);
+        let bottom = (bbox[1] + bbox[3]).clamp(0.0, 1.0);
+        if right <= x || bottom <= y {
+            continue;
+        }
+        min_x = min_x.min(x);
+        min_y = min_y.min(y);
+        max_x = max_x.max(right);
+        max_y = max_y.max(bottom);
+        valid = true;
+    }
+
+    valid.then(|| vec![min_x, min_y, max_x - min_x, max_y - min_y])
+}
+
+/// Expand a pixel-space rectangle without changing the coordinate-system
+/// meaning of its edges. `left` and `top` move the origin toward zero;
+/// `right` and `bottom` move the far edge toward the page bounds.
+fn expand_rect(
+    rect: PixelRect,
+    left: u32,
+    top: u32,
+    right: u32,
+    bottom: u32,
+    img_w: u32,
+    img_h: u32,
+) -> PixelRect {
+    let x0 = rect.x.saturating_sub(left);
+    let y0 = rect.y.saturating_sub(top);
+    let x1 = rect
+        .x
+        .saturating_add(rect.w)
+        .saturating_add(right)
+        .min(img_w);
+    let y1 = rect
+        .y
+        .saturating_add(rect.h)
+        .saturating_add(bottom)
+        .min(img_h);
+    PixelRect {
+        x: x0,
+        y: y0,
+        w: x1.saturating_sub(x0),
+        h: y1.saturating_sub(y0),
+    }
+}
+
+/// Crop a diagram with optional graph-canvas margins. Graphs need asymmetric
+/// room outside the plotted rectangle for vertical axis titles/units on the
+/// left and tick labels/axis titles below the x-axis.
+pub fn crop_diagram_with_options(
+    img: &image::DynamicImage,
+    bbox: &[f32],
+    padding: u32,
+    ignore_grid: bool,
+    graph_like: bool,
+) -> Result<image::RgbaImage, CropReject> {
+    let primary = crop_diagram_reading(img, bbox, padding, ignore_grid, graph_like);
+    if primary.is_ok() {
+        return primary;
+    }
+
+    // Vision providers sometimes return [x1, y1, x2, y2] despite the
+    // requested [x, y, width, height] schema. If the primary crop is rejected,
+    // retry the equivalent width/height reading before discarding the figure.
+    // This fallback is deliberately limited to rejected crops so valid
+    // width/height proposals retain their existing interpretation.
+    if bbox.len() == 4 && bbox[2] > bbox[0] && bbox[3] > bbox[1] {
+        let alternate = [
+            bbox[0],
+            bbox[1],
+            bbox[2] - bbox[0],
+            bbox[3] - bbox[1],
+        ];
+        if alternate
+            .iter()
+            .zip(bbox.iter())
+            .any(|(alternate, original)| alternate != original)
+        {
+            if let Ok(crop) = crop_diagram_reading(img, &alternate, padding, ignore_grid, graph_like) {
+                return Ok(crop);
+            }
+        }
+    }
+
+    primary
+}
+
+fn crop_diagram_reading(
+    img: &image::DynamicImage,
+    bbox: &[f32],
+    padding: u32,
+    ignore_grid: bool,
+    graph_like: bool,
 ) -> Result<image::RgbaImage, CropReject> {
     use image::GenericImageView;
     let (img_w, img_h) = img.dimensions();
@@ -493,14 +622,42 @@ pub fn crop_diagram(
         return Err(CropReject::BadBox);
     }
 
-    let safe_x = rect.x.saturating_sub(padding);
-    let safe_y = rect.y.saturating_sub(padding);
-    // img_w - safe_x / img_h - safe_y cannot underflow: the sanitizer
-    // guarantees rect.x <= img_w - 1 and rect.y <= img_h - 1.
-    let x_pad_left = rect.x - safe_x;
-    let y_pad_top = rect.y - safe_y;
-    let safe_w = (rect.w + x_pad_left + padding).min(img_w - safe_x);
-    let safe_h = (rect.h + y_pad_top + padding).min(img_h - safe_y);
+    // Scale padding proportionally to image resolution. The vision model
+    // returns bboxes based on a downsampled 1024px image, but we crop from
+    // the full 300-DPI page. A fixed 40px padding is too small for high-res
+    // images, causing truncation of labels and borders.
+    let scale_factor = (img_w.max(img_h) as f32 / 1024.0).max(1.0);
+    let scaled_padding = (padding as f32 * scale_factor).round() as u32;
+    let left_padding = if graph_like {
+        scaled_padding.max((img_w as f32 * 0.10).round() as u32)
+    } else {
+        scaled_padding
+    };
+    let right_padding = scaled_padding;
+    let top_padding = if graph_like {
+        scaled_padding.max((img_h as f32 * 0.06).round() as u32)
+    } else {
+        scaled_padding
+    };
+    let bottom_padding = if graph_like {
+        scaled_padding.max((img_h as f32 * 0.10).round() as u32)
+    } else {
+        scaled_padding
+    };
+
+    let expanded = expand_rect(
+        rect,
+        left_padding,
+        top_padding,
+        right_padding,
+        bottom_padding,
+        img_w,
+        img_h,
+    );
+    let safe_x = expanded.x;
+    let safe_y = expanded.y;
+    let safe_w = expanded.w;
+    let safe_h = expanded.h;
 
     if safe_w < MIN_EDGE_PX || safe_h < MIN_EDGE_PX {
         return Err(CropReject::BadBox);
@@ -556,9 +713,20 @@ pub struct PageBand {
 /// top/bottom lines of the question.
 #[allow(dead_code)]
 pub fn crop_page_vertical(b64: &str, start_frac: f32, end_frac: f32) -> Option<PageBand> {
+    let img = decode_page_image(b64)?;
+    crop_page_vertical_from_image(&img, start_frac, end_frac)
+}
+
+/// Crop an already-decoded page image to a vertical band. This is the
+/// allocation-heavy half of `crop_page_vertical`; callers that also need the
+/// decoded full page can now decode once and retain it for diagram auditing.
+pub fn crop_page_vertical_from_image(
+    img: &image::DynamicImage,
+    start_frac: f32,
+    end_frac: f32,
+) -> Option<PageBand> {
     use base64::Engine;
     use image::GenericImageView;
-    let img = decode_page_image(b64)?;
     let (w, h) = img.dimensions();
     if w < 2 || h < 2 {
         return None;
@@ -577,8 +745,7 @@ pub fn crop_page_vertical(b64: &str, start_frac: f32, end_frac: f32) -> Option<P
     let y1 = y1.min(h).max(y0 + 1);
     let band_h = y1 - y0;
 
-    let mut owned = img;
-    let cropped_rgba = image::imageops::crop(&mut owned, 0, y0, w, band_h).to_image();
+    let cropped_rgba = image::imageops::crop_imm(img, 0, y0, w, band_h).to_image();
     let cropped = image::DynamicImage::ImageRgba8(cropped_rgba).to_rgb8();
 
     // Re-encode as JPEG at high quality (matching what the frontend sends).
@@ -615,6 +782,7 @@ pub fn strip_data_url(b64: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use base64::Engine;
 
     const W: u32 = 1654;
     const H: u32 = 2339;
@@ -622,6 +790,26 @@ mod tests {
     fn assert_close(a: u32, b: u32, tol: u32) {
         let d = (a as i64 - b as i64).abs();
         assert!(d <= tol as i64, "{a} not within {tol} of {b}");
+    }
+
+    #[test]
+    fn decoded_vertical_crop_matches_base64_entry_point() {
+        let image = image::DynamicImage::ImageRgb8(image::RgbImage::from_fn(320, 480, |x, y| {
+            image::Rgb([(x % 255) as u8, (y % 255) as u8, 180])
+        }));
+        let mut png = std::io::Cursor::new(Vec::new());
+        image.write_to(&mut png, image::ImageFormat::Png).unwrap();
+        let b64 = base64::engine::general_purpose::STANDARD.encode(png.into_inner());
+
+        let from_b64 = crop_page_vertical(&b64, 0.2, 0.7).unwrap();
+        let decoded = decode_page_image(&b64).unwrap();
+        let from_decoded = crop_page_vertical_from_image(&decoded, 0.2, 0.7).unwrap();
+
+        assert_eq!(from_b64.y_offset_px, from_decoded.y_offset_px);
+        assert_eq!(from_b64.height_px, from_decoded.height_px);
+        assert_eq!(from_b64.y_offset_frac, from_decoded.y_offset_frac);
+        assert_eq!(from_b64.height_frac, from_decoded.height_frac);
+        assert_eq!(from_b64.b64, from_decoded.b64);
     }
 
     #[test]
@@ -639,6 +827,19 @@ mod tests {
         // Could be (x,y,w,h) or (x1,y1,x2,y2) — either way: valid + in bounds.
         let r = sanitize_bbox(&[0.1, 0.1, 0.45, 0.45], W, H).unwrap();
         assert!(r.x + r.w <= W && r.y + r.h <= H);
+    }
+
+    #[test]
+    fn corner_coordinates_are_preferred_when_width_height_crosses_page_edge() {
+        let r = sanitize_bbox(&[0.17, 0.399, 0.77, 0.864], W, H).unwrap();
+        assert_close(r.x, (0.17 * W as f32).round() as u32, 2);
+        assert_close(r.y, (0.399 * H as f32).round() as u32, 2);
+        assert_close(r.w, ((0.77 - 0.17) * W as f32).round() as u32, 2);
+        assert_close(r.h, ((0.864 - 0.399) * H as f32).round() as u32, 2);
+
+        let r = sanitize_bbox(&[0.17, 0.463, 0.78, 0.84], W, H).unwrap();
+        assert_close(r.w, ((0.78 - 0.17) * W as f32).round() as u32, 2);
+        assert_close(r.h, ((0.84 - 0.463) * H as f32).round() as u32, 2);
     }
 
     #[test]
@@ -715,6 +916,78 @@ mod tests {
         ] {
             let _ = crop_diagram(&img, b, 40, false); // must not panic
         }
+    }
+
+    /// Regression test: padding must scale with image resolution.
+    /// A 300-DPI page (~3000x4000px) needs ~3x more padding than a 1024px
+    /// downsampled image to capture the same labels/borders.
+    #[test]
+    fn crop_diagram_padding_scales_with_resolution() {
+        // Low-res image (1024px longest edge) - should use base 40px padding
+        let low_res = image::DynamicImage::new_rgba8(1024, 1024);
+        let bbox = &[0.2, 0.2, 0.6, 0.6]; // 60% of image = 614px
+        let crop_low = crop_diagram(&low_res, bbox, 40, true).unwrap();
+        // With 40px padding on each side: 614 + 80 = 694px
+        assert!(crop_low.width() >= 690 && crop_low.width() <= 700);
+
+        // High-res image (3072px longest edge, 3x scale) - should use ~120px padding
+        let high_res = image::DynamicImage::new_rgba8(3072, 3072);
+        let crop_high = crop_diagram(&high_res, bbox, 40, true).unwrap();
+        // With ~120px padding on each side: 1843 + 240 = 2083px
+        assert!(crop_high.width() >= 2070 && crop_high.width() <= 2100);
+
+        // Verify high-res crop is proportionally larger
+        let scale_ratio = crop_high.width() as f32 / crop_low.width() as f32;
+        assert!(
+            scale_ratio >= 2.8 && scale_ratio <= 3.2,
+            "High-res crop should be ~3x larger than low-res crop, got {:.2}x",
+            scale_ratio
+        );
+    }
+
+    #[test]
+    fn graph_crops_reserve_margin_for_axis_labels() {
+        let image = image::DynamicImage::ImageRgb8(image::RgbImage::from_fn(W, H, |x, y| {
+            image::Rgb([(x % 251) as u8, (y % 251) as u8, ((x + y) % 251) as u8])
+        }));
+        let bbox = &[0.2, 0.2, 0.6, 0.6];
+        let regular = crop_diagram(&image, bbox, 40, true).unwrap();
+        let graph = crop_diagram_with_options(&image, bbox, 40, true, true).unwrap();
+
+        assert!(graph.width() > regular.width());
+        assert!(graph.height() > regular.height());
+    }
+
+    #[test]
+    fn graph_margin_expansion_moves_all_edges_outward_and_clamps() {
+        let rect = PixelRect {
+            x: 300,
+            y: 400,
+            w: 500,
+            h: 600,
+        };
+        let expanded = expand_rect(rect, 100, 120, 140, 160, 1000, 1200);
+        assert_eq!(expanded.x, 200);
+        assert_eq!(expanded.y, 280);
+        assert_eq!(expanded.x + expanded.w, 940);
+        assert_eq!(expanded.y + expanded.h, 1160);
+
+        let edge = expand_rect(rect, 500, 500, 500, 500, 700, 800);
+        assert_eq!(edge.x, 0);
+        assert_eq!(edge.y, 0);
+        assert_eq!(edge.x + edge.w, 700);
+        assert_eq!(edge.y + edge.h, 800);
+    }
+
+    #[test]
+    fn union_relative_bboxes_encloses_visual_options_and_clamps() {
+        let union = union_relative_bboxes(&[
+            vec![0.10, 0.20, 0.30, 0.15],
+            vec![0.15, 0.40, 0.70, 0.20],
+            vec![0.05, 0.65, 0.90, 0.40],
+        ])
+        .unwrap();
+        assert_eq!(union, vec![0.05, 0.20, 0.90, 0.80]);
     }
 
     // ── Synthetic fixtures for the answer-grid guard ────────────────────────
