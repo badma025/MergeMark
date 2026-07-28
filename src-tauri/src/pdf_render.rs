@@ -1,16 +1,82 @@
+use std::collections::{HashMap, VecDeque};
 use std::path::Path;
+use std::sync::{Arc, Mutex};
 use pdfium_render::prelude::*;
 use crate::pipeline::{PageInput, PageInputKind};
 use base64::Engine;
 use image::{DynamicImage, ImageFormat};
 use std::io::Cursor;
+use std::sync::OnceLock;
+
+static PDFIUM_INSTANCE: OnceLock<Result<Pdfium, String>> = OnceLock::new();
+
+struct PageRenderCacheState {
+    pages: HashMap<usize, Arc<DynamicImage>>,
+    lru: VecDeque<usize>,
+}
+
+/// Bounded, per-import cache for high-resolution pages used by physical
+/// diagram crops. The internal mutex lets the existing concurrent extraction
+/// futures share one cache without changing their scheduling model.
+pub struct PageRenderCache {
+    capacity: usize,
+    state: Mutex<PageRenderCacheState>,
+}
+
+impl PageRenderCache {
+    pub fn new(capacity: usize) -> Self {
+        Self {
+            capacity: capacity.max(1),
+            state: Mutex::new(PageRenderCacheState {
+                pages: HashMap::with_capacity(capacity.max(1)),
+                lru: VecDeque::with_capacity(capacity.max(1)),
+            }),
+        }
+    }
+
+    /// Return a shared 300-DPI page image, rendering it exactly once while it
+    /// remains resident in the bounded cache.
+    pub fn get_or_render(
+        &self,
+        path: &Path,
+        page_idx: usize,
+    ) -> Result<Arc<DynamicImage>, String> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| "300-DPI page cache lock poisoned".to_string())?;
+
+        if let Some(image) = state.pages.get(&page_idx).cloned() {
+            if let Some(position) = state.lru.iter().position(|cached| *cached == page_idx) {
+                state.lru.remove(position);
+            }
+            state.lru.push_back(page_idx);
+            return Ok(image);
+        }
+
+        let image = Arc::new(render_pdf_page_at_300dpi(path, page_idx)?);
+        if state.pages.len() >= self.capacity {
+            if let Some(evicted) = state.lru.pop_front() {
+                state.pages.remove(&evicted);
+            }
+        }
+        state.pages.insert(page_idx, Arc::clone(&image));
+        state.lru.push_back(page_idx);
+        Ok(image)
+    }
+}
+
+fn get_pdfium() -> Result<&'static Pdfium, String> {
+    PDFIUM_INSTANCE.get_or_init(|| {
+        let bindings = Pdfium::bind_to_system_library()
+            .map_err(|e| format!("Failed to bind to pdfium: {:?}", e))?;
+        Ok(Pdfium::new(bindings))
+    }).as_ref().map_err(|e| e.clone())
+}
 
 #[allow(dead_code)]
 pub fn render_pdf_pages(path: &Path) -> Result<Vec<PageInput>, String> {
-    let pdfium = Pdfium::new(
-        Pdfium::bind_to_system_library()
-            .map_err(|e| format!("Failed to bind to pdfium: {:?}", e))?
-    );
+    let pdfium = get_pdfium()?;
 
     let document = pdfium.load_pdf_from_file(path, None)
         .map_err(|e| format!("Failed to load PDF: {:?}", e))?;
@@ -74,10 +140,7 @@ pub fn render_pdf_pages(path: &Path) -> Result<Vec<PageInput>, String> {
 }
 
 pub fn render_pdf_page_at_300dpi(path: &Path, page_idx: usize) -> Result<image::DynamicImage, String> {
-    let pdfium = Pdfium::new(
-        Pdfium::bind_to_system_library()
-            .map_err(|e| format!("Failed to bind to pdfium: {:?}", e))?
-    );
+    let pdfium = get_pdfium()?;
 
     let document = pdfium.load_pdf_from_file(path, None)
         .map_err(|e| format!("Failed to load PDF: {:?}", e))?;

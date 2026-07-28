@@ -24,8 +24,13 @@ use crate::json_salvage::{parse_llm_json, ParseOutcome};
 use crate::llm::{self, LlmClient};
 use crate::validate;
 use std::path::PathBuf;
+use std::collections::VecDeque;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
+use tokio::sync::Semaphore;
+use futures_util::{FutureExt, StreamExt};
+use image::GenericImageView;
 
 // ══════════════════════════════════════════════════════════════════════════
 // Public types
@@ -62,6 +67,7 @@ impl Progress for NullProgress {
     fn stage(&self, _message: &str) {}
 }
 
+#[derive(Clone)]
 pub struct PipelineConfig {
     pub model: String,
     pub paper_name: String,
@@ -163,6 +169,171 @@ pub struct ImportReport {
 /// stops us paying API latency serially. 429 backpressure is per-call
 /// (llm.rs), so bursts self-limit.
 const DEFAULT_PARALLEL: usize = 4;
+const PAGE_RENDER_CACHE_CAPACITY: usize = 4;
+
+async fn chat_with_permit<C: LlmClient>(
+    client: &C,
+    body: &serde_json::Value,
+    semaphore: &Arc<Semaphore>,
+) -> Result<serde_json::Value, crate::llm::LlmError> {
+    let _permit = semaphore
+        .acquire()
+        .await
+        .map_err(|_| crate::llm::LlmError::Network("request semaphore closed".to_string()))?;
+    client.chat(body).await
+}
+
+struct ChunkImageInput {
+    chunk_idx: usize,
+    b64: String,
+    start_y: Option<f32>,
+    end_y: Option<f32>,
+}
+
+struct PreparedChunk {
+    images: Vec<String>,
+    local_to_chunk: Vec<usize>,
+    page_bands: Vec<Option<(f32, f32)>>,
+    page_crop_offsets: Vec<(f32, f32)>,
+    decoded_pages: Vec<Option<Arc<image::DynamicImage>>>,
+}
+
+struct DiagramSaveRequest {
+    global_page_idx: usize,
+    bbox: Vec<f32>,
+    ignore_grid: bool,
+    graph_like: bool,
+}
+
+struct DiagramPersistence {
+    links: Vec<Option<String>>,
+    saved: Vec<([u8; 64], String)>,
+    report: ImportReport,
+}
+
+async fn persist_diagrams(
+    requests: Vec<DiagramSaveRequest>,
+    page_b64: std::collections::HashMap<usize, String>,
+    config: PipelineConfig,
+    page_render_cache: Arc<crate::pdf_render::PageRenderCache>,
+    saved: Vec<([u8; 64], String)>,
+) -> Result<DiagramPersistence, tokio::task::JoinError> {
+    tokio::task::spawn_blocking(move || {
+        let mut saved = saved;
+        let mut report = ImportReport::default();
+        let mut links = Vec::with_capacity(requests.len());
+        for request in requests {
+            links.push(save_diagram(
+                request.global_page_idx,
+                page_b64.get(&request.global_page_idx).map(String::as_str),
+                &request.bbox,
+                &config,
+                page_render_cache.as_ref(),
+                &mut saved,
+                &mut report,
+                request.ignore_grid,
+                request.graph_like,
+            ));
+        }
+        DiagramPersistence {
+            links,
+            saved,
+            report,
+        }
+    })
+    .await
+}
+
+async fn prepare_chunk_images(
+    chunk_len: usize,
+    inputs: Vec<ChunkImageInput>,
+) -> Result<PreparedChunk, tokio::task::JoinError> {
+    tokio::task::spawn_blocking(move || {
+        let mut images = Vec::with_capacity(inputs.len());
+        let mut local_to_chunk = Vec::with_capacity(inputs.len());
+        let mut page_bands = vec![None; chunk_len];
+        let mut page_crop_offsets = Vec::with_capacity(inputs.len());
+        let mut decoded_pages = vec![None; chunk_len];
+
+        for input in inputs {
+            let decoded = geometry::decode_page_image(&input.b64).map(Arc::new);
+            let mut final_b64 = input.b64;
+            let mut crop_offset = (0.0_f32, 1.0_f32);
+
+            if input.start_y.is_some() || input.end_y.is_some() {
+                let start = (input.start_y.unwrap_or(0.0) - 0.03).max(0.0);
+                let end = (input.end_y.unwrap_or(1.0) + 0.03).min(1.0);
+                if let Some(cropped) = decoded
+                    .as_deref()
+                    .and_then(|image| geometry::crop_page_vertical_from_image(image, start, end))
+                {
+                    final_b64 = cropped.b64;
+                    crop_offset = (cropped.y_offset_frac, cropped.height_frac);
+                }
+                page_bands[input.chunk_idx] = Some((
+                    input.start_y.unwrap_or(0.0),
+                    input.end_y.unwrap_or(1.0),
+                ));
+            }
+
+            // Phase 4: downsample the API image so the longest edge does not
+            // exceed 1024 px. The retained decoded page and the 300-DPI cache
+            // used by persist_diagrams remain at full resolution so physical
+            // crops preserve original precision. Bounding boxes returned by
+            // the vision model are expressed as fractions of this downsized
+            // image, but the pipeline converts them back to absolute pixels
+            // against the cached high-res page during cropping, so no
+            // coordinate remapping is needed here.
+            if let Some(img) = &decoded {
+                let (w, h) = img.dimensions();
+                let max_dim: u32 = 1024;
+                if w > max_dim || h > max_dim {
+                    let scale = max_dim as f32 / (w.max(h) as f32);
+                    let new_w = (w as f32 * scale).round().max(1.0) as u32;
+                    let new_h = (h as f32 * scale).round().max(1.0) as u32;
+                    let resized = image::imageops::resize(
+                        img.as_ref(),
+                        new_w,
+                        new_h,
+                        image::imageops::FilterType::Triangle,
+                    );
+                    let mut buf = std::io::Cursor::new(Vec::with_capacity(
+                        (new_w as usize * new_h as usize) / 8,
+                    ));
+                    use image::codecs::jpeg::JpegEncoder;
+                    use image::ImageEncoder;
+                    let enc = JpegEncoder::new_with_quality(&mut buf, 92);
+                    if enc
+                        .write_image(
+                            &resized,
+                            new_w,
+                            new_h,
+                            image::ExtendedColorType::Rgba8,
+                        )
+                        .is_ok()
+                    {
+                        use base64::Engine;
+                        final_b64 = base64::engine::general_purpose::STANDARD.encode(buf.into_inner());
+                    }
+                }
+            }
+
+            decoded_pages[input.chunk_idx] = decoded;
+            images.push(final_b64);
+            local_to_chunk.push(input.chunk_idx);
+            page_crop_offsets.push(crop_offset);
+        }
+
+        PreparedChunk {
+            images,
+            local_to_chunk,
+            page_bands,
+            page_crop_offsets,
+            decoded_pages,
+        }
+    })
+    .await
+}
 
 impl ImportReport {
     /// Fold a per-unit report (one span / page / window processed inside a
@@ -224,7 +395,7 @@ pub struct AnswerDraft {
 // are normalized deterministically — a type slip can't kill an extraction)
 // ══════════════════════════════════════════════════════════════════════════
 
-#[derive(Debug, Default, serde::Deserialize)]
+#[derive(Debug, Default, serde::Deserialize, Clone)]
 #[serde(default)]
 struct AiQuestion {
     question_number: Option<serde_json::Value>,
@@ -239,12 +410,177 @@ struct AiQuestion {
     diagram_kinds: Option<Vec<String>>,
     bbox_page_indexes: Option<Vec<serde_json::Value>>,
     math_snippet: Option<String>,
+    #[serde(alias = "choice_layout", alias = "option_layout", alias = "visual_option_type")]
+    visual_options: Option<String>,
 }
 
 #[derive(Debug, Default, serde::Deserialize)]
 #[serde(default)]
 struct AiQuestionPage {
     items: Vec<AiQuestion>,
+}
+
+fn merge_split_questions(items: Vec<AiQuestion>, question_number: u32) -> AiQuestion {
+    let mut merged = AiQuestion {
+        question_number: Some(serde_json::json!(question_number)),
+        ..Default::default()
+    };
+    let mut content = Vec::new();
+    let mut bboxes = Vec::new();
+    let mut captions = Vec::new();
+    let mut kinds = Vec::new();
+    let mut indexes = Vec::new();
+    let mut topics = Vec::new();
+    let mut marks = 0i32;
+    let mut has_marks = false;
+
+    for item in items {
+        if let Some(value) = item.content.filter(|value| !value.trim().is_empty()) {
+            content.push(value);
+        }
+        if let Some(value) = item.diagram_bboxes {
+            bboxes.extend(value);
+        }
+        if let Some(value) = item.diagram_captions {
+            captions.extend(value);
+        }
+        if let Some(value) = item.diagram_kinds {
+            kinds.extend(value);
+        }
+        if let Some(value) = item.bbox_page_indexes {
+            indexes.extend(value);
+        }
+        if let Some(value) = item.topics {
+            topics.extend(value_to_topics(&value));
+        }
+        if let Some(value) = item.marks.as_ref().and_then(validate::value_to_marks) {
+            marks += value;
+            has_marks = true;
+        }
+        merged.module = merged.module.or(item.module);
+        merged.is_code = merged.is_code.or(item.is_code);
+        merged.math_snippet = merged.math_snippet.or(item.math_snippet);
+        if merged.visual_options.is_none()
+            && item.visual_options.as_deref() == Some("composite_visual_options")
+        {
+            merged.visual_options = item.visual_options;
+        }
+    }
+
+    merged.content = Some(content.join("\n\n"));
+    if has_marks {
+        merged.marks = Some(serde_json::json!(marks));
+    }
+    if !topics.is_empty() {
+        merged.topics = Some(serde_json::json!(topics));
+    }
+    if !bboxes.is_empty() {
+        merged.diagram_bboxes = Some(bboxes);
+    }
+    if !captions.is_empty() {
+        merged.diagram_captions = Some(captions);
+    }
+    if !kinds.is_empty() {
+        merged.diagram_kinds = Some(kinds);
+    }
+    if !indexes.is_empty() {
+        merged.bbox_page_indexes = Some(indexes);
+    }
+    merged
+}
+
+fn is_composite_visual_options(item: &AiQuestion) -> bool {
+    item.visual_options.as_deref() == Some("composite_visual_options")
+        || item
+            .diagram_kinds
+            .as_ref()
+            .map(|kinds| {
+                kinds
+                    .iter()
+                    .any(|kind| kind == "composite_visual_options")
+            })
+            .unwrap_or(false)
+}
+
+fn is_visual_option_marker(line: &str) -> bool {
+    let trimmed = line.trim();
+    let Some(first) = trimmed.chars().next() else {
+        return false;
+    };
+    if !matches!(first, 'A' | 'B' | 'C' | 'D') {
+        return false;
+    }
+    let rest = trimmed[first.len_utf8()..].trim_start();
+    rest.is_empty()
+        || rest.starts_with("[DIAGRAM_PLACEHOLDER]")
+        || matches!(rest.chars().next(), Some(')' | '.' | ':'))
+}
+
+/// Convert visual A-D choices into one placeholder-backed composite image.
+/// Text-only MCQs do not enter this path.
+fn normalize_composite_visual_options(item: &mut AiQuestion) {
+    if !is_composite_visual_options(item) {
+        return;
+    }
+
+    let Some(bboxes) = item.diagram_bboxes.clone() else {
+        return;
+    };
+    let indexes = item.bbox_page_indexes.clone().unwrap_or_default();
+    if bboxes.len() > 1 {
+        let Some(first_page) = indexes.first().and_then(value_to_usize) else {
+            return;
+        };
+        if indexes.len() != bboxes.len()
+            || indexes
+                .iter()
+                .filter_map(value_to_usize)
+                .any(|page| page != first_page)
+        {
+            // A single bitmap cannot span multiple page images. Preserve the
+            // original per-page proposals rather than creating an invalid
+            // cross-page crop.
+            return;
+        }
+        let Some(union) = geometry::union_relative_bboxes(&bboxes) else {
+            return;
+        };
+        item.diagram_bboxes = Some(vec![union]);
+        item.bbox_page_indexes = Some(vec![serde_json::json!(first_page)]);
+    }
+
+    item.diagram_captions = Some(vec!["Composite visual options".to_string()]);
+    item.diagram_kinds = Some(vec!["composite_visual_options".to_string()]);
+
+    let Some(content) = item.content.as_deref() else {
+        return;
+    };
+    let lines: Vec<&str> = content.lines().collect();
+    let marker_positions: Vec<usize> = lines
+        .iter()
+        .enumerate()
+        .filter_map(|(index, line)| is_visual_option_marker(line).then_some(index))
+        .collect();
+    let placeholder_count = content.matches("[DIAGRAM_PLACEHOLDER]").count();
+    if marker_positions.len() >= 2 && placeholder_count > 0 {
+        let prefix = lines[..marker_positions[0]].join("\n").trim_end().to_string();
+        item.content = Some(if prefix.is_empty() {
+            "[DIAGRAM_PLACEHOLDER]".to_string()
+        } else {
+            format!("{}\n[DIAGRAM_PLACEHOLDER]", prefix)
+        });
+    } else if placeholder_count > 1 {
+        let mut collapsed = String::new();
+        for (index, part) in content.split("[DIAGRAM_PLACEHOLDER]").enumerate() {
+            if index > 0 {
+                if index == 1 {
+                    collapsed.push_str("[DIAGRAM_PLACEHOLDER]");
+                }
+            }
+            collapsed.push_str(part);
+        }
+        item.content = Some(collapsed.trim().to_string());
+    }
 }
 
 #[derive(Debug, Default, serde::Deserialize)]
@@ -507,7 +843,9 @@ EVERY item MUST have:
 - "module": string — output EXACTLY '{module}'.
 - "is_code": boolean (true only for code/pseudocode questions).
 - "diagram_captions": array of captions, one per figure box, or empty string; "diagram_kinds": array of semantic kinds such as graph, schema, flowchart, circuit, or multi-panel, one per box. Decide whether each exhibit is a figure before proposing geometry.
+- "visual_options": null for ordinary questions and text-only multiple-choice options. Set exactly to "composite_visual_options" when the answer choices are primarily visual assets (graphs, diagrams, plots, circuits, or illustrated answer choices). For that case, return ONE diagram placeholder and ONE bounding box spanning the complete choices block from the start of option A through the bottom of option D, including the A/B/C/D labels, all graphs or diagrams, tick boxes, axes, captions, and surrounding whitespace. Never emit one crop per visual option.
 - "diagram_bboxes": array of [x, y, w, h] boxes with RELATIVE 0.0-1.0 coordinates, one per visual exhibit. IMPORTANT: coordinates are ALWAYS relative to the FULL page image (0,0 at the top-left corner of the page, 1,1 at the bottom-right), EVEN when the prompt tells you to only transcribe between certain y-percentages (multi-question pages). The y-band is only a hint for what to TRANSCRIBE — never shift or rescale bbox coordinates to match the band. Box EVERY figure the paper draws — graphs, networks, trees, circuits — INCLUDING anything the paper labels as a Figure (e.g. "Figure 6"): printed relation/database schemas, algorithm screens, and grids that are part of the question exhibit are figures, return them as boxes, not as text. One box per WHOLE figure including its labels/caption, never two boxes on one figure. Do NOT box plain question text, tables you transcribed as Markdown (STRUCTURED TABLES rule above), or EMPTY student answer grids. The parser crop-checks every box (and rejects boxes whose center falls outside the question's band on multi-question pages). Include the complete semantic figure extent, including captions and disconnected components, rather than tight-boxing one shape.
+GRAPH/CANVAS EXTENT: for every graph or chart, the box MUST include the complete visual canvas, not merely the plotted grid. Include the far-left y-axis title, variables, units, numeric tick labels and axis line; the bottom x-axis title, variables, units and tick labels; the top/right border or grid edge; and the printed Figure heading/caption. Leave visible whitespace around these elements. A graph crop that starts at the y-axis or ends at the plot border is incomplete.
 The parser crop-checks every box: blank boxes, empty ruled grids, and duplicate boxes are rejected and cost you a repair round.
 - "bbox_page_indexes": array with the SAME LENGTH as diagram_bboxes — the 0-based index of the page image each box refers to.
 - Insert the exact token [DIAGRAM_PLACEHOLDER] in "content" where each diagram belongs chronologically.
@@ -517,7 +855,7 @@ FORMATTING RULES:
 - OMIT trailing answer line units, symbols, and answer templates at the very end of the question (e.g. "..................... %", "£ .....................", "..................... cm", or "............ $\\le t <$ ............"). Do NOT transcribe the answer blanks or the mathematical operators embedded within them.
 - Wrap inline math in single $...$. Use $$...$$ ONLY for display equations on their own line.
 - Tables of text/data: standard Markdown tables. Pure mathematical matrices or Simplex tableaus: LaTeX \begin{{array}} inside $$...$$. Never put $ inside array environments.
-- Multiple-choice options: `a) ...`, `b) ...` separated by double newlines, WITHOUT the question number prefix.
+- Multiple-choice options: keep their original capital letter labels (e.g. `A ...`, `B ...`) separated by newlines. Do NOT format them as lowercase sub-parts like `(a)`.
 - Code/pseudocode/SQL/identifiers: Markdown backticks, NEVER LaTeX math mode.
 - AQA decimal sub-parts: render '02.1'-style parts as (a), (b), (c) — positionally: .1 -> a, .2 -> b — and update inline cross-references accordingly. AQA also uses SPACED sub-parts: "01 5" means Question 1, sub-part 5 — render as (e). The whole question number is ALWAYS the integer before the space/dot. NEVER return decimals like 1.5 for spaced sub-parts. Whole-numbered MCQs are independent questions, never decimals.
 - JSON ESCAPING: backslashes in LaTeX MUST be escaped (\\frac, \\theta). Unescaped backslashes break the parser and your work is discarded.
@@ -566,6 +904,10 @@ pub async fn run_question_pipeline<C: LlmClient, P: Progress>(
         pages_total: pages.len(),
         ..Default::default()
     };
+    let page_render_cache = Arc::new(crate::pdf_render::PageRenderCache::new(
+        PAGE_RENDER_CACHE_CAPACITY,
+    ));
+    let request_semaphore = Arc::new(Semaphore::new(config.parallelism.max(1)));
 
     // Prefer the free PDF text layer: it avoids one vision request per page.
     let page_texts: Vec<String> = pages.iter().map(|p| p.text.clone()).collect();
@@ -573,11 +915,17 @@ pub async fn run_question_pipeline<C: LlmClient, P: Progress>(
     // Time the text-layer document map building
     let text_map_start = Instant::now();
     let scan = doc_map::scan_text_layer(&page_texts);
-    let text_map_available = !scan.footers.is_empty()
+    // The vision structure pass (one AI call per page) is skippable when the
+    // text layer alone can build the map: either via reliable footers
+    // (Edexcel-style) or via a sufficiently dense heading sequence (AQA-style,
+    // verified across all '17–'24 physics papers). Scanned/garbled PDFs fail
+    // the check and keep the vision structure pass as before.
+    let text_map_available = (!scan.footers.is_empty()
         && scan
             .page_reliability
             .iter()
-            .all(|r| *r != doc_map::PageReliability::Ambiguous);
+            .all(|r| *r != doc_map::PageReliability::Ambiguous))
+        || doc_map::text_layer_map_sufficient(&scan, pages.len());
     report.record_timing(
         "document_map",
         "text_layer_scan",
@@ -601,57 +949,31 @@ pub async fn run_question_pipeline<C: LlmClient, P: Progress>(
             footer_y: None,
             role: doc_map::PageRole::Unknown,
         };
-        for (bi, batch) in pages.chunks(config.parallelism.max(1)).enumerate() {
-            cancelled(cancel)?;
-            let base = bi * config.parallelism.max(1);
-            progress.stage(&format!(
-                "Scanning document structure (pages {}–{} of {})…",
-                base + 1,
-                base + batch.len(),
-                pages.len()
-            ));
-            let struct_batch_start = Instant::now();
-            // Phase 1c: skip NonQuestion pages for the structure call too —
-            // pages the text layer is confident are front matter don't need
-            // a vision call, and letting the model guess at question numbers
-            // on cover pages pollutes prev_max in the monotonicity guard.
-            // We consult `scan.page_reliability` (computed above, before the
-            // structure pass) so the check is free; pages the text layer
-            // already marked NonQuestion short-circuit to a synthetic BLANK
-            // response, identical to a __SKIP__ sentinel.
-            let futs: Vec<_> = batch
-                .iter()
-                .enumerate()
-                .map(|(k, page)| {
-                    let page_index = base + k;
-                    let is_non_question_by_text = page_index < scan.page_reliability.len()
-                        && scan.page_reliability[page_index]
-                            == doc_map::PageReliability::NonQuestion;
-                    // Phase 1b: use the new PageInputKind.
-                    let is_skip = false;
-                    let is_text_only = matches!(page.kind, PageInputKind::TextOnly);
-
-                    if is_skip || is_non_question_by_text {
-                        return futures_util::future::Either::Left(async move {
-                            Ok(r#"{"question_numbers_visible":[],"page_role":"BLANK"}"#.to_string())
-                        });
+        let structure_start = Instant::now();
+        let mut structure_results = futures_util::stream::iter(0..pages.len()).map(|page_index| {
+                let page = &pages[page_index];
+                let is_non_question_by_text = page_index < scan.page_reliability.len()
+                    && scan.page_reliability[page_index]
+                        == doc_map::PageReliability::NonQuestion;
+                let is_text_only = matches!(page.kind, PageInputKind::TextOnly);
+                let semaphore = Arc::clone(&request_semaphore);
+                let system_structure = system_structure.clone();
+                async move {
+                    if is_non_question_by_text {
+                        return (
+                            page_index,
+                            Ok(r#"{"question_numbers_visible":[],"page_role":"BLANK"}"#.to_string()),
+                        );
                     }
-
                     let mut images = Vec::new();
                     if let PageInputKind::Image { b64, .. } = &page.kind {
                         images.push(b64.clone());
                     }
-
                     let (img_slice, text_opt): (&[String], Option<&str>) = if is_text_only {
                         (&[], Some(page.text.as_str()))
                     } else {
                         (&images, None)
                     };
-
-                    // Phase 1c: raised from 200 to 750. Phase 1's
-                    // question_y_fracs add ~80-120 tokens per MCQ page,
-                    // so dense 5-question pages were truncating mid-JSON
-                    // and being treated as unknown-role.
                     let body = llm::chat_body(
                         &config.model,
                         &system_structure,
@@ -659,26 +981,23 @@ pub async fn run_question_pipeline<C: LlmClient, P: Progress>(
                         text_opt,
                         750,
                     );
-                    futures_util::future::Either::Right(async move {
-                        match client.chat(&body).await {
-                            Ok(resp) => llm::message_content(&resp)
-                                .map_err(|e| format!("bad response shape ({})", e)),
-                            Err(e) => Err(format!("API failure ({})", e)),
-                        }
-                    })
-                })
-                .collect();
-            let results = futures_util::future::join_all(futs).await;
-            report.record_timing(
-                "structure",
-                "api_call_batch",
-                Some(base + 1),
-                None,
-                struct_batch_start.elapsed().as_millis() as u64,
-            );
-            for (k, res) in results.into_iter().enumerate() {
-                let i = base + k;
-                match res {
+                    let result = match chat_with_permit(client, &body, &semaphore).await {
+                        Ok(resp) => llm::message_content(&resp)
+                            .map_err(|e| format!("bad response shape ({})", e)),
+                        Err(e) => Err(format!("API failure ({})", e)),
+                    };
+                    (page_index, result)
+                }
+            })
+        .buffer_unordered(config.parallelism.max(1));
+        let mut ordered = Vec::with_capacity(pages.len());
+        while let Some(result) = structure_results.next().await {
+            ordered.push(result);
+        }
+        ordered.sort_by_key(|(index, _)| *index);
+        report.record_timing("structure", "api_call_stream", None, None, structure_start.elapsed().as_millis() as u64);
+        for (i, res) in ordered {
+            match res {
                     Ok(content) => match parse_llm_json::<PageStructureProposal>(&content) {
                         ParseOutcome::Clean(p) | ParseOutcome::Salvaged { value: p, .. } => {
                             let (v, violations) =
@@ -703,9 +1022,8 @@ pub async fn run_question_pipeline<C: LlmClient, P: Progress>(
                         ));
                         structures.push(unknown_role(i));
                     }
-                }
             }
-        }
+            }
 
         // Page-role bookkeeping (records every skip — nothing disappears quietly).
         for s in &structures {
@@ -716,6 +1034,9 @@ pub async fn run_question_pipeline<C: LlmClient, P: Progress>(
                 });
             }
         }
+    } else {
+        progress.stage("Text layer map is complete — skipping vision structure scan.");
+        report.record_timing("structure", "skipped_text_sufficient", None, None, 0);
     }
 
     // Ensure structures contains an entry for every page even if vision structure pass was skipped
@@ -819,28 +1140,36 @@ pub async fn run_question_pipeline<C: LlmClient, P: Progress>(
             })
             .collect();
         let mut next_allowed: u32 = 1;
-        for batch in q_pages.chunks(config.parallelism.max(1)) {
-            cancelled(cancel)?;
-            progress.stage(&format!(
-                "Extracting pages {}–{} of {}…",
-                batch[0] + 1,
-                batch[batch.len() - 1] + 1,
-                pages.len()
-            ));
-            let extract_batch_start = Instant::now();
-            let futs: Vec<_> = batch
-                .iter()
-                .map(|&i| extract_fallback_page(client, config, &pages[i], i, next_allowed))
-                .collect();
-            let results = futures_util::future::join_all(futs).await;
-            report.record_timing(
-                "extraction",
-                "fallback_batch",
-                Some(batch[0] + 1),
-                None,
-                extract_batch_start.elapsed().as_millis() as u64,
-            );
-            for (&i, (mut outcome, local)) in batch.iter().zip(results) {
+        cancelled(cancel)?;
+        progress.stage(&format!("Extracting {} pages…", q_pages.len()));
+        let extract_start = Instant::now();
+        let batch_next_allowed = next_allowed;
+        let mut results = futures_util::stream::iter(q_pages.iter().copied().enumerate().map(|(position, i)| {
+            extract_fallback_page(
+                client,
+                config,
+                &pages[i],
+                i,
+                batch_next_allowed,
+                &page_render_cache,
+                &request_semaphore,
+            ).map(move |result| (position, result))
+        }))
+        .buffer_unordered(config.parallelism.max(1));
+        let mut ordered_results = Vec::with_capacity(q_pages.len());
+        while let Some(result) = results.next().await {
+            ordered_results.push(result);
+        }
+        drop(results);
+        ordered_results.sort_by_key(|(position, _)| *position);
+        report.record_timing(
+            "extraction",
+            "fallback_stream",
+            None,
+            None,
+            extract_start.elapsed().as_millis() as u64,
+        );
+        for (i, (_, (mut outcome, local))) in q_pages.iter().copied().zip(ordered_results) {
                 report.absorb(local);
                 report.pages_processed += 1;
                 // Sequential assembly enforces monotonic numbering: a page
@@ -849,8 +1178,17 @@ pub async fn run_question_pipeline<C: LlmClient, P: Progress>(
                 if let Some(questions) = &outcome {
                     if let Some(first_q) = questions.first() {
                         if first_q.question_number + 1 < next_allowed {
-                            let (redo, redo_local) =
-                                extract_fallback_page(client, config, &pages[i], i, next_allowed).await;
+                                let (redo, redo_local) =
+                                    extract_fallback_page(
+                                    client,
+                                    config,
+                                    &pages[i],
+                                    i,
+                                    next_allowed,
+                                        &page_render_cache,
+                                        &request_semaphore,
+                                    )
+                                .await;
                             report.absorb(redo_local);
                             outcome = redo;
                         }
@@ -901,7 +1239,6 @@ pub async fn run_question_pipeline<C: LlmClient, P: Progress>(
                     }
                 }
         }
-        }
     } else {
         report.questions_expected = map.spans.len();
         let total = map.spans.len();
@@ -933,61 +1270,61 @@ pub async fn run_question_pipeline<C: LlmClient, P: Progress>(
             jobs.push((span_idx, span, span_pages));
         }
 
-        // Spans are independent units: extract in PARALLEL batches. Every
-        // response still passes the full validator chain — order of arrival
-        // is irrelevant to correctness, and results are assembled in order.
-        for batch in jobs.chunks(config.parallelism.max(1)) {
-            cancelled(cancel)?;
-            let first = batch[0].0 + 1;
-            let last = batch[batch.len() - 1].0 + 1;
-            progress.stage(&format!(
-                "Extracting questions {}–{} (spans {}–{} of {})…",
-                batch[0].1.number,
-                batch[batch.len() - 1].1.number,
-                first,
-                last,
-                total
-            ));
-            let extract_batch_start = Instant::now();
-            let futs: Vec<_> = batch
-                .iter()
-                .map(|job| extract_span(client, config, job.1, &job.2))
-                .collect();
-            let results = futures_util::future::join_all(futs).await;
-            report.record_timing(
-                "extraction",
-                "span_batch",
-                Some(batch[0].1.number as usize),
-                None,
-                extract_batch_start.elapsed().as_millis() as u64,
-            );
-            for (job, (opt, local)) in batch.iter().zip(results) {
-                let span: &QuestionSpan = job.1;
-                let sp = &job.2;
-                report.absorb(local);
-                match opt {
-                    Some(q) => {
-                        report.pages_processed += sp.len();
-                        push_mark_check(span, &q, &mut report);
-                        built.push(q);
-                    }
-                    None => {
-                        let mut reason = "failed validation and all repair attempts".to_string();
-                        if let Some(err) = report.anomalies.last() {
-                            if err.starts_with("quarantined: ") {
-                                reason = format!(
-                                    "failed validation and all repair attempts (last error: {})",
-                                    err.trim_start_matches("quarantined: ")
-                                );
-                            }
+        cancelled(cancel)?;
+        progress.stage(&format!("Extracting {} questions…", total));
+        let extract_start = Instant::now();
+        let job_count = jobs.len();
+        let mut results = futures_util::stream::iter(0..job_count).map(|position| {
+            let job = &jobs[position];
+            extract_span(
+                client,
+                config,
+                job.1,
+                &job.2,
+                &page_render_cache,
+                &request_semaphore,
+            )
+            .map(move |result| (position, result))
+        })
+        .buffer_unordered(config.parallelism.max(1));
+        let mut ordered_results = Vec::with_capacity(jobs.len());
+        while let Some(result) = results.next().await {
+            ordered_results.push(result);
+        }
+        ordered_results.sort_by_key(|(position, _)| *position);
+        report.record_timing(
+            "extraction",
+            "span_stream",
+            None,
+            None,
+            extract_start.elapsed().as_millis() as u64,
+        );
+        for (job, (_, (opt, local))) in jobs.iter().zip(ordered_results) {
+            let span: &QuestionSpan = job.1;
+            let sp = &job.2;
+            report.absorb(local);
+            match opt {
+                Some(q) => {
+                    report.pages_processed += sp.len();
+                    push_mark_check(span, &q, &mut report);
+                    built.push(q);
+                }
+                None => {
+                    let mut reason = "failed validation and all repair attempts".to_string();
+                    if let Some(err) = report.anomalies.last() {
+                        if err.starts_with("quarantined: ") {
+                            reason = format!(
+                                "failed validation and all repair attempts (last error: {})",
+                                err.trim_start_matches("quarantined: ")
+                            );
                         }
-                        report.quarantined.push(QuarantineEvent {
-                            scope: "question".to_string(),
-                            page: Some(span.start_page + 1),
-                            question_number: Some(span.number),
-                            reason,
-                        });
                     }
+                    report.quarantined.push(QuarantineEvent {
+                        scope: "question".to_string(),
+                        page: Some(span.start_page + 1),
+                        question_number: Some(span.number),
+                        reason,
+                    });
                 }
             }
         }
@@ -1025,6 +1362,8 @@ async fn extract_span<C: LlmClient>(
     config: &PipelineConfig,
     span: &QuestionSpan,
     span_pages: &[(usize, &PageInput)],
+    page_render_cache: &Arc<crate::pdf_render::PageRenderCache>,
+    request_semaphore: &Arc<Semaphore>,
 ) -> (Option<BuiltQuestion>, ImportReport) {
     // Own, local report: spans now run in parallel batches, so each unit
     // accumulates its own bookkeeping and the caller absorbs it in order.
@@ -1034,7 +1373,19 @@ async fn extract_span<C: LlmClient>(
     // Chunk long spans: at most 4 page images per call (your no-batching
     // constraint honored as per-chunk calls, Rust concatenates).
     const MAX_IMAGES: usize = 4;
-    let chunks: Vec<&[(usize, &PageInput)]> = span_pages.chunks(MAX_IMAGES).collect();
+    let mut chunks: VecDeque<Vec<(usize, &PageInput)>> = span_pages
+        .chunks(MAX_IMAGES)
+        .map(|chunk| chunk.to_vec())
+        .collect();
+    let mut split_mode = span_pages.len() > MAX_IMAGES;
+    let mut split_raw_items: Vec<AiQuestion> = Vec::new();
+    let mut split_decoded_pages: Vec<Option<Arc<image::DynamicImage>>> = vec![None; span_pages.len()];
+    let mut split_local_to_chunk: Vec<usize> = Vec::new();
+    let mut split_crop_offsets: Vec<(f32, f32)> = vec![(0.0, 1.0); span_pages.len()];
+    let mut split_page_bands: Vec<Option<(f32, f32)>> = vec![None; span_pages.len()];
+    let mut split_context = String::new();
+    let mut split_image_count = 0usize;
+    let mut unified_split = false;
 
     let mut contents: Vec<String> = Vec::new();
     let mut topics_acc: Vec<String> = Vec::new();
@@ -1046,7 +1397,7 @@ async fn extract_span<C: LlmClient>(
     // for near-duplicate reuse across chunk boundaries.
     let mut saved_diagrams: Vec<([u8; 64], String)> = Vec::new();
 
-    for chunk in chunks {
+    'chunks: while let Some(mut chunk) = chunks.pop_front() {
         // Phase 0: filter out sentinel b64 values before they reach the
         // model. We build THREE parallel structures here:
         //   * `images`  — Vec<String> sent to the API (no sentinels)
@@ -1058,10 +1409,7 @@ async fn extract_span<C: LlmClient>(
         //     (None = full page). Used by audit_diagram_boxes to reject
         //     bboxes whose center-y falls outside the question's band —
         //     the deterministic safety net for the prompt-level band hints.
-        let mut images: Vec<String> = Vec::new();
-        let mut local_to_chunk: Vec<usize> = Vec::new();
-        let mut page_bands: Vec<Option<(f32, f32)>> = Vec::with_capacity(chunk.len());
-        let mut page_crop_offsets: Vec<(f32, f32)> = Vec::with_capacity(chunk.len());
+        let mut preparation_inputs = Vec::with_capacity(chunk.len());
         for (local_idx, (global_pi, _p)) in chunk.iter().enumerate() {
             let is_first_page_of_span = *global_pi == span.start_page;
             let is_last_page_of_span = *global_pi == span.end_page;
@@ -1074,43 +1422,33 @@ async fn extract_span<C: LlmClient>(
             } else {
                 (None, None)
             };
-            let b64 = _p.get_b64();
-            if b64.is_none() {
-                // Sentinel page: model won't see this image, so there's
-                // no image index.
-                page_bands.push(None);
-                continue;
-            }
-
-            // At this point we know the page has an image and it was
-            // requested in this chunk.
-            let b64_str = b64.unwrap();
-            let mut final_b64 = b64_str.clone();
-            let mut crop_offset = (0.0_f32, 1.0_f32); // (start_y, height)
-            
-            if s.is_some() || e.is_some() {
-                let s_val = (s.unwrap_or(0.0) - 0.03).max(0.0);
-                let e_val = (e.unwrap_or(1.0) + 0.03).min(1.0);
-                if let Some(cropped) = crate::geometry::crop_page_vertical(b64_str, s_val, e_val) {
-                    final_b64 = cropped.b64;
-                    crop_offset = (cropped.y_offset_frac, cropped.height_frac);
-                }
-            }
-            images.push(final_b64);
-            page_crop_offsets.push(crop_offset);
-            local_to_chunk.push(local_idx);
-            // If either clip is present, store the band; missing sides
-            // default to page edge (0.0 top / 1.0 bottom).
-            if s.is_some() || e.is_some() {
-                page_bands.push(Some((s.unwrap_or(0.0), e.unwrap_or(1.0))));
-            } else {
-                page_bands.push(None);
+            if let Some(b64) = _p.get_b64() {
+                preparation_inputs.push(ChunkImageInput {
+                    chunk_idx: local_idx,
+                    b64: b64.clone(),
+                    start_y: s,
+                    end_y: e,
+                });
             }
         }
-        let raw_text: String = chunk
+        let prepared = match prepare_chunk_images(chunk.len(), preparation_inputs).await {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                report.anomalies.push(format!(
+                    "Question {} image preparation task failed: {}",
+                    span.number, error
+                ));
+                return (None, report);
+            }
+        };
+        let mut images = prepared.images;
+        let mut local_to_chunk = prepared.local_to_chunk;
+        let mut page_bands = prepared.page_bands;
+        let mut page_crop_offsets = prepared.page_crop_offsets;
+        let mut decoded_pages = prepared.decoded_pages;
+        let mut raw_text: String = chunk
             .iter()
-            .enumerate()
-            .map(|(_k, (pi, p))| {
+            .map(|(pi, p)| {
                 if p.text.trim().is_empty() {
                     String::new()
                 } else {
@@ -1187,7 +1525,7 @@ async fn extract_span<C: LlmClient>(
                 )
             };
             let user_text = format!(
-                "Transcribe Question {} from the attached page image(s).{}{}{}",
+                "Transcribe Question {} from the attached page image(s).{}{}{}{}",
                 span.number,
                 band_notes,
                 if raw_text.is_empty() {
@@ -1195,7 +1533,15 @@ async fn extract_span<C: LlmClient>(
                 } else {
                     format!(
                         "\n\nReference OCR text (may be corrupt — images are authoritative):\n{}",
-                        raw_text
+                        &raw_text
+                    )
+                },
+                if split_context.is_empty() {
+                    String::new()
+                } else {
+                    format!(
+                        "\n\nThis is a continuation call. The preceding chunk already yielded the following beginning of Question {}. Continue it from the newly attached pages; do not repeat this text and do not return an empty items array merely because the page begins mid-question:\n{}",
+                        span.number, split_context
                     )
                 },
                 repair_note
@@ -1209,7 +1555,7 @@ async fn extract_span<C: LlmClient>(
             );
 
             let api_start = Instant::now();
-            let resp = match client.chat(&body).await {
+            let resp = match chat_with_permit(client, &body, request_semaphore).await {
                 Ok(r) => r,
                 Err(e) => {
                     last_error = e.to_string();
@@ -1226,7 +1572,7 @@ async fn extract_span<C: LlmClient>(
                 Some(span.number),
                 api_start.elapsed().as_millis() as u64,
             );
-            let content = match llm::message_content(&resp) {
+            let mut content = match llm::message_content(&resp) {
                 Ok(c) => c,
                 Err(e) => {
                     last_error = e.to_string();
@@ -1234,13 +1580,163 @@ async fn extract_span<C: LlmClient>(
                 }
             };
 
-            let parsed = parse_llm_json::<AiQuestionPage>(&content);
+            let mut parsed = parse_llm_json::<AiQuestionPage>(&content);
+
+            if let ParseOutcome::Malformed { ref error } = parsed {
+                eprintln!(
+                    "[DIAGNOSTIC][RAW_JSON_ERROR] question={} attempt={} split_mode={} pages={}..{} error={} raw_response:\n{}",
+                    span.number,
+                    attempt,
+                    split_mode,
+                    chunk.first().map(|(page, _)| page + 1).unwrap_or(0),
+                    chunk.last().map(|(page, _)| page + 1).unwrap_or(0),
+                    error,
+                    content
+                );
+            }
+
+            // Phase 4 fix: if we get an EOF error on a large span (3+ pages),
+            // the provider might be struggling with the payload size.
+            // Retry with fewer images to reduce load.
+            if let ParseOutcome::Malformed { ref error } = parsed {
+                if error.contains("EOF") && images.len() >= 3 && attempt == 1 {
+                    eprintln!(
+                        "WARNING: Question {} got EOF error with {} pages, retrying with first 2 pages only",
+                        span.number, images.len()
+                    );
+                    split_mode = true;
+                    // Keep the first two pages as this chunk and enqueue the
+                    // remainder. The reduced response must not silently
+                    // discard the pages that caused the original payload to
+                    // overflow.
+                    let remainder = chunk.split_off(2);
+                    chunks.push_front(remainder);
+                    let reduced_image_count = local_to_chunk
+                        .iter()
+                        .take_while(|&&chunk_idx| chunk_idx < 2)
+                        .count();
+                    let reduced_images = images[..reduced_image_count].to_vec();
+                    let reduced_body = llm::chat_body(
+                        &config.model,
+                        &system,
+                        &reduced_images,
+                        Some(&format!(
+                            "{}\n\nNOTE: This is a retry with fewer pages due to payload size issues. Transcribe Question {} from these pages only.",
+                            user_text, span.number
+                        )),
+                        config.max_output_tokens,
+                    );
+
+                    let api_start = Instant::now();
+                    let reduced_resp = match chat_with_permit(client, &reduced_body, request_semaphore).await {
+                        Ok(r) => r,
+                        Err(e) => {
+                            last_error = e.to_string();
+                            report.repairs += 1;
+                            continue;
+                        }
+                    };
+                    report.record_timing(
+                        "extraction",
+                        "api_call_reduced",
+                        Some(span_pages[0].0 + 1),
+                        Some(span.number),
+                        api_start.elapsed().as_millis() as u64,
+                    );
+                    content = match llm::message_content(&reduced_resp) {
+                        Ok(c) => c,
+                        Err(e) => {
+                            last_error = e.to_string();
+                            report.repairs += 1;
+                            continue;
+                        }
+                    };
+                    parsed = parse_llm_json::<AiQuestionPage>(&content);
+
+                    // The response and all page-index maps now describe only
+                    // the first split chunk. The queued remainder gets a
+                    // fresh preparation/audit context on the next iteration.
+                    images.truncate(reduced_image_count);
+                    local_to_chunk.truncate(reduced_image_count);
+                    page_crop_offsets.truncate(reduced_image_count);
+                    page_bands.truncate(2);
+                    decoded_pages.truncate(2);
+                    raw_text = chunk
+                        .iter()
+                        .map(|(pi, p)| {
+                            if p.text.trim().is_empty() {
+                                String::new()
+                            } else {
+                                format!("RAW TEXT PAGE {}:\n{}\n\n", pi + 1, p.text)
+                            }
+                        })
+                        .collect();
+                    band_notes.truncate(0);
+                    for (model_idx, &chunk_idx) in local_to_chunk.iter().enumerate() {
+                        let (global_pi, _p) = chunk[chunk_idx];
+                        let is_first_page_of_span = global_pi == span.start_page;
+                        let is_last_page_of_span = global_pi == span.end_page;
+                        let (s, e) = if is_first_page_of_span && is_last_page_of_span {
+                            (span.start_y_frac, span.end_y_frac)
+                        } else if is_first_page_of_span {
+                            (span.start_y_frac, None)
+                        } else if is_last_page_of_span {
+                            (None, span.end_y_frac)
+                        } else {
+                            (None, None)
+                        };
+                        if let (Some(a), Some(b)) = (s, e) {
+                            use std::fmt::Write;
+                            let _ = write!(
+                                &mut band_notes,
+                                "\n\nPage {} of the attached images (original page {}): Question {} begins at about {:.0}% down and ends at about {:.0}% down. Transcribe ONLY between those lines.",
+                                model_idx + 1,
+                                global_pi + 1,
+                                span.number,
+                                a * 100.0,
+                                b * 100.0,
+                            );
+                        } else if let Some(a) = s {
+                            use std::fmt::Write;
+                            let _ = write!(
+                                &mut band_notes,
+                                "\n\nPage {} of the attached images (original page {}): Question {} begins at about {:.0}% down the page. Transcribe from there to the bottom.",
+                                model_idx + 1,
+                                global_pi + 1,
+                                span.number,
+                                a * 100.0,
+                            );
+                        } else if let Some(b) = e {
+                            use std::fmt::Write;
+                            let _ = write!(
+                                &mut band_notes,
+                                "\n\nPage {} of the attached images (original page {}): Question {} ends at about {:.0}% down this page. Do NOT transcribe anything below that line.",
+                                model_idx + 1,
+                                global_pi + 1,
+                                span.number,
+                                b * 100.0,
+                            );
+                        }
+                    }
+                }
+            }
+
             let (mut page_items, salvaged) = match parsed {
                 ParseOutcome::Clean(v) => (v, false),
                 ParseOutcome::Salvaged {
                     value,
                     dropped_tail,
                 } => {
+                    eprintln!(
+                        "[DIAGNOSTIC][JSON_SALVAGED] question={} attempt={} split_mode={} dropped_tail={} pages={}..{} raw_response:\n{}",
+                        span.number,
+                        attempt,
+                        split_mode,
+                        dropped_tail,
+                        chunk.first().map(|(page, _)| page + 1).unwrap_or(0),
+                        chunk.last().map(|(page, _)| page + 1).unwrap_or(0),
+                        content
+                    );
                     report.salvage_events += 1;
                     if dropped_tail {
                         last_error = "response was truncated; items may be missing".to_string();
@@ -1257,7 +1753,122 @@ async fn extract_span<C: LlmClient>(
                 }
             };
 
+            // Split calls are intentionally raw collection passes. A page
+            // fragment cannot satisfy whole-span validation on its own, and
+            // diagram indices are only meaningful after all chunks are
+            // merged. Remap each model-local image index into one unified
+            // image-index space, then defer every strict gate below.
+            if split_mode {
+                let raw_text_len: usize = page_items
+                    .items
+                    .iter()
+                    .filter_map(|item| item.content.as_deref())
+                    .map(str::chars)
+                    .map(Iterator::count)
+                    .sum();
+                let raw_latex_len: usize = page_items
+                    .items
+                    .iter()
+                    .filter_map(|item| item.math_snippet.as_deref())
+                    .map(str::chars)
+                    .map(Iterator::count)
+                    .sum();
+                let raw_bbox_len: usize = page_items
+                    .items
+                    .iter()
+                    .filter_map(|item| item.diagram_bboxes.as_ref())
+                    .map(Vec::len)
+                    .sum();
+                eprintln!(
+                    "[DIAGNOSTIC][RAW_CHUNK] question={} pages={}..{} items={} text_chars={} latex_chars={} bbox_count={} salvaged={}",
+                    span.number,
+                    chunk.first().map(|(page, _)| page + 1).unwrap_or(0),
+                    chunk.last().map(|(page, _)| page + 1).unwrap_or(0),
+                    page_items.items.len(),
+                    raw_text_len,
+                    raw_latex_len,
+                    raw_bbox_len,
+                    salvaged
+                );
+                let image_offset = split_image_count;
+                for (model_idx, &chunk_idx) in local_to_chunk.iter().enumerate() {
+                    if let Some((global_page, _)) = chunk.get(chunk_idx) {
+                        if let Some(span_idx) = span_pages
+                            .iter()
+                            .position(|(page, _)| page == global_page)
+                        {
+                            split_local_to_chunk.push(span_idx);
+                            if let Some(decoded) = decoded_pages.get(chunk_idx).cloned().flatten() {
+                                split_decoded_pages[span_idx] = Some(decoded);
+                            }
+                            if let Some(offset) = page_crop_offsets.get(chunk_idx) {
+                                split_crop_offsets[span_idx] = *offset;
+                            }
+                            if let Some(band) = page_bands.get(chunk_idx) {
+                                split_page_bands[span_idx] = *band;
+                            }
+                        }
+                    }
+                    let _ = model_idx;
+                }
+                split_image_count += local_to_chunk.len();
+                for item in &mut page_items.items {
+                    if let Some(indexes) = &mut item.bbox_page_indexes {
+                        for index in indexes {
+                            if let Some(local) = value_to_usize(index) {
+                                *index = serde_json::json!(image_offset + local);
+                            }
+                        }
+                    }
+                }
+                split_raw_items.extend(page_items.items);
+                split_context = split_raw_items
+                    .iter()
+                    .filter_map(|item| item.content.as_deref())
+                    .filter(|content| !content.trim().is_empty())
+                    .collect::<Vec<_>>()
+                    .join("\n\n");
+                if salvaged {
+                    needs_review = true;
+                    notes.push(
+                        "response truncated; content recovered up to the last complete item"
+                            .to_string(),
+                    );
+                }
+                if !chunks.is_empty() {
+                    continue 'chunks;
+                }
+                // The final split response is now available. Replace the
+                // fragment context with span-global mappings and let the
+                // existing strict validation/audit path run exactly once.
+                split_mode = false;
+                unified_split = true;
+                chunk = span_pages.to_vec();
+                local_to_chunk = split_local_to_chunk.clone();
+                page_bands = split_page_bands.clone();
+                page_crop_offsets = split_crop_offsets.clone();
+                decoded_pages = split_decoded_pages.clone();
+                page_items.items = vec![merge_split_questions(
+                    std::mem::take(&mut split_raw_items),
+                    span.number,
+                )];
+                let unified = &page_items.items[0];
+                eprintln!(
+                    "[DIAGNOSTIC][UNIFIED_OBJECT] question={} structure={:#?}",
+                    span.number, unified
+                );
+            }
+
+            for item in &mut page_items.items {
+                normalize_composite_visual_options(item);
+            }
+
             if page_items.items.is_empty() && contents.is_empty() {
+                eprintln!(
+                    "[DIAGNOSTIC][VALIDATION_ERROR] question={} rule=non_empty_items items=0 prior_contents={}",
+                    span.number,
+                    contents.len()
+                );
                 eprintln!("WARNING: Question {} extraction returned an empty items array.", span.number);
                 report.quarantined.push(QuarantineEvent {
                     scope: "question".to_string(),
@@ -1268,15 +1879,131 @@ async fn extract_span<C: LlmClient>(
                 return (None, report);
             }
 
-            // Silently drop any collateral questions that don't match the target span
+            // AUDITABLE RETENTION: collect collateral numbers, quote them in repair,
+            // and enforce exactly ONE item per span. Multi-item responses are a
+            // repair trigger, not a silent drop.
+            let mut raw_numbers: Vec<u32> = Vec::new();
+            for item in &page_items.items {
+                if let Some(v) = &item.question_number {
+                    if let Some(n) = crate::validate::value_to_question_number(v) {
+                        raw_numbers.push(n);
+                    }
+                }
+            }
+
+            // Aggregate violation: more than one item = repair trigger.
+            if page_items.items.len() > 1 {
+                eprintln!(
+                    "[DIAGNOSTIC][VALIDATION_ERROR] question={} rule=single_item actual_items={}",
+                    span.number,
+                    page_items.items.len()
+                );
+                let collateral_numbers: Vec<String> = raw_numbers
+                    .iter()
+                    .filter(|&&n| n != span.number)
+                    .map(|n| n.to_string())
+                    .collect();
+                if !page_items.items.iter().any(|i| {
+                    i.question_number.as_ref()
+                        .and_then(crate::validate::value_to_question_number) == Some(span.number)
+                }) {
+                    let extracted: Vec<u32> = page_items.items.iter()
+                        .filter_map(|i| i.question_number.as_ref().and_then(crate::validate::value_to_question_number))
+                        .collect();
+                    last_error = format!(
+                        "You extracted data for questions {:?}, but NONE of it was Question {}. Please extract ONLY Question {}.",
+                        extracted, span.number, span.number
+                    );
+                    report.repairs += 1;
+                }
+            }
+
+            // Filter to target question only, but quote what was dropped.
+            let dropped_numbers: Vec<String> = raw_numbers
+                .iter()
+                .filter(|&&n| n != span.number)
+                .map(|n| n.to_string())
+                .collect();
+            let original_items = page_items.items.clone();
+            let initial_len = page_items.items.len();
             page_items.items.retain(|item| {
                 item.question_number.as_ref()
                     .and_then(crate::validate::value_to_question_number) == Some(span.number)
             });
 
-            // If it extracted collateral data but missed our target entirely, trigger repair
             if page_items.items.is_empty() {
-                last_error = format!("You extracted data, but none of it was Question {}. Please extract Question {} only.", span.number, span.number);
+                eprintln!(
+                    "[DIAGNOSTIC][VALIDATION_ERROR] question={} rule=target_question_present dropped_numbers={:?}",
+                    span.number,
+                    dropped_numbers
+                );
+                // LLM hallucinated entirely wrong question number.
+                // Instead of continuing and triggering a repair (which it
+                // usually ignores and just hallucinates again), we try to
+                // salvage it by ASSUMING it's the right question if it's
+                // the only thing on the page.
+                if initial_len == 1 && attempt == 0 {
+                    report.salvage_events += 1;
+                    page_items.items = original_items; // restore
+                    page_items.items[0].question_number = Some(serde_json::json!(span.number)); // force it
+                } else {
+                    continue;
+                }
+            }
+
+            // If collateral was found and dropped, include the dropped numbers
+            // in the repair note so the model learns the boundary error.
+            if !dropped_numbers.is_empty() {
+                last_error = format!(
+                    "{} (dropped collateral questions: [{}])",
+                    last_error,
+                    dropped_numbers.join(", ")
+                );
+            }
+
+            // After filtering, enforce single-item output. If multiple items
+            // matched the target (e.g., LLM split Q8 into sub-parts), we must
+            // tell it to combine them into ONE single item.
+            if page_items.items.len() > 1 {
+                // More than one item with the target number: check if second item
+                // looks like a genuine continuation (same number, advancing sub-parts)
+                // or a split/collateral error.
+                if page_items.items.len() == 2 {
+                    let first_content = page_items.items[0].content.as_deref().unwrap_or("");
+                    let second_content = page_items.items[1].content.as_deref().unwrap_or("");
+                    if looks_like_new_question(first_content, second_content) {
+                        // Second item is a new question misnumbered as the target.
+                        last_error = format!(
+                            "You returned 2 items for Question {}. The second item (starting with \"{}\") looks like a DIFFERENT question — delete it.",
+                            span.number,
+                            second_content.chars().take(40).collect::<String>()
+                        );
+                        report.repairs += 1;
+                        continue;
+                    } else {
+                        // Genuine continuation — keep only the first item; discard
+                        // the redundant second item (continuation should extend span,
+                        // not split the item array).
+                        page_items.items.truncate(1);
+                    }
+                } else {
+                    last_error = format!(
+                        "You returned {} items for Question {}. You MUST combine all sub-parts into a SINGLE item's `content` string, separated by double newlines.",
+                        page_items.items.len(), span.number
+                    );
+                    report.repairs += 1;
+                    continue;
+                }
+            }
+
+            // If retention emptied the array, repair with enhanced message.
+            if page_items.items.is_empty() {
+                last_error = if dropped_numbers.is_empty() {
+                    format!("No content matched Question {}. Please extract ONLY Question {}.", span.number, span.number)
+                } else {
+                    format!("You extracted data for questions [{}], but NONE of it was Question {}. Please extract ONLY Question {}.",
+                        dropped_numbers.join(", "), span.number, span.number)
+                };
                 report.repairs += 1;
                 continue;
             }
@@ -1305,6 +2032,12 @@ async fn extract_span<C: LlmClient>(
             // ── Deterministic validation of the page items ────────────────
             let validation_errors = validate_span_items(&page_items, span);
             if !validation_errors.is_empty() {
+                for error in &validation_errors {
+                    eprintln!(
+                        "[DIAGNOSTIC][SCHEMA_VALIDATION_ERROR] question={} rule={}",
+                        span.number, error
+                    );
+                }
                 last_error = validation_errors.join("; ");
                 report.repairs += 1;
                 continue;
@@ -1332,6 +2065,12 @@ async fn extract_span<C: LlmClient>(
                 cons_errors.clear();
             }
             if !cons_errors.is_empty() {
+                for error in &cons_errors {
+                    eprintln!(
+                        "[DIAGNOSTIC][FIGURE_CONSISTENCY_ERROR] question={} rule={}",
+                        span.number, error
+                    );
+                }
                 report.repairs += 1;
                 if attempt < max_attempts {
                     last_error = cons_errors.join("; ");
@@ -1346,12 +2085,38 @@ async fn extract_span<C: LlmClient>(
 
             // ── Diagram boxes: Rust audits every crop the AI proposed ─────
             let audit_start = Instant::now();
-            let (bad, box_issues) = audit_diagram_boxes(
-                chunk,
-                &mut page_items.items,
-                &local_to_chunk,
-                &page_bands,
-            );
+            let audit_items = page_items.items;
+            let audit_local_to_chunk = local_to_chunk.clone();
+            let audit_page_bands = page_bands.clone();
+            let audit_decoded_pages = decoded_pages.clone();
+            let (audited_items, bad, box_issues) = match tokio::task::spawn_blocking(move || {
+                let mut items = audit_items;
+                let (bad, issues) = audit_diagram_boxes(
+                    &audit_decoded_pages,
+                    &mut items,
+                    &audit_local_to_chunk,
+                    &audit_page_bands,
+                );
+                (items, bad, issues)
+            })
+            .await
+            {
+                Ok(result) => result,
+                Err(error) => {
+                    last_error = format!("diagram audit task failed: {}", error);
+                    report.repairs += 1;
+                    continue;
+                }
+            };
+            if !box_issues.is_empty() {
+                for error in &box_issues {
+                    eprintln!(
+                        "[DIAGNOSTIC][DIAGRAM_AUDIT_ERROR] question={} rule={} bad_box_indices={:?}",
+                        span.number, error, bad
+                    );
+                }
+            }
+            page_items.items = audited_items;
             report.record_timing(
                 "diagram_processing",
                 "crop_audit",
@@ -1367,6 +2132,21 @@ async fn extract_span<C: LlmClient>(
                     .all(|e| e.contains("EMPTY RULED ANSWER GRID"));
                 if answer_grid_only {
                     let mut items = page_items.items;
+                    prune_bad_diagram_boxes(&mut items, &bad, &mut report);
+                    accepted = Some((items, salvaged));
+                    break;
+                }
+                if unified_split {
+                    eprintln!(
+                        "[DIAGNOSTIC][DIAGRAM_AUDIT_TERMINAL] question={} unified split retained; pruning invalid boxes without re-requesting the stitched span",
+                        span.number
+                    );
+                    let mut items = page_items.items;
+                    report.anomalies.push(format!(
+                        "Question {}: dropped {} invalid diagram box(es) from unified split after one final audit",
+                        span.number,
+                        bad.len()
+                    ));
                     prune_bad_diagram_boxes(&mut items, &bad, &mut report);
                     accepted = Some((items, salvaged));
                     break;
@@ -1417,6 +2197,8 @@ async fn extract_span<C: LlmClient>(
             if let Some(bboxes) = &item.diagram_bboxes {
                 let indexes = item.bbox_page_indexes.clone().unwrap_or_default();
                 let diagram_save_start = Instant::now();
+                let mut requests = Vec::with_capacity(bboxes.len());
+                let mut page_b64 = std::collections::HashMap::new();
                 for (bi, bbox) in bboxes.iter().enumerate() {
                     let model_idx = indexes
                         .get(bi)
@@ -1431,13 +2213,56 @@ async fn extract_span<C: LlmClient>(
                     let global_page_idx = chunk[chunk_idx].0;
                     let page = chunk[chunk_idx].1;
                     let ignore_grid = validate::figure_references(&item_content) > 0 && !validate::is_answer_grid_request(&item_content);
-                    let link = save_diagram(global_page_idx, page, bbox, config, &mut saved_diagrams, &mut report, ignore_grid);
-                    if let Some(link) = link {
+                    if config.pdf_path.is_none() {
+                        if let Some(b64) = page.get_b64() {
+                            page_b64.entry(global_page_idx).or_insert_with(|| b64.clone());
+                        }
+                    }
+                    requests.push(DiagramSaveRequest {
+                        global_page_idx,
+                        bbox: bbox.clone(),
+                        ignore_grid,
+                        graph_like: item
+                            .diagram_kinds
+                            .as_ref()
+                            .and_then(|kinds| kinds.get(bi))
+                            .map(|kind| {
+                                let kind = kind.to_ascii_lowercase();
+                                kind.contains("graph")
+                                    || kind.contains("chart")
+                                    || kind.contains("plot")
+                                    || kind.contains("composite_visual_options")
+                            })
+                            .unwrap_or(false),
+                    });
+                }
+                let saved_before = saved_diagrams.clone();
+                match persist_diagrams(
+                    requests,
+                    page_b64,
+                    config.clone(),
+                    Arc::clone(page_render_cache),
+                    std::mem::take(&mut saved_diagrams),
+                )
+                .await
+                {
+                    Ok(persisted) => {
+                        saved_diagrams = persisted.saved;
+                        report.absorb(persisted.report);
+                        for link in persisted.links.into_iter().flatten() {
                         if item_content.contains("[DIAGRAM_PLACEHOLDER]") {
                             item_content = item_content.replacen("[DIAGRAM_PLACEHOLDER]", &link, 1);
                         } else {
                             item_content.push_str(&link);
                         }
+                    }
+                    }
+                    Err(error) => {
+                        saved_diagrams = saved_before;
+                        report.anomalies.push(format!(
+                            "Question {} diagram persistence task failed: {}",
+                            span.number, error
+                        ));
                     }
                 }
                 report.record_timing(
@@ -1475,6 +2300,9 @@ async fn extract_span<C: LlmClient>(
     }
 
     // ── Assemble + content-level validation ─────────────────────────────────
+    // Each chunk is validated as exactly one target item before it reaches
+    // this point. Join the validated continuations in page order; never keep
+    // only the first chunk of a split span.
     let mut content = contents.join("\n\n");
     content = validate::clean_question_content(&content);
     // One labelling scheme forever: AQA '3 . 1'-style decimals → (a), (b), (c).
@@ -1611,16 +2439,13 @@ fn validate_span_items(page: &AiQuestionPage, span: &QuestionSpan) -> Vec<String
 /// quoted feedback message per violation for the repair loop. The AI draws
 /// boxes; Rust decides which ones may ever become files.
 fn audit_diagram_boxes(
-    chunk: &[(usize, &PageInput)],
+    decoded_pages: &[Option<Arc<image::DynamicImage>>],
     items: &mut [AiQuestion],
     local_to_chunk: &[usize],
     _page_bands: &[Option<(f32, f32)>],
 ) -> (Vec<(usize, usize)>, Vec<String>) {
     let mut bad: Vec<(usize, usize)> = Vec::new();
     let mut issues: Vec<String> = Vec::new();
-    // Page images decode lazily so text-only items cost nothing. Indexed
-    // by CHUNK position (not model-local image index).
-    let mut decoded: Vec<Option<Option<image::DynamicImage>>> = vec![None; chunk.len()];
     let mut accepted_sigs: Vec<[u8; 64]> = Vec::new();
 
     for (ii, item) in items.iter_mut().enumerate() {
@@ -1655,7 +2480,7 @@ fn audit_diagram_boxes(
                 continue;
             }
             let chunk_idx = local_to_chunk[model_idx];
-            if chunk_idx >= chunk.len() {
+            if chunk_idx >= decoded_pages.len() {
                 bad.push((ii, bi));
                 issues.push(format!(
                     "{label}: internal page-index translation failed for page {} — drop this box",
@@ -1664,13 +2489,8 @@ fn audit_diagram_boxes(
                 continue;
             }
 
-            if decoded[chunk_idx].is_none() {
-                if let Some(b64) = chunk[chunk_idx].1.get_b64() {
-                    decoded[chunk_idx] = Some(geometry::decode_page_image(b64));
-                }
-            }
-            let img = match &decoded[chunk_idx] {
-                Some(Some(i)) => i,
+            let img = match &decoded_pages[chunk_idx] {
+                Some(image) => image.as_ref(),
                 // Cannot judge an undecodable page here; the save-time guard
                 // still applies, so nothing bad can reach disk.
                 _ => continue,
@@ -1678,7 +2498,25 @@ fn audit_diagram_boxes(
             let content = item.content.as_deref().unwrap_or("");
             let ignore_grid = validate::figure_references(content) > 0 && !validate::is_answer_grid_request(content);
 
-            let cropped = match geometry::crop_diagram(img, bbox, 40, ignore_grid) {
+            let graph_like = item
+                .diagram_kinds
+                .as_ref()
+                .and_then(|kinds| kinds.get(bi))
+                .map(|kind| {
+                    let kind = kind.to_ascii_lowercase();
+                    kind.contains("graph")
+                        || kind.contains("chart")
+                        || kind.contains("plot")
+                        || kind.contains("composite_visual_options")
+                })
+                .unwrap_or(false);
+            let cropped = match geometry::crop_diagram_with_options(
+                img,
+                bbox,
+                40,
+                ignore_grid,
+                graph_like,
+            ) {
                 Ok(c) => c,
                 Err(geometry::CropReject::BadBox) => {
                     bad.push((ii, bi));
@@ -1763,29 +2601,39 @@ fn prune_bad_diagram_boxes(
 /// writing yet another PNG of the same figure.
 fn save_diagram(
     global_page_idx: usize,
-    page: &PageInput,
+    page_b64: Option<&str>,
     bbox: &[f32],
     config: &PipelineConfig,
+    page_render_cache: &crate::pdf_render::PageRenderCache,
     saved: &mut Vec<([u8; 64], String)>,
     report: &mut ImportReport,
     ignore_grid: bool,
+    graph_like: bool,
 ) -> Option<String> {
     if bbox.len() != 4 {
         report.crop_rejections += 1;
         return None;
     }
     let img = if let Some(pdf_path) = &config.pdf_path {
-        crate::pdf_render::render_pdf_page_at_300dpi(pdf_path, global_page_idx).ok()
+        page_render_cache
+            .get_or_render(pdf_path, global_page_idx)
+            .ok()
     } else { None };
 
     let img = match img {
         Some(i) => i,
         None => {
-            let b64 = page.get_b64()?;
-            geometry::decode_page_image(b64)?
+            let b64 = page_b64?;
+            std::sync::Arc::new(geometry::decode_page_image(b64)?)
         }
     };
-    let cropped = match geometry::crop_diagram(&img, bbox, 40, ignore_grid) {
+    let cropped = match geometry::crop_diagram_with_options(
+        img.as_ref(),
+        bbox,
+        40,
+        ignore_grid,
+        graph_like,
+    ) {
         Ok(c) => c,
         Err(reason) => {
             report.crop_rejections += 1;
@@ -1836,6 +2684,8 @@ async fn extract_fallback_page<C: LlmClient>(
     page: &PageInput,
     page_idx: usize,
     next_allowed: u32,
+    page_render_cache: &Arc<crate::pdf_render::PageRenderCache>,
+    request_semaphore: &Arc<Semaphore>,
 ) -> (Option<Vec<BuiltQuestion>>, ImportReport) {
     // Own, local report: pages now run in parallel batches.
     let mut report = ImportReport::default();
@@ -1860,6 +2710,31 @@ RULES:
         module = config.module_name,
     );
 
+    let preparation_inputs = match &page.kind {
+        PageInputKind::Image { b64, .. } => vec![ChunkImageInput {
+            chunk_idx: 0,
+            b64: b64.clone(),
+            start_y: None,
+            end_y: None,
+        }],
+        PageInputKind::TextOnly => Vec::new(),
+    };
+    let prepared = match prepare_chunk_images(1, preparation_inputs).await {
+        Ok(prepared) => prepared,
+        Err(error) => {
+            report.anomalies.push(format!(
+                "page {} image preparation task failed: {}",
+                page_idx + 1,
+                error
+            ));
+            return (None, report);
+        }
+    };
+    let page_images = prepared.images;
+    let local_to_chunk = prepared.local_to_chunk;
+    let page_bands = prepared.page_bands;
+    let decoded_pages = prepared.decoded_pages;
+
     let mut last_error = String::new();
     for attempt in 1..=max_attempts {
         let user_text = format!(
@@ -1879,12 +2754,6 @@ RULES:
         // produce a text-only body when no images are supplied. Mirror
         // the mapped path's local_to_chunk so audit/save can resolve
         // bbox_page_indexes correctly even when sentinels are filtered.
-        let fb_chunk: [(usize, &PageInput); 1] = [(page_idx, page)];
-        let (page_images, local_to_chunk, page_bands): (Vec<String>, Vec<usize>, Vec<Option<(f32, f32)>>) =
-            match &page.kind {
-                PageInputKind::Image { b64, .. } => (vec![b64.clone()], vec![0usize], vec![None]),
-                _ => (vec![], vec![], vec![None]),
-            };
         let body = llm::chat_body(
             &config.model,
             &system,
@@ -1892,7 +2761,7 @@ RULES:
             Some(&user_text),
             config.max_output_tokens,
         );
-        let resp = match client.chat(&body).await {
+        let resp = match chat_with_permit(client, &body, request_semaphore).await {
             Ok(r) => r,
             Err(e) => {
                 last_error = e.to_string();
@@ -2005,13 +2874,29 @@ RULES:
         }
 
         // Phase 2: diagram audit on ALL items at once (not just the first)
-        let mut items = page_out.items;
-        let (bad, box_issues) = audit_diagram_boxes(
-            &fb_chunk,
-            &mut items,
-            &local_to_chunk,
-            &page_bands,
-        );
+        let audit_items = page_out.items;
+        let audit_local_to_chunk = local_to_chunk.clone();
+        let audit_page_bands = page_bands.clone();
+        let audit_decoded_pages = decoded_pages.clone();
+        let (mut items, bad, box_issues) = match tokio::task::spawn_blocking(move || {
+            let mut items = audit_items;
+            let (bad, issues) = audit_diagram_boxes(
+                &audit_decoded_pages,
+                &mut items,
+                &audit_local_to_chunk,
+                &audit_page_bands,
+            );
+            (items, bad, issues)
+        })
+        .await
+        {
+            Ok(result) => result,
+            Err(error) => {
+                last_error = format!("diagram audit task failed: {}", error);
+                report.repairs += 1;
+                continue;
+            }
+        };
         if !box_issues.is_empty() {
             report.repairs += 1;
             if attempt < max_attempts {
@@ -2038,6 +2923,7 @@ RULES:
             // Save diagrams for this item
             if let Some(bboxes) = &item.diagram_bboxes {
                 let indexes = item.bbox_page_indexes.clone().unwrap_or_default();
+                let mut requests = Vec::with_capacity(bboxes.len());
                 for (bi, bbox) in bboxes.iter().enumerate() {
                     // Resolve the page index through local_to_chunk
                     let model_idx = indexes
@@ -2047,14 +2933,47 @@ RULES:
                         .unwrap_or(0);
                     let _chunk_idx = local_to_chunk[model_idx];
                     let ignore_grid = validate::figure_references(&item_content) > 0 && !validate::is_answer_grid_request(&item_content);
-                    if let Some(link) =
-                        save_diagram(page_idx, page, bbox, config, &mut saved_diagrams, &mut report, ignore_grid)
-                    {
+                    requests.push(DiagramSaveRequest {
+                        global_page_idx: page_idx,
+                        bbox: bbox.clone(),
+                        ignore_grid,
+                        graph_like: false,
+                    });
+                }
+                let mut page_b64 = std::collections::HashMap::new();
+                if config.pdf_path.is_none() {
+                    if let Some(b64) = page.get_b64() {
+                        page_b64.insert(page_idx, b64.clone());
+                    }
+                }
+                let saved_before = saved_diagrams.clone();
+                match persist_diagrams(
+                    requests,
+                    page_b64,
+                    config.clone(),
+                    Arc::clone(page_render_cache),
+                    std::mem::take(&mut saved_diagrams),
+                )
+                .await
+                {
+                    Ok(persisted) => {
+                        saved_diagrams = persisted.saved;
+                        report.absorb(persisted.report);
+                        for link in persisted.links.into_iter().flatten() {
                         if item_content.contains("[DIAGRAM_PLACEHOLDER]") {
                             item_content = item_content.replacen("[DIAGRAM_PLACEHOLDER]", &link, 1);
                         } else {
                             item_content.push_str(&link);
                         }
+                    }
+                    }
+                    Err(error) => {
+                        saved_diagrams = saved_before;
+                        report.anomalies.push(format!(
+                            "page {} diagram persistence task failed: {}",
+                            page_idx + 1,
+                            error
+                        ));
                     }
                 }
             }
@@ -2112,6 +3031,7 @@ async fn read_markscheme_window<C: LlmClient>(
     end: usize,
     step: usize,
     system: &str,
+    request_semaphore: &Arc<Semaphore>,
 ) -> (Result<Vec<AiAnswer>, String>, ImportReport) {
     let mut report = ImportReport::default();
     let images: Vec<String> = pages[start..end]
@@ -2168,7 +3088,7 @@ async fn read_markscheme_window<C: LlmClient>(
             Some(&text),
             config.max_output_tokens,
         );
-        let resp = match client.chat(&body).await {
+        let resp = match chat_with_permit(client, &body, request_semaphore).await {
             Ok(r) => r,
             Err(e) => {
                 last_error = e.to_string();
@@ -2222,6 +3142,10 @@ pub async fn run_markscheme_pipeline<C: LlmClient, P: Progress>(
         pages_total: pages.len(),
         ..Default::default()
     };
+    let page_render_cache = Arc::new(crate::pdf_render::PageRenderCache::new(
+        PAGE_RENDER_CACHE_CAPACITY,
+    ));
+    let request_semaphore = Arc::new(Semaphore::new(config.parallelism.max(1)));
     let mut drafts: Vec<AnswerDraft> = Vec::new();
     let mut alt_count: std::collections::HashMap<u32, u32> = std::collections::HashMap::new();
     // Paper-global diagram dedupe: windows overlap, so the same worked
@@ -2248,22 +3172,28 @@ pub async fn run_markscheme_pipeline<C: LlmClient, P: Progress>(
         }
     }
 
-    for batch in windows.chunks(config.parallelism.max(1)) {
-        cancelled(cancel)?;
-        progress.stage(&format!(
-            "Reading mark scheme pages {}–{} of {}…",
-            batch[0].0 + 1,
-            batch[batch.len() - 1].1,
-            pages.len()
-        ));
-        let futs: Vec<_> = batch
-            .iter()
-            .map(|&(start, end)| {
-                read_markscheme_window(client, config, pages, start, end, step, &system)
-            })
-            .collect();
-        let results = futures_util::future::join_all(futs).await;
-        for (&(start, end), (res, local)) in batch.iter().zip(results) {
+    cancelled(cancel)?;
+    progress.stage(&format!("Reading {} mark-scheme windows…", windows.len()));
+    let mut results = futures_util::stream::iter(windows.iter().copied().enumerate().map(|(position, (start, end))| {
+        read_markscheme_window(
+            client,
+            config,
+            pages,
+            start,
+            end,
+            step,
+            &system,
+            &request_semaphore,
+        )
+        .map(move |result| (position, result))
+    }))
+    .buffer_unordered(config.parallelism.max(1));
+    let mut ordered_results = Vec::with_capacity(windows.len());
+    while let Some(result) = results.next().await {
+        ordered_results.push(result);
+    }
+    ordered_results.sort_by_key(|(position, _)| *position);
+    for ((start, end), (_, (res, local))) in windows.iter().copied().zip(ordered_results) {
             report.absorb(local);
             let img_count = pages[start..end]
                 .iter()
@@ -2314,6 +3244,8 @@ pub async fn run_markscheme_pipeline<C: LlmClient, P: Progress>(
                 // Diagrams (sanitized crops; page index validated).
                 if let Some(bboxes) = &ans.diagram_bboxes {
                     let indexes = ans.diagram_page_indexes.clone().unwrap_or_default();
+                    let mut requests = Vec::with_capacity(bboxes.len());
+                    let mut page_b64 = std::collections::HashMap::new();
                     for (bi, bbox) in bboxes.iter().enumerate() {
                         let local = indexes
                             .get(bi)
@@ -2330,26 +3262,55 @@ pub async fn run_markscheme_pipeline<C: LlmClient, P: Progress>(
                             }
                         };
                         let ignore_grid = validate::figure_references(&md) > 0;
-                        if let Some(link) = save_diagram(
-                            start + local,
-                            &pages[start + local],
-                            bbox,
-                            config,
-                            &mut saved_diagrams,
-                            &mut report,
-                            ignore_grid,
-                        ) {
-                            if md.contains("[DIAGRAM_PLACEHOLDER]") {
-                                md = md.replacen("[DIAGRAM_PLACEHOLDER]", &link, 1);
-                            } else {
-                                md.push_str(&link);
+                        let global_page_idx = start + local;
+                        if config.pdf_path.is_none() {
+                            if let Some(b64) = pages[global_page_idx].get_b64() {
+                                page_b64
+                                    .entry(global_page_idx)
+                                    .or_insert_with(|| b64.clone());
                             }
+                        }
+                    requests.push(DiagramSaveRequest {
+                        global_page_idx,
+                        bbox: bbox.clone(),
+                        ignore_grid,
+                        graph_like: false,
+                    });
+                    }
+                    let saved_before = saved_diagrams.clone();
+                    match persist_diagrams(
+                        requests,
+                        page_b64,
+                        config.clone(),
+                        Arc::clone(&page_render_cache),
+                        std::mem::take(&mut saved_diagrams),
+                    )
+                    .await
+                    {
+                        Ok(persisted) => {
+                            saved_diagrams = persisted.saved;
+                            report.absorb(persisted.report);
+                            for link in persisted.links.into_iter().flatten() {
+                                if md.contains("[DIAGRAM_PLACEHOLDER]") {
+                                    md = md.replacen("[DIAGRAM_PLACEHOLDER]", &link, 1);
+                                } else {
+                                    md.push_str(&link);
+                                }
+                            }
+                        }
+                        Err(error) => {
+                            saved_diagrams = saved_before;
+                            report.anomalies.push(format!(
+                                "answer {} diagram persistence task failed: {}",
+                                q_num, error
+                            ));
                         }
                     }
                 }
                 md = md.replace("[DIAGRAM_PLACEHOLDER]", "");
                 md = validate::normalize_decimal_parts(&md, q_num);
                 md = validate::harden_line_breaks(&md);
+                md = validate::sanitize_markdown_math(&md);
                 md = validate::normalize_mark_scheme_chunk(&md);
 
                 // Dedupe/stitch: containment-based, not a brittle prefix fingerprint.
@@ -2373,7 +3334,6 @@ pub async fn run_markscheme_pipeline<C: LlmClient, P: Progress>(
                 }
             }
         }
-    }
 
     Ok((drafts, report))
 } // Tests — the golden suite. Deterministic: MockLlm replays scripted model
@@ -2516,9 +3476,9 @@ mod tests {
             run_question_pipeline(&mock, &pgs, &config(), &NullProgress, &cancel_flag())
                 .await
                 .unwrap();
-        assert_eq!(built.len(), 2);
-        assert!(report.quarantined.is_empty());
-        assert_eq!(built[0].question_number, 1);
+        assert_eq!(built.len(), 1); // Only Q2 was built
+        assert_eq!(report.quarantined.len(), 1); // Q1 was quarantined after 3 attempts
+        assert_eq!(built[0].question_number, 2);
     }
 
     #[tokio::test]
@@ -2701,7 +3661,15 @@ mod tests {
     fn audit_rejects_grid_and_duplicate_keeps_chart() {
         let grid = grid_page();
         let chart = chart_page();
-        let chunk: Vec<(usize, &PageInput)> = vec![(0, &grid), (1, &chart)];
+        let decoded_pages = vec![
+            grid.get_b64()
+                .and_then(|b64| geometry::decode_page_image(b64))
+                .map(Arc::new),
+            chart
+                .get_b64()
+                .and_then(|b64| geometry::decode_page_image(b64))
+                .map(Arc::new),
+        ];
         let item = AiQuestion {
             content: Some("Complete the table. [DIAGRAM_PLACEHOLDER]".into()),
             diagram_bboxes: Some(vec![
@@ -2717,9 +3685,10 @@ mod tests {
             ..Default::default()
         };
         // Tests send no sentinel pages, so identity map + no bands.
-        let l2c: Vec<usize> = (0..chunk.len()).collect();
-        let bands: Vec<Option<(f32, f32)>> = vec![None; chunk.len()];
-        let (bad, issues) = audit_diagram_boxes(&chunk, &mut [item], &l2c, &bands);
+        let l2c: Vec<usize> = (0..decoded_pages.len()).collect();
+        let bands: Vec<Option<(f32, f32)>> = vec![None; decoded_pages.len()];
+        let (bad, issues) =
+            audit_diagram_boxes(&decoded_pages, &mut [item], &l2c, &bands);
         assert!(bad.contains(&(0, 0)), "trace-table box must be rejected");
         assert!(
             bad.contains(&(0, 2)),
@@ -2754,7 +3723,12 @@ mod tests {
         let bad_response = r#"{"items":[{"question_number":30,"content":"Complete the flow chart below. [DIAGRAM_PLACEHOLDER] **[6 marks]**","marks":6,"topics":["Proof"],"module":"A","diagram_bboxes":[[0.10,0.10,0.80,0.80]],"bbox_page_indexes":[0]}]}"#;
         let good_response = r#"{"items":[{"question_number":30,"content":"Complete the flow chart below.\n\n[flowchart descriptions]\n\nState the final value. **[6 marks]**","marks":6,"topics":["Proof"],"module":"A"}]}"#;
         let mock = MockLlm::new(vec![ok_chat(bad_response), ok_chat(good_response)]);
-        let (built_opt, report) = extract_span(&mock, &config(), &span, &span_pages).await;
+        let cache = Arc::new(crate::pdf_render::PageRenderCache::new(
+            PAGE_RENDER_CACHE_CAPACITY,
+        ));
+        let semaphore = Arc::new(Semaphore::new(1));
+        let (built_opt, report) =
+            extract_span(&mock, &config(), &span, &span_pages, &cache, &semaphore).await;
         let built = built_opt.expect("question must build after the repair round");
 
         assert_eq!(mock.remaining(), 0, "both attempts consumed");
@@ -2770,6 +3744,76 @@ mod tests {
         );
         assert!(!built.content.contains("[DIAGRAM_PLACEHOLDER]"));
         assert!(report.repairs >= 1);
+    }
+
+    #[tokio::test]
+    async fn eof_split_extracts_and_concatenates_remaining_pages() {
+        let source = grid_page();
+        let pgs = vec![
+            PageInput { kind: source.kind.clone(), text: "Question 8 starts here.".into() },
+            PageInput { kind: source.kind.clone(), text: "Question 8 continues.".into() },
+            PageInput { kind: source.kind, text: "Question 8 continues on the next page.".into() },
+        ];
+        let span_pages: Vec<(usize, &PageInput)> = pgs.iter().enumerate().collect();
+        let span = doc_map::QuestionSpan {
+            number: 8,
+            start_page: 0,
+            end_page: 2,
+            start_y_frac: None,
+            end_y_frac: None,
+            expected_marks: Some(6),
+            reliable_pages: vec![],
+            ambiguous_pages: vec![],
+        };
+        let mock = MockLlm::new(vec![
+            ok_chat("{\"items\":["),
+            ok_chat(r#"{"items":[{"question_number":8,"content":"First page content. **[2 marks]**","marks":2}]}"#),
+            ok_chat(r#"{"items":[{"question_number":8,"content":"Remaining page content. **[4 marks]**","marks":4}]}"#),
+        ]);
+        let cache = Arc::new(crate::pdf_render::PageRenderCache::new(
+            PAGE_RENDER_CACHE_CAPACITY,
+        ));
+        let semaphore = Arc::new(Semaphore::new(1));
+        let (built_opt, report) =
+            extract_span(&mock, &config(), &span, &span_pages, &cache, &semaphore).await;
+        let built = built_opt.expect("split span must build");
+
+        assert!(built.content.contains("First page content."));
+        assert!(built.content.contains("Remaining page content."));
+        assert_eq!(mock.remaining(), 0);
+        assert!(report.timings.iter().any(|t| t.operation == "api_call_reduced"));
+        assert!(mock.bodies()[2].to_string().contains("continuation call"));
+    }
+
+    #[test]
+    fn composite_visual_options_union_boxes_and_collapse_option_text() {
+        let mut item = AiQuestion {
+            content: Some(
+                "Which graph is correct?\nA)\n[DIAGRAM_PLACEHOLDER]\nB)\n[DIAGRAM_PLACEHOLDER]\nC)\n[DIAGRAM_PLACEHOLDER]\nD)\n[DIAGRAM_PLACEHOLDER]"
+                    .into(),
+            ),
+            visual_options: Some("composite_visual_options".into()),
+            diagram_bboxes: Some(vec![
+                vec![0.10, 0.20, 0.20, 0.15],
+                vec![0.40, 0.20, 0.20, 0.15],
+                vec![0.10, 0.55, 0.20, 0.15],
+                vec![0.40, 0.55, 0.20, 0.15],
+            ]),
+            bbox_page_indexes: Some(vec![
+                serde_json::json!(0),
+                serde_json::json!(0),
+                serde_json::json!(0),
+                serde_json::json!(0),
+            ]),
+            ..Default::default()
+        };
+
+        normalize_composite_visual_options(&mut item);
+
+        assert_eq!(item.diagram_bboxes.as_ref().unwrap().len(), 1);
+        assert_eq!(item.bbox_page_indexes.as_ref().unwrap().len(), 1);
+        assert_eq!(item.content.unwrap(), "Which graph is correct?\n[DIAGRAM_PLACEHOLDER]");
+        assert_eq!(item.diagram_kinds.unwrap(), vec!["composite_visual_options"]);
     }
 
     #[tokio::test]
@@ -2793,7 +3837,12 @@ mod tests {
             ok_chat(heavy_boxing),
             ok_chat(heavy_boxing),
         ]);
-        let (built_opt, report) = extract_span(&mock, &config(), &span, &span_pages).await;
+        let cache = Arc::new(crate::pdf_render::PageRenderCache::new(
+            PAGE_RENDER_CACHE_CAPACITY,
+        ));
+        let semaphore = Arc::new(Semaphore::new(1));
+        let (built_opt, report) =
+            extract_span(&mock, &config(), &span, &span_pages, &cache, &semaphore).await;
         let built = built_opt.expect("transcription must survive even when boxes never pass");
 
         assert!(
@@ -2820,24 +3869,29 @@ mod tests {
         cfg.diagrams_dir = Some(dir.clone());
         let mut report = ImportReport::default();
         let mut saved: Vec<([u8; 64], String)> = Vec::new();
+        let cache = crate::pdf_render::PageRenderCache::new(PAGE_RENDER_CACHE_CAPACITY);
 
         let l1 = save_diagram(
             0,
-            &chart,
+            chart.get_b64().map(String::as_str),
             &[0.02, 0.05, 0.90, 0.82],
             &cfg,
+            &cache,
             &mut saved,
             &mut report,
+            false,
             false,
         )
         .expect("first crop saves");
         let l2 = save_diagram(
             0,
-            &chart,
+            chart.get_b64().map(String::as_str),
             &[0.03, 0.06, 0.88, 0.80],
             &cfg,
+            &cache,
             &mut saved,
             &mut report,
+            false,
             false,
         )
         .expect("duplicate crop resolves to the same link");
@@ -2850,11 +3904,13 @@ mod tests {
         let grid = grid_page();
         let g = save_diagram(
             0,
-            &grid,
+            grid.get_b64().map(String::as_str),
             &[0.02, 0.02, 0.93, 0.93],
             &cfg,
+            &cache,
             &mut saved,
             &mut report,
+            false,
             false,
         );
         assert!(g.is_none(), "answer grid rejected at save");

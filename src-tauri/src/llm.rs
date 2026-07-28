@@ -53,11 +53,12 @@ pub trait LlmClient: Send + Sync {
 }
 
 /// Build a standard OpenAI-compatible chat request body (json_object mode).
-/// `images` are base64 page renders; a data-URL prefix is stripped if present.
-pub fn chat_body(
+/// `images` are base64 page renders. Existing data URLs retain their MIME
+/// type; legacy raw-base64 inputs are treated as JPEG.
+pub fn chat_body<S: AsRef<str>>(
     model: &str,
     system: &str,
-    images: &[String],
+    images: &[S],
     text: Option<&str>,
     max_tokens: u32,
 ) -> serde_json::Value {
@@ -70,7 +71,7 @@ pub fn chat_body(
         // base64 JPEG must be dropped here so it never reaches the vision API
         // as a bogus image. We also accept legacy sentinels so old tests and
         // code paths don't accidentally ship "TEXT_ONLY" as an image.
-        let t = img.trim();
+        let t = img.as_ref().trim();
         if t.is_empty()
             || t == "__SKIP__"
             || t == "SKIP"
@@ -79,7 +80,15 @@ pub fn chat_body(
         {
             continue;
         }
-        let b64 = crate::geometry::strip_data_url(img);
+        // Preserve the source MIME type when a data URL is supplied. PDF
+        // renders containing vector objects are PNGs; relabelling their bytes
+        // as JPEG produces an invalid payload for strict vision providers.
+        // Legacy raw-base64 callers still default to JPEG.
+        let image_url = if t.starts_with("data:image/") && t.contains(',') {
+            t.to_string()
+        } else {
+            format!("data:image/jpeg;base64,{}", crate::geometry::strip_data_url(t))
+        };
         // Phase 0: OpenAI-style vision APIs honour a "detail" hint. "high"
         // forces 768-px tiles and lets the model see fine detail (small
         // subscripts, axis labels, circuit symbols). Providers that don't
@@ -89,7 +98,7 @@ pub fn chat_body(
         content.push(serde_json::json!({
             "type": "image_url",
             "image_url": {
-                "url": format!("data:image/jpeg;base64,{b64}"),
+                "url": image_url,
                 "detail": "high"
             }
         }));
@@ -120,7 +129,14 @@ pub fn message_content(resp: &serde_json::Value) -> Result<String, LlmError> {
         .as_str()
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
-        .ok_or_else(|| LlmError::BadShape("missing choices[0].message.content".to_string()))
+        .ok_or_else(|| {
+            eprintln!(
+                "[DIAGNOSTIC][LLM_SHAPE_ERROR] missing choices[0].message.content; raw response:\n{}",
+                serde_json::to_string_pretty(resp)
+                    .unwrap_or_else(|_| format!("<unserializable response: {:?}>", resp))
+            );
+            LlmError::BadShape("missing choices[0].message.content".to_string())
+        })
 }
 
 // ── Real client ─────────────────────────────────────────────────────────────
@@ -137,6 +153,23 @@ impl ReqwestLlm {
             config,
         }
     }
+}
+
+fn retry_jitter() -> std::time::Duration {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.subsec_nanos())
+        .unwrap_or(0);
+    std::time::Duration::from_millis(100 + (nanos as u64 % 401))
+}
+
+fn retry_after(response: &reqwest::Response) -> Option<std::time::Duration> {
+    response
+        .headers()
+        .get(reqwest::header::RETRY_AFTER)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .map(std::time::Duration::from_secs)
 }
 
 impl LlmClient for ReqwestLlm {
@@ -165,37 +198,92 @@ impl LlmClient for ReqwestLlm {
                 match res {
                     Ok(r) => {
                         let status = r.status();
+                        let provider_delay = retry_after(&r);
+                        let body_text = match r.text().await {
+                            Ok(body) => body,
+                            Err(error) => {
+                                eprintln!(
+                                    "[LLM][BODY_READ_ERROR] status={} error={}",
+                                    status, error
+                                );
+                                return Err(LlmError::BadShape(format!(
+                                    "unable to read provider response body: {}",
+                                    error
+                                )));
+                            }
+                        };
+                        let trimmed_body = body_text.trim();
                         if status == reqwest::StatusCode::TOO_MANY_REQUESTS
                             || status == reqwest::StatusCode::SERVICE_UNAVAILABLE
                         {
+                            eprintln!(
+                                "[LLM][RETRYABLE_HTTP] status={} raw_body:\n{}",
+                                status, body_text
+                            );
                             attempt += 1;
                             if attempt > 3 {
                                 return Err(LlmError::RateLimited);
                             }
-                            // Consistent exponential backoff: 10s, 20s, 40s.
-                            tokio::time::sleep(std::time::Duration::from_secs(
-                                10 * (1 << (attempt - 1)),
-                            ))
-                            .await;
+                            let backoff = provider_delay.unwrap_or_else(|| {
+                                std::time::Duration::from_secs(10 * (1 << (attempt - 1)))
+                            });
+                            tokio::time::sleep(backoff + retry_jitter()).await;
                             continue;
                         }
                         if !status.is_success() {
+                            eprintln!(
+                                "[LLM][HTTP_ERROR] status={} raw_body:\n{}",
+                                status, body_text
+                            );
                             return Err(LlmError::Http {
                                 status: status.as_u16(),
-                                body: r.text().await.unwrap_or_default(),
+                                body: body_text,
                             });
                         }
-                        return r
-                            .json::<serde_json::Value>()
-                            .await
-                            .map_err(|e| LlmError::BadShape(e.to_string()));
+                        if trimmed_body.is_empty() {
+                            eprintln!(
+                                "[LLM][EMPTY_BODY] WARN: LLM returned empty body. Check API provider for content filter flags or silent drops."
+                            );
+                            return Err(LlmError::BadShape(
+                                "provider returned an empty response body".to_string(),
+                            ));
+                        }
+                        let resp: serde_json::Value = match serde_json::from_str(&body_text) {
+                            Ok(value) => value,
+                            Err(error) => {
+                                eprintln!(
+                                    "[LLM][RESPONSE_JSON_ERROR] error={} raw_body:\n{}",
+                                    error, body_text
+                                );
+                                return Err(LlmError::BadShape(format!(
+                                    "invalid provider response JSON: {}",
+                                    error
+                                )));
+                            }
+                        };
+                        // Empty-content guard: some Kilo-Gateway providers
+                        // respond 200 but leave choices[0].message.content
+                        // blank or whitespace-only. Retry up to the same
+                        // budget used for rate-limit / network errors.
+                        if message_content(&resp).is_err() {
+                            attempt += 1;
+                            if attempt > 3 {
+                                return Err(LlmError::BadShape(
+                                    "provider returned empty content after retries".to_string(),
+                                ));
+                            }
+                            tokio::time::sleep(std::time::Duration::from_secs(5) + retry_jitter())
+                                .await;
+                            continue;
+                        }
+                        return Ok(resp);
                     }
                     Err(e) => {
                         attempt += 1;
                         if attempt > 2 {
                             return Err(LlmError::Network(e.to_string()));
                         }
-                        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                        tokio::time::sleep(std::time::Duration::from_secs(5) + retry_jitter()).await;
                     }
                 }
             }
@@ -257,4 +345,36 @@ pub fn ok_chat(content: &str) -> Result<serde_json::Value, LlmError> {
     Ok(serde_json::json!({
         "choices": [{ "message": { "content": content } }]
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn image_url(body: &serde_json::Value) -> &str {
+        body["messages"][1]["content"][0]["image_url"]["url"]
+            .as_str()
+            .unwrap()
+    }
+
+    #[test]
+    fn chat_body_preserves_png_data_url() {
+        let images = ["data:image/png;base64,AAAA"];
+        let body = chat_body("model", "system", &images, None, 100);
+        assert_eq!(image_url(&body), images[0]);
+    }
+
+    #[test]
+    fn chat_body_preserves_jpeg_data_url() {
+        let images = ["data:image/jpeg;base64,BBBB"];
+        let body = chat_body("model", "system", &images, None, 100);
+        assert_eq!(image_url(&body), images[0]);
+    }
+
+    #[test]
+    fn chat_body_defaults_raw_base64_to_jpeg() {
+        let images = ["CCCC"];
+        let body = chat_body("model", "system", &images, None, 100);
+        assert_eq!(image_url(&body), "data:image/jpeg;base64,CCCC");
+    }
 }
