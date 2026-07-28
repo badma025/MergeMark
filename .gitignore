@@ -1,3 +1,6 @@
+# miscellaneous
+regex_test/
+
 # Logs
 logs
 *.log
@@ -34,4 +37,3 @@ pull.cjs
 pull.js
 test.cjs
 test.json
-regex_test/
