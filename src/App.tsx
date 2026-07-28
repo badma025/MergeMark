@@ -1,4 +1,5 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
+import { checkForAppUpdates } from "@/updater";
 import { Toaster } from "sonner";
 import { LayoutGrid, UploadCloud, Settings as SettingsIcon, BookOpen } from "lucide-react";
 import { RepositoryFeed } from "@/components/repository/RepositoryFeed";
@@ -26,6 +27,10 @@ const TABS: { id: Tab; label: string; icon: React.ElementType }[] = [
 function App() {
   const [activeTab, setActiveTab] = useState<Tab>("repository");
   const [selectedQuestions, setSelectedQuestions] = useState<WorksheetItemData[]>([]);
+
+  useEffect(() => {
+    checkForAppUpdates();
+  }, []);
 
   // ── Free-tier upload counter ──────────────────────────────────────────
   // `status` is the live SQLite snapshot of `usage_config.free_uploads_used`.

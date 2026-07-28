@@ -64,6 +64,37 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf
 
+      - name: Download and Lipo PDFium for macOS
+        if: matrix.platform == 'macos-latest'
+        run: |
+          mkdir -p src-tauri/libs
+          mkdir -p /tmp/pdfium-x64 /tmp/pdfium-arm64
+          
+          # Download both Intel and Apple Silicon binaries
+          curl -L https://github.com/bblanchon/pdfium-binaries/releases/latest/download/pdfium-mac-x64.tgz | tar -xz -C /tmp/pdfium-x64 lib/libpdfium.dylib
+          curl -L https://github.com/bblanchon/pdfium-binaries/releases/latest/download/pdfium-mac-arm64.tgz | tar -xz -C /tmp/pdfium-arm64 lib/libpdfium.dylib
+          
+          # Stitch them into a single Universal Binary
+          lipo -create /tmp/pdfium-x64/lib/libpdfium.dylib /tmp/pdfium-arm64/lib/libpdfium.dylib -output src-tauri/libs/libpdfium.dylib
+
+      - name: Download PDFium for Windows
+        if: matrix.platform == 'windows-latest'
+        shell: bash
+        run: |
+          mkdir -p src-tauri/libs
+          curl -L https://github.com/bblanchon/pdfium-binaries/releases/latest/download/pdfium-win-x64.tgz | tar -xz -C src-tauri/libs bin/pdfium.dll
+          mv src-tauri/libs/bin/pdfium.dll src-tauri/libs/
+          rm -rf src-tauri/libs/bin
+
+      - name: Download PDFium for Linux
+        if: matrix.platform == 'ubuntu-22.04'
+        run: |
+          mkdir -p src-tauri/libs
+          curl -L https://github.com/bblanchon/pdfium-binaries/releases/latest/download/pdfium-linux-x64.tgz | tar -xz -C src-tauri/libs lib/libpdfium.so
+          mv src-tauri/libs/lib/libpdfium.so src-tauri/libs/
+          rm -rf src-tauri/libs/lib
+
+          
       - name: Install frontend dependencies
         run: npm ci
 
@@ -72,10 +103,13 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           MERGEMARK_OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         with:
           tagName: ${{ github.ref_name }}
           releaseName: "MergeMark ${{ github.ref_name }}"
           releaseBody: "Download the installer for your platform below."
           releaseDraft: true
           prerelease: false
+          includeUpdaterJson: true
           args: ${{ matrix.args }}
