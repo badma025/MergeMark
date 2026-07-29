@@ -14,8 +14,10 @@ name: Release
 
 on:
   push:
+    branches:
+      - main
     tags:
-      - "v*"
+      - 'v*' # This tells it to run when a tag starting with "v" is pushed
 
 permissions:
   contents: write # required to create the draft release
