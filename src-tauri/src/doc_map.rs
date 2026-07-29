@@ -1249,8 +1249,13 @@ fn build_spans_from_vision(
         let is_text_layer = qi == 999;
 
         // --- HYBRID RUST VETO CHECK ---
-        if !is_text_layer && is_figure_hallucination(q, &page_texts[page]) {
-            continue;
+        let page_index = page.saturating_sub(1);
+        if let Some(page_text) = page_texts.get(page_index) {
+            if !is_text_layer && is_figure_hallucination(q, page_text) {
+                continue;
+            }
+        } else {
+            println!("WARNING: Text missing for page {}", page);
         }
 
         // --- CROSS-PAGE TEXT CONFIRMATION ---
