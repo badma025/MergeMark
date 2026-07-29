@@ -1,5 +1,5 @@
 // ── The PVRV pipeline: Propose → Validate → Repair → Verify ────────────────
-//
+// hello
 // Orchestrates ingestion with the AI treated as an untrusted proposer:
 //
 //   1. STRUCTURE: a cheap per-page structure pass (tiny schema) + the
