@@ -1,6 +1,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+use parking_lot::Mutex;
 use pdfium_render::prelude::*;
 use crate::pipeline::{PageInput, PageInputKind};
 use base64::Engine;
@@ -36,40 +37,98 @@ impl PageRenderCache {
 
     /// Return a shared 300-DPI page image, rendering it exactly once while it
     /// remains resident in the bounded cache.
+    ///
+    /// The mutex is NOT held during the expensive pdfium render call. This
+    /// prevents blocking-thread-pool starvation on macOS where multiple
+    /// `spawn_blocking` tasks compete for this lock: if the lock were held
+    /// during rendering, other blocking tasks (e.g. `prepare_chunk_images`)
+    /// could never be scheduled, causing a deadlock.
     pub fn get_or_render(
         &self,
         path: &Path,
         page_idx: usize,
     ) -> Result<Arc<DynamicImage>, String> {
-        let mut state = self
-            .state
-            .lock()
-            .map_err(|_| "300-DPI page cache lock poisoned".to_string())?;
+        // Fast path: check cache under lock, return immediately if hit.
+        {
+            let mut state = self.state.lock();
 
-        if let Some(image) = state.pages.get(&page_idx).cloned() {
-            if let Some(position) = state.lru.iter().position(|cached| *cached == page_idx) {
-                state.lru.remove(position);
+            if let Some(image) = state.pages.get(&page_idx).cloned() {
+                if let Some(position) = state.lru.iter().position(|cached| *cached == page_idx) {
+                    state.lru.remove(position);
+                }
+                state.lru.push_back(page_idx);
+                return Ok(image);
             }
-            state.lru.push_back(page_idx);
-            return Ok(image);
-        }
+        } // Lock released before slow render.
 
+        // Slow path: render WITHOUT holding the lock so other blocking
+        // threads can access the cache concurrently.
         let image = Arc::new(render_pdf_page_at_300dpi(path, page_idx)?);
-        if state.pages.len() >= self.capacity {
-            if let Some(evicted) = state.lru.pop_front() {
-                state.pages.remove(&evicted);
+
+        // Re-acquire to insert into cache. Another thread may have rendered
+        // the same page in the meantime — that's fine, we just overwrite.
+        {
+            let mut state = self.state.lock();
+
+            if state.pages.len() >= self.capacity && !state.pages.contains_key(&page_idx) {
+                if let Some(evicted) = state.lru.pop_front() {
+                    state.pages.remove(&evicted);
+                }
             }
+            state.pages.insert(page_idx, Arc::clone(&image));
+            state.lru.push_back(page_idx);
         }
-        state.pages.insert(page_idx, Arc::clone(&image));
-        state.lru.push_back(page_idx);
+
         Ok(image)
     }
 }
 
 fn get_pdfium() -> Result<&'static Pdfium, String> {
     PDFIUM_INSTANCE.get_or_init(|| {
+        #[cfg(target_os = "macos")]
+        let bindings = {
+            // On macOS, prefer the bundled dylib inside the .app/Frameworks
+            // directory. Fall back to system library search for development.
+            let exe_dir = std::env::current_exe()
+                .ok()
+                .and_then(|p| p.parent().map(|d| d.to_path_buf()))
+                .unwrap_or_else(|| std::path::PathBuf::from("."));
+            let bundled_paths = [
+                exe_dir.join("../Frameworks/libpdfium.dylib"),
+                exe_dir.join("libpdfium.dylib"),
+                exe_dir.join("../Resources/libpdfium.dylib"),
+            ];
+            let mut last_err = String::new();
+            let mut bound = None;
+            for lib_path in &bundled_paths {
+                if lib_path.exists() {
+                    match Pdfium::bind_to_library(lib_path.to_str().unwrap_or("")) {
+                        Ok(b) => {
+                            bound = Some(b);
+                            break;
+                        }
+                        Err(e) => {
+                            last_err = format!("{:?}: {:?}", lib_path, e);
+                        }
+                    }
+                }
+            }
+            if let Some(b) = bound {
+                b
+            } else {
+                // Development fallback: try system paths (brew, etc.)
+                Pdfium::bind_to_system_library()
+                    .map_err(|e| format!(
+                        "Failed to bind to pdfium. Tried bundled paths ({}) and system library: {:?}",
+                        last_err, e
+                    ))?
+            }
+        };
+
+        #[cfg(not(target_os = "macos"))]
         let bindings = Pdfium::bind_to_system_library()
             .map_err(|e| format!("Failed to bind to pdfium: {:?}", e))?;
+
         Ok(Pdfium::new(bindings))
     }).as_ref().map_err(|e| e.clone())
 }
@@ -86,8 +145,6 @@ pub fn render_pdf_pages(path: &Path) -> Result<Vec<PageInput>, String> {
         .unwrap_or_else(|_| "200".to_string())
         .parse::<u32>()
         .unwrap_or(200);
-    let target_width = (8.27 * render_dpi as f32).round() as i32;
-    let render_config = PdfRenderConfig::new().set_target_width(target_width.try_into().unwrap());
 
     for (i, page) in document.pages().iter().enumerate() {
         let text = page.text().map_err(|e| e.to_string())?.all();
@@ -103,6 +160,12 @@ pub fn render_pdf_pages(path: &Path) -> Result<Vec<PageInput>, String> {
             });
             continue;
         }
+
+        // Use actual page width instead of hardcoded A4 (8.27"). This handles
+        // US Letter (8.5"), A3, and other sizes correctly on all platforms.
+        let page_width_inches = page.width().value / 72.0;
+        let target_width = (page_width_inches * render_dpi as f32).round() as i32;
+        let render_config = PdfRenderConfig::new().set_target_width(target_width.max(1).try_into().unwrap());
 
         let bitmap = page.render_with_config(&render_config)
             .map_err(|e| format!("Failed to render page {}: {:?}", i, e))?;
@@ -153,7 +216,10 @@ pub fn render_pdf_page_at_300dpi(path: &Path, page_idx: usize) -> Result<image::
     let page = pages.get((page_idx as u16).into())
         .map_err(|e| format!("Failed to get page: {:?}", e))?;
 
-    let render_config = PdfRenderConfig::new().set_target_width(2480); // roughly 300 DPI for A4 width (8.27 * 300 = 2481)
+    // Use actual page width for correct DPI on all paper sizes (A4, Letter, etc.)
+    let page_width_inches = page.width().value / 72.0;
+    let target_width = (page_width_inches * 300.0).round() as i32;
+    let render_config = PdfRenderConfig::new().set_target_width(target_width.max(1).try_into().unwrap());
     let bitmap = page.render_with_config(&render_config)
         .map_err(|e| format!("Failed to render page: {:?}", e))?;
 

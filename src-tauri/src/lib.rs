@@ -36,6 +36,15 @@ pub struct AppState {
     
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // Ensure enough blocking threads for concurrent pdfium renders + diagram
+    // audits. macOS has fewer default blocking threads than Windows; without
+    // this, heavy imports can starve the pool and deadlock spawn_blocking tasks.
+    // Tauri creates its own tokio runtime, so we configure via env var before
+    // the builder starts.
+    if std::env::var("TOKIO_BLOCKING_THREADS").is_err() {
+        unsafe { std::env::set_var("TOKIO_BLOCKING_THREADS", "16") };
+    }
+
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())

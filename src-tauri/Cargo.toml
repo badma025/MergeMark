@@ -42,5 +42,6 @@ base64 = "0.22.1"
 zip = { version = "2", default-features = false, features = ["deflate"] }
 csv = "1.4.0"
 pdfium-render = "0.9.3"
+parking_lot = "0.12"
 tauri-plugin-updater = "2.10.1"
 tauri-plugin-process = "2.3.1"
