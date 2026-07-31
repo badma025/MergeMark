@@ -406,21 +406,10 @@ pub struct AnswerDraft {
 // are normalized deterministically — a type slip can't kill an extraction)
 // ══════════════════════════════════════════════════════════════════════════
 
-#[derive(Debug, serde::Deserialize, Clone)]
-#[serde(tag = "type", content = "value")]
-#[serde(rename_all = "lowercase")]
-pub enum Block {
-    Prose(String),
-    DisplayMath(String),
-    Image(String),
-    Marks(serde_json::Value),
-}
-
 #[derive(Debug, Default, serde::Deserialize, Clone)]
 #[serde(default)]
 struct AiQuestion {
     question_number: Option<serde_json::Value>,
-    blocks: Option<Vec<Block>>,
     content: Option<String>,
     marks: Option<serde_json::Value>,
     topics: Option<serde_json::Value>,
@@ -436,60 +425,10 @@ struct AiQuestion {
     visual_options: Option<String>,
 }
 
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Default, serde::Deserialize)]
+#[serde(default)]
 struct AiQuestionPage {
     items: Vec<AiQuestion>,
-}
-
-impl<'de> serde::Deserialize<'de> for AiQuestionPage {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        #[derive(serde::Deserialize)]
-        #[serde(untagged)]
-        enum Fallback {
-            Object { items: Vec<AiQuestion> },
-            Array(Vec<AiQuestion>),
-        }
-
-        let fallback = Fallback::deserialize(deserializer)?;
-        match fallback {
-            Fallback::Object { items } => Ok(AiQuestionPage { items }),
-            Fallback::Array(items) => Ok(AiQuestionPage { items }),
-        }
-    }
-}
-
-fn build_markdown_from_blocks(blocks: &[Block]) -> String {
-    let mut out = String::new();
-    for block in blocks {
-        match block {
-            Block::Prose(text) => {
-                let clean_text = text.replace("$$", "").trim().to_string();
-                out.push_str(&format!("{}\n\n", clean_text));
-            }
-            Block::DisplayMath(math) => {
-                let clean_math = math.replace("$", "").trim().to_string();
-                out.push_str(&format!("$$\n{}\n$$\n\n", clean_math));
-            }
-            Block::Image(img) => out.push_str(&format!("{}\n\n", img)),
-            Block::Marks(val) => {
-                let raw_str = if let Some(s) = val.as_str() { 
-                    s.to_string() 
-                } else { 
-                    val.to_string() 
-                };
-                
-                let numeric_marks: String = raw_str.chars().filter(|c| c.is_ascii_digit()).collect();
-                
-                if !numeric_marks.is_empty() {
-                    out.push_str(&format!("**[{} marks]**\n\n", numeric_marks));
-                }
-            }
-        }
-    }
-    out.trim().to_string()
 }
 
 fn merge_split_questions(items: Vec<AiQuestion>, question_number: u32) -> AiQuestion {
@@ -506,12 +445,7 @@ fn merge_split_questions(items: Vec<AiQuestion>, question_number: u32) -> AiQues
     let mut marks = 0i32;
     let mut has_marks = false;
 
-    for mut item in items {
-        if let Some(blocks) = &item.blocks {
-            if item.content.is_none() || item.content.as_deref() == Some("") {
-                item.content = Some(build_markdown_from_blocks(blocks));
-            }
-        }
+    for item in items {
         if let Some(value) = item.content.filter(|value| !value.trim().is_empty()) {
             content.push(value);
         }
@@ -913,19 +847,8 @@ Normally there is exactly ONE item. Return more than one ONLY if Question {numbe
 
 EVERY item MUST have:
 - "question_number": {number} (integer, exactly).
-- "blocks": array of objects holding the actual content. This completely replaces raw text. You MUST output your response in valid JSON format using the following schema:
-    [
-      {{ "type": "prose", "value": "English text and inline math like $x=2$ go here." }},
-      {{ "type": "displaymath", "value": "\\int_{{2}}^{{T}} 12t^2 \\, dt" }},
-      {{ "type": "image", "value": "![Diagram](...)" }},
-      {{ "type": "marks", "value": "5" }}
-    ]
-  CRITICAL RULES FOR BLOCKS:
-  1. NEVER include $$ or \begin{{aligned}} tags in the "displaymath" value. Output ONLY the raw LaTeX equation.
-  2. Isolate all Markdown images into their own "image" block.
-  3. Put mark allocations (just the number) in a "marks" block.
-  4. Preserve all punctuation in "prose".
-- STRUCTURED TABLES WITH HEADERS — trace tables, function tables, working grids — ARE question content even when the body cells are EMPTY. If the text says Complete the trace table, Complete the table, or show the results of executing, NEVER return a diagram box for that grid, even when the question mentions another Figure; transcribe every row and pre-filled cell as Markdown. Transcribe them as Markdown tables in a "prose" block (keeping every header and any pre-filled cells), NEVER as diagram boxes.
+- "content": FULL transcription of Question {number} only (never a summary). Preserve all punctuation. Separate sub-parts (a), (b), (c) with double newlines, keeping them in printed order. Append the mark tag `**[X marks]**` to every sub-part that shows a mark allocation. Transcribe every sentence, including instructions to the candidate that belong to this question. Do NOT include: any text belonging to another question, page headers/footers ("Question X continued", "Turn over"), the "(Total for Question X is Y marks)" footer, plain ruled answer lines, or "BLANK PAGE".
+- STRUCTURED TABLES WITH HEADERS — trace tables, function tables, working grids — ARE question content even when the body cells are EMPTY. If the text says Complete the trace table, Complete the table, or show the results of executing, NEVER return a diagram box for that grid, even when the question mentions another Figure; transcribe every row and pre-filled cell as Markdown. Transcribe them as Markdown tables in "content" (keeping every header and any pre-filled cells), NEVER as diagram boxes.
 - "marks": integer total for this question's visible part, or null if unknown.
 {topics_instruction}
 - "module": string — output EXACTLY '{module}'.
@@ -936,21 +859,19 @@ EVERY item MUST have:
 GRAPH/CANVAS EXTENT: for every graph or chart, the box MUST include the complete visual canvas, not merely the plotted grid. Include the far-left y-axis title, variables, units, numeric tick labels and axis line; the bottom x-axis title, variables, units and tick labels; the top/right border or grid edge; and the printed Figure heading/caption. Leave visible whitespace around these elements. A graph crop that starts at the y-axis or ends at the plot border is incomplete.
 The parser crop-checks every box: blank boxes, empty ruled grids, and duplicate boxes are rejected and cost you a repair round.
 - "bbox_page_indexes": array with the SAME LENGTH as diagram_bboxes — the 0-based index of the page image each box refers to.
-- Insert the exact token [DIAGRAM_PLACEHOLDER] in a "prose" block where each diagram belongs chronologically.
+- Insert the exact token [DIAGRAM_PLACEHOLDER] in "content" where each diagram belongs chronologically.
 
 FORMATTING RULES:
 - OMIT the leading question number at the very start of the question text (e.g. if the text reads "17 Here is triangle ABC.", you MUST output "Here is triangle ABC." without the "17").
 - OMIT trailing answer line units, symbols, and answer templates at the very end of the question (e.g. "..................... %", "£ .....................", "..................... cm", or "............ $\\le t <$ ............"). Do NOT transcribe the answer blanks or the mathematical operators embedded within them.
-- Wrap inline math inside "prose" blocks in single $...$.
-- LATEX SAFETY: never place prose, Markdown emphasis, image links, [DIAGRAM_PLACEHOLDER], or ordinary instructions inside $...$ or any other math environment. Keep every $ delimiter balanced; never end content with a stray delimiter.
-- Tables of text/data: standard Markdown tables. Pure mathematical matrices or Simplex tableaus: LaTeX \begin{{array}} inside a "displaymath" block. Never put $ inside array environments.
+- Wrap inline math in single $...$. Use $$...$$ ONLY for display equations on their own line.
+- LATEX SAFETY: never place prose, Markdown emphasis such as **[5 marks]**, image links, [DIAGRAM_PLACEHOLDER], or ordinary instructions inside $...$, $$...$$, \begin{{aligned}}, or any other math environment. Use aligned only for multiple equation rows. Keep every $ and $$ delimiter balanced; never end content with a stray delimiter.
+- Tables of text/data: standard Markdown tables. Pure mathematical matrices or Simplex tableaus: LaTeX \begin{{array}} inside $$...$$. Never put $ inside array environments.
 - Multiple-choice options: keep their original capital letter labels (e.g. `A ...`, `B ...`) separated by newlines. Do NOT format them as lowercase sub-parts like `(a)`.
 - Code/pseudocode/SQL/identifiers: Markdown backticks, NEVER LaTeX math mode.
 - AQA decimal sub-parts: render '02.1'-style parts as (a), (b), (c) — positionally: .1 -> a, .2 -> b — and update inline cross-references accordingly. AQA also uses SPACED sub-parts: "01 5" means Question 1, sub-part 5 — render as (e). The whole question number is ALWAYS the integer before the space/dot. NEVER return decimals like 1.5 for spaced sub-parts. Whole-numbered MCQs are independent questions, never decimals.
 - JSON ESCAPING: backslashes in LaTeX MUST be escaped (\\frac, \\theta). Unescaped backslashes break the parser and your work is discarded.
-- The content MUST end with terminal punctuation or a mark tag. Never stop mid-sentence.
-
-IMPORTANT: You must extract EVERY question from the document. Do not skip any. Your response must ALWAYS be a single JSON object containing an items array."#,
+- The content MUST end with terminal punctuation or a mark tag. Never stop mid-sentence."#,
         number = span.number,
         paper = config.paper_name,
         module = config.module_name,
@@ -1854,14 +1775,6 @@ async fn extract_span<C: LlmClient>(
                 }
             };
 
-            for item in &mut page_items.items {
-                if let Some(blocks) = &item.blocks {
-                    if item.content.is_none() || item.content.as_deref() == Some("") {
-                        item.content = Some(build_markdown_from_blocks(blocks));
-                    }
-                }
-            }
-
             // Split calls are intentionally raw collection passes. A page
             // fragment cannot satisfy whole-span validation on its own, and
             // diagram indices are only meaningful after all chunks are
@@ -2007,7 +1920,7 @@ async fn extract_span<C: LlmClient>(
                     span.number,
                     page_items.items.len()
                 );
-                let _collateral_numbers: Vec<String> = raw_numbers
+                let collateral_numbers: Vec<String> = raw_numbers
                     .iter()
                     .filter(|&&n| n != span.number)
                     .map(|n| n.to_string())
