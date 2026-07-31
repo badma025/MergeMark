@@ -53,20 +53,35 @@ export function Settings() {
   const [replaceInput, setReplaceInput] = useState("");
 
   useEffect(() => {
-    const savedKey = localStorage.getItem("mergemark_openai_key");
-    if (savedKey) setApiKey(savedKey);
-
-    const savedBaseUrl = localStorage.getItem("mergemark_openai_base_url");
-    if (savedBaseUrl) setBaseUrl(savedBaseUrl);
+    async function loadBackendState() {
+      try {
+        const [backendKey, backendBase] = await invoke<[string | null, string | null]>("get_byok_state");
+        if (backendKey) {
+          setApiKey(backendKey);
+          localStorage.setItem("mergemark_openai_key", backendKey);
+        } else {
+          const savedKey = localStorage.getItem("mergemark_openai_key");
+          if (savedKey) {
+            setApiKey(savedKey);
+            invoke("set_byok_key", { apiKey: savedKey, baseUrl: backendBase || localStorage.getItem("mergemark_openai_base_url") || null }).catch(console.error);
+          }
+        }
+        
+        if (backendBase) {
+          setBaseUrl(backendBase);
+          localStorage.setItem("mergemark_openai_base_url", backendBase);
+        } else {
+          const savedBaseUrl = localStorage.getItem("mergemark_openai_base_url");
+          if (savedBaseUrl) setBaseUrl(savedBaseUrl);
+        }
+      } catch (err) {
+        console.error("Failed to load BYOK state from backend", err);
+      }
+    }
+    loadBackendState();
 
     const savedModel = localStorage.getItem("mergemark_openai_model");
     if (savedModel) setModelName(savedModel);
-
-    // Sync to backend for billing logic
-    invoke("set_byok_key", { 
-      apiKey: savedKey || null, 
-      baseUrl: savedBaseUrl || null 
-    }).catch(console.error);
   }, []);
 
   function handleKeyChange(e: React.ChangeEvent<HTMLInputElement>) {

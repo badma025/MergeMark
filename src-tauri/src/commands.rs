@@ -1977,6 +1977,20 @@ pub async fn set_byok_key(
     Ok(())
 }
 
+#[tauri::command]
+pub async fn get_byok_state(
+    state: tauri::State<'_, AppState>,
+) -> Result<(Option<String>, Option<String>), String> {
+    let pool = state.db.lock().await;
+    let key = crate::db::get_byok_api_key(&pool)
+        .await
+        .map_err(|e| format!("DB read failed: {e}"))?;
+    let base = crate::db::get_byok_base_url(&pool)
+        .await
+        .map_err(|e| format!("DB read failed: {e}"))?;
+    Ok((key, base))
+}
+
 // ── Flashcards Export & Import ────────────────────────────────────────────────
 
 #[tauri::command]

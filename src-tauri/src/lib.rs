@@ -88,6 +88,7 @@ pub fn run() {
             commands::generate_worksheet_from_pdf,
             commands::export_worksheet_markdown,
             commands::get_usage_status,
+            commands::get_byok_state,
             commands::set_byok_key,
             commands::export_flashcards,
             commands::import_flashcards,

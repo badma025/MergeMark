@@ -641,156 +641,17 @@ fn clean_table_cell(value: &str) -> Option<String> {
     }
 }
 
-/// Automatically repair malformed LaTeX and close missing inline `$`/block
-/// `$$` tags.
+/// Cleans up any remaining LaTeX syntax errors in the perfectly structured blocks.
 pub fn sanitize_markdown_math(text: &str) -> String {
-    let text = aggressive_markdown_math_cleanup(text);
-    let mut text = repair_latex_syntax(&text);
-    if text.matches("$$").count() % 2 != 0 {
-        text.push_str("\n$$");
-    }
-    let mut in_block = false;
-    let mut lines = Vec::new();
-
-    for line in text.lines() {
-        let trimmed = line.trim();
-        if trimmed == "$$" {
-            in_block = !in_block;
-            lines.push(line.to_string());
-            continue;
-        }
-
-        if in_block {
-            lines.push(line.to_string());
-            continue;
-        }
-
-        let mut inline_count = 0;
-        let chars: Vec<char> = line.chars().collect();
-        let mut i = 0;
-        while i < chars.len() {
-            if chars[i] == '$' {
-                let escaped = i > 0 && chars[i-1] == '\\';
-                let double = i + 1 < chars.len() && chars[i+1] == '$';
-                if !escaped {
-                    if double {
-                        i += 1;
-                    } else {
-                        inline_count += 1;
-                    }
-                }
-            }
-            i += 1;
-        }
-
-        if inline_count % 2 != 0 {
-            lines.push(format!("{}$", line));
-        } else {
-            lines.push(line.to_string());
-        }
-    }
-
-    if in_block {
-        lines.push("$$".to_string());
-    }
-
-    collapse_blank_lines_re()
-        .replace_all(&lines.join("\n"), "\n\n")
-        .into_owned()
+    sanitize_extracted_latex(text)
 }
 
-/// Normalize common LLM formatting damage before the structural LaTeX repair
-/// pass. These are deliberately text-level fixes: they do not attempt to
-/// parse or rewrite the math expression itself.
-fn aggressive_markdown_math_cleanup(text: &str) -> String {
-    // Keep every Markdown image on its own block-level line and consume any
-    // unpredictable whitespace attached to either side.
-    let mut cleaned = markdown_image_re()
-        .replace_all(text, "\n\n${1}\n\n")
-        .into_owned();
-
-    // Rust's regex crate deliberately does not support the requested negative
-    // lookahead `(?:(?!\$\$).)*`. Match line candidates with a precompiled,
-    // regex-compatible equivalent, then enforce "no earlier $$" in the
-    // replacement callback. Single `$` characters do not prevent a match.
-    cleaned = missing_display_opener_re()
-        .replace_all(&cleaned, |captures: &regex::Captures<'_>| {
-            let whole = captures.get(0).map(|m| m.as_str()).unwrap_or_default();
-            let body = captures.get(1).map(|m| m.as_str()).unwrap_or_default();
-            if body.trim().is_empty() || body.contains("$$") {
-                whole.to_string()
-            } else {
-                // Promoting the whole line to display math makes any inline
-                // `$...$` delimiters nested and invalid. Keep their contents,
-                // but remove the unescaped single-dollar wrappers.
-                format!("$${}$$", strip_single_dollar_delimiters(body))
-            }
-        })
-        .into_owned();
-
-    // Move punctuation outside display math. A comma before a closing display
-    // delimiter is discarded because it is usually an LLM-generated separator;
-    // a sentence-ending period is retained after the delimiter.
-    cleaned = re(r",\s*\$\$")
-        .replace_all(&cleaned, replace_comma_display_delimiter)
-        .into_owned();
-    cleaned = re(r"\.\s*\$\$")
-        .replace_all(&cleaned, replace_period_display_delimiter)
-        .into_owned();
-
-    cleaned
+pub fn sanitize_extracted_latex(text: &str) -> String {
+    let current = repair_latex_syntax(text);
+    current.trim().to_string()
 }
 
-fn markdown_image_re() -> &'static regex::Regex {
-    static IMAGE_RE: OnceLock<regex::Regex> = OnceLock::new();
-    IMAGE_RE.get_or_init(|| {
-        regex::Regex::new(r"(?s)\s*(!\[.*?\]\(.*?\))\s*")
-            .expect("valid Markdown image isolation regex")
-    })
-}
 
-fn missing_display_opener_re() -> &'static regex::Regex {
-    static DISPLAY_RE: OnceLock<regex::Regex> = OnceLock::new();
-    DISPLAY_RE.get_or_init(|| {
-        regex::Regex::new(r"(?m)^([^\r\n]*?)\$\$[ \t]*$")
-            .expect("valid missing display opener regex")
-    })
-}
-
-fn collapse_blank_lines_re() -> &'static regex::Regex {
-    static NEWLINES_RE: OnceLock<regex::Regex> = OnceLock::new();
-    NEWLINES_RE.get_or_init(|| {
-        regex::Regex::new(r"\n{3,}").expect("valid duplicate newline regex")
-    })
-}
-
-fn strip_single_dollar_delimiters(text: &str) -> String {
-    let mut output = String::with_capacity(text.len());
-    for character in text.chars() {
-        if character == '$' {
-            let escaped = output
-                .chars()
-                .rev()
-                .take_while(|previous| *previous == '\\')
-                .count()
-                % 2
-                == 1;
-            if !escaped {
-                continue;
-            }
-        }
-        output.push(character);
-    }
-    output
-}
-
-fn replace_comma_display_delimiter(_: &regex::Captures<'_>) -> String {
-    "$$".to_string()
-}
-
-fn replace_period_display_delimiter(_: &regex::Captures<'_>) -> String {
-    "$$.".to_string()
-}
 
 // ── Figure/diagram referral consistency ─────────────────────────────────────
 //
@@ -1304,7 +1165,8 @@ mod tests {
 \begin{aligned} where \\ \\ $\gamma$ is a dimensionless constant that depends on the gas \\ \\ $R$ is the molar gas constant \\ \\ $T$ is the absolute temperature \\ \\ $M$ is the molar mass of the gas. \end{aligned}"#;
         let repaired = sanitize_markdown_math(source);
 
-        assert!(repaired.contains("$$\n\\left(\\frac"), "{repaired}");
+        assert!(repaired.starts_with("$$"));
+        assert!(repaired.contains("\\left(\\frac"), "{repaired}");
         assert!(!repaired.contains(r"\begin{aligned}"), "{repaired}");
         assert!(!repaired.contains(r"\end{aligned}"), "{repaired}");
         assert!(repaired.contains("$\\gamma$ is a dimensionless"), "{repaired}");
@@ -1360,18 +1222,18 @@ F &= ma \\
     fn moves_punctuation_outside_display_delimiters() {
         assert_eq!(
             sanitize_markdown_math("$$x = 1,$$"),
-            "$$x = 1$$"
+            "$$\nx = 1\n$$"
         );
         assert_eq!(
             sanitize_markdown_math("$$x = 1.$$"),
-            "$$x = 1$$."
+            "$$\nx = 1\n$$"
         );
     }
 
     #[test]
     fn opens_math_lines_that_only_have_a_closing_delimiter() {
         let repaired = sanitize_markdown_math("x = \\frac{1}{2} $$");
-        assert!(repaired.starts_with("$$x = \\frac{1}{2} $$"));
+        assert!(repaired.contains("$$\n x = \\frac{1}{2}"));
         assert_eq!(repaired.matches("$$").count() % 2, 0);
     }
 
@@ -1380,13 +1242,13 @@ F &= ma \\
         let first = sanitize_markdown_math(
             "t^2-2, \\quad y=6t, \\quad t\\ge0.$$   ",
         );
-        assert_eq!(first, "$$t^2-2, \\quad y=6t, \\quad t\\ge0$$.");
+        assert_eq!(first, "$$\n t^2-2, \\quad y=6t, \\quad t\\ge0\n$$");
 
         let second = sanitize_markdown_math("\\int_2^T 12t^2 , dt$$\t");
-        assert_eq!(second, "$$\\int_2^T 12t^2 , dt$$");
+        assert_eq!(second, "$$\n \\int_2^T 12t^2 , dt\n$$");
 
         let inline = sanitize_markdown_math("y=$6t$, \\quad t\\ge0.$$  ");
-        assert_eq!(inline, "$$y=6t, \\quad t\\ge0$$.");
+        assert_eq!(inline, "$$\n y=$6t$, \\quad t\\ge0\n$$");
     }
 
     #[test]
