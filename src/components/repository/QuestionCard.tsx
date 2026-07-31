@@ -15,6 +15,7 @@ import { useTaxonomy } from "@/lib/TaxonomyContext";
 import { toast } from "sonner";
 import Zoom from "react-medium-image-zoom";
 import "react-medium-image-zoom/dist/styles.css";
+import { SafeMarkdown } from "@/components/ui/SafeMarkdown";
 
 /**
  * Regex that matches display-worthy LaTeX operators.
@@ -180,7 +181,8 @@ export function preprocessMath(raw: string, isCode?: boolean, subject?: string):
   const formatBlock = (inner: string) => {
     let clean = fixSlashes(inner.trim());
     // If it has multiple lines and isn't already using an environment, wrap in aligned
-    if (clean.includes("\n") && !clean.includes("\\begin{")) {
+    const containsNonMath = /\*\*|!\[[^\]]*\]\(|\[DIAGRAM_PLACEHOLDER\]|\b(?:the|where|which|figure|question|marks?)\b/i.test(clean);
+    if (clean.includes("\n") && !clean.includes("\\begin{") && !containsNonMath) {
       // Replace newlines with \\ so KaTeX renders them on separate lines
       clean = `\\begin{aligned}\n${clean.replace(/\n/g, " \\\\\n")}\n\\end{aligned}`;
     }
@@ -450,24 +452,36 @@ export function QuestionCard(props: QuestionCardProps) {
             isShowingAnswer ? "opacity-0 absolute inset-0 pointer-events-none" : "opacity-100 relative"
           )}
         >
-          <ReactMarkdown 
-            remarkPlugins={[remarkMath, remarkGfm]} 
-            rehypePlugins={[rehypeKatex]}
-            urlTransform={(value) => value}
-            components={{
-              img: ({ node, ...props }) => {
-                if (!props.src) return null;
-                return (
-                  <DiagramImg
-                    src={props.src}
-                    alt={props.alt || "Diagram"}
-                  />
-                );
-              },
-            }}
-          >
-            {preprocessMath(displayContent, isCode, displaySubject)}
-          </ReactMarkdown>
+           <SafeMarkdown
+             rawText={displayContent}
+             fallback={
+               <ReactMarkdown
+                 remarkPlugins={[remarkGfm]}
+                 urlTransform={(value) => value}
+                 components={{
+                   img: ({ node, ...props }) => props.src
+                     ? <DiagramImg src={props.src} alt={props.alt || "Diagram"} />
+                     : null,
+                 }}
+               >
+                 {displayContent}
+               </ReactMarkdown>
+             }
+           >
+             <ReactMarkdown
+               remarkPlugins={[remarkMath, remarkGfm]}
+               rehypePlugins={[[rehypeKatex, { throwOnError: false, errorColor: "inherit" }]]}
+               urlTransform={(value) => value}
+               components={{
+                 img: ({ node, ...props }) => {
+                   if (!props.src) return null;
+                   return <DiagramImg src={props.src} alt={props.alt || "Diagram"} />;
+                 },
+               }}
+             >
+               {preprocessMath(displayContent, isCode, displaySubject)}
+             </ReactMarkdown>
+           </SafeMarkdown>
         </div>
 
         {/* Answer Content */}
@@ -478,24 +492,36 @@ export function QuestionCard(props: QuestionCardProps) {
           )}
         >
           <div className="font-semibold text-xs text-muted-foreground mb-2 uppercase tracking-wider">Mark Scheme Answer</div>
-          <ReactMarkdown 
-            remarkPlugins={[remarkMath, remarkGfm]} 
-            rehypePlugins={[rehypeKatex]}
-            urlTransform={(value) => value}
-            components={{
-              img: ({ node, ...props }) => {
-                if (!props.src) return null;
-                return (
-                  <DiagramImg
-                    src={props.src}
-                    alt={props.alt || "Diagram"}
-                  />
-                );
-              },
-            }}
-          >
-            {preprocessMath(answerContent ?? "", isCode, displaySubject)}
-          </ReactMarkdown>
+           <SafeMarkdown
+             rawText={answerContent ?? ""}
+             fallback={
+               <ReactMarkdown
+                 remarkPlugins={[remarkGfm]}
+                 urlTransform={(value) => value}
+                 components={{
+                   img: ({ node, ...props }) => props.src
+                     ? <DiagramImg src={props.src} alt={props.alt || "Diagram"} />
+                     : null,
+                 }}
+               >
+                 {answerContent ?? ""}
+               </ReactMarkdown>
+             }
+           >
+             <ReactMarkdown
+               remarkPlugins={[remarkMath, remarkGfm]}
+               rehypePlugins={[[rehypeKatex, { throwOnError: false, errorColor: "inherit" }]]}
+               urlTransform={(value) => value}
+               components={{
+                 img: ({ node, ...props }) => {
+                   if (!props.src) return null;
+                   return <DiagramImg src={props.src} alt={props.alt || "Diagram"} />;
+                 },
+               }}
+             >
+               {preprocessMath(answerContent ?? "", isCode, displaySubject)}
+             </ReactMarkdown>
+           </SafeMarkdown>
         </div>
       </div>
       {/* ── Edit Modal ── */}

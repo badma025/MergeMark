@@ -6,6 +6,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { open, save } from "@tauri-apps/plugin-dialog";
 import { toast } from "sonner";
 import { TaxonomyManager } from "./TaxonomyManager";
+import { parseTauriError } from "@/lib/tauriError";
 
 // Mirrors the serde camelCase report structs in src-tauri/src/backup.rs
 interface ExportReport {
@@ -98,7 +99,7 @@ export function Settings() {
         // optionally don't auto-set, just let the user pick
       }
     } catch (err: any) {
-      setModelFetchError(err.toString());
+      setModelFetchError(parseTauriError(err));
     } finally {
       setFetchingModels(false);
     }
@@ -121,7 +122,7 @@ export function Settings() {
         toast.success(`Backup saved — ${report.questions} questions, ${report.images} images`);
       }
     } catch (err) {
-      toast.error("Backup failed", { description: String(err) });
+      toast.error("Backup failed", { description: parseTauriError(err) });
     } finally {
       setBackupBusy(null);
     }
@@ -140,7 +141,7 @@ export function Settings() {
       setImportMode("merge");
       setReplaceInput("");
     } catch (err) {
-      toast.error("Could not read that backup", { description: String(err) });
+      toast.error("Could not read that backup", { description: parseTauriError(err) });
     } finally {
       setBackupBusy(null);
     }
@@ -162,7 +163,7 @@ export function Settings() {
       );
       setPendingImport(null);
     } catch (err) {
-      toast.error("Import failed", { description: String(err) });
+      toast.error("Import failed", { description: parseTauriError(err) });
     } finally {
       setBackupBusy(null);
     }

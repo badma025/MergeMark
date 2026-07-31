@@ -6,7 +6,7 @@
 //!   questions.json  — JSON array of `Question` rows; diagram references inside
 //!                     `content` / `answer_content` rewritten from absolute local
 //!                     paths to archive-relative `images/<name>` so the backup is
-//!                     portable across machines and OSes
+//!     hello                portable across machines and OSes
 //!   images/<name>   — the referenced diagram PNGs, included exactly once each
 
 use crate::commands::Question;
@@ -219,8 +219,15 @@ pub async fn export_backup(
     }
 
     let dest = PathBuf::from(&dest_path);
-    let file = std::fs::File::create(&dest)
-        .map_err(|e| format!("Could not create backup file at {}: {}", dest_path, e))?;
+    let temp = dest.with_file_name(format!(
+        ".{}.{}.tmp",
+        dest.file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("mergemark-backup"),
+        Uuid::new_v4()
+    ));
+    let file = std::fs::File::create(&temp)
+        .map_err(|e| format!("Could not create temporary backup file: {}", e))?;
     let mut zip = zip::ZipWriter::new(file);
     let options = zip::write::SimpleFileOptions::default()
         .compression_method(zip::CompressionMethod::Deflated);
@@ -265,17 +272,31 @@ pub async fn export_backup(
             .map(|_| ())
             .map_err(|e| format!("Failed to finalise backup: {}", e))
     }) {
-        Ok(()) => Ok(ExportReport {
-            questions: questions.len(),
-            images: image_map.len(),
-            missing_images: missing,
-            path: dest_path,
-        }),
         Err(e) => {
             // Don't leave a half-written archive behind.
-            let _ = std::fs::remove_file(&dest);
+            let _ = std::fs::remove_file(&temp);
             Err(e)
         }
+        Ok(()) => {
+            std::fs::rename(&temp, &dest).map_err(|error| {
+                let _ = std::fs::remove_file(&temp);
+                format!("Failed to move completed backup into place: {error}")
+            })?;
+            Ok(ExportReport {
+                questions: questions.len(),
+                images: image_map.len(),
+                missing_images: missing,
+                path: dest_path,
+            })
+        }
+    }
+}
+
+struct ImportTempCleanup(PathBuf);
+
+impl Drop for ImportTempCleanup {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
     }
 }
 
@@ -344,8 +365,13 @@ pub async fn import_backup(
     let dir = diagrams_dir(&app)?;
     std::fs::create_dir_all(&dir)
         .map_err(|e| format!("Failed to create diagrams directory: {}", e))?;
+    let import_dir = dir.join(format!(".import-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&import_dir)
+        .map_err(|e| format!("Failed to create temporary import directory: {}", e))?;
+    let _import_cleanup = ImportTempCleanup(import_dir.clone());
 
     let mut extracted: HashMap<String, String> = HashMap::new(); // entry name -> new abs path
+    let mut extracted_files = Vec::new();
     for i in 0..archive.len() {
         let mut entry = archive
             .by_index(i)
@@ -370,12 +396,16 @@ pub async fn import_backup(
             .and_then(|e| e.to_str())
             .unwrap_or("png")
             .to_string();
-        let new_abs = slashy(&dir.join(format!("{}.{}", Uuid::new_v4(), ext)));
-        let mut out = std::fs::File::create(&new_abs)
+        let file_name = format!("{}.{}", Uuid::new_v4(), ext);
+        let temp_path = import_dir.join(&file_name);
+        let final_path = dir.join(&file_name);
+        let new_abs = slashy(&final_path);
+        let mut out = std::fs::File::create(&temp_path)
             .map_err(|e| format!("Failed to restore image {}: {}", name, e))?;
         std::io::copy(&mut entry, &mut out)
             .map_err(|e| format!("Failed to restore image {}: {}", name, e))?;
         extracted.insert(name, new_abs);
+        extracted_files.push((temp_path, final_path));
     }
 
     for q in &mut questions {
@@ -500,6 +530,14 @@ pub async fn import_backup(
             tx.commit()
                 .await
                 .map_err(|e| format!("Failed to finalise import: {}", e))?;
+            for (temp_path, final_path) in &extracted_files {
+                std::fs::rename(temp_path, final_path).map_err(|error| {
+                    format!(
+                        "Database import committed, but image {} could not be moved into place: {error}",
+                        final_path.display()
+                    )
+                })?;
+            }
             Ok(ImportSummary {
                 added,
                 updated,

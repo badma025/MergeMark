@@ -38,9 +38,12 @@
     "macOS": {
       "frameworks": [
         "./libs/libpdfium.dylib"
-      ]
+      ],
+      "entitlements": "Entitlements.plist"
     },
-    "resources": {}
+    "resources": {
+      "libs/*": "libs/"
+    }
   },
   "plugins": {
     "updater": {

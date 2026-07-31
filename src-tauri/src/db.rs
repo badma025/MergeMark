@@ -1,20 +1,15 @@
 use sqlx::{sqlite::SqliteConnectOptions, SqlitePool};
 use std::path::PathBuf;
-use std::str::FromStr;
 
 pub async fn init_db(app_data_dir: PathBuf) -> Result<SqlitePool, sqlx::Error> {
     // 1. Ensure the app data directory exists
-    if !app_data_dir.exists() {
-        std::fs::create_dir_all(&app_data_dir).expect("Failed to create app data directory");
-    }
+    std::fs::create_dir_all(&app_data_dir).map_err(sqlx::Error::Io)?;
 
     // 2. Define the path to the database file
     let db_path = app_data_dir.join("mergemark.db");
     
-    // Using `mode=rwc` ensures the file is created if it doesn't exist
-    let db_url = format!("sqlite://{}?mode=rwc", db_path.display());
-
-    let options = SqliteConnectOptions::from_str(&db_url)?
+    let options = SqliteConnectOptions::new()
+        .filename(&db_path)
         .create_if_missing(true);
 
     // 3. Connect to the SQLite database

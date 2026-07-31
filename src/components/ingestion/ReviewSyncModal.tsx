@@ -10,6 +10,7 @@ import remarkGfm from "remark-gfm";
 import "katex/dist/katex.min.css";
 import { preprocessMath } from "@/components/repository/QuestionCard";
 import { Loader2 } from "lucide-react";
+import { SafeMarkdown } from "@/components/ui/SafeMarkdown";
 
 export interface ProposedMapping {
   questionId: string;
@@ -119,11 +120,12 @@ export function ReviewSyncModal({ mappings, onClose, onSuccess }: ReviewSyncModa
                       <div className="text-xs font-semibold text-muted-foreground mb-2 uppercase tracking-wider">
                         Question {qNum}
                       </div>
-                      <ReactMarkdown 
-                        remarkPlugins={[remarkMath, remarkGfm]} 
-                        rehypePlugins={[rehypeKatex]}
-                        urlTransform={(value) => value}
-                        components={{
+                      <SafeMarkdown rawText={m.rawContent}>
+                        <ReactMarkdown
+                          remarkPlugins={[remarkMath, remarkGfm]}
+                          rehypePlugins={[[rehypeKatex, { throwOnError: false, errorColor: "inherit" }]]}
+                          urlTransform={(value) => value}
+                          components={{
                           img: ({ node, ...props }) => {
                             if (props.src && (props.src.match(/^[a-zA-Z]:[\\/]/) || props.src.startsWith("/"))) {
                               try {
@@ -155,8 +157,9 @@ export function ReviewSyncModal({ mappings, onClose, onSuccess }: ReviewSyncModa
                             }
                           }}
                         >
-                        {preprocessMath(m.rawContent)}
-                      </ReactMarkdown>
+                          {preprocessMath(m.rawContent)}
+                        </ReactMarkdown>
+                      </SafeMarkdown>
                     </div>
 
                     {/* ── Proposed answer column ───────────────────────────── */}
@@ -190,11 +193,12 @@ export function ReviewSyncModal({ mappings, onClose, onSuccess }: ReviewSyncModa
                           </select>
                         </div>
                       </div>
-                      <ReactMarkdown 
-                        remarkPlugins={[remarkMath, remarkGfm]} 
-                        rehypePlugins={[rehypeKatex]}
-                        urlTransform={(value) => value}
-                        components={{
+                      <SafeMarkdown rawText={m.proposedAnswer}>
+                        <ReactMarkdown
+                          remarkPlugins={[remarkMath, remarkGfm]}
+                          rehypePlugins={[[rehypeKatex, { throwOnError: false, errorColor: "inherit" }]]}
+                          urlTransform={(value) => value}
+                          components={{
                           img: ({ node, ...props }) => {
                             if (props.src && (props.src.match(/^[a-zA-Z]:[\\/]/) || props.src.startsWith("/"))) {
                               try {
@@ -216,8 +220,9 @@ export function ReviewSyncModal({ mappings, onClose, onSuccess }: ReviewSyncModa
                             }
                           }}
                         >
-                        {preprocessMath(m.proposedAnswer)}
-                      </ReactMarkdown>
+                          {preprocessMath(m.proposedAnswer)}
+                        </ReactMarkdown>
+                      </SafeMarkdown>
                     </div>
                   </div>
                 );

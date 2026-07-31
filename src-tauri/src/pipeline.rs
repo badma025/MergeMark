@@ -175,12 +175,23 @@ async fn chat_with_permit<C: LlmClient>(
     client: &C,
     body: &serde_json::Value,
     semaphore: &Arc<Semaphore>,
+    cancel: &AtomicBool,
 ) -> Result<serde_json::Value, crate::llm::LlmError> {
-    let _permit = semaphore
-        .acquire()
-        .await
-        .map_err(|_| crate::llm::LlmError::Network("request semaphore closed".to_string()))?;
-    client.chat(body).await
+    let _permit = tokio::select! {
+        permit = semaphore.acquire() => permit
+            .map_err(|_| crate::llm::LlmError::Network("request semaphore closed".to_string()))?,
+        _ = wait_for_cancellation(cancel) => return Err(crate::llm::LlmError::Cancelled),
+    };
+    tokio::select! {
+        result = client.chat(body) => result,
+        _ = wait_for_cancellation(cancel) => Err(crate::llm::LlmError::Cancelled),
+    }
+}
+
+async fn wait_for_cancellation(cancel: &AtomicBool) {
+    while !cancel.load(Ordering::Relaxed) {
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
 }
 
 struct ChunkImageInput {
@@ -854,6 +865,7 @@ FORMATTING RULES:
 - OMIT the leading question number at the very start of the question text (e.g. if the text reads "17 Here is triangle ABC.", you MUST output "Here is triangle ABC." without the "17").
 - OMIT trailing answer line units, symbols, and answer templates at the very end of the question (e.g. "..................... %", "£ .....................", "..................... cm", or "............ $\\le t <$ ............"). Do NOT transcribe the answer blanks or the mathematical operators embedded within them.
 - Wrap inline math in single $...$. Use $$...$$ ONLY for display equations on their own line.
+- LATEX SAFETY: never place prose, Markdown emphasis such as **[5 marks]**, image links, [DIAGRAM_PLACEHOLDER], or ordinary instructions inside $...$, $$...$$, \begin{{aligned}}, or any other math environment. Use aligned only for multiple equation rows. Keep every $ and $$ delimiter balanced; never end content with a stray delimiter.
 - Tables of text/data: standard Markdown tables. Pure mathematical matrices or Simplex tableaus: LaTeX \begin{{array}} inside $$...$$. Never put $ inside array environments.
 - Multiple-choice options: keep their original capital letter labels (e.g. `A ...`, `B ...`) separated by newlines. Do NOT format them as lowercase sub-parts like `(a)`.
 - Code/pseudocode/SQL/identifiers: Markdown backticks, NEVER LaTeX math mode.
@@ -871,6 +883,8 @@ fn markscheme_system_prompt() -> String {
     r#"You are an expert examiner transcribing a mark scheme into Markdown. Return ONLY a valid JSON object: {"answers": [...]} (or an empty array [] / {"answers": []} when the pages contain no real answers).
 
 ESCAPE HATCH: If the images show only front covers, general marking guidance, abbreviation lists, or formula booklets, return an empty array. NEVER invent questions to fill the output.
+
+LATEX SAFETY: output Markdown and LaTeX separately. Never put prose, **[marks]**, image links, or [DIAGRAM_PLACEHOLDER] inside math delimiters or aligned/array environments. Keep every $ and $$ delimiter balanced.
 EXTRACTION GUARDRAIL: Only extract entries with explicit mark-scheme structure: a question-number column header (e.g. 1(a), 2(b)(i)) AND mark labels (M1, A1, B1, dM1, ft). Numbered lists in guidance pages are NOT mark schemes.
 
 Each array item: { "question_number": int (WHOLE question only; AQA 03.1 → 3), "answer_markdown": string, "diagram_bboxes": [[x,y,w,h]...] relative 0.0-1.0, "diagram_page_indexes": [ints, same length as bboxes, 0-based image index] }.
@@ -981,7 +995,7 @@ pub async fn run_question_pipeline<C: LlmClient, P: Progress>(
                         text_opt,
                         750,
                     );
-                    let result = match chat_with_permit(client, &body, &semaphore).await {
+                    let result = match chat_with_permit(client, &body, &semaphore, cancel).await {
                         Ok(resp) => llm::message_content(&resp)
                             .map_err(|e| format!("bad response shape ({})", e)),
                         Err(e) => Err(format!("API failure ({})", e)),
@@ -1153,11 +1167,13 @@ pub async fn run_question_pipeline<C: LlmClient, P: Progress>(
                 batch_next_allowed,
                 &page_render_cache,
                 &request_semaphore,
+                cancel,
             ).map(move |result| (position, result))
         }))
         .buffer_unordered(config.parallelism.max(1));
         let mut ordered_results = Vec::with_capacity(q_pages.len());
         while let Some(result) = results.next().await {
+            cancelled(cancel)?;
             ordered_results.push(result);
         }
         drop(results);
@@ -1187,6 +1203,7 @@ pub async fn run_question_pipeline<C: LlmClient, P: Progress>(
                                     next_allowed,
                                         &page_render_cache,
                                         &request_semaphore,
+                                        cancel,
                                     )
                                 .await;
                             report.absorb(redo_local);
@@ -1283,12 +1300,14 @@ pub async fn run_question_pipeline<C: LlmClient, P: Progress>(
                 &job.2,
                 &page_render_cache,
                 &request_semaphore,
+                cancel,
             )
             .map(move |result| (position, result))
         })
         .buffer_unordered(config.parallelism.max(1));
         let mut ordered_results = Vec::with_capacity(jobs.len());
         while let Some(result) = results.next().await {
+            cancelled(cancel)?;
             ordered_results.push(result);
         }
         ordered_results.sort_by_key(|(position, _)| *position);
@@ -1330,6 +1349,8 @@ pub async fn run_question_pipeline<C: LlmClient, P: Progress>(
         }
     }
 
+    cancelled(cancel)?;
+
     report.questions_extracted = built.len();
     report.extracted_total_marks = built.iter().map(|q| q.marks.max(0) as u32).sum();
     report.marks_checksum_ok = match (report.paper_total_marks, map.spans.is_empty()) {
@@ -1364,6 +1385,7 @@ async fn extract_span<C: LlmClient>(
     span_pages: &[(usize, &PageInput)],
     page_render_cache: &Arc<crate::pdf_render::PageRenderCache>,
     request_semaphore: &Arc<Semaphore>,
+    cancel: &AtomicBool,
 ) -> (Option<BuiltQuestion>, ImportReport) {
     // Own, local report: spans now run in parallel batches, so each unit
     // accumulates its own bookkeeping and the caller absorbs it in order.
@@ -1555,7 +1577,7 @@ async fn extract_span<C: LlmClient>(
             );
 
             let api_start = Instant::now();
-            let resp = match chat_with_permit(client, &body, request_semaphore).await {
+            let resp = match chat_with_permit(client, &body, request_semaphore, cancel).await {
                 Ok(r) => r,
                 Err(e) => {
                     last_error = e.to_string();
@@ -1628,7 +1650,7 @@ async fn extract_span<C: LlmClient>(
                     );
 
                     let api_start = Instant::now();
-                    let reduced_resp = match chat_with_permit(client, &reduced_body, request_semaphore).await {
+                    let reduced_resp = match chat_with_permit(client, &reduced_body, request_semaphore, cancel).await {
                         Ok(r) => r,
                         Err(e) => {
                             last_error = e.to_string();
@@ -2686,6 +2708,7 @@ async fn extract_fallback_page<C: LlmClient>(
     next_allowed: u32,
     page_render_cache: &Arc<crate::pdf_render::PageRenderCache>,
     request_semaphore: &Arc<Semaphore>,
+    cancel: &AtomicBool,
 ) -> (Option<Vec<BuiltQuestion>>, ImportReport) {
     // Own, local report: pages now run in parallel batches.
     let mut report = ImportReport::default();
@@ -2761,7 +2784,7 @@ RULES:
             Some(&user_text),
             config.max_output_tokens,
         );
-        let resp = match chat_with_permit(client, &body, request_semaphore).await {
+        let resp = match chat_with_permit(client, &body, request_semaphore, cancel).await {
             Ok(r) => r,
             Err(e) => {
                 last_error = e.to_string();
@@ -3032,6 +3055,7 @@ async fn read_markscheme_window<C: LlmClient>(
     step: usize,
     system: &str,
     request_semaphore: &Arc<Semaphore>,
+    cancel: &AtomicBool,
 ) -> (Result<Vec<AiAnswer>, String>, ImportReport) {
     let mut report = ImportReport::default();
     let images: Vec<String> = pages[start..end]
@@ -3088,7 +3112,7 @@ async fn read_markscheme_window<C: LlmClient>(
             Some(&text),
             config.max_output_tokens,
         );
-        let resp = match chat_with_permit(client, &body, request_semaphore).await {
+        let resp = match chat_with_permit(client, &body, request_semaphore, cancel).await {
             Ok(r) => r,
             Err(e) => {
                 last_error = e.to_string();
@@ -3184,12 +3208,14 @@ pub async fn run_markscheme_pipeline<C: LlmClient, P: Progress>(
             step,
             &system,
             &request_semaphore,
+            cancel,
         )
         .map(move |result| (position, result))
     }))
     .buffer_unordered(config.parallelism.max(1));
     let mut ordered_results = Vec::with_capacity(windows.len());
     while let Some(result) = results.next().await {
+        cancelled(cancel)?;
         ordered_results.push(result);
     }
     ordered_results.sort_by_key(|(position, _)| *position);
@@ -3727,8 +3753,9 @@ mod tests {
             PAGE_RENDER_CACHE_CAPACITY,
         ));
         let semaphore = Arc::new(Semaphore::new(1));
+        let cancel = cancel_flag();
         let (built_opt, report) =
-            extract_span(&mock, &config(), &span, &span_pages, &cache, &semaphore).await;
+            extract_span(&mock, &config(), &span, &span_pages, &cache, &semaphore, &cancel).await;
         let built = built_opt.expect("question must build after the repair round");
 
         assert_eq!(mock.remaining(), 0, "both attempts consumed");
@@ -3774,8 +3801,9 @@ mod tests {
             PAGE_RENDER_CACHE_CAPACITY,
         ));
         let semaphore = Arc::new(Semaphore::new(1));
+        let cancel = cancel_flag();
         let (built_opt, report) =
-            extract_span(&mock, &config(), &span, &span_pages, &cache, &semaphore).await;
+            extract_span(&mock, &config(), &span, &span_pages, &cache, &semaphore, &cancel).await;
         let built = built_opt.expect("split span must build");
 
         assert!(built.content.contains("First page content."));
@@ -3841,8 +3869,9 @@ mod tests {
             PAGE_RENDER_CACHE_CAPACITY,
         ));
         let semaphore = Arc::new(Semaphore::new(1));
+        let cancel = cancel_flag();
         let (built_opt, report) =
-            extract_span(&mock, &config(), &span, &span_pages, &cache, &semaphore).await;
+            extract_span(&mock, &config(), &span, &span_pages, &cache, &semaphore, &cancel).await;
         let built = built_opt.expect("transcription must survive even when boxes never pass");
 
         assert!(

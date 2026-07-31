@@ -8,8 +8,10 @@ use base64::Engine;
 use image::{DynamicImage, ImageFormat};
 use std::io::Cursor;
 use std::sync::OnceLock;
+use tauri::{AppHandle, Manager};
 
 static PDFIUM_INSTANCE: OnceLock<Result<Pdfium, String>> = OnceLock::new();
+static PDFIUM_RESOURCE_DIR: OnceLock<std::path::PathBuf> = OnceLock::new();
 
 struct PageRenderCacheState {
     pages: HashMap<usize, Arc<DynamicImage>>,
@@ -83,51 +85,53 @@ impl PageRenderCache {
     }
 }
 
+pub fn initialize_pdfium(app_handle: &AppHandle) -> Result<(), String> {
+    let resource_dir = app_handle
+        .path()
+        .resource_dir()
+        .map_err(|error| format!("failed to resolve Tauri resource directory: {error}"))?;
+    let _ = PDFIUM_RESOURCE_DIR.set(resource_dir);
+    get_pdfium().map(|_| ())
+}
+
 fn get_pdfium() -> Result<&'static Pdfium, String> {
     PDFIUM_INSTANCE.get_or_init(|| {
-        #[cfg(target_os = "macos")]
-        let bindings = {
-            // On macOS, prefer the bundled dylib inside the .app/Frameworks
-            // directory. Fall back to system library search for development.
-            let exe_dir = std::env::current_exe()
-                .ok()
-                .and_then(|p| p.parent().map(|d| d.to_path_buf()))
-                .unwrap_or_else(|| std::path::PathBuf::from("."));
-            let bundled_paths = [
-                exe_dir.join("../Frameworks/libpdfium.dylib"),
-                exe_dir.join("libpdfium.dylib"),
-                exe_dir.join("../Resources/libpdfium.dylib"),
-            ];
-            let mut last_err = String::new();
-            let mut bound = None;
-            for lib_path in &bundled_paths {
-                if lib_path.exists() {
-                    match Pdfium::bind_to_library(lib_path.to_str().unwrap_or("")) {
-                        Ok(b) => {
-                            bound = Some(b);
-                            break;
-                        }
-                        Err(e) => {
-                            last_err = format!("{:?}: {:?}", lib_path, e);
-                        }
-                    }
-                }
-            }
-            if let Some(b) = bound {
-                b
-            } else {
-                // Development fallback: try system paths (brew, etc.)
-                Pdfium::bind_to_system_library()
-                    .map_err(|e| format!(
-                        "Failed to bind to pdfium. Tried bundled paths ({}) and system library: {:?}",
-                        last_err, e
-                    ))?
-            }
+        let filename = if cfg!(target_os = "windows") {
+            "pdfium.dll"
+        } else if cfg!(target_os = "macos") {
+            "libpdfium.dylib"
+        } else {
+            "libpdfium.so"
         };
+        let mut candidates = Vec::new();
+        if let Some(resource_dir) = PDFIUM_RESOURCE_DIR.get() {
+            candidates.push(resource_dir.join("libs").join(filename));
+            candidates.push(resource_dir.join(filename));
+        }
+        if let Ok(exe_dir) = std::env::current_exe()
+            .and_then(|path| path.parent().map(|parent| parent.to_path_buf()).ok_or(std::io::Error::other("missing executable directory")))
+        {
+            candidates.push(exe_dir.join(filename));
+            #[cfg(target_os = "macos")]
+            candidates.push(exe_dir.join("../Frameworks").join(filename));
+        }
 
-        #[cfg(not(target_os = "macos"))]
-        let bindings = Pdfium::bind_to_system_library()
-            .map_err(|e| format!("Failed to bind to pdfium: {:?}", e))?;
+        let mut last_error = None;
+        for path in candidates.iter().filter(|path| path.is_file()) {
+            match Pdfium::bind_to_library(path.to_string_lossy().as_ref()) {
+                Ok(bindings) => return Ok(Pdfium::new(bindings)),
+                Err(error) => last_error = Some(format!("{}: {:?}", path.display(), error)),
+            }
+        }
+
+        let bindings = Pdfium::bind_to_system_library().map_err(|error| {
+            format!(
+                "failed to bind bundled {} or system PDFium: {:?} (last bundled error: {})",
+                filename,
+                error,
+                last_error.unwrap_or_else(|| "no bundled candidate found".to_string())
+            )
+        })?;
 
         Ok(Pdfium::new(bindings))
     }).as_ref().map_err(|e| e.clone())

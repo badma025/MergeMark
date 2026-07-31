@@ -563,6 +563,92 @@ pub async fn export_worksheet_markdown(
     Ok(header)
 }
 
+fn find_pdflatex() -> Option<std::path::PathBuf> {
+    #[cfg(target_os = "macos")]
+    {
+        for candidate in [
+            "/Library/TeX/texbin/pdflatex",
+            "/opt/homebrew/bin/pdflatex",
+            "/usr/local/bin/pdflatex",
+        ] {
+            let path = std::path::PathBuf::from(candidate);
+            if path.is_file() {
+                return Some(path);
+            }
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    if let Some(local_app_data) = std::env::var_os("LOCALAPPDATA") {
+        let path = std::path::PathBuf::from(local_app_data)
+            .join("Programs")
+            .join("MiKTeX")
+            .join("miktex")
+            .join("bin")
+            .join("x64")
+            .join("pdflatex.exe");
+        if path.is_file() {
+            return Some(path);
+        }
+    }
+
+    let executable = if cfg!(target_os = "windows") {
+        "pdflatex.exe"
+    } else {
+        "pdflatex"
+    };
+    std::env::var_os("PATH")
+        .into_iter()
+        .flat_map(|path| std::env::split_paths(&path).collect::<Vec<_>>())
+        .map(|directory| directory.join(executable))
+        .find(|path| path.is_file())
+}
+
+struct TempDirCleanup(std::path::PathBuf);
+
+impl Drop for TempDirCleanup {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+async fn run_pdflatex(
+    pdflatex_path: &std::path::Path,
+    working_directory: &std::path::Path,
+    tex_file: &std::path::Path,
+) -> Result<std::process::Output, String> {
+    let output = tokio::time::timeout(
+        std::time::Duration::from_secs(120),
+        tokio::process::Command::new(pdflatex_path)
+            .current_dir(working_directory)
+            .arg("-interaction=nonstopmode")
+            .arg("-halt-on-error")
+            .arg("-output-directory")
+            .arg(working_directory)
+            .arg(tex_file)
+            .output(),
+    )
+    .await
+    .map_err(|_| {
+        format!(
+            "pdflatex timed out after 120 seconds while compiling {}",
+            tex_file.display()
+        )
+    })?
+    .map_err(|error| format!("Failed to execute pdflatex: {error}"))?;
+
+    if !output.status.success() {
+        return Err(format!(
+            "pdflatex exited with {}:\n{}\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+
+    Ok(output)
+}
+
 #[tauri::command]
 pub async fn compile_worksheet(
     app: tauri::AppHandle,
@@ -878,77 +964,50 @@ pub async fn compile_worksheet(
     let worksheet_stem = format!("{}", base_name);
     let answer_stem = format!("{}_answers", base_name);
 
-    let worksheet_tex = download_dir.join(format!("{}.tex", worksheet_stem));
-    let answer_key_tex = download_dir.join(format!("{}.tex", answer_stem));
+    let work_dir = std::env::temp_dir()
+        .join("MergeMark")
+        .join(uuid::Uuid::new_v4().to_string());
+    std::fs::create_dir_all(&work_dir)
+        .map_err(|error| format!("Failed to create LaTeX work directory: {error}"))?;
+    let _cleanup = TempDirCleanup(work_dir.clone());
+
+    let worksheet_tex = work_dir.join(format!("{}.tex", worksheet_stem));
+    let answer_key_tex = work_dir.join(format!("{}.tex", answer_stem));
 
     std::fs::write(&worksheet_tex, &latex)
         .map_err(|e| format!("Failed to write worksheet file: {}", e))?;
     std::fs::write(&answer_key_tex, &answer_latex)
         .map_err(|e| format!("Failed to write answer key file: {}", e))?;
 
-    let pdflatex_cmd = if std::process::Command::new("pdflatex")
-        .arg("--version")
-        .output()
-        .is_ok()
-    {
-        "pdflatex".to_string()
-    } else if let Some(local_app_data) = std::env::var_os("LOCALAPPDATA") {
-        let miktex_path = std::path::PathBuf::from(local_app_data)
-            .join("Programs\\MiKTeX\\miktex\\bin\\x64\\pdflatex.exe");
-        if miktex_path.exists() {
-            miktex_path.to_string_lossy().to_string()
-        } else {
-            "pdflatex".to_string()
-        }
-    } else {
-        "pdflatex".to_string()
-    };
+    let pdflatex_path = find_pdflatex()
+        .ok_or_else(|| "pdflatex was not found in the standard installation paths or PATH".to_string())?;
 
-    let output_worksheet = std::process::Command::new(&pdflatex_cmd)
-        .current_dir(&download_dir)
-        .arg("-interaction=nonstopmode")
-        .arg("-output-directory")
-        .arg(&download_dir)
-        .arg(&worksheet_tex)
-        .output()
-        .map_err(|e| format!("Failed to execute pdflatex for worksheet: {}", e))?;
+    run_pdflatex(&pdflatex_path, &work_dir, &worksheet_tex).await?;
 
+    let worksheet_temp_pdf = work_dir.join(format!("{}.pdf", worksheet_stem));
     let worksheet_pdf = download_dir.join(format!("{}.pdf", worksheet_stem));
-    if !worksheet_pdf.exists() {
-        let stdout = String::from_utf8_lossy(&output_worksheet.stdout);
-        let stderr = String::from_utf8_lossy(&output_worksheet.stderr);
+    if !worksheet_temp_pdf.exists() {
         return Err(format!(
-            "pdflatex failed to generate worksheet PDF:\n{}\n{}",
-            stdout, stderr
+            "pdflatex completed successfully but did not generate {}",
+            worksheet_temp_pdf.display()
         ));
     }
 
-    let output_answer_key = std::process::Command::new(&pdflatex_cmd)
-        .current_dir(&download_dir)
-        .arg("-interaction=nonstopmode")
-        .arg("-output-directory")
-        .arg(&download_dir)
-        .arg(&answer_key_tex)
-        .output()
-        .map_err(|e| format!("Failed to execute pdflatex for answer key: {}", e))?;
+    run_pdflatex(&pdflatex_path, &work_dir, &answer_key_tex).await?;
 
+    let answer_key_temp_pdf = work_dir.join(format!("{}.pdf", answer_stem));
     let answer_key_pdf = download_dir.join(format!("{}.pdf", answer_stem));
-    if !answer_key_pdf.exists() {
-        let stdout = String::from_utf8_lossy(&output_answer_key.stdout);
-        let stderr = String::from_utf8_lossy(&output_answer_key.stderr);
+    if !answer_key_temp_pdf.exists() {
         return Err(format!(
-            "pdflatex failed to generate answer key PDF:\n{}\n{}",
-            stdout, stderr
+            "pdflatex completed successfully but did not generate {}",
+            answer_key_temp_pdf.display()
         ));
     }
 
-    // Clean up all intermediary files
-    let _ = std::fs::remove_file(download_dir.join(format!("{}.tex", worksheet_stem)));
-    let _ = std::fs::remove_file(download_dir.join(format!("{}.aux", worksheet_stem)));
-    let _ = std::fs::remove_file(download_dir.join(format!("{}.log", worksheet_stem)));
-    let _ = std::fs::remove_file(download_dir.join(format!("{}.tex", answer_stem)));
-    let _ = std::fs::remove_file(download_dir.join(format!("{}.aux", answer_stem)));
-    let _ = std::fs::remove_file(download_dir.join(format!("{}.log", answer_stem)));
+    std::fs::rename(&worksheet_temp_pdf, &worksheet_pdf)
+        .map_err(|error| format!("Failed to move worksheet PDF into Downloads: {error}"))?;
+    std::fs::rename(&answer_key_temp_pdf, &answer_key_pdf)
+        .map_err(|error| format!("Failed to move answer key PDF into Downloads: {error}"))?;
 
     Ok(vec![
         worksheet_pdf.to_string_lossy().to_string(),

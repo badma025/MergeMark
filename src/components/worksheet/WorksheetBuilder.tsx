@@ -22,6 +22,7 @@ import { Button } from "@/components/ui/button";
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogDescription, DialogFooter } from "@/components/ui/dialog";
 import { WorksheetItem, type WorksheetItemData } from "./WorksheetItem";
 import { cn } from "@/lib/utils";
+import { parseTauriError } from "@/lib/tauriError";
 
 // ── Stat badge ────────────────────────────────────────────────────────────────
 
@@ -94,11 +95,12 @@ export function WorksheetBuilder({ selectedQuestions, onRemove, onReorder }: Wor
         duration: 8000,
       });
     } catch (err) {
-      if (err === "PDFLATEX_NOT_FOUND") {
+      const errorMessage = parseTauriError(err);
+      if (errorMessage === "PDFLATEX_NOT_FOUND" || errorMessage.includes("pdflatex was not found")) {
         setShowPdfLatexError(true);
       } else {
         toast.error("Compilation failed", {
-          description: String(err),
+          description: errorMessage,
           duration: 8000,
         });
       }
@@ -129,7 +131,7 @@ export function WorksheetBuilder({ selectedQuestions, onRemove, onReorder }: Wor
       setShowPdfLatexError(false);
     } catch (err) {
       toast.error("Markdown export failed", {
-        description: String(err)
+        description: parseTauriError(err)
       });
     }
   }

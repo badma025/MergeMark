@@ -7,6 +7,19 @@ export function cn(...inputs: ClassValue[]) {
 
 export function sanitizeMarkdownMath(text: string): string {
   if (!text) return text;
+  // Match the backend sanitizer so existing cards with older malformed
+  // content are repaired before remark-math sees them.
+  text = text.replace(/\r\n?/g, "\n");
+  text = text.replace(/\s*(!\[.*?\]\(.*?\))\s*/gs, "\n\n$1\n\n");
+  text = text.replace(/^((?:(?!\$\$).)*)\$\$\s*$/gm, (whole, body: string) => {
+    if (!body.trim()) return whole;
+    // A whole-line display cannot contain nested inline delimiters.
+    const displayBody = body.replace(/(^|[^\\])\$/g, "$1");
+    return `$$${displayBody}$$`;
+  });
+  text = text.replace(/,\s*\$\$/g, () => "$$");
+  text = text.replace(/\.\s*\$\$/g, () => "$$.");
+
   let inBlock = false;
   let lines = text.split('\n');
   let outputLines = [];
@@ -70,5 +83,5 @@ export function sanitizeMarkdownMath(text: string): string {
       outputLines.push("$$");
   }
 
-  return outputLines.join("\n");
+  return outputLines.join("\n").replace(/\n{3,}/g, "\n\n");
 }

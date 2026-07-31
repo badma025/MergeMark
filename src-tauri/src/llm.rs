@@ -8,6 +8,8 @@
 
 #[derive(Debug, Clone)]
 pub enum LlmError {
+    /// The owning import was cancelled by the user.
+    Cancelled,
     /// request never got a usable HTTP response
     Network(String),
     /// a non-success HTTP status
@@ -21,6 +23,7 @@ pub enum LlmError {
 impl std::fmt::Display for LlmError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            LlmError::Cancelled => write!(f, "Import cancelled by user"),
             LlmError::Network(e) => write!(f, "network error: {e}"),
             LlmError::Http { status, body } => {
                 let snippet: String = body.chars().take(300).collect();
@@ -184,12 +187,27 @@ impl LlmClient for ReqwestLlm {
                 "{}/chat/completions",
                 self.config.base_url.trim_end_matches('/')
             );
+            let raw_key = self.config.api_key.trim();
+            if raw_key.is_empty() {
+                return Err(LlmError::BadShape("BYOK API key is empty".to_string()));
+            }
+            let token = raw_key
+                .strip_prefix("Bearer ")
+                .or_else(|| raw_key.strip_prefix("bearer "))
+                .unwrap_or(raw_key)
+                .trim();
+            if token.is_empty() {
+                return Err(LlmError::BadShape(
+                    "BYOK API key contains no token".to_string(),
+                ));
+            }
+            let authorization = format!("Bearer {token}");
             let mut attempt: u32 = 0;
             loop {
                 let res = self
                     .client
                     .post(&url)
-                    .header("Authorization", format!("Bearer {}", self.config.api_key))
+                    .header(reqwest::header::AUTHORIZATION, &authorization)
                     .timeout(self.config.timeout)
                     .json(body)
                     .send()

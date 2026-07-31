@@ -10,6 +10,7 @@ import { cn } from "@/lib/utils";
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { Button } from "@/components/ui/button";
 import { useTaxonomy } from "@/lib/TaxonomyContext";
+import { parseTauriError } from "@/lib/tauriError";
 
 export interface Quarantine { scope: string; page?: number; questionNumber?: number; reason: string }
 export interface TimingEntry {
@@ -62,6 +63,7 @@ export function IngestionDropzone({ isActive = false, onSuccess }: IngestionDrop
   const [pendingMappings, setPendingMappings] = useState<ProposedMapping[] | null>(null);
   const [isDraggingOver, setIsDraggingOver] = useState(false);
   const [isProcessing, setIsProcessing] = useState(false);
+  const [isCancelling, setIsCancelling] = useState(false);
   const [progressMsg, setProgressMsg] = useState("");
   const [lastFile, setLastFile] = useState<string | null>(null);
   const [reports, setReports] = useState<ImportReport[]>([]);
@@ -225,7 +227,7 @@ export function IngestionDropzone({ isActive = false, onSuccess }: IngestionDrop
         if (onSuccess) onSuccess();
       }
     } catch (err) {
-      const errMsg = String(err);
+      const errMsg = parseTauriError(err);
       if (errMsg.includes("Import cancelled by user")) {
         toast.info("Import Cancelled", {
           description: `Stopped processing ${paperName}`,
@@ -242,6 +244,7 @@ export function IngestionDropzone({ isActive = false, onSuccess }: IngestionDrop
       setLastFile(null);
       setProgressMsg("");
       setIsProcessing(false);
+      setIsCancelling(false);
     }
   }
 
@@ -263,6 +266,7 @@ export function IngestionDropzone({ isActive = false, onSuccess }: IngestionDrop
   }, [isActive]);
 
   useEffect(() => {
+    let disposed = false;
     let unlisten: (() => void) | undefined;
     
     import("@tauri-apps/api/webview").then(({ getCurrentWebview }) => {
@@ -301,11 +305,16 @@ export function IngestionDropzone({ isActive = false, onSuccess }: IngestionDrop
           }
         }
       }).then(fn => {
-        unlisten = fn;
+        if (disposed) {
+          fn();
+        } else {
+          unlisten = fn;
+        }
       }).catch(console.error);
     }).catch(console.error);
 
     return () => {
+      disposed = true;
       if (unlisten) unlisten();
     };
   }, []);
@@ -547,11 +556,16 @@ export function IngestionDropzone({ isActive = false, onSuccess }: IngestionDrop
                 type="button"
                 onClick={(e) => {
                   e.stopPropagation();
-                  invoke("cancel_import").catch(console.error);
+                  setIsCancelling(true);
+                  invoke("cancel_import").catch((error) => {
+                    setIsCancelling(false);
+                    console.error(error);
+                  });
                 }}
+                disabled={isCancelling}
                 className="pointer-events-auto px-4 py-1.5 text-xs font-semibold text-destructive-foreground bg-destructive hover:bg-destructive/90 rounded-md transition-colors shadow-sm"
               >
-                Cancel Import
+                {isCancelling ? "Cancelling…" : "Cancel Import"}
               </button>
             </>
           ) : (

@@ -310,6 +310,19 @@ pub async fn call_byok_direct(
     user_text: &str,
 ) -> Result<serde_json::Value, BillingError> {
     let client = build_client();
+    let raw_key = byok_api_key.trim();
+    if raw_key.is_empty() {
+        return Err(BillingError::network("BYOK API key is empty"));
+    }
+    let token = raw_key
+        .strip_prefix("Bearer ")
+        .or_else(|| raw_key.strip_prefix("bearer "))
+        .unwrap_or(raw_key)
+        .trim();
+    if token.is_empty() {
+        return Err(BillingError::network("BYOK API key contains no token"));
+    }
+    let authorization = format!("Bearer {token}");
     let url = format!(
         "{}/chat/completions",
         byok_base_url.trim_end_matches('/')
@@ -328,7 +341,7 @@ pub async fn call_byok_direct(
 
     let res = client
         .post(&url)
-        .header("Authorization", format!("Bearer {}", byok_api_key))
+        .header(reqwest::header::AUTHORIZATION, authorization)
         .header("Content-Type", "application/json")
         .timeout(REQUEST_TIMEOUT)
         .json(&body)
