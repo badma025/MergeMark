@@ -430,6 +430,349 @@ pub fn clean_question_content(content: &str) -> String {
     sanitize_markdown_math(&hardened)
 }
 
+// ── Unified Math Normalization Suite (Objectives 1, 2, 3) ──────────────────
+
+const MATRIX_ENVS: &[&str] = &[
+    "pmatrix",
+    "bmatrix",
+    "vmatrix",
+    "Vmatrix",
+    "Bmatrix",
+    "matrix",
+    "smallmatrix",
+    "array",
+    "cases",
+    "aligned",
+    "align",
+    "align*",
+    "gather",
+    "gather*",
+    "gathered",
+    "tabular",
+    "tabular*",
+];
+
+fn is_matrix_begin_env(s: &str) -> bool {
+    MATRIX_ENVS
+        .iter()
+        .any(|env| s.contains(&format!("\\begin{{{}}}", env)))
+}
+
+fn is_matrix_end_env(s: &str) -> bool {
+    MATRIX_ENVS
+        .iter()
+        .any(|env| s.contains(&format!("\\end{{{}}}", env)))
+}
+
+#[derive(Debug, Clone, Copy)]
+struct DisplaySpan {
+    start: usize,
+    end: usize,
+    inner_start: usize,
+    inner_end: usize,
+}
+
+fn find_display_spans(text: &str) -> Vec<DisplaySpan> {
+    let mut spans = Vec::new();
+    let mut cursor = 0;
+    while let Some(rel_start) = text[cursor..].find("$$") {
+        let start = cursor + rel_start;
+        let inner_start = start + 2;
+        if let Some(rel_end) = text[inner_start..].find("$$") {
+            let inner_end = inner_start + rel_end;
+            let end = inner_end + 2;
+            spans.push(DisplaySpan {
+                start,
+                end,
+                inner_start,
+                inner_end,
+            });
+            cursor = end;
+        } else {
+            break;
+        }
+    }
+    spans
+}
+
+fn should_merge_display_math(sep: &str, left_inner: &str, right_inner: &str) -> bool {
+    let sep_trim = sep.trim();
+    if !sep_trim.is_empty() {
+        if sep_trim
+            .chars()
+            .any(|c| matches!(c, '.' | ';' | ':' | '!' | '?' | ','))
+        {
+            return false;
+        }
+        let stripped = re(r"\\[a-zA-Z]+").replace_all(sep_trim, "");
+        if re(r"[a-zA-Z]{2,}").is_match(&stripped) {
+            return false;
+        }
+        true
+    } else {
+        let matrix_envs = [
+            r"\begin{pmatrix}",
+            r"\begin{bmatrix}",
+            r"\begin{vmatrix}",
+            r"\begin{Vmatrix}",
+            r"\begin{Bmatrix}",
+            r"\begin{matrix}",
+            r"\begin{array}",
+            r"\begin{smallmatrix}",
+            r"\begin{cases}",
+        ];
+        if matrix_envs
+            .iter()
+            .any(|e| left_inner.contains(e) || right_inner.contains(e))
+        {
+            return true;
+        }
+        let op_end_re = re(
+            r"(?:=|\+|-|\*|/|\\times|\\cdot|\\le|\\ge|<|>|\\approx|\\equiv|\\to|\\rightarrow|\\Rightarrow|\(|\[|\{)\s*$",
+        );
+        let op_start_re = re(
+            r"^\s*(?:=|\+|-|\*|/|\\times|\\cdot|\\le|\\ge|<|>|\\pm|\\mp|\\approx|\\equiv|\\to|\\rightarrow|\\Rightarrow|\)|\]|\})",
+        );
+        op_end_re.is_match(left_inner) || op_start_re.is_match(right_inner)
+    }
+}
+
+/// Objective 1: Consolidate Fragmented Display Math.
+/// Detects single equations shattered across multiple `$$ ... $$` display blocks
+/// and merges them into a single, valid display math environment.
+pub fn consolidate_display_math(text: &str) -> String {
+    let spans = find_display_spans(text);
+    if spans.is_empty() {
+        return text.to_string();
+    }
+
+    let mut clusters: Vec<Vec<usize>> = Vec::new();
+    let mut current_cluster = vec![0];
+
+    for i in 0..(spans.len() - 1) {
+        let left_idx = spans[i];
+        let right_idx = spans[i + 1];
+        let sep = &text[left_idx.end..right_idx.start];
+        let left_inner = &text[left_idx.inner_start..left_idx.inner_end];
+        let right_inner = &text[right_idx.inner_start..right_idx.inner_end];
+
+        if should_merge_display_math(sep, left_inner, right_inner) {
+            current_cluster.push(i + 1);
+        } else {
+            clusters.push(current_cluster);
+            current_cluster = vec![i + 1];
+        }
+    }
+    clusters.push(current_cluster);
+
+    if clusters.iter().all(|c| c.len() <= 1) {
+        return text.to_string();
+    }
+
+    let mut result = String::with_capacity(text.len());
+    let mut cursor = 0;
+    for cluster in clusters {
+        let first_span = &spans[*cluster.first().unwrap()];
+        let last_span = &spans[*cluster.last().unwrap()];
+        result.push_str(&text[cursor..first_span.start]);
+        if cluster.len() == 1 {
+            result.push_str(&text[first_span.start..last_span.end]);
+        } else {
+            let mut pieces = Vec::new();
+            for (idx_in_cluster, &span_idx) in cluster.iter().enumerate() {
+                let span = &spans[span_idx];
+                let inner = text[span.inner_start..span.inner_end].trim();
+                if !inner.is_empty() {
+                    pieces.push(inner);
+                }
+                if idx_in_cluster + 1 < cluster.len() {
+                    let next_span = &spans[cluster[idx_in_cluster + 1]];
+                    let sep_trim = text[span.end..next_span.start].trim();
+                    if !sep_trim.is_empty() {
+                        pieces.push(sep_trim);
+                    }
+                }
+            }
+            let merged_inner = pieces.join(" ");
+            result.push_str("$$ ");
+            result.push_str(&merged_inner);
+            result.push_str(" $$");
+        }
+        cursor = last_span.end;
+    }
+    result.push_str(&text[cursor..]);
+    result
+}
+
+fn starts_with_matrix_begin(chars: &[char], idx: usize) -> Option<usize> {
+    let sub: String = chars[idx..chars.len().min(idx + 25)].iter().collect();
+    for env in MATRIX_ENVS {
+        let pat = format!("\\begin{{{}}}", env);
+        if sub.starts_with(&pat) {
+            return Some(pat.chars().count());
+        }
+    }
+    None
+}
+
+fn starts_with_matrix_end(chars: &[char], idx: usize) -> Option<usize> {
+    let sub: String = chars[idx..chars.len().min(idx + 25)].iter().collect();
+    for env in MATRIX_ENVS {
+        let pat = format!("\\end{{{}}}", env);
+        if sub.starts_with(&pat) {
+            return Some(pat.chars().count());
+        }
+    }
+    None
+}
+
+/// Objective 2: Repair Matrix Row Breaks.
+/// Normalizes single backslashes (`\`) for row breaks inside matrix environments
+/// (`pmatrix`, `bmatrix`, `vmatrix`, etc.) to double backslashes (`\\`) safely
+/// without double-escaping valid syntax or touching LaTeX macro commands.
+pub fn repair_matrix_row_breaks(text: &str) -> String {
+    let chars: Vec<char> = text.chars().collect();
+    let mut out = String::with_capacity(text.len() + 32);
+    let mut env_depth: usize = 0;
+    let mut i = 0;
+    let n = chars.len();
+
+    while i < n {
+        if let Some(l_begin) = starts_with_matrix_begin(&chars, i) {
+            env_depth += 1;
+            for j in 0..l_begin {
+                out.push(chars[i + j]);
+            }
+            i += l_begin;
+            continue;
+        }
+
+        if let Some(l_end) = starts_with_matrix_end(&chars, i) {
+            env_depth = env_depth.saturating_sub(1);
+            for j in 0..l_end {
+                out.push(chars[i + j]);
+            }
+            i += l_end;
+            continue;
+        }
+
+        if env_depth > 0 && chars[i] == '\\' {
+            if i + 1 < n && chars[i + 1] == '\\' {
+                out.push('\\');
+                out.push('\\');
+                i += 2;
+                continue;
+            } else if i + 1 < n
+                && (chars[i + 1].is_ascii_alphabetic()
+                    || matches!(
+                        chars[i + 1],
+                        '{' | '}' | '%' | '_' | '$' | '#' | '&' | ',' | ';' | ':' | '!'
+                    ))
+            {
+                out.push('\\');
+                out.push(chars[i + 1]);
+                i += 2;
+                continue;
+            } else {
+                out.push('\\');
+                out.push('\\');
+                i += 1;
+                continue;
+            }
+        }
+
+        out.push(chars[i]);
+        i += 1;
+    }
+
+    out
+}
+
+fn is_escaped_dollar(chars: &[char], idx: usize) -> bool {
+    let mut count = 0;
+    let mut j = idx;
+    while j > 0 && chars[j - 1] == '\\' {
+        count += 1;
+        j -= 1;
+    }
+    count % 2 != 0
+}
+
+/// Objective 3: Enforce Inline Math Boundaries.
+/// Guarantees a single space is inserted outside inline `$` delimiters when
+/// adjacent to alphanumeric characters, while strictly preserving standard
+/// sentence punctuation and leaving display math `$$ ... $$` untouched.
+pub fn enforce_inline_math_boundaries(text: &str) -> String {
+    let chars: Vec<char> = text.chars().collect();
+    let mut out = String::with_capacity(text.len() + 32);
+    let mut in_inline_math = false;
+    let mut i = 0;
+    let n = chars.len();
+
+    while i < n {
+        if chars[i] == '$'
+            && i + 1 < n
+            && chars[i + 1] == '$'
+            && !in_inline_math
+            && !is_escaped_dollar(&chars, i)
+        {
+            out.push('$');
+            out.push('$');
+            i += 2;
+            while i < n {
+                if chars[i] == '$'
+                    && i + 1 < n
+                    && chars[i + 1] == '$'
+                    && !is_escaped_dollar(&chars, i)
+                {
+                    out.push('$');
+                    out.push('$');
+                    i += 2;
+                    break;
+                } else {
+                    out.push(chars[i]);
+                    i += 1;
+                }
+            }
+            continue;
+        }
+
+        if chars[i] == '$' && !is_escaped_dollar(&chars, i) {
+            if !in_inline_math {
+                if out.chars().last().map_or(false, |c| c.is_alphanumeric()) {
+                    out.push(' ');
+                }
+                out.push('$');
+                in_inline_math = true;
+                i += 1;
+                continue;
+            } else {
+                out.push('$');
+                if i + 1 < n && chars[i + 1].is_alphanumeric() {
+                    out.push(' ');
+                }
+                in_inline_math = false;
+                i += 1;
+                continue;
+            }
+        }
+
+        out.push(chars[i]);
+        i += 1;
+    }
+
+    out
+}
+
+/// Unified normalization pipeline that applies display consolidation,
+/// matrix row-break repair, and inline math boundary enforcement in order.
+pub fn normalize_math_blocks(text: &str) -> String {
+    let s1 = consolidate_display_math(text);
+    let s2 = repair_matrix_row_breaks(&s1);
+    let s3 = enforce_inline_math_boundaries(&s2);
+    s3
+}
+
 /// Repair common LLM/PDF LaTeX damage before balancing Markdown delimiters.
 ///
 /// This deliberately handles structure rather than trying to be a LaTeX
@@ -462,17 +805,17 @@ pub fn repair_latex_syntax(text: &str) -> String {
             continue;
         }
 
-        if line.contains(r"\begin{array}") || line.contains(r"\begin{matrix}") {
+        if is_matrix_begin_env(&line) {
             in_array = true;
             array_lines.push(line);
-            if array_lines.last().is_some_and(|s| s.contains(r"\end{array}") || s.contains(r"\end{matrix}")) {
+            if array_lines.last().is_some_and(|s| is_matrix_end_env(s)) {
                 append_array_block(&mut out, &mut array_lines);
                 in_array = false;
             }
             continue;
         }
         if in_array {
-            let closes_array = line.contains(r"\end{array}") || line.contains(r"\end{matrix}");
+            let closes_array = is_matrix_end_env(&line);
             array_lines.push(line);
             if closes_array {
                 append_array_block(&mut out, &mut array_lines);
@@ -485,8 +828,7 @@ pub fn repair_latex_syntax(text: &str) -> String {
         let bare_math = trimmed.starts_with(r"\left")
             || trimmed.starts_with(r"\frac")
             || trimmed.starts_with(r"\sqrt")
-            || trimmed.starts_with(r"\begin{array}")
-            || trimmed.starts_with(r"\begin{matrix}");
+            || is_matrix_begin_env(trimmed);
         if bare_math && !trimmed.contains('$') {
             line = format!("$$\n{}\n$$", trimmed);
         }
@@ -496,13 +838,24 @@ pub fn repair_latex_syntax(text: &str) -> String {
     if in_array && !array_lines.is_empty() {
         // Complete an accidentally truncated array rather than leaving an
         // unterminated environment for the Markdown/LaTeX renderer.
-        if !array_lines.iter().any(|line| line.contains(r"\end{array}")) {
-            array_lines.push(r"\end{array}".to_string());
+        if !array_lines.iter().any(|line| is_matrix_end_env(line)) {
+            let mut closer = r"\end{array}".to_string();
+            if let Some(first) = array_lines.first() {
+                for env in MATRIX_ENVS {
+                    let pat = format!("\\begin{{{}}}", env);
+                    if first.contains(&pat) {
+                        closer = format!("\\end{{{}}}", env);
+                        break;
+                    }
+                }
+            }
+            array_lines.push(closer);
         }
         append_array_block(&mut out, &mut array_lines);
     }
 
-    out.join("\n")
+    let res = out.join("\n");
+    normalize_math_blocks(&res)
 }
 
 fn append_array_block(out: &mut Vec<String>, lines: &mut Vec<String>) {
@@ -666,7 +1019,8 @@ pub fn sanitize_markdown_math(text: &str) -> String {
         lines.push("$$".to_string());
     }
 
-    lines.join("\n")
+    let balanced = lines.join("\n");
+    normalize_math_blocks(&balanced)
 }
 
 // ── Figure/diagram referral consistency ─────────────────────────────────────
@@ -1250,5 +1604,79 @@ N
         assert!(repaired.contains("| 6 | 500.4 | 512.7 | 499.5 | 504.2 |"), "{repaired}");
         assert!(!repaired.contains("**1**\n**2**\n**3**\n**Mean**"), "{repaired}");
         assert_eq!(sanitize_markdown_math(&repaired), repaired);
+    }
+
+    #[test]
+    fn consolidates_fragmented_display_math_blocks() {
+        let input = r#"$$ \begin{pmatrix}1\\2\end{pmatrix} $$ \lambda $$ \begin{pmatrix}3\\4\end{pmatrix} $$"#;
+        let output = consolidate_display_math(input);
+        assert_eq!(
+            output,
+            r#"$$ \begin{pmatrix}1\\2\end{pmatrix} \lambda \begin{pmatrix}3\\4\end{pmatrix} $$"#
+        );
+
+        let input_prose = r#"$$ A $$ where $$ B $$ is here."#;
+        assert_eq!(consolidate_display_math(input_prose), input_prose);
+
+        let input_spaces = r#"$$ \begin{pmatrix}1\end{pmatrix} $$ $$ \begin{pmatrix}2\end{pmatrix} $$"#;
+        assert_eq!(
+            consolidate_display_math(input_spaces),
+            r#"$$ \begin{pmatrix}1\end{pmatrix} \begin{pmatrix}2\end{pmatrix} $$"#
+        );
+    }
+
+    #[test]
+    fn repairs_matrix_row_breaks_safely() {
+        let m1 = r#"\begin{pmatrix} 1 & 2 \ 3 & 4 \end{pmatrix}"#;
+        assert_eq!(
+            repair_matrix_row_breaks(m1),
+            r#"\begin{pmatrix} 1 & 2 \\ 3 & 4 \end{pmatrix}"#
+        );
+
+        let m2 = r#"\begin{pmatrix} 1 & 2 \\ 3 & 4 \end{pmatrix}"#;
+        assert_eq!(repair_matrix_row_breaks(m2), m2); // no double-escaping
+
+        let m3 = r#"\begin{pmatrix} \alpha & \beta \\ \gamma & \delta \end{pmatrix}"#;
+        assert_eq!(repair_matrix_row_breaks(m3), m3); // macros preserved
+
+        let m4 = r#"\begin{pmatrix} 1 & 2 \ \hline 3 & 4 \end{pmatrix}"#;
+        assert_eq!(
+            repair_matrix_row_breaks(m4),
+            r#"\begin{pmatrix} 1 & 2 \\ \hline 3 & 4 \end{pmatrix}"#
+        );
+    }
+
+    #[test]
+    fn enforces_inline_math_boundaries_while_preserving_punctuation() {
+        let i1 = "where$a$and$b$";
+        assert_eq!(enforce_inline_math_boundaries(i1), "where $a$ and $b$");
+
+        let i2 = "$x$.";
+        assert_eq!(enforce_inline_math_boundaries(i2), "$x$.");
+
+        let i3 = "($x$, $y$)";
+        assert_eq!(enforce_inline_math_boundaries(i3), "($x$, $y$)");
+
+        let i4 = "Let$x=5$.Then$y=10$,and$z=15$.";
+        assert_eq!(
+            enforce_inline_math_boundaries(i4),
+            "Let $x=5$.Then $y=10$,and $z=15$."
+        );
+
+        let i5 = "$x$-axis";
+        assert_eq!(enforce_inline_math_boundaries(i5), "$x$-axis");
+
+        let i6 = "$$ where$a$ $$";
+        assert_eq!(enforce_inline_math_boundaries(i6), "$$ where$a$ $$");
+    }
+
+    #[test]
+    fn normalize_math_blocks_unified() {
+        let combo = r#"where$a$and$b$, and equation $$ \begin{pmatrix} 1 & 2 \ 3 & 4 \end{pmatrix} $$ \lambda $$ \begin{pmatrix} 5 & 6 \ 7 & 8 \end{pmatrix} $$. Here is $x$."#;
+        let res = normalize_math_blocks(combo);
+        assert_eq!(
+            res,
+            r#"where $a$ and $b$, and equation $$ \begin{pmatrix} 1 & 2 \\ 3 & 4 \end{pmatrix} \lambda \begin{pmatrix} 5 & 6 \\ 7 & 8 \end{pmatrix} $$. Here is $x$."#
+        );
     }
 }
