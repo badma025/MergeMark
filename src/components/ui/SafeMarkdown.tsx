@@ -8,6 +8,7 @@ interface SafeMarkdownProps {
 
 interface SafeMarkdownState {
   failed: boolean;
+  failureKey?: string;
 }
 
 /** Prevent one malformed KaTeX node from taking down an entire card. */
@@ -24,7 +25,7 @@ export class SafeMarkdown extends Component<SafeMarkdownProps, SafeMarkdownState
 
   componentDidUpdate(previous: SafeMarkdownProps) {
     if (this.state.failed && previous.rawText !== this.props.rawText) {
-      this.setState({ failed: false });
+      this.setState({ failed: false, failureKey: undefined });
     }
   }
 

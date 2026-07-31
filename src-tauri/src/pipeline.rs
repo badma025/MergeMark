@@ -864,13 +864,22 @@ The parser crop-checks every box: blank boxes, empty ruled grids, and duplicate 
 FORMATTING RULES:
 - OMIT the leading question number at the very start of the question text (e.g. if the text reads "17 Here is triangle ABC.", you MUST output "Here is triangle ABC." without the "17").
 - OMIT trailing answer line units, symbols, and answer templates at the very end of the question (e.g. "..................... %", "£ .....................", "..................... cm", or "............ $\\le t <$ ............"). Do NOT transcribe the answer blanks or the mathematical operators embedded within them.
-- Wrap inline math in single $...$. Use $$...$$ ONLY for display equations on their own line.
-- LATEX SAFETY: never place prose, Markdown emphasis such as **[5 marks]**, image links, [DIAGRAM_PLACEHOLDER], or ordinary instructions inside $...$, $$...$$, \begin{{aligned}}, or any other math environment. Use aligned only for multiple equation rows. Keep every $ and $$ delimiter balanced; never end content with a stray delimiter.
+- Use inline single `$...$` for any equation that appears within a sentence, list item, sub-question, or other prose line. Reserve display `$$` exclusively for a standalone equation: blank line, `$$` alone, equation content, `$$` alone, blank line. Never emit `prose $$equation$$`, `equation$$`, `$$equation`, `,$$`, or `.$$`.
+- LATEX SAFETY: never place prose, Markdown emphasis such as **[5 marks]**, image links, [DIAGRAM_PLACEHOLDER], or ordinary instructions inside math delimiters or \begin{{aligned}}. Keep every mark allocation as ordinary prose on its own line, immediately after the relevant sentence or equation. Use aligned only for multiple equation rows. Keep every $ and $$ delimiter balanced; never end content with a stray delimiter. Punctuation belongs in the surrounding prose: inline math is followed directly by punctuation, such as `$x=2$.`; a standalone display equation must not be followed by a punctuation-only line.
 - Tables of text/data: standard Markdown tables. Pure mathematical matrices or Simplex tableaus: LaTeX \begin{{array}} inside $$...$$. Never put $ inside array environments.
 - Multiple-choice options: keep their original capital letter labels (e.g. `A ...`, `B ...`) separated by newlines. Do NOT format them as lowercase sub-parts like `(a)`.
 - Code/pseudocode/SQL/identifiers: Markdown backticks, NEVER LaTeX math mode.
 - AQA decimal sub-parts: render '02.1'-style parts as (a), (b), (c) — positionally: .1 -> a, .2 -> b — and update inline cross-references accordingly. AQA also uses SPACED sub-parts: "01 5" means Question 1, sub-part 5 — render as (e). The whole question number is ALWAYS the integer before the space/dot. NEVER return decimals like 1.5 for spaced sub-parts. Whole-numbered MCQs are independent questions, never decimals.
-- JSON ESCAPING: backslashes in LaTeX MUST be escaped (\\frac, \\theta). Unescaped backslashes break the parser and your work is discarded.
+- JSON ESCAPING: backslashes in LaTeX MUST be escaped (\\frac, \\theta). Unescaped backslashes break the parser and your work is discarded. Before returning JSON, verify that inline equations remain inside their sentence/list item and that standalone display blocks have no prose, punctuation, or marks on delimiter lines.
+
+MARKDOWN & TYPOGRAPHY RULES:
+- Paragraph spacing: use double newlines (\n\n) before every sub-question label (**(a)**, **(b)**), every Roman numeral sub-part (**(i)**, **(ii)**), every display math block ($$...$$), and every mark allocation that does not naturally follow a sentence.
+- Inline math spacing: NEVER place spaces immediately inside inline delimiters. CORRECT: roots $\alpha$, $\beta$ and $\gamma$. INCORRECT: roots $ \alpha $, $ \beta $.
+- Matrices and column vectors: NEVER use \begin{{pmatrix}}, \begin{{vmatrix}}, or any matrix environment inside inline math ($...$). These must always be isolated in display math ($$...$$).
+- Typographic emphasis: bold all sub-question labels (**(a)**, **(b)(i)**) and all mark allocations (**[5 marks]**). Never use spaces between asterisks for bolding; `* * text * *` is wrong, `**text**` is correct.
+- Equal sign: `=` is a plain LaTeX character. Write `x = 2`, never `x \= 2`.
+- Variables and units: wrap every single-letter variable in inline `$...$`. Wrap every value-unit pair containing a superscript or subscript in inline `$...$` (for example: `$13.6 \\text{{ ms}}^{{-2}}$`). Never emit bare unit expressions with superscripts or subscripts as plain text.
+
 - The content MUST end with terminal punctuation or a mark tag. Never stop mid-sentence."#,
         number = span.number,
         paper = config.paper_name,
@@ -884,7 +893,7 @@ fn markscheme_system_prompt() -> String {
 
 ESCAPE HATCH: If the images show only front covers, general marking guidance, abbreviation lists, or formula booklets, return an empty array. NEVER invent questions to fill the output.
 
-LATEX SAFETY: output Markdown and LaTeX separately. Never put prose, **[marks]**, image links, or [DIAGRAM_PLACEHOLDER] inside math delimiters or aligned/array environments. Keep every $ and $$ delimiter balanced.
+LATEX SAFETY: output Markdown and LaTeX separately. Use single `$...$` for math inside prose or list items. Use a three-line `$$` block only for a standalone equation. Never put prose, **[marks]**, image links, or [DIAGRAM_PLACEHOLDER] inside math delimiters or aligned/array environments. Keep every delimiter balanced and keep mark allocations on their own prose lines.
 EXTRACTION GUARDRAIL: Only extract entries with explicit mark-scheme structure: a question-number column header (e.g. 1(a), 2(b)(i)) AND mark labels (M1, A1, B1, dM1, ft). Numbered lists in guidance pages are NOT mark schemes.
 
 Each array item: { "question_number": int (WHOLE question only; AQA 03.1 → 3), "answer_markdown": string, "diagram_bboxes": [[x,y,w,h]...] relative 0.0-1.0, "diagram_page_indexes": [ints, same length as bboxes, 0-based image index] }.
@@ -897,6 +906,14 @@ RULES:
 - Data/trace tables: Markdown tables. True matrices/Simplex tableaus: \begin{array} in $$...$$.
 - Diagrams (activity networks, Gantt charts, trees, graphs): capture via diagram_bboxes + diagram_page_indexes and insert [DIAGRAM_PLACEHOLDER] where the diagram belongs. NEVER box text, math working, examiner notes, or empty grids (the CRITICAL DIAGRAM BAN).
 - JSON ESCAPING: escape LaTeX backslashes (\\frac not \frac). Invalid JSON is rejected outright and your work is lost.
+
+MARKDOWN & TYPOGRAPHY RULES:
+- Paragraph spacing: use double newlines (\n\n) before every sub-question label (**(a)**, **(b)**), every Roman numeral sub-part (**(i)**, **(ii)**), every display math block ($$...$$), and every mark allocation that does not naturally follow a sentence.
+- Inline math spacing: NEVER place spaces immediately inside inline delimiters. CORRECT: roots $\alpha$, $\beta$ and $\gamma$. INCORRECT: roots $ \alpha $, $ \beta $.
+- Matrices and column vectors: NEVER use \begin{{pmatrix}}, \begin{{vmatrix}}, or any matrix environment inside inline math ($...$). These must always be isolated in display math ($$...$$).
+- Typographic emphasis: bold all sub-question labels (**(a)**, **(b)(i)**) and all mark allocations (**[5 marks]**). Never use spaces between asterisks for bolding; `* * text * *` is wrong, `**text**` is correct.
+- Equal sign: `=` is a plain LaTeX character. Write `x = 2`, never `x \= 2`.
+
 - You are a transcriber, not a solver. If there is no question-number column with mark labels on these pages, return an empty array."#
         .to_string()
 }

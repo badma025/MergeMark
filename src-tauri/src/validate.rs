@@ -620,7 +620,16 @@ fn clean_table_cell(value: &str) -> Option<String> {
 /// Automatically repair malformed LaTeX and close missing inline `$`/block
 /// `$$` tags.
 pub fn sanitize_markdown_math(text: &str) -> String {
-    let text = repair_latex_syntax(text);
+    let text = remove_escaped_equals(&text);
+    let text = repair_spaced_asterisk_bold(&text);
+    let text = repair_matrix_row_breaks(&text);
+    let text = strip_bare_matrix_environments(&text);
+    let text = merge_fragmented_display_math(&text);
+    let text = wrap_naked_superscript_text(&text);
+    let isolated = isolate_markdown_images(&text);
+    let repaired = repair_latex_syntax(&isolated);
+    let repaired = repair_orphan_display_closers(&repaired);
+    let text = canonicalize_display_math(&repaired);
     let mut in_block = false;
     let mut lines = Vec::new();
 
@@ -666,7 +675,648 @@ pub fn sanitize_markdown_math(text: &str) -> String {
         lines.push("$$".to_string());
     }
 
-    lines.join("\n")
+    let normalized = isolate_inline_math_spacing(&isolate_mark_allocations(&lines.join("\n")));
+    let result = collapse_blank_lines_re()
+        .replace_all(&normalized, "\n\n")
+        .trim()
+        .to_string();
+    collapse_duplicate_spaces_re()
+        .replace_all(&result, " ")
+        .into_owned()
+}
+
+/// LLMs sometimes hallucinate `\=` in math mode, treating `=` as a command.
+fn remove_escaped_equals(text: &str) -> String {
+    static EQ_RE: OnceLock<regex::Regex> = OnceLock::new();
+    EQ_RE
+        .get_or_init(|| regex::Regex::new(r"\\(=)").expect("valid escaped-equals regex"))
+        .replace_all(text, "$1")
+        .into_owned()
+}
+
+/// Matrix environments must always sit inside $$...$$. When the LLM emits
+/// them bare or inside single $...$, wrap with display math.
+#[allow(dead_code)]
+fn wrap_bare_matrices(text: &str) -> String {
+    let (bare_matrix_start, bare_matrix_end) = precompiled_bare_matrix_patterns();
+    let mut output = String::with_capacity(text.len() + 32);
+    let mut cursor = 0usize;
+
+    while let Some(start_match) = bare_matrix_start.find(&text[cursor..]) {
+        let absolute_start = cursor + start_match.start();
+        let inside_math = text[..absolute_start]
+            .rmatch_indices('$')
+            .filter(|(idx, _)| {
+                text.as_bytes()[..*idx]
+                    .iter()
+                    .rev()
+                    .take_while(|byte| **byte == b'\\')
+                    .count()
+                    % 2
+                    == 0
+            })
+            .count()
+            % 2
+            == 1;
+
+        output.push_str(&text[cursor..absolute_start]);
+        if inside_math {
+            output.push_str(
+                text.get(absolute_start..absolute_start + start_match.len())
+                    .unwrap_or_default(),
+            );
+            cursor = absolute_start + start_match.len();
+            continue;
+        }
+
+        let search_from = absolute_start + start_match.len();
+        let Some(end_match) = bare_matrix_end.find(&text[search_from..]) else {
+            output.push_str(&text[absolute_start..]);
+            cursor = text.len();
+            break;
+        };
+        let absolute_end = search_from + end_match.end();
+
+        let needs_leading_blank = !output.is_empty() && !output.ends_with("\n\n");
+        output.push_str(if needs_leading_blank { "\n\n$$" } else { "$$" });
+        output.push('\n');
+        output.push_str(&text[absolute_start..absolute_end]);
+        output.push_str("\n$$\n\n");
+        cursor = absolute_end;
+    }
+
+    output.push_str(&text[cursor..]);
+    output
+}
+
+fn precompiled_bare_matrix_patterns() -> (&'static regex::Regex, &'static regex::Regex) {
+    static MATRIX_START: OnceLock<regex::Regex> = OnceLock::new();
+    static MATRIX_END: OnceLock<regex::Regex> = OnceLock::new();
+    (
+        MATRIX_START.get_or_init(|| {
+            regex::Regex::new(r"\\begin\{(pmatrix|vmatrix|bmatrix|matrix)\}")
+                .expect("valid matrix start regex")
+        }),
+        MATRIX_END.get_or_init(|| {
+            regex::Regex::new(r"\\end\{(pmatrix|vmatrix|bmatrix|matrix)\}")
+                .expect("valid matrix end regex")
+        }),
+    )
+}
+
+fn strip_bare_matrix_environments(text: &str) -> String {
+    static MATRIX_BLOCK_RE: OnceLock<regex::Regex> = OnceLock::new();
+    let re = MATRIX_BLOCK_RE.get_or_init(|| {
+        regex::Regex::new(
+            r"(?s)(\\begin\{(?:pmatrix|vmatrix|bmatrix|matrix)\}.*?\\end\{(?:pmatrix|vmatrix|bmatrix|matrix)\})"
+        )
+        .expect("valid matrix block regex")
+    });
+    re.replace_all(text, |captures: &regex::Captures<'_>| {
+        format!(
+            "\n\n$$\n{}\n$$\n\n",
+            captures.get(0).map(|m| m.as_str()).unwrap_or_default()
+        )
+    })
+    .into_owned()
+}
+
+/// Inside matrix environments the LLM sometimes writes a single backslash
+/// for row breaks (`\ ` or `\&`) when LaTeX requires `\\`. This pass fixes
+/// those before wrapping the matrix in display delimiters.
+fn repair_matrix_row_breaks(text: &str) -> String {
+    static MATRIX_BLOCK_RE: OnceLock<regex::Regex> = OnceLock::new();
+    let re = MATRIX_BLOCK_RE.get_or_init(|| {
+        regex::Regex::new(
+            r"(?s)(\\begin\{(?:pmatrix|vmatrix|bmatrix|matrix)\}.*?\\end\{(?:pmatrix|vmatrix|bmatrix|matrix)\})"
+        )
+        .expect("valid matrix block regex")
+    });
+    re.replace_all(text, |captures: &regex::Captures<'_>| {
+        let block = captures.get(0).map(|m| m.as_str()).unwrap_or_default();
+        let bytes = block.as_bytes();
+        let mut out = String::with_capacity(block.len() + 16);
+        let mut i = 0usize;
+        while i < bytes.len() {
+            if bytes[i] == b'\\'
+                && !(i > 0 && bytes[i - 1] == b'\\')
+                && i + 1 < bytes.len()
+                && (bytes[i + 1] == b' ' || bytes[i + 1] == b'\t' || bytes[i + 1] == b'&')
+            {
+                out.push('\\');
+                out.push('\\');
+                out.push(bytes[i + 1] as char);
+                i += 2;
+            } else {
+                out.push(bytes[i] as char);
+                i += 1;
+            }
+        }
+        out
+    })
+    .into_owned()
+}
+
+/// Merges consecutive display math blocks separated by short text (symbols,
+/// LaTeX commands, or whitespace) into a single block. Example:
+/// `$$ A $$ \lambda $$ B $$` becomes `$$ A \lambda B $$`
+fn merge_fragmented_display_math(text: &str) -> String {
+    static DISPLAY_RE: OnceLock<regex::Regex> = OnceLock::new();
+    let re = DISPLAY_RE.get_or_init(|| {
+        regex::Regex::new(r"(?s)\$\$(.*?)\$\$").expect("valid display math regex")
+    });
+
+    let mut result = text.to_string();
+    let mut changed = true;
+
+    // Iteratively merge until no more merges are possible
+    while changed {
+        changed = false;
+        let mut new_result = String::new();
+        let mut last_end = 0;
+        let mut matches = re.find_iter(&result).peekable();
+
+        while let Some(first) = matches.next() {
+            if let Some(second) = matches.peek() {
+                let between = &result[first.end()..second.start()];
+                let trimmed = between.trim();
+
+                // Check if the text between is mergeable (no English words)
+                if is_mergeable_separator(trimmed) {
+                    // Merge: extract content from both blocks
+                    let first_content = &result[first.start() + 2..first.end() - 2];
+                    let second_content = &result[second.start() + 2..second.end() - 2];
+                    let merged = format!("$$ {} {} {} $$", first_content, trimmed, second_content);
+
+                    new_result.push_str(&result[last_end..first.start()]);
+                    new_result.push_str(&merged);
+                    last_end = second.end();
+                    matches.next(); // consume the second match
+                    changed = true;
+                    continue;
+                }
+            }
+
+            // No merge, keep the original
+            new_result.push_str(&result[last_end..first.end()]);
+            last_end = first.end();
+        }
+
+        new_result.push_str(&result[last_end..]);
+        result = new_result;
+    }
+
+    result
+}
+
+/// Checks if text between display blocks is mergeable (no English words)
+fn is_mergeable_separator(text: &str) -> bool {
+    if text.is_empty() {
+        return true;
+    }
+
+    // Remove LaTeX commands (backslash-prefixed identifiers) before checking
+    static LATEX_CMD_RE: OnceLock<regex::Regex> = OnceLock::new();
+    let latex_re = LATEX_CMD_RE.get_or_init(|| {
+        regex::Regex::new(r"\\[a-zA-Z]+").expect("valid latex command regex")
+    });
+    let without_latex = latex_re.replace_all(text, "");
+
+    // Check for English words (sequences of 3+ letters)
+    static WORD_RE: OnceLock<regex::Regex> = OnceLock::new();
+    let word_re = WORD_RE.get_or_init(|| {
+        regex::Regex::new(r"[a-zA-Z]{3,}").expect("valid word regex")
+    });
+
+    // If there are English words, don't merge
+    if word_re.is_match(&without_latex) {
+        return false;
+    }
+
+    // Check for common English words (2 letters)
+    let common_words = ["and", "or", "the", "is", "for", "not", "but", "with", "from", "that"];
+    let lower = without_latex.to_lowercase();
+    if common_words.iter().any(|word| lower.contains(word)) {
+        return false;
+    }
+
+    true
+}
+
+fn repair_spaced_asterisk_bold(text: &str) -> String {
+    static SPACED_BOLD_RE: OnceLock<regex::Regex> = OnceLock::new();
+    SPACED_BOLD_RE
+        .get_or_init(|| {
+            regex::Regex::new(r"\* *\* *([^*\n]+?) *\* *\*").expect("valid spaced bold regex")
+        })
+        .replace_all(text, "**$1**")
+        .into_owned()
+}
+
+fn wrap_naked_superscript_text(text: &str) -> String {
+    static NAKED_UNIT_RE: OnceLock<regex::Regex> = OnceLock::new();
+    let re = NAKED_UNIT_RE.get_or_init(|| {
+        regex::Regex::new(r"(\d+(?:\.\d+)?(?:\s*[a-zA-Z]{1,4}(?:\^\{[^}]+\}|_[^}\s]+))+)")
+            .expect("valid naked superscript regex")
+    });
+    let mut output = String::with_capacity(text.len() + 16);
+    let mut cursor = 0usize;
+
+    while let Some(match_) = re.find(&text[cursor..]) {
+        let absolute = cursor + match_.start();
+        output.push_str(&text[cursor..absolute]);
+
+        let prior = &text[..absolute];
+        let inside_math = prior
+            .chars()
+            .rev()
+            .scan(false, |escaped, character| {
+                if *escaped {
+                    *escaped = false;
+                    return Some(None);
+                }
+                if character == '\\' {
+                    *escaped = true;
+                    return Some(None);
+                }
+                if character == '$' {
+                    return Some(Some('$'));
+                }
+                Some(None)
+            })
+            .flatten()
+            .count()
+            % 2
+            == 1;
+
+        if inside_math {
+            output.push_str(match_.as_str());
+        } else {
+            output.push('$');
+            output.push_str(match_.as_str());
+            output.push('$');
+        }
+        cursor = absolute + match_.len();
+    }
+    output.push_str(&text[cursor..]);
+    output
+}
+
+fn isolate_inline_math_spacing(text: &str) -> String {
+    let chars: Vec<char> = text.chars().collect();
+    let mut output = String::with_capacity(text.len() + 16);
+    let mut index = 0usize;
+
+    while index < chars.len() {
+        if chars[index] == '$' && !is_escaped_char(&chars, index) {
+            if index + 1 < chars.len() && chars[index + 1] == '$' {
+                // Display math is deliberately copied untouched.
+                output.push('$');
+                output.push('$');
+                index += 2;
+                continue;
+            }
+
+            let Some(close) = chars[index + 1..]
+                .iter()
+                .enumerate()
+                .find_map(|(offset, character)| {
+                    (*character == '$'
+                        && !is_escaped_char(&chars, index + 1 + offset)
+                        && (index + 1 + offset + 1 >= chars.len()
+                            || chars[index + 1 + offset + 1] != '$'))
+                        .then_some(index + 1 + offset)
+                })
+            else {
+                output.push('$');
+                index += 1;
+                continue;
+            };
+
+            let before_is_word = index > 0 && chars[index - 1].is_ascii_alphanumeric();
+            if before_is_word {
+                output.push(' ');
+            }
+
+            output.push('$');
+            for character in &chars[index + 1..close] {
+                output.push(*character);
+            }
+            output.push('$');
+
+            let after = chars.get(close + 1).copied();
+            if after.is_some_and(|character| {
+                character.is_ascii_alphanumeric() || character == '['
+            }) {
+                output.push(' ');
+            }
+            index = close + 1;
+            continue;
+        }
+
+        output.push(chars[index]);
+        index += 1;
+    }
+
+    output
+}
+
+fn is_escaped_char(chars: &[char], index: usize) -> bool {
+    let mut backslashes = 0usize;
+    let mut cursor = index;
+    while cursor > 0 && chars[cursor - 1] == '\\' {
+        backslashes += 1;
+        cursor -= 1;
+    }
+    backslashes % 2 == 1
+}
+
+fn isolate_mark_allocations(text: &str) -> String {
+    static MARK_LINE_RE: OnceLock<regex::Regex> = OnceLock::new();
+    MARK_LINE_RE
+        .get_or_init(|| {
+            regex::Regex::new(r"\s*(\*\*\[\s*\d+\s+marks?\s*\]\*\*)\s*")
+                .expect("valid mark allocation isolation regex")
+        })
+        .replace_all(text, "\n\n${1}\n\n")
+        .into_owned()
+}
+
+fn isolate_markdown_images(text: &str) -> String {
+    markdown_image_re()
+        .replace_all(text, "\n\n${1}\n\n")
+        .into_owned()
+}
+
+fn markdown_image_re() -> &'static regex::Regex {
+    static IMAGE_RE: OnceLock<regex::Regex> = OnceLock::new();
+    IMAGE_RE.get_or_init(|| {
+        regex::Regex::new(r"(?s)\s*(!\[.*?\]\(.*?\))\s*")
+            .expect("valid Markdown image isolation regex")
+    })
+}
+
+fn collapse_blank_lines_re() -> &'static regex::Regex {
+    static NEWLINES_RE: OnceLock<regex::Regex> = OnceLock::new();
+    NEWLINES_RE.get_or_init(|| {
+        regex::Regex::new(r"\n{3,}").expect("valid duplicate newline regex")
+    })
+}
+
+fn collapse_duplicate_spaces_re() -> &'static regex::Regex {
+    static SPACES_RE: OnceLock<regex::Regex> = OnceLock::new();
+    SPACES_RE.get_or_init(|| {
+        regex::Regex::new(r"  +").expect("valid duplicate space regex")
+    })
+}
+
+/// A single `$$` at the end of a non-empty line is an orphaned closing
+/// delimiter. Repair it before pairing delimiters across the full document.
+fn repair_orphan_display_closers(text: &str) -> String {
+    let mut output = Vec::new();
+    let mut in_display = false;
+
+    for line in text.replace("\r\n", "\n").replace('\r', "\n").lines() {
+        let positions = display_delimiter_positions(line);
+        let trimmed = line.trim_end();
+        let ends_with_delimiter = trimmed.ends_with("$$");
+
+        if !in_display
+            && positions.len() == 1
+            && ends_with_delimiter
+            && trimmed != "$$"
+        {
+            let body = trimmed[..trimmed.len() - 2].trim_end();
+            output.push(format!("$${}$$", strip_single_dollar_delimiters(body)));
+            continue;
+        }
+
+        if positions.len() % 2 == 1 {
+            in_display = !in_display;
+        }
+        output.push(line.to_string());
+    }
+
+    if in_display {
+        output.push("$$".to_string());
+    }
+    output.join("\n")
+}
+
+#[derive(Debug)]
+enum MarkdownMathSegment {
+    Text(String),
+    Display(String),
+}
+
+/// Tokenize paired display delimiters and serialize them into one canonical
+/// representation. This avoids regex replacement ordering bugs and guarantees
+/// that no prose, marks, or punctuation shares a delimiter line.
+fn canonicalize_display_math(text: &str) -> String {
+    let positions = display_delimiter_positions(text);
+    if positions.is_empty() {
+        return text.to_string();
+    }
+
+    let mut source = text.to_string();
+    if positions.len() % 2 == 1 {
+        source.push_str("\n$$");
+    }
+    let positions = display_delimiter_positions(&source);
+    let mut segments = Vec::<MarkdownMathSegment>::new();
+    let mut cursor = 0usize;
+    let mut pending_after_math = String::new();
+
+    for pair in positions.chunks_exact(2) {
+        let opening = pair[0];
+        let closing = pair[1];
+        let mut outside = source[cursor..opening].to_string();
+        if !pending_after_math.is_empty() {
+            outside = format!("{}{}", pending_after_math, outside);
+            pending_after_math.clear();
+        }
+        let line_prefix = outside
+            .rsplit('\n')
+            .next()
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+        let line_suffix = source[closing + 2..]
+            .split('\n')
+            .next()
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+        push_text_segment(&mut segments, outside);
+
+        let raw_body = source[opening + 2..closing].trim();
+        let (leading, body, trailing) = split_boundary_punctuation(raw_body);
+        if !leading.is_empty() && append_to_last_text(&mut segments, &leading) {
+            // Leading punctuation belongs to the prose immediately before the
+            // opening delimiter, as in `equation$$.x=1$$`.
+        } else if !leading.is_empty() {
+            segments.push(MarkdownMathSegment::Text(leading));
+        }
+
+        let (body, marks) = detach_mark_allocation(&body);
+        if !body.trim().is_empty() {
+            let math = strip_single_dollar_delimiters(body.trim());
+            let is_inline_context = !line_prefix.is_empty() || !line_suffix.is_empty();
+
+            if is_inline_context {
+                let needs_leading_space = line_prefix
+                    .chars()
+                    .next_back()
+                    .is_some_and(|character| character.is_alphanumeric());
+                let needs_trailing_space = line_suffix
+                    .chars()
+                    .next()
+                    .is_some_and(|character| character.is_alphanumeric());
+                push_text_segment(
+                    &mut segments,
+                    format!(
+                        "{}${math}${}",
+                        if needs_leading_space { " " } else { "" },
+                        if needs_trailing_space { " " } else { "" }
+                    ),
+                );
+            } else {
+                segments.push(MarkdownMathSegment::Display(math));
+            }
+        }
+        pending_after_math.push_str(&trailing);
+        if !marks.is_empty() {
+            pending_after_math.push_str("\n\n");
+            pending_after_math.push_str(&marks);
+        }
+        cursor = closing + 2;
+    }
+
+    let mut remainder = source[cursor..].to_string();
+    if !pending_after_math.is_empty() {
+        remainder = format!("{}{}", pending_after_math, remainder);
+    }
+    push_text_segment(&mut segments, remainder);
+    serialize_markdown_math_segments(&segments)
+}
+
+fn display_delimiter_positions(text: &str) -> Vec<usize> {
+    let bytes = text.as_bytes();
+    let mut positions = Vec::new();
+    let mut index = 0usize;
+    while index + 1 < bytes.len() {
+        if bytes[index] == b'$' && bytes[index + 1] == b'$' {
+            let preceding_slashes = bytes[..index]
+                .iter()
+                .rev()
+                .take_while(|byte| **byte == b'\\')
+                .count();
+            if preceding_slashes % 2 == 0 {
+                positions.push(index);
+                index += 2;
+                continue;
+            }
+        }
+        index += 1;
+    }
+    positions
+}
+
+fn split_boundary_punctuation(body: &str) -> (String, String, String) {
+    let mut body = body.trim();
+    let mut leading = String::new();
+    while let Some(character) = body.chars().next() {
+        if !matches!(character, '.' | ',') {
+            break;
+        }
+        leading.push(character);
+        body = body[character.len_utf8()..].trim_start();
+    }
+
+    let mut trailing_reversed = String::new();
+    while let Some(character) = body.chars().next_back() {
+        if !matches!(character, '.' | ',') {
+            break;
+        }
+        trailing_reversed.push(character);
+        body = body[..body.len() - character.len_utf8()].trim_end();
+    }
+    let trailing = trailing_reversed.chars().rev().collect();
+    (leading, body.to_string(), trailing)
+}
+
+fn detach_mark_allocation(body: &str) -> (String, String) {
+    static MARKS_RE: OnceLock<regex::Regex> = OnceLock::new();
+    let marks_re = MARKS_RE.get_or_init(|| {
+        regex::Regex::new(r"(?i)\s*(\*\*\[\s*\d+\s+marks?\s*\]\*\*)\s*$")
+            .expect("valid mark allocation regex")
+    });
+    if let Some(captures) = marks_re.captures(body) {
+        let whole = captures.get(0).expect("full mark match");
+        let marks = captures.get(1).expect("mark capture").as_str().to_string();
+        return (body[..whole.start()].trim_end().to_string(), marks);
+    }
+    (body.to_string(), String::new())
+}
+
+fn strip_single_dollar_delimiters(text: &str) -> String {
+    let mut output = String::with_capacity(text.len());
+    for character in text.chars() {
+        if character == '$' {
+            let escaped = output
+                .chars()
+                .rev()
+                .take_while(|previous| *previous == '\\')
+                .count()
+                % 2
+                == 1;
+            if !escaped {
+                continue;
+            }
+        }
+        output.push(character);
+    }
+    output
+}
+
+fn push_text_segment(segments: &mut Vec<MarkdownMathSegment>, text: String) {
+    if text.trim().is_empty() {
+        return;
+    }
+    if let Some(MarkdownMathSegment::Text(existing)) = segments.last_mut() {
+        existing.push_str(&text);
+    } else {
+        segments.push(MarkdownMathSegment::Text(text));
+    }
+}
+
+fn append_to_last_text(segments: &mut [MarkdownMathSegment], text: &str) -> bool {
+    if let Some(MarkdownMathSegment::Text(existing)) = segments.last_mut() {
+        while existing.ends_with(char::is_whitespace) {
+            existing.pop();
+        }
+        existing.push_str(text);
+        return true;
+    }
+    false
+}
+
+fn serialize_markdown_math_segments(segments: &[MarkdownMathSegment]) -> String {
+    let mut output = String::new();
+    for segment in segments {
+        let value = match segment {
+            MarkdownMathSegment::Text(text) => text.trim().to_string(),
+            MarkdownMathSegment::Display(math) => format!("$$\n{}\n$$", math.trim()),
+        };
+        if value.is_empty() {
+            continue;
+        }
+        if !output.is_empty() {
+            output.push_str("\n\n");
+        }
+        output.push_str(&value);
+    }
+    output
 }
 
 // ── Figure/diagram referral consistency ─────────────────────────────────────
@@ -1189,6 +1839,89 @@ mod tests {
     }
 
     #[test]
+    fn canonicalizes_suffocated_display_math_between_prose_and_marks() {
+        let source = "Solve the equation$$.3n+21m=137$$ **[4 marks]**";
+        let repaired = sanitize_markdown_math(source);
+        assert_eq!(repaired, "Solve the equation. $3n+21m=137$\n\n**[4 marks]**");
+    }
+
+    #[test]
+    fn converts_embedded_display_delimiters_to_inline_math() {
+        let repaired = sanitize_markdown_math("The value $$x=2$$ is positive.");
+        assert_eq!(repaired, "The value $x=2$ is positive.");
+        assert!(!repaired.contains("$$"));
+    }
+
+    #[test]
+    fn spaces_inline_math_between_adjacent_prose_words() {
+        let repaired = sanitize_markdown_math(
+            "with centre at$O$and the angle$POQ$is \\theta radians.",
+        );
+        assert_eq!(
+            repaired,
+            "with centre at $O$ and the angle $POQ$ is \\theta radians."
+        );
+    }
+
+    #[test]
+    fn does_not_add_spaces_before_math_punctuation() {
+        let repaired = sanitize_markdown_math("The value is $x$. It is $y$-axis.");
+        assert_eq!(repaired, "The value is $x$. It is $y$-axis.");
+    }
+
+    #[test]
+    fn adds_space_before_mark_allocation_after_inline_math() {
+        let repaired = sanitize_markdown_math("value of$\\theta$[4 marks]");
+        assert_eq!(repaired, "value of $\\theta$ [4 marks]");
+    }
+
+    #[test]
+    fn does_not_treat_display_math_as_inline_math() {
+        let repaired = sanitize_markdown_math("Before\n\n$$\nx^2=1\n$$\n\nAfter");
+        assert_eq!(repaired, "Before\n\n$$\nx^2=1\n$$\n\nAfter");
+    }
+
+    #[test]
+    fn preserves_isolated_display_equation_and_separates_marks() {
+        let repaired = sanitize_markdown_math(
+            "Find the value.\n\n$$\nx^2 + y^2 = 1\n$$\n\n**[4 marks]**",
+        );
+        assert_eq!(
+            repaired,
+            "Find the value.\n\n$$\nx^2 + y^2 = 1\n$$\n\n**[4 marks]**"
+        );
+    }
+
+    #[test]
+    fn canonicalizes_orphan_closer_and_detaches_math_punctuation() {
+        let source = "a) Hence find the curve.\nt^2-2, \\quad y=6t, \\quad t\\ge0.$$   ";
+        let repaired = sanitize_markdown_math(source);
+        assert_eq!(
+            repaired,
+            "a) Hence find the curve.\n\n$$\nt^2-2, \\quad y=6t, \\quad t\\ge0\n$$\n\n."
+        );
+    }
+
+    #[test]
+    fn display_delimiters_are_always_the_only_content_on_their_lines() {
+        let source = "Before $$x=1,$$ after.\n\n$$y=2 **[3 marks]**$$";
+        let repaired = sanitize_markdown_math(source);
+        for line in repaired.lines().filter(|line| line.contains("$$")) {
+            assert_eq!(line.trim(), "$$", "delimiter shares a line: {line:?}");
+        }
+        assert!(repaired.contains("$x=1$"), "{repaired}");
+        assert!(repaired.ends_with("**[3 marks]**"), "{repaired}");
+    }
+
+    #[test]
+    fn canonical_display_normalization_is_idempotent() {
+        let source = "Before\n\n$$\nx^2 + y^2 = 1\n$$\n\nAfter.";
+        let once = sanitize_markdown_math(source);
+        let twice = sanitize_markdown_math(&once);
+        assert_eq!(once, twice);
+    }
+
+    #[test]
     fn repairs_array_environment_into_display_math() {
         let source = r#"\begin{array}{|l|l|l|} \hline \text{Gas} & \gamma & M \\ \hline \text{Air} & 1.40 & 29.0 \\ \hline \text{Helium} & 1.67 & 4.00 \\ \hline \end{array}"#;
         let repaired = sanitize_markdown_math(source);
@@ -1250,5 +1983,63 @@ N
         assert!(repaired.contains("| 6 | 500.4 | 512.7 | 499.5 | 504.2 |"), "{repaired}");
         assert!(!repaired.contains("**1**\n**2**\n**3**\n**Mean**"), "{repaired}");
         assert_eq!(sanitize_markdown_math(&repaired), repaired);
+    }
+
+    #[test]
+    fn removes_escaped_equals_in_math() {
+        let repaired = sanitize_markdown_math("Find $x \\= 3$ and $y \\= 5$.");
+        assert_eq!(repaired, "Find $x = 3$ and $y = 5$.");
+    }
+
+    #[test]
+    fn restores_spaced_asterisk_bold() {
+        let repaired = sanitize_markdown_math("* * (a) * * is a sub-part and * * (b) * * is another.");
+        assert_eq!(
+            repaired,
+            "**(a)** is a sub-part and **(b)** is another."
+        );
+    }
+
+    #[test]
+    fn wraps_bare_matrix_in_display_math() {
+        let repaired = sanitize_markdown_math(
+            "Calculate\n\n\\begin{pmatrix}\na & b \\\\\nc & d\n\\end{pmatrix}\n\nfor the matrix.",
+        );
+        assert!(repaired.contains("$$\n\\begin{pmatrix}"), "{repaired}");
+        assert!(repaired.contains("\\end{pmatrix}\n$$"), "{repaired}");
+    }
+
+    #[test]
+    fn wraps_naked_superscript_units_in_inline_math() {
+        let repaired = sanitize_markdown_math("the value is 13.6ms^{-2} and 9.81ms^{-2}");
+        assert!(repaired.contains("$13.6ms^{-2}$"), "{repaired}");
+        assert!(repaired.contains("$9.81ms^{-2}$"), "{repaired}");
+    }
+
+    #[test]
+    fn restores_spaced_asterisk_roman_numeral_bold() {
+        let repaired = sanitize_markdown_math("* * (i) * * and * * (ii) * * are sub-parts.");
+        assert_eq!(repaired, "**(i)** and **(ii)** are sub-parts.");
+    }
+
+    #[test]
+    fn repairs_matrix_single_backslash_row_breaks() {
+        let repaired = sanitize_markdown_math(
+            "\\begin{pmatrix} 1 & 2 \\ 3 & 4 \\end{pmatrix}",
+        );
+        assert!(repaired.contains(r"\\ 3"), "{repaired}");
+        assert!(repaired.contains("$$\n\\begin{pmatrix}"), "{repaired}");
+        assert!(repaired.contains("\\end{pmatrix}\n$$"), "{repaired}");
+    }
+
+    #[test]
+    fn merges_fragmented_display_math_blocks() {
+        let repaired = sanitize_markdown_math(
+            "$$ \\begin{pmatrix} 1 & 2 \\end{pmatrix} $$ \\lambda $$ \\begin{pmatrix} 3 & 4 \\end{pmatrix} $$",
+        );
+        // Should merge into a single $$ block
+        assert_eq!(repaired.matches("$$").count(), 2, "Should have exactly one opening and one closing $$");
+        assert!(repaired.contains("\\lambda"), "Should preserve the lambda symbol");
+        assert!(repaired.contains("\\begin{pmatrix}"), "Should preserve both matrices");
     }
 }

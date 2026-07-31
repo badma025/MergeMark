@@ -1,4 +1,4 @@
-import { useState, useRef } from "react";
+import { useEffect, useState, useRef } from "react";
 import "katex/dist/katex.min.css";
 import { RichTextEditor } from "./RichTextEditor";
 import { Badge } from "@/components/ui/badge";
@@ -6,16 +6,14 @@ import { Button } from "@/components/ui/button";
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { Plus, Trash2, Pencil, AlertTriangle, ShieldCheck } from "lucide-react";
 import ReactMarkdown from "react-markdown";
-import remarkMath from "remark-math";
-import rehypeKatex from "rehype-katex";
 import remarkGfm from "remark-gfm";
+import katex from "katex";
 import { cn, sanitizeMarkdownMath } from "@/lib/utils";
 import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 import { useTaxonomy } from "@/lib/TaxonomyContext";
 import { toast } from "sonner";
 import Zoom from "react-medium-image-zoom";
 import "react-medium-image-zoom/dist/styles.css";
-import { SafeMarkdown } from "@/components/ui/SafeMarkdown";
 
 /**
  * Regex that matches display-worthy LaTeX operators.
@@ -62,6 +60,61 @@ function DiagramImg({
         />
       </Zoom>
     </div>
+  );
+}
+
+const MATH_TOKEN_RE = /(\$\$[\s\S]*?\$\$|\$[^$\n]+\$)/g;
+
+function CardMarkdown({ content }: { content: string }) {
+  const normalized = sanitizeMarkdownMath(content);
+  const segments = normalized.split(MATH_TOKEN_RE);
+
+  const renderTextSegment = (segment: string, key: number) => (
+    <ReactMarkdown
+      key={key}
+      remarkPlugins={[remarkGfm]}
+      urlTransform={(value) => value}
+      components={{
+        // Each text fragment is adjacent to a possible inline math fragment.
+        // Avoid ReactMarkdown's default block <p>, which would put `$...$`
+        // on a separate line from the surrounding sentence.
+        p: ({ children }) => <span className="inline-markdown">{children}</span>,
+        img: ({ node, ...props }) => props.src
+          ? <DiagramImg src={props.src} alt={props.alt || "Diagram"} />
+          : null,
+      }}
+    >
+      {segment}
+    </ReactMarkdown>
+  );
+
+  return (
+    <>
+      {segments.map((segment, index) => {
+        if (!segment) return null;
+        const isDisplay = segment.startsWith("$$") && segment.endsWith("$$");
+        const isInline = segment.startsWith("$") && segment.endsWith("$") && !isDisplay;
+        if (!isDisplay && !isInline) {
+          return renderTextSegment(segment, index);
+        }
+
+        const expression = segment.slice(isDisplay ? 2 : 1, isDisplay ? -2 : -1).trim();
+        try {
+          const html = katex.renderToString(expression, {
+            displayMode: isDisplay,
+            throwOnError: false,
+            strict: "ignore",
+            trust: false,
+          });
+          return isDisplay
+            ? <div key={index} className="my-2" dangerouslySetInnerHTML={{ __html: html }} />
+            : <span key={index} dangerouslySetInnerHTML={{ __html: html }} />;
+        } catch (error) {
+          console.warn("KaTeX segment failed; showing source text", error);
+          return <span key={index} className="whitespace-pre-wrap">{segment}</span>;
+        }
+      })}
+    </>
   );
 }
 
@@ -256,7 +309,6 @@ export function QuestionCard(props: QuestionCardProps) {
     module,
     marks,
     content,
-    isCode,
     topics,
     answerContent,
     className,
@@ -292,6 +344,17 @@ export function QuestionCard(props: QuestionCardProps) {
   const [editMarks, setEditMarks] = useState(marks);
   const [editAnswerContent, setEditAnswerContent] = useState(strippedAnswerContent);
   const [editTopics, setEditTopics] = useState<string[]>(parsedTopics);
+
+  // Extraction replaces the question object after the card may already have
+  // mounted. Keep the editor draft and display renderer synchronized with the
+  // latest persisted content, but never overwrite active user edits.
+  useEffect(() => {
+    if (isEditing) return;
+    setEditContent(displayContent);
+    setEditMarks(marks);
+    setEditAnswerContent(strippedAnswerContent);
+    setEditTopics(parsedTopics);
+  }, [content, answerContent, marks, topics, isEditing]);
 
   const lastCloseTime = useRef(0);
 
@@ -452,36 +515,7 @@ export function QuestionCard(props: QuestionCardProps) {
             isShowingAnswer ? "opacity-0 absolute inset-0 pointer-events-none" : "opacity-100 relative"
           )}
         >
-           <SafeMarkdown
-             rawText={displayContent}
-             fallback={
-               <ReactMarkdown
-                 remarkPlugins={[remarkGfm]}
-                 urlTransform={(value) => value}
-                 components={{
-                   img: ({ node, ...props }) => props.src
-                     ? <DiagramImg src={props.src} alt={props.alt || "Diagram"} />
-                     : null,
-                 }}
-               >
-                 {displayContent}
-               </ReactMarkdown>
-             }
-           >
-             <ReactMarkdown
-               remarkPlugins={[remarkMath, remarkGfm]}
-               rehypePlugins={[[rehypeKatex, { throwOnError: false, errorColor: "inherit" }]]}
-               urlTransform={(value) => value}
-               components={{
-                 img: ({ node, ...props }) => {
-                   if (!props.src) return null;
-                   return <DiagramImg src={props.src} alt={props.alt || "Diagram"} />;
-                 },
-               }}
-             >
-               {preprocessMath(displayContent, isCode, displaySubject)}
-             </ReactMarkdown>
-           </SafeMarkdown>
+           <CardMarkdown key={`question-markdown-${id}-${displayContent}`} content={displayContent} />
         </div>
 
         {/* Answer Content */}
@@ -492,36 +526,7 @@ export function QuestionCard(props: QuestionCardProps) {
           )}
         >
           <div className="font-semibold text-xs text-muted-foreground mb-2 uppercase tracking-wider">Mark Scheme Answer</div>
-           <SafeMarkdown
-             rawText={answerContent ?? ""}
-             fallback={
-               <ReactMarkdown
-                 remarkPlugins={[remarkGfm]}
-                 urlTransform={(value) => value}
-                 components={{
-                   img: ({ node, ...props }) => props.src
-                     ? <DiagramImg src={props.src} alt={props.alt || "Diagram"} />
-                     : null,
-                 }}
-               >
-                 {answerContent ?? ""}
-               </ReactMarkdown>
-             }
-           >
-             <ReactMarkdown
-               remarkPlugins={[remarkMath, remarkGfm]}
-               rehypePlugins={[[rehypeKatex, { throwOnError: false, errorColor: "inherit" }]]}
-               urlTransform={(value) => value}
-               components={{
-                 img: ({ node, ...props }) => {
-                   if (!props.src) return null;
-                   return <DiagramImg src={props.src} alt={props.alt || "Diagram"} />;
-                 },
-               }}
-             >
-               {preprocessMath(answerContent ?? "", isCode, displaySubject)}
-             </ReactMarkdown>
-           </SafeMarkdown>
+           <CardMarkdown key={`answer-markdown-${id}-${strippedAnswerContent}`} content={answerContent ?? ""} />
         </div>
       </div>
       {/* ── Edit Modal ── */}

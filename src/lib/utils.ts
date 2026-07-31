@@ -83,5 +83,17 @@ export function sanitizeMarkdownMath(text: string): string {
       outputLines.push("$$");
   }
 
-  return outputLines.join("\n").replace(/\n{3,}/g, "\n\n");
+  return normalizeInlineMathSpacing(outputLines.join("\n").replace(/\n{3,}/g, "\n\n"));
+}
+
+function normalizeInlineMathSpacing(text: string): string {
+  const token = /\$\$[\s\S]*?\$\$|\$[^$\n]+\$/g;
+  return text.replace(token, (match, offset: number, source: string) => {
+    if (match.startsWith("$$")) return match;
+    const before = source.slice(0, offset).slice(-1);
+    const after = source.slice(offset + match.length, offset + match.length + 1);
+    const leading = /[\p{L}\p{N}]/u.test(before) ? " " : "";
+    const trailing = /[\p{L}\p{N}]/u.test(after) ? " " : "";
+    return `${leading}${match}${trailing}`;
+  });
 }

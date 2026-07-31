@@ -122,8 +122,8 @@ export function ReviewSyncModal({ mappings, onClose, onSuccess }: ReviewSyncModa
                       </div>
                       <SafeMarkdown rawText={m.rawContent}>
                         <ReactMarkdown
-                          remarkPlugins={[remarkMath, remarkGfm]}
-                          rehypePlugins={[[rehypeKatex, { throwOnError: false, errorColor: "inherit" }]]}
+                          remarkPlugins={[[remarkMath, { singleDollarTextMath: true }], remarkGfm]}
+                          rehypePlugins={[[rehypeKatex, { throwOnError: false, strict: false, errorColor: "inherit" }]]}
                           urlTransform={(value) => value}
                           components={{
                           img: ({ node, ...props }) => {
@@ -195,8 +195,8 @@ export function ReviewSyncModal({ mappings, onClose, onSuccess }: ReviewSyncModa
                       </div>
                       <SafeMarkdown rawText={m.proposedAnswer}>
                         <ReactMarkdown
-                          remarkPlugins={[remarkMath, remarkGfm]}
-                          rehypePlugins={[[rehypeKatex, { throwOnError: false, errorColor: "inherit" }]]}
+                          remarkPlugins={[[remarkMath, { singleDollarTextMath: true }], remarkGfm]}
+                          rehypePlugins={[[rehypeKatex, { throwOnError: false, strict: false, errorColor: "inherit" }]]}
                           urlTransform={(value) => value}
                           components={{
                           img: ({ node, ...props }) => {
