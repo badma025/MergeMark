@@ -923,6 +923,37 @@ pub fn clean_textbullets(s: &str) -> String {
         .replace(r"\textbullet", "* ")
 }
 
+/// Replaces non-standard `\text{...}` math function usage with proper LaTeX math operators.
+pub fn normalize_latex_operators(text: &str) -> String {
+    let mut s = text.to_string();
+    let op_map = [
+        (r"\text{arcosh}", r"\operatorname{arcosh}"),
+        (r"\text{arsinh}", r"\operatorname{arsinh}"),
+        (r"\text{artanh}", r"\operatorname{artanh}"),
+        (r"\text{arcsec}", r"\operatorname{arcsec}"),
+        (r"\text{arccsc}", r"\operatorname{arccsc}"),
+        (r"\text{arccot}", r"\operatorname{arccot}"),
+        (r"\text{ln}", r"\ln"),
+        (r"\text{sin}", r"\sin"),
+        (r"\text{cos}", r"\cos"),
+        (r"\text{tan}", r"\tan"),
+        (r"\text{sec}", r"\sec"),
+        (r"\text{csc}", r"\csc"),
+        (r"\text{cot}", r"\cot"),
+        (r"\text{log}", r"\log"),
+        (r"\text{exp}", r"\exp"),
+        (r"\text{lim}", r"\lim"),
+        (r"\text{max}", r"\max"),
+        (r"\text{min}", r"\min"),
+        (r"\text{sup}", r"\sup"),
+        (r"\text{inf}", r"\inf"),
+    ];
+    for (old, new) in op_map {
+        s = s.replace(old, new);
+    }
+    s
+}
+
 /// Repair common LLM/PDF LaTeX damage before balancing Markdown delimiters.
 ///
 /// This deliberately handles structure rather than trying to be a LaTeX
@@ -931,6 +962,7 @@ pub fn clean_textbullets(s: &str) -> String {
 /// from PDF transcription and can be repaired without changing ordinary text.
 pub fn repair_latex_syntax(text: &str) -> String {
     let text = clean_textbullets(text);
+    let text = normalize_latex_operators(&text);
     let text = normalize_trace_table(&text);
     let mut out = Vec::new();
     let mut in_array = false;
@@ -1868,6 +1900,15 @@ N
         assert_eq!(
             isolate_display_math(raw),
             "Before \n\n$$\n\\frac{4}{15}\n$$\n\n After"
+        );
+    }
+
+    #[test]
+    fn normalizes_latex_text_operators() {
+        let raw = r#"$$ y = \frac{4}{15} x \text{arcosh} x \quad x \ge 1 $$"#;
+        assert_eq!(
+            normalize_latex_operators(raw),
+            r#"$$ y = \frac{4}{15} x \operatorname{arcosh} x \quad x \ge 1 $$"#
         );
     }
 }

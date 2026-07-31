@@ -862,9 +862,11 @@ The parser crop-checks every box: blank boxes, empty ruled grids, and duplicate 
 - Insert the exact token [DIAGRAM_PLACEHOLDER] in "content" where each diagram belongs chronologically.
 
 FORMATTING RULES:
+- DELIMITER ISOLATION & BALANCE (CRITICAL): EVERY math expression must have balanced, matching delimiters ($ for inline, $$ for block). NEVER attach a math delimiter directly to plain English text (e.g., write "$x$ The region", NEVER "$x$The region" or "$The region$"). NEVER open inline math before prose or leave unclosed math tags at the end of an equation.
+- STANDALONE DISPLAY EQUATIONS: Any major function, curve equation, or integral must sit in its own display block on dedicated lines surrounded by double newlines (\n\n$$\n...\n$$\n\n).
+- STANDARD FUNCTIONS & FORMATTING: Use standard LaTeX math operators (\operatorname{{arcosh}}, \ln, \sin, \cos) rather than \text{{...}} inside math blocks. Sub-question labels (e.g., **(a)**, **(b)**) and mark allocations (e.g., **[5 marks]**) must always sit on their own lines as standard bold prose, never inside math delimiters. Bullet points must use standard Markdown hyphens (-) or asterisks (*), never \textbullet.
 - OMIT the leading question number at the very start of the question text (e.g. if the text reads "17 Here is triangle ABC.", you MUST output "Here is triangle ABC." without the "17").
 - OMIT trailing answer line units, symbols, and answer templates at the very end of the question (e.g. "..................... %", "£ .....................", "..................... cm", or "............ $\\le t <$ ............"). Do NOT transcribe the answer blanks or the mathematical operators embedded within them.
-- Never use \textbullet or LaTeX commands for lists. You MUST use standard Markdown hyphens (-) or asterisks (*) for all bulleted lists.
 - Wrap inline math in single $...$. Use $$...$$ ONLY for display equations on their own line.
 - LATEX SAFETY: never place prose, Markdown emphasis such as **[5 marks]**, image links, [DIAGRAM_PLACEHOLDER], or ordinary instructions inside $...$, $$...$$, \begin{{aligned}}, or any other math environment. Use aligned only for multiple equation rows. Keep every $ and $$ delimiter balanced; never end content with a stray delimiter.
 - Tables of text/data: standard Markdown tables. Pure mathematical matrices or Simplex tableaus: LaTeX \begin{{array}} inside $$...$$. Never put $ inside array environments.
@@ -891,7 +893,9 @@ EXTRACTION GUARDRAIL: Only extract entries with explicit mark-scheme structure: 
 Each array item: { "question_number": int (WHOLE question only; AQA 03.1 → 3), "answer_markdown": string, "diagram_bboxes": [[x,y,w,h]...] relative 0.0-1.0, "diagram_page_indexes": [ints, same length as bboxes, 0-based image index] }.
 
 RULES:
-- Never use \textbullet or LaTeX commands for lists. You MUST use standard Markdown hyphens (-) or asterisks (*) for all bulleted lists.
+- DELIMITER ISOLATION & BALANCE (CRITICAL): EVERY math expression must have balanced, matching delimiters ($ for inline, $$ for block). NEVER attach a math delimiter directly to plain English text (e.g., write "$x$ The region", NEVER "$x$The region" or "$The region$"). NEVER open inline math before prose or leave unclosed math tags at the end of an equation.
+- STANDALONE DISPLAY EQUATIONS: Any major function, curve equation, or integral must sit in its own display block on dedicated lines surrounded by double newlines (\n\n$$\n...\n$$\n\n).
+- STANDARD FUNCTIONS & FORMATTING: Use standard LaTeX math operators (\operatorname{arcosh}, \ln, \sin, \cos) rather than \text{...} inside math blocks. Sub-question labels (e.g., **(a)**, **(b)**) and mark allocations (e.g., **[5 marks]**) must always sit on their own lines as standard bold prose, never inside math delimiters. Bullet points must use standard Markdown hyphens (-) or asterisks (*), never \textbullet.
 - Group every part of one question (main + ONE alternative method max) into a SINGLE item for that question_number. Further alternatives: discard. Alternative appended after a Markdown divider `---` and a bold "**ALTERNATIVE METHOD**" header.
 - Part labels bolded on their own line: **(a)**. Every distinct marking step separated by a double newline. Inline math with single $...$; display equations with $$...$$ on their own line. NEVER use code fences.
 - Sub-part letters must continue across pages: do not reset (g) back to (a).

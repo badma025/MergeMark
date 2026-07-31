@@ -5,8 +5,41 @@ export function cn(...inputs: ClassValue[]) {
   return twMerge(clsx(inputs))
 }
 
+const OP_MAP: [string, string][] = [
+  ["\\text{arcosh}", "\\operatorname{arcosh}"],
+  ["\\text{arsinh}", "\\operatorname{arsinh}"],
+  ["\\text{artanh}", "\\operatorname{artanh}"],
+  ["\\text{arcsec}", "\\operatorname{arcsec}"],
+  ["\\text{arccsc}", "\\operatorname{arccsc}"],
+  ["\\text{arccot}", "\\operatorname{arccot}"],
+  ["\\text{ln}", "\\ln"],
+  ["\\text{sin}", "\\sin"],
+  ["\\text{cos}", "\\cos"],
+  ["\\text{tan}", "\\tan"],
+  ["\\text{sec}", "\\sec"],
+  ["\\text{csc}", "\\csc"],
+  ["\\text{cot}", "\\cot"],
+  ["\\text{log}", "\\log"],
+  ["\\text{exp}", "\\exp"],
+  ["\\text{lim}", "\\lim"],
+  ["\\text{max}", "\\max"],
+  ["\\text{min}", "\\min"],
+  ["\\text{sup}", "\\sup"],
+  ["\\text{inf}", "\\inf"],
+];
+
+export function normalizeLatexOperators(text: string): string {
+  if (!text) return text;
+  let s = text;
+  for (const [oldOp, newOp] of OP_MAP) {
+    s = s.split(oldOp).join(newOp);
+  }
+  return s;
+}
+
 export function sanitizeMarkdownMath(text: string): string {
   if (!text) return text;
+  text = normalizeLatexOperators(text);
   // Match the backend sanitizer so existing cards with older malformed
   // content are repaired before remark-math sees them.
   text = text.replace(/\r\n?/g, "\n");
