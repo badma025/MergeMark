@@ -31,15 +31,26 @@ export class SafeMarkdown extends Component<SafeMarkdownProps, SafeMarkdownState
   render() {
     if (this.state.failed) {
       if (this.props.fallback) {
-        return this.props.fallback;
+        return (
+          <div key={`fallback-${this.props.rawText}`} className="contents">
+            {this.props.fallback}
+          </div>
+        );
       }
       return (
-        <pre className="whitespace-pre-wrap break-words font-sans text-inherit">
+        <pre
+          key={`error-${this.props.rawText}`}
+          className="whitespace-pre-wrap break-words font-sans text-inherit"
+        >
           {this.props.rawText}
         </pre>
       );
     }
 
-    return this.props.children;
+    return (
+      <div key={`content-${this.props.rawText}`} className="contents">
+        {this.props.children}
+      </div>
+    );
   }
 }

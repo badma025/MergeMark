@@ -453,9 +453,11 @@ export function QuestionCard(props: QuestionCardProps) {
           )}
         >
            <SafeMarkdown
+             key={displayContent}
              rawText={displayContent}
              fallback={
                <ReactMarkdown
+                 key={`fallback-${displayContent}`}
                  remarkPlugins={[remarkGfm]}
                  urlTransform={(value) => value}
                  components={{
@@ -469,6 +471,7 @@ export function QuestionCard(props: QuestionCardProps) {
              }
            >
              <ReactMarkdown
+               key={`content-${displayContent}`}
                remarkPlugins={[remarkMath, remarkGfm]}
                rehypePlugins={[[rehypeKatex, { throwOnError: false, errorColor: "inherit" }]]}
                urlTransform={(value) => value}
@@ -493,9 +496,11 @@ export function QuestionCard(props: QuestionCardProps) {
         >
           <div className="font-semibold text-xs text-muted-foreground mb-2 uppercase tracking-wider">Mark Scheme Answer</div>
            <SafeMarkdown
+             key={answerContent ?? ""}
              rawText={answerContent ?? ""}
              fallback={
                <ReactMarkdown
+                 key={`fallback-${answerContent ?? ""}`}
                  remarkPlugins={[remarkGfm]}
                  urlTransform={(value) => value}
                  components={{
@@ -509,6 +514,7 @@ export function QuestionCard(props: QuestionCardProps) {
              }
            >
              <ReactMarkdown
+               key={`content-${answerContent ?? ""}`}
                remarkPlugins={[remarkMath, remarkGfm]}
                rehypePlugins={[[rehypeKatex, { throwOnError: false, errorColor: "inherit" }]]}
                urlTransform={(value) => value}

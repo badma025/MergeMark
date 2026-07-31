@@ -120,8 +120,9 @@ export function ReviewSyncModal({ mappings, onClose, onSuccess }: ReviewSyncModa
                       <div className="text-xs font-semibold text-muted-foreground mb-2 uppercase tracking-wider">
                         Question {qNum}
                       </div>
-                      <SafeMarkdown rawText={m.rawContent}>
+                      <SafeMarkdown key={m.rawContent} rawText={m.rawContent}>
                         <ReactMarkdown
+                          key={`content-${m.rawContent}`}
                           remarkPlugins={[remarkMath, remarkGfm]}
                           rehypePlugins={[[rehypeKatex, { throwOnError: false, errorColor: "inherit" }]]}
                           urlTransform={(value) => value}
@@ -193,8 +194,9 @@ export function ReviewSyncModal({ mappings, onClose, onSuccess }: ReviewSyncModa
                           </select>
                         </div>
                       </div>
-                      <SafeMarkdown rawText={m.proposedAnswer}>
+                      <SafeMarkdown key={m.proposedAnswer} rawText={m.proposedAnswer}>
                         <ReactMarkdown
+                          key={`content-${m.proposedAnswer}`}
                           remarkPlugins={[remarkMath, remarkGfm]}
                           rehypePlugins={[[rehypeKatex, { throwOnError: false, errorColor: "inherit" }]]}
                           urlTransform={(value) => value}

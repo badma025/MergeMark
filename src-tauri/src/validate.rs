@@ -765,13 +765,154 @@ pub fn enforce_inline_math_boundaries(text: &str) -> String {
     out
 }
 
+/// Objective 1 & 2 (Part 2): Strip Internal Padding Inside Inline Math Delimiters
+/// and Promote Inline Matrices to Display Math.
+/// Strips leading/trailing whitespace inside single dollar signs so `$ R $` becomes `$R$`
+/// and `$ x = 3 $` becomes `$x = 3$`, while converting inline matrix/array environments
+/// (`$\begin{pmatrix}...\end{pmatrix}$`) into isolated display math blocks.
+pub fn strip_inline_math_padding_and_promote_matrices(text: &str) -> String {
+    let chars: Vec<char> = text.chars().collect();
+    let mut out = String::with_capacity(text.len() + 32);
+    let mut i = 0;
+    let n = chars.len();
+
+    while i < n {
+        // Skip display math $$ ... $$ unchanged
+        if chars[i] == '$'
+            && i + 1 < n
+            && chars[i + 1] == '$'
+            && !is_escaped_dollar(&chars, i)
+        {
+            let start = i + 2;
+            let mut j = start;
+            while j < n {
+                if chars[j] == '$'
+                    && j + 1 < n
+                    && chars[j + 1] == '$'
+                    && !is_escaped_dollar(&chars, j)
+                {
+                    break;
+                }
+                j += 1;
+            }
+            if j < n {
+                out.push('$');
+                out.push('$');
+                for k in start..j {
+                    out.push(chars[k]);
+                }
+                out.push('$');
+                out.push('$');
+                i = j + 2;
+                continue;
+            } else {
+                out.push('$');
+                out.push('$');
+                i += 2;
+                continue;
+            }
+        }
+
+        // Process single inline $ ... $
+        if chars[i] == '$' && !is_escaped_dollar(&chars, i) {
+            let start = i + 1;
+            let mut j = start;
+            let mut found_close = false;
+            while j < n {
+                if chars[j] == '$'
+                    && !is_escaped_dollar(&chars, j)
+                    && (j + 1 >= n || chars[j + 1] != '$')
+                {
+                    found_close = true;
+                    break;
+                }
+                j += 1;
+            }
+            if found_close {
+                let inner: String = chars[start..j].iter().collect();
+                let trimmed = inner.trim();
+                if is_matrix_begin_env(&inner) {
+                    out.push_str(&format!("\n\n$$\n{}\n$$\n\n", trimmed));
+                } else if !trimmed.is_empty() {
+                    out.push('$');
+                    out.push_str(trimmed);
+                    out.push('$');
+                } else {
+                    out.push('$');
+                    out.push_str(&inner);
+                    out.push('$');
+                }
+                i = j + 1;
+                continue;
+            }
+        }
+
+        out.push(chars[i]);
+        i += 1;
+    }
+
+    out
+}
+
+/// Objective 2 (Part 1): Isolate Display Math.
+/// Ensures all `$$` display blocks are isolated on their own dedicated lines
+/// with surrounding double newlines (`\n\n$$\n...\n$$\n\n`).
+pub fn isolate_display_math(text: &str) -> String {
+    let chars: Vec<char> = text.chars().collect();
+    let mut out = String::with_capacity(text.len() + 32);
+    let mut i = 0;
+    let n = chars.len();
+
+    while i < n {
+        if chars[i] == '$'
+            && i + 1 < n
+            && chars[i + 1] == '$'
+            && !is_escaped_dollar(&chars, i)
+        {
+            let start = i + 2;
+            let mut j = start;
+            while j < n {
+                if chars[j] == '$'
+                    && j + 1 < n
+                    && chars[j + 1] == '$'
+                    && !is_escaped_dollar(&chars, j)
+                {
+                    break;
+                }
+                j += 1;
+            }
+            if j < n {
+                let inner: String = chars[start..j].iter().collect();
+                let trimmed = inner.trim();
+                out.push_str(&format!("\n\n$$\n{}\n$$\n\n", trimmed));
+                i = j + 2;
+                continue;
+            } else {
+                out.push('$');
+                out.push('$');
+                i += 2;
+                continue;
+            }
+        }
+
+        out.push(chars[i]);
+        i += 1;
+    }
+
+    let collapsed = re(r"\n{3,}").replace_all(&out, "\n\n");
+    collapsed.trim().to_string()
+}
+
 /// Unified normalization pipeline that applies display consolidation,
-/// matrix row-break repair, and inline math boundary enforcement in order.
+/// matrix row-break repair, inline math boundary enforcement,
+/// inline math padding stripping, matrix promotion, and display math isolation in order.
 pub fn normalize_math_blocks(text: &str) -> String {
     let s1 = consolidate_display_math(text);
     let s2 = repair_matrix_row_breaks(&s1);
-    let s3 = enforce_inline_math_boundaries(&s2);
-    s3
+    let s3 = strip_inline_math_padding_and_promote_matrices(&s2);
+    let s4 = enforce_inline_math_boundaries(&s3);
+    let s5 = isolate_display_math(&s4);
+    s5
 }
 
 /// Globally replace occurrences of LaTeX `\textbullet` macros with a standard Markdown bullet (`* `).
@@ -1704,5 +1845,29 @@ N
 
         let raw4 = r#"\textbullet"#;
         assert_eq!(clean_textbullets(raw4), "* ");
+    }
+
+    #[test]
+    fn strips_inline_math_padding_and_promotes_matrices() {
+        let raw1 = "Here is $ R $ and $ C $ with $ x = 3 $.";
+        assert_eq!(
+            strip_inline_math_padding_and_promote_matrices(raw1),
+            "Here is $R$ and $C$ with $x = 3$."
+        );
+
+        let raw2 = "Matrix $\\begin{pmatrix}1&2\\\\3&4\\end{pmatrix}$ inline.";
+        assert_eq!(
+            strip_inline_math_padding_and_promote_matrices(raw2),
+            "Matrix \n\n$$\n\\begin{pmatrix}1&2\\\\3&4\\end{pmatrix}\n$$\n\n inline."
+        );
+    }
+
+    #[test]
+    fn isolates_display_math_blocks_with_double_newlines() {
+        let raw = "Before $$\\frac{4}{15}$$ After";
+        assert_eq!(
+            isolate_display_math(raw),
+            "Before \n\n$$\n\\frac{4}{15}\n$$\n\n After"
+        );
     }
 }
