@@ -484,6 +484,23 @@ pub fn crop_diagram(
     crop_diagram_with_options(img, bbox, padding, ignore_grid, false)
 }
 
+/// Safely clamp an `f32` value between `min` and `max`.
+/// Before clamping, this sorts `min` and `max` so that inverted bounds
+/// (e.g., from floating-point rounding errors like min = 0.001, max = 0.0009999871)
+/// never cause a panic, and replaces any `NaN` values safely.
+pub fn safe_clamp(val: f32, mut min: f32, mut max: f32) -> f32 {
+    if min.is_nan() {
+        min = 0.0;
+    }
+    if max.is_nan() {
+        max = 1.0;
+    }
+    let sorted_min = min.min(max);
+    let sorted_max = min.max(max);
+    let v = if val.is_nan() { sorted_min } else { val };
+    v.clamp(sorted_min, sorted_max)
+}
+
 /// Return one normalized [x, y, width, height] box enclosing visual option
 /// boxes. Inputs are clamped to the normalized page and malformed entries are
 /// ignored; callers can therefore use this at the JSON boundary safely.
@@ -498,10 +515,10 @@ pub fn union_relative_bboxes(boxes: &[Vec<f32>]) -> Option<Vec<f32>> {
         if bbox.len() != 4 || bbox.iter().any(|value| !value.is_finite()) {
             continue;
         }
-        let x = bbox[0].clamp(0.0, 1.0);
-        let y = bbox[1].clamp(0.0, 1.0);
-        let right = (bbox[0] + bbox[2]).clamp(0.0, 1.0);
-        let bottom = (bbox[1] + bbox[3]).clamp(0.0, 1.0);
+        let x = safe_clamp(bbox[0], 0.0, 1.0);
+        let y = safe_clamp(bbox[1], 0.0, 1.0);
+        let right = safe_clamp(bbox[0] + bbox[2], 0.0, 1.0);
+        let bottom = safe_clamp(bbox[1] + bbox[3], 0.0, 1.0);
         if right <= x || bottom <= y {
             continue;
         }
@@ -734,8 +751,8 @@ pub fn crop_page_vertical_from_image(
     // Pad by ~0.005 of the page (a few lines) so descenders/headings aren't
     // clipped, and clamp into [0,1].
     let pad = 0.005_f32;
-    let s = (start_frac - pad).clamp(0.0, 1.0);
-    let e = (end_frac + pad).clamp(0.0, 1.0);
+    let s = safe_clamp(start_frac - pad, 0.0, 1.0);
+    let e = safe_clamp(end_frac + pad, 0.0, 1.0);
     if e - s < 0.01 {
         return None;
     }
@@ -1110,5 +1127,17 @@ mod tests {
         let sc = tile_signature(&chart);
         assert!(signature_distance(&s1, &s2) < 4, "same table, resized → duplicate");
         assert!(signature_distance(&s1, &sc) >= 6, "table vs chart → distinct");
+    }
+
+    #[test]
+    fn test_safe_clamp_inverted_bounds_and_nan() {
+        let res = safe_clamp(0.5, 0.001, 0.0009999871);
+        assert!((res - 0.001).abs() < 1e-6 || (res - 0.0009999871).abs() < 1e-6);
+
+        let res_nan = safe_clamp(f32::NAN, 0.001, 0.0009999871);
+        assert!(!res_nan.is_nan());
+
+        let res_nan_bounds = safe_clamp(0.5, f32::NAN, f32::NAN);
+        assert_eq!(res_nan_bounds, 0.5);
     }
 }

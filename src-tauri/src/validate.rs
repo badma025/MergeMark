@@ -394,6 +394,7 @@ pub fn harden_line_breaks(content: &str) -> String {
 }
 
 pub fn clean_question_content(content: &str) -> String {
+    let content_cleaned = clean_textbullets(content);
     let patterns: &[&str] = &[
         r"(?i)Question\s+\d+\s+continued",
         r"(?i)\(Total\s+for\s+Question\s+\d+\s+is\s+\d+\s+marks?\)",
@@ -406,7 +407,7 @@ pub fn clean_question_content(content: &str) -> String {
         r"(?im)^\s*Problem\s*\d+\s*$",
         r"(?im)^\s*Answer\s*_*\s*$",
     ];
-    let mut cleaned = content.to_string();
+    let mut cleaned = content_cleaned.to_string();
     for p in patterns {
         cleaned = re(p).replace_all(&cleaned, "").into_owned();
     }
@@ -773,6 +774,14 @@ pub fn normalize_math_blocks(text: &str) -> String {
     s3
 }
 
+/// Globally replace occurrences of LaTeX `\textbullet` macros with a standard Markdown bullet (`* `).
+pub fn clean_textbullets(s: &str) -> String {
+    s.replace(r"\textbullet\ ", "* ")
+        .replace(r"\textbullet\", "* ")
+        .replace(r"\textbullet ", "* ")
+        .replace(r"\textbullet", "* ")
+}
+
 /// Repair common LLM/PDF LaTeX damage before balancing Markdown delimiters.
 ///
 /// This deliberately handles structure rather than trying to be a LaTeX
@@ -780,7 +789,8 @@ pub fn normalize_math_blocks(text: &str) -> String {
 /// outside math mode, and line-oriented trace tables are all common outputs
 /// from PDF transcription and can be repaired without changing ordinary text.
 pub fn repair_latex_syntax(text: &str) -> String {
-    let text = normalize_trace_table(text);
+    let text = clean_textbullets(text);
+    let text = normalize_trace_table(&text);
     let mut out = Vec::new();
     let mut in_array = false;
     let mut array_lines: Vec<String> = Vec::new();
@@ -1356,6 +1366,7 @@ pub fn is_duplicate_answer(existing: &str, new: &str) -> bool {
 // ── Mark Scheme Normalization (Task 2) ──────────────────────────────────────
 
 pub fn normalize_mark_scheme_chunk(chunk: &str) -> String {
+    let chunk = clean_textbullets(chunk);
     let re_examiner_codes = regex::Regex::new(r"(?i)[\s,;]*(?:[\[(]?\b(?:d?(?:[mab]1?|ft|oe|cao|aef|awrt|dep|indep|allow|condone|ignore|accept|or\s+equivalent|award))[\](,)]*)+\s*$").unwrap();
     let mut lines: Vec<String> = chunk.lines().map(|line| {
         let cleaned = re_examiner_codes.replace_all(line, "");
@@ -1678,5 +1689,20 @@ N
             res,
             r#"where $a$ and $b$, and equation $$ \begin{pmatrix} 1 & 2 \\ 3 & 4 \end{pmatrix} \lambda \begin{pmatrix} 5 & 6 \\ 7 & 8 \end{pmatrix} $$. Here is $x$."#
         );
+    }
+
+    #[test]
+    fn cleans_latex_textbullet_to_markdown_list() {
+        let raw1 = r#"\textbullet\ First item"#;
+        assert_eq!(clean_textbullets(raw1), "* First item");
+
+        let raw2 = r#"\textbullet Second item"#;
+        assert_eq!(clean_textbullets(raw2), "* Second item");
+
+        let raw3 = r#"\textbullet\Third item"#;
+        assert_eq!(clean_textbullets(raw3), "* Third item");
+
+        let raw4 = r#"\textbullet"#;
+        assert_eq!(clean_textbullets(raw4), "* ");
     }
 }

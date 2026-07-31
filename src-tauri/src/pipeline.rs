@@ -864,6 +864,7 @@ The parser crop-checks every box: blank boxes, empty ruled grids, and duplicate 
 FORMATTING RULES:
 - OMIT the leading question number at the very start of the question text (e.g. if the text reads "17 Here is triangle ABC.", you MUST output "Here is triangle ABC." without the "17").
 - OMIT trailing answer line units, symbols, and answer templates at the very end of the question (e.g. "..................... %", "£ .....................", "..................... cm", or "............ $\\le t <$ ............"). Do NOT transcribe the answer blanks or the mathematical operators embedded within them.
+- Never use \textbullet or LaTeX commands for lists. You MUST use standard Markdown hyphens (-) or asterisks (*) for all bulleted lists.
 - Wrap inline math in single $...$. Use $$...$$ ONLY for display equations on their own line.
 - LATEX SAFETY: never place prose, Markdown emphasis such as **[5 marks]**, image links, [DIAGRAM_PLACEHOLDER], or ordinary instructions inside $...$, $$...$$, \begin{{aligned}}, or any other math environment. Use aligned only for multiple equation rows. Keep every $ and $$ delimiter balanced; never end content with a stray delimiter.
 - Tables of text/data: standard Markdown tables. Pure mathematical matrices or Simplex tableaus: LaTeX \begin{{array}} inside $$...$$. Never put $ inside array environments.
@@ -890,6 +891,7 @@ EXTRACTION GUARDRAIL: Only extract entries with explicit mark-scheme structure: 
 Each array item: { "question_number": int (WHOLE question only; AQA 03.1 → 3), "answer_markdown": string, "diagram_bboxes": [[x,y,w,h]...] relative 0.0-1.0, "diagram_page_indexes": [ints, same length as bboxes, 0-based image index] }.
 
 RULES:
+- Never use \textbullet or LaTeX commands for lists. You MUST use standard Markdown hyphens (-) or asterisks (*) for all bulleted lists.
 - Group every part of one question (main + ONE alternative method max) into a SINGLE item for that question_number. Further alternatives: discard. Alternative appended after a Markdown divider `---` and a bold "**ALTERNATIVE METHOD**" header.
 - Part labels bolded on their own line: **(a)**. Every distinct marking step separated by a double newline. Inline math with single $...$; display equations with $$...$$ on their own line. NEVER use code fences.
 - Sub-part letters must continue across pages: do not reset (g) back to (a).
@@ -2485,11 +2487,11 @@ fn audit_diagram_boxes(
                 continue;
             }
             
-            // Ensure all bounding box coordinates are clamped to valid positive area within [0.0, 1.0]
-            bbox[0] = bbox[0].clamp(0.0, 0.999);
-            bbox[1] = bbox[1].clamp(0.0, 0.999);
-            bbox[2] = bbox[2].clamp(0.001, 1.0 - bbox[0]);
-            bbox[3] = bbox[3].clamp(0.001, 1.0 - bbox[1]);
+            // Ensure all bounding box coordinates are safely clamped to valid positive area within [0.0, 1.0]
+            bbox[0] = crate::geometry::safe_clamp(bbox[0], 0.0, 0.999);
+            bbox[1] = crate::geometry::safe_clamp(bbox[1], 0.0, 0.999);
+            bbox[2] = crate::geometry::safe_clamp(bbox[2], 0.001, 1.0 - bbox[0]);
+            bbox[3] = crate::geometry::safe_clamp(bbox[3], 0.001, 1.0 - bbox[1]);
 
             let model_idx = indexes.get(bi).and_then(|v| value_to_usize(v)).unwrap_or(0);
             if model_idx >= local_to_chunk.len() {

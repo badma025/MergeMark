@@ -324,7 +324,7 @@ pub fn scan_text_layer(page_texts: &[String]) -> TextScan {
         for (re, has_qn) in &footer_res {
             for cap in re.captures_iter(text) {
                 let m = cap.get(0).unwrap();
-                let y_frac = (m.start() as f32 / page_len).clamp(0.0, 1.0);
+                let y_frac = crate::geometry::safe_clamp(m.start() as f32 / page_len, 0.0, 1.0);
                 let (q, mk) = if *has_qn {
                     let q = cap.get(1).and_then(|s| s.as_str().parse::<u32>().ok()).unwrap_or(0);
                     let mk = cap.get(2).and_then(|s| s.as_str().parse::<u32>().ok()).unwrap_or(0);
@@ -424,7 +424,7 @@ pub fn scan_text_layer(page_texts: &[String]) -> TextScan {
 
             // --- FILTER 3: Clean, parse, and range-check ---
             let cleaned_num = question_num_str.replace(" ", "");
-            let y_frac = (full.start() as f32 / page_len).clamp(0.0, 1.0);
+            let y_frac = crate::geometry::safe_clamp(full.start() as f32 / page_len, 0.0, 1.0);
             if let Ok(n) = cleaned_num.parse::<u32>() {
                 if n > 0 && n <= 50 { // Plausible exam range; dense papers rarely exceed 50.
                     let chars_remaining = text.len() - safe_end;
@@ -808,7 +808,7 @@ fn infer_y_clips(
             // actually want the first heading of THIS question. Without
             // ground truth we take the lowest y after a small top margin
             // to avoid picking up running headers).
-            let y_clamped = y.clamp(0.02, 0.98);
+            let y_clamped = crate::geometry::safe_clamp(y, 0.02, 0.98);
             match acc {
                 None => Some(y_clamped),
                 Some(cur) if (y_clamped - cur).abs() < f32::EPSILON => Some(cur),
@@ -823,7 +823,7 @@ fn infer_y_clips(
     // If it sits higher up, clip at the footer + a small padding band so
     // the model doesn't see the next question's heading below it.
     let end_y = if footer_y_frac < 0.7 {
-        Some((footer_y_frac + 0.04).clamp(0.0, 1.0))
+        Some(crate::geometry::safe_clamp(footer_y_frac + 0.04, 0.0, 1.0))
     } else {
         None
     };
@@ -944,8 +944,8 @@ fn append_text_only_short_answer_spans(
                 number: h.number,
                 start_page: page,
                 end_page,
-                start_y_frac: Some(start_y.clamp(0.0, 1.0)),
-                end_y_frac: end_y.map(|y| y.clamp(0.0, 1.0)),
+                start_y_frac: Some(crate::geometry::safe_clamp(start_y, 0.0, 1.0)),
+                end_y_frac: end_y.map(|y| crate::geometry::safe_clamp(y, 0.0, 1.0)),
                 expected_marks: None,
                 reliable_pages: (page..=end_page)
                     .filter(|p| scan.page_reliability[*p] == PageReliability::Reliable)
@@ -1413,10 +1413,10 @@ fn build_spans_from_vision(
         //     question runs to the bottom of its last page -> None ("to
         //     bottom"), never the last detection's y (which for text-layer
         //     detections is just the last margin marker, not the content end).
-        let start_y = b.first_y.map(|y| (y - 0.01).clamp(0.0, 1.0));
+        let start_y = b.first_y.map(|y| crate::geometry::safe_clamp(y - 0.01, 0.0, 1.0));
         let end_y = match next {
             Some((_, nb)) if nb.first_page <= end_page => {
-                nb.first_y.map(|y| (y - 0.005).clamp(0.0, 1.0))
+                nb.first_y.map(|y| crate::geometry::safe_clamp(y - 0.005, 0.0, 1.0))
             }
             _ => None,
         };
@@ -1650,8 +1650,8 @@ pub fn validate_structure_proposal(
                 if pos >= question_y.len() {
                     question_y.resize(pos + 1, (None, None));
                 }
-                let y0 = pair.get(0).and_then(|v| v.as_f64()).map(|f| f.clamp(0.0, 1.0) as f32);
-                let y1 = pair.get(1).and_then(|v| v.as_f64()).map(|f| f.clamp(0.0, 1.0) as f32);
+                let y0 = pair.get(0).and_then(|v| v.as_f64()).map(|f| crate::geometry::safe_clamp(f as f32, 0.0, 1.0));
+                let y1 = pair.get(1).and_then(|v| v.as_f64()).map(|f| crate::geometry::safe_clamp(f as f32, 0.0, 1.0));
                 // Sanity: y0 < y1
                 let (y0, y1) = match (y0, y1) {
                     (Some(a), Some(b)) if a < b => (Some(a), Some(b)),
@@ -1720,7 +1720,7 @@ pub fn validate_structure_proposal(
     });
     let footer_y = proposal
         .total_marks_footer_y
-        .map(|f| f.clamp(0.0, 1.0))
+        .map(|f| crate::geometry::safe_clamp(f, 0.0, 1.0))
         .filter(|_| footer.is_some());
 
     let role = match proposal
