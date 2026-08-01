@@ -6,7 +6,7 @@ import modal
 from fastapi import FastAPI, UploadFile, File
 from fastapi.responses import JSONResponse
 
-app = modal.App("mineru-pdf-service")
+app = modal.App("mineru-pdf-extraction-v2")
 
 # Mount a persistent volume to store the models
 vol = modal.Volume.from_name("mineru-models-vol", create_if_missing=True)
@@ -19,10 +19,16 @@ image = (
     .pip_install(
         "magic-pdf[full]",
         "huggingface-hub",
-        "fastapi[standard]"
+        "fastapi[standard]",
+        "timm",  # Required for LayoutLMv3
+        "einops",  # Required for transformer models
     )
     # Detectron2 requires a custom wheel repository
     .run_commands("pip install detectron2 --extra-index-url https://myhloli.github.io/wheels/")
+    # Force rebuild with new dependencies
+    .run_commands("pip install --upgrade timm einops && echo 'Cache bust v3.0'")
+    # Force rebuild with new dependencies
+    .run_commands("echo 'Rebuild v2.0 with timm and einops'")
 )
 
 web_app = FastAPI(title="MinerU PDF Extraction Microservice")
@@ -112,7 +118,6 @@ async def extract_pdf(file: UploadFile = File(...)):
             
         # MinerU Pipeline
         from magic_pdf.tools.common import do_parse
-        from magic_pdf.config.enums import SupportedPdfParseMethod
         import magic_pdf.model as model_config
         
         # Enable model usage
@@ -125,7 +130,7 @@ async def extract_pdf(file: UploadFile = File(...)):
             pdf_file_name=pdf_name,
             pdf_bytes_or_dataset=pdf_bytes,
             model_list=[],
-            parse_method=SupportedPdfParseMethod.OCR.value,
+            parse_method="ocr",
             f_dump_md=True,
             f_dump_middle_json=False,
             f_dump_model_json=False,
