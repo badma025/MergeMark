@@ -405,6 +405,10 @@ pub fn clean_question_content(content: &str) -> String {
         r"(?im)^\s*Disadvantage\s*\d*\s*$",
         r"(?im)^\s*Problem\s*\d+\s*$",
         r"(?im)^\s*Answer\s*_*\s*$",
+        r"(?im)^\s*PMT\s*$",
+        r"(?i)<!--\s*image\s*-->",
+        r"(?m)^\s*[-_]{4,}\s*$",
+        r"(?m)^[\s\-_]*(?:🗹|□|■|☒|\d|\\|/|\s)+$",
     ];
     let mut cleaned = content.to_string();
     for p in patterns {

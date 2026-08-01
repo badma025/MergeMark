@@ -37,3 +37,4 @@ pull.cjs
 pull.js
 test.cjs
 test.json
+.env

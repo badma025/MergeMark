@@ -1,9 +1,51 @@
-use crate::llm::{LlmConfig, ReqwestLlm};
-use crate::pipeline::{
-    self, AnswerDraft, BuiltQuestion, ImportReport, PageInput, PipelineConfig, Progress,
-};
 use crate::AppState;
 use serde::{Deserialize, Serialize};
+
+#[derive(Debug, serde::Serialize, serde::Deserialize, Clone, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct ImportReport {
+    pub quarantined: Vec<String>,
+    pub anomalies: Vec<String>,
+    pub timings: Vec<TimingRecord>,
+    pub repairs: usize,
+    pub salvage_events: usize,
+    pub crop_rejections: usize,
+    pub marks_checksum_ok: Option<bool>,
+}
+
+#[derive(Debug, serde::Serialize, serde::Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct TimingRecord {
+    pub stage: String,
+    pub action: String,
+    pub milliseconds: u64,
+}
+
+pub fn chunk_markdown_paper(markdown: &str) -> Vec<String> {
+    let re = regex::Regex::new(r"(?m)^\s*(#{1,4}\s*(?:Question|Q)\s*\d+)").unwrap();
+    
+    let mut chunks = Vec::new();
+    let mut last_start = 0;
+    
+    for mat in re.find_iter(markdown) {
+        if mat.start() > last_start {
+            let chunk = &markdown[last_start..mat.start()];
+            if !chunk.trim().is_empty() {
+                chunks.push(chunk.trim().to_string());
+            }
+        }
+        last_start = mat.start();
+    }
+    
+    if last_start < markdown.len() {
+        let chunk = &markdown[last_start..];
+        if !chunk.trim().is_empty() {
+            chunks.push(chunk.trim().to_string());
+        }
+    }
+    
+    chunks
+}
 use std::time::Instant;
 use tauri::{Emitter, Manager, State};
 
@@ -43,65 +85,6 @@ pub struct ProposedMapping {
 }
 
 // ── Billing integration helper ──────────────────────────────────────────────────
-
-async fn resolve_llm_client<'a>(
-    state: &State<'a, AppState>,
-    frontend_model: String,
-) -> Result<(crate::billing::BillingRoute, ReqwestLlm), crate::billing::BillingError> {
-    let pool = state.db.lock().await;
-    let free_uploads_used = crate::db::get_free_uploads_used(&pool)
-        .await
-        .map_err(|e| crate::billing::BillingError::network(&format!("DB read failed: {e}")))?;
-    let byok_key = crate::db::get_byok_api_key(&pool)
-        .await
-        .map_err(|e| crate::billing::BillingError::network(&format!("DB read failed: {e}")))?;
-    let byok_base = crate::db::get_byok_base_url(&pool)
-        .await
-        .map_err(|e| crate::billing::BillingError::network(&format!("DB read failed: {e}")))?
-        .unwrap_or_else(|| "https://api.openai.com/v1".to_string());
-    drop(pool);
-
-    let route = crate::billing::pick_route(free_uploads_used, byok_key.is_some());
-    let config = match &route {
-        crate::billing::BillingRoute::FreeTier { .. } => {
-            let key = crate::billing::openrouter_api_key();
-            if key == "dev-openrouter-key-not-set" {
-                return Err(crate::billing::BillingError::network("The built-in Free Tier is unavailable on this installation. Please enter your own API Key in Settings."));
-            }
-            LlmConfig {
-                base_url: crate::billing::OPENROUTER_API_URL.to_string(),
-                api_key: key.to_string(),
-                model: crate::billing::OPENROUTER_MODEL.to_string(),
-                timeout: crate::billing::REQUEST_TIMEOUT,
-            }
-        }
-        crate::billing::BillingRoute::Byok => LlmConfig {
-            base_url: byok_base,
-            api_key: byok_key.unwrap(),
-            model: frontend_model,
-            timeout: crate::billing::REQUEST_TIMEOUT,
-        },
-        crate::billing::BillingRoute::NeedsByok => {
-            return Err(crate::billing::BillingError::needs_byok(free_uploads_used));
-        }
-    };
-    Ok((route, ReqwestLlm::new(config)))
-}
-
-// ── Progress bridge: pipeline stages → frontend `import-progress` events ──────
-
-struct TauriProgress {
-    app: tauri::AppHandle,
-}
-
-impl Progress for TauriProgress {
-    fn stage(&self, message: &str) {
-        let _ = self.app.emit(
-            "import-progress",
-            serde_json::json!({ "page": 0, "total": 0, "message": message }),
-        );
-    }
-}
 
 // ── Helper: shared question-classification + DB-insert logic (legacy path) ────
 
@@ -1058,9 +1041,9 @@ pub async fn parse_pdf_vision(
     app: tauri::AppHandle,
     _api_key: String,
     file_path: String,
-    pdf_base64_pages: Option<Vec<String>>,
+    _pdf_base64_pages: Option<Vec<String>>,
     _base_url: String,
-    model_name: String,
+    _model_name: String,
     subject: String,
     module_override: Option<String>,
     paper_name: String,
@@ -1070,48 +1053,21 @@ pub async fn parse_pdf_vision(
         "Another extraction is already in progress. Please wait for it to finish.".to_string()
     })?;
 
-    let model_name = model_name.trim().to_string();
+    state.cancel_flag.store(false, std::sync::atomic::Ordering::Relaxed);
 
-    state
-        .cancel_flag
-        .store(false, std::sync::atomic::Ordering::Relaxed);
+    let bytes = tokio::fs::read(&file_path)
+        .await
+        .map_err(|e| format!("Failed to read file: {}", e))?;
 
-    let pages: Vec<PageInput> = match pdf_base64_pages.filter(|p| !p.is_empty()) {
-        Some(pdf_pages) => {
-            let num_pages = pdf_pages.len();
-            let path_clone = file_path.clone();
-            let page_texts = tokio::task::spawn_blocking(move || extract_page_texts(&path_clone, num_pages))
-                .await
-                .map_err(|e| format!("Thread-pool error: {}", e))?;
-            
-            pdf_pages
-                .into_iter()
-                .enumerate()
-                .map(|(i, b64)| PageInput {
-                    kind: if b64.is_empty() {
-                        crate::pipeline::PageInputKind::TextOnly
-                    } else {
-                        crate::pipeline::PageInputKind::Image { b64 }
-                    },
-                    text: page_texts.get(i).cloned().unwrap_or_default(),
-                })
-                .collect()
-        },
-        None => {
-            if file_path.to_lowercase().ends_with(".pdf") {
-                let path_clone = file_path.clone();
-                tokio::task::spawn_blocking(move || crate::pdf_render::render_pdf_pages(std::path::Path::new(&path_clone)))
-                    .await
-                    .map_err(|e| format!("Thread-pool error: {}", e))??
-            } else {
-                return Err("No rasterized PDF pages provided and file is not a PDF.".into());
-            }
-        }
-    };
+    let filename = std::path::Path::new(&file_path)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("document.pdf");
 
-    let diagrams_dir = app.path().app_data_dir().map(|d| d.join("diagrams")).ok();
+    let markdown = crate::docling_client::extract_pdf(bytes, filename)
+        .await
+        .map_err(|e| format!("Docling extraction failed: {}", e))?;
 
-    // ── Fetch Taxonomy ───────────────────────────────────────────
     let pool = state.db.lock().await;
     let module_id = module_override
         .clone()
@@ -1124,13 +1080,6 @@ pub async fn parse_pdf_vision(
         .map_err(|e| e.to_string())?
         .ok_or_else(|| "Selected module not found in database.".to_string())?;
 
-    let topics_rows: Vec<(String,)> = sqlx::query_as("SELECT name FROM topics WHERE module_id = ?")
-        .bind(&module_id)
-        .fetch_all(&*pool)
-        .await
-        .map_err(|e| e.to_string())?;
-    let allowed_topics = topics_rows.into_iter().map(|(n,)| n).collect();
-
     let subject_name: (String,) = sqlx::query_as("SELECT name FROM subjects WHERE id = ?")
         .bind(&subject)
         .fetch_optional(&*pool)
@@ -1139,70 +1088,29 @@ pub async fn parse_pdf_vision(
         .ok_or_else(|| "Selected subject not found in database.".to_string())?;
     drop(pool);
 
-    let mut config = PipelineConfig::new(
-        model_name.clone(),
-        paper_name.trim().to_string(),
-        subject_name.0,
-        module_name.0,
-        Some(std::path::PathBuf::from(&file_path)),
-    );
-    config.allowed_topics = allowed_topics;
-    config.diagrams_dir = diagrams_dir;
-    config.max_repairs = 2;
-    // Phase 0: questions now get the same output budget as mark schemes.
-    // Long physics questions with sub-parts (a)–(f), derivations, graph
-    // descriptions, and circuit analysis routinely hit the previous 16k
-    // cap, triggering truncation-salvage + repair retries that doubled
-    // latency and quarantined questions. 32k gives a healthy headroom at
-    // modest cost (output tokens are the expensive part, but a truncated
-    // question that requires a full retry is far more expensive).
-    config.max_output_tokens = 32768;
-    config.parallelism = std::env::var("MERGEMARK_PARALLELISM")
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-        .map(|v| v.clamp(1, 8))
-        .unwrap_or(4);
-
-    let (route, client) = resolve_llm_client(&state, model_name.clone())
-        .await
-        .map_err(|e| e.hint.unwrap_or(e.message))?;
-
-    let progress = TauriProgress { app: app.clone() };
-    let (built, mut report): (Vec<BuiltQuestion>, ImportReport) =
-        pipeline::run_question_pipeline(&client, &pages, &config, &progress, &state.cancel_flag)
-            .await?;
-
-    // Surface the report to the UI — nothing fails silently anymore.
-    let _ = app.emit("import-report", &report);
+    let chunks = chunk_markdown_paper(&markdown);
+    
+    let mut final_questions = Vec::with_capacity(chunks.len());
+    let mut question_number = 1;
 
     let pool = state.db.lock().await;
 
-    // Increment free uploads if we used the Free Tier
-    if matches!(route, crate::billing::BillingRoute::FreeTier { .. }) {
-        let _ = crate::db::increment_free_uploads(&pool).await;
-    }
+    for chunk in chunks {
+        let mut md = chunk;
+        md = crate::validate::clean_question_content(&md);
+        md = crate::validate::normalize_decimal_parts(&md, question_number as u32);
+        md = crate::validate::harden_line_breaks(&md);
+        md = crate::validate::sanitize_markdown_math(&md);
 
-    // ── Persist: idempotent upserts keyed by (paper_name, question_number) ──
-    let mut final_questions = Vec::with_capacity(built.len());
+        let topics_json = "[]".to_string();
+        let marks = crate::validate::sum_inline_marks(&md) as i32;
+        let subtopic = "Unsorted".to_string();
 
-    for q in built {
-        let topics_json = if q.topics.is_empty() {
-            "[]".to_string()
-        } else {
-            serde_json::to_string(&q.topics).unwrap_or_else(|_| "[]".to_string())
-        };
-        let subtopic = q
-            .topics
-            .first()
-            .cloned()
-            .unwrap_or_else(|| "Imported".to_string());
-
-        // Keep the existing row's UUID when we're refreshing it.
         let existing: Option<(String,)> = sqlx::query_as(
             "SELECT id FROM questions WHERE paper_name = ? AND question_number = ? LIMIT 1",
         )
-        .bind(&config.paper_name)
-        .bind(q.question_number as i64)
+        .bind(&paper_name)
+        .bind(question_number)
         .fetch_optional(&*pool)
         .await
         .map_err(|e| e.to_string())?;
@@ -1211,61 +1119,55 @@ pub async fn parse_pdf_vision(
             .map(|(i,)| i)
             .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
 
-        let db_start = Instant::now();
         sqlx::query(
             r#"
             INSERT INTO questions (id, subject, subtopic, topics, marks, content, math_snippet, is_code, paper_name, question_number, module, needs_review, answer_stale)
-            VALUES (?, ?, ?, ?, ?, ?, '', ?, ?, ?, ?, ?, 0)
+            VALUES (?, ?, ?, ?, ?, ?, '', 0, ?, ?, ?, 1, 0)
             ON CONFLICT(paper_name, question_number) DO UPDATE SET
                 subject = excluded.subject,
                 subtopic = excluded.subtopic,
                 topics = CASE WHEN excluded.topics != '[]' THEN excluded.topics ELSE questions.topics END,
                 marks = excluded.marks,
                 content = excluded.content,
-                is_code = excluded.is_code,
                 module = COALESCE(excluded.module, questions.module),
                 needs_review = excluded.needs_review
             "#,
         )
         .bind(&id)
-        .bind(&config.subject)
+        .bind(&subject_name.0)
         .bind(&subtopic)
         .bind(&topics_json)
-        .bind(q.marks)
-        .bind(&q.content)
-        .bind(q.is_code)
-        .bind(&config.paper_name)
-        .bind(q.question_number as i64)
-        .bind(&q.module)
-        .bind(q.needs_review)
+        .bind(marks)
+        .bind(&md)
+        .bind(&paper_name)
+        .bind(question_number)
+        .bind(&module_name.0)
         .execute(&*pool)
         .await
-        .map_err(|e| format!("DB upsert failed for question {}: {}", q.question_number, e))?;
-        report.record_timing(
-            "database",
-            "upsert_question",
-            None,
-            Some(q.question_number),
-            db_start.elapsed().as_millis() as u64,
-        );
+        .map_err(|e| format!("DB upsert failed for question {}: {}", question_number, e))?;
 
         final_questions.push(Question {
             id,
-            subject: config.subject.clone(),
+            subject: subject_name.0.clone(),
             subtopic,
-            marks: q.marks,
-            content: q.content,
+            marks,
+            content: md,
             math_snippet: String::new(),
-            is_code: q.is_code,
+            is_code: false,
             answer_content: None,
             topics: Some(topics_json),
-            paper_name: config.paper_name.clone(),
-            question_number: Some(q.question_number as i64),
-            module: Some(q.module),
-            needs_review: q.needs_review,
+            paper_name: paper_name.clone(),
+            question_number: Some(question_number),
+            module: Some(module_name.0.clone()),
+            needs_review: true,
             answer_stale: false,
         });
+
+        question_number += 1;
     }
+
+    let report = ImportReport::default();
+    let _ = app.emit("import-report", &report);
 
     Ok(final_questions)
 }
@@ -1387,9 +1289,9 @@ pub async fn parse_mark_scheme_vision(
     app: tauri::AppHandle,
     _api_key: String,
     file_path: String,
-    pdf_base64_pages: Option<Vec<String>>,
+    _pdf_base64_pages: Option<Vec<String>>,
     _base_url: String,
-    model_name: String,
+    _model_name: String,
     paper_name: String,
     state: State<'_, AppState>,
 ) -> Result<Vec<ProposedMapping>, String> {
@@ -1397,138 +1299,27 @@ pub async fn parse_mark_scheme_vision(
         "Another extraction is already in progress. Please wait for it to finish.".to_string()
     })?;
 
-    let model_name = model_name.trim().to_string();
+    state.cancel_flag.store(false, std::sync::atomic::Ordering::Relaxed);
 
-    state
-        .cancel_flag
-        .store(false, std::sync::atomic::Ordering::Relaxed);
-
-    let ext = std::path::Path::new(&file_path)
-        .extension()
-        .and_then(|s| s.to_str())
-        .unwrap_or("")
-        .to_lowercase();
-    let is_image = ext == "png" || ext == "jpg" || ext == "jpeg";
-    let has_pdf_pages = pdf_base64_pages
-        .as_ref()
-        .map(|p| !p.is_empty())
-        .unwrap_or(false);
-
-    // ── Build PageInput list from whatever source we have ───────────────────
-    let pages: Vec<PageInput> = if has_pdf_pages {
-        let raw_pages = pdf_base64_pages.unwrap();
-        let num_pages = raw_pages.len();
-        let path_clone = file_path.clone();
-        let texts = tokio::task::spawn_blocking(move || {
-            if !path_clone.to_lowercase().ends_with(".pdf") {
-                return vec![String::new(); num_pages];
-            }
-            match pdf_extract::extract_text_by_pages_encrypted(&path_clone, "") {
-                Ok(pages) => {
-                    let re_lines = regex::Regex::new(r"_+|-+").unwrap();
-                    let mut out: Vec<String> = pages
-                        .into_iter()
-                        .map(|s| re_lines.replace_all(&s, "").to_string())
-                        .map(|s| crate::validate::clean_ligatures(&s))
-                        .collect();
-                    out.resize(num_pages, String::new());
-                    out
-                }
-                Err(_) => vec![String::new(); num_pages],
-            }
-        })
+    let bytes = tokio::fs::read(&file_path)
         .await
-        .unwrap_or_else(|_| vec![String::new(); num_pages]);
+        .map_err(|e| format!("Failed to read file: {}", e))?;
 
-        raw_pages
-            .into_iter()
-            .enumerate()
-            .map(|(i, b64)| PageInput {
-                kind: if b64.is_empty() {
-                    crate::pipeline::PageInputKind::TextOnly
-                } else {
-                    crate::pipeline::PageInputKind::Image { b64 }
-                },
-                text: texts.get(i).cloned().unwrap_or_default(),
-            })
-            .collect()
-    } else if file_path.to_lowercase().ends_with(".pdf") {
-        let path_clone = file_path.clone();
-        tokio::task::spawn_blocking(move || crate::pdf_render::render_pdf_pages(std::path::Path::new(&path_clone)))
-            .await
-            .map_err(|e| format!("Thread-pool error: {}", e))??
-    } else if is_image {
-        use base64::Engine;
-        let image_bytes = tokio::fs::read(&file_path)
-            .await
-            .map_err(|e| format!("Failed to read image: {}", e))?;
-        let b64 = base64::engine::general_purpose::STANDARD.encode(&image_bytes);
-        vec![PageInput {
-            kind: crate::pipeline::PageInputKind::Image { b64 },
-            text: String::new(),
-        }]
-    } else {
-        // Plain-text source: one synthetic page carrying the whole text.
-        let text = match ext.as_str() {
-            "txt" => tokio::fs::read_to_string(&file_path)
-                .await
-                .map_err(|e| e.to_string())?,
-            _ => {
-                let path_clone = file_path.clone();
-                tokio::task::spawn_blocking(move || {
-                    pdf_extract::extract_text_encrypted(&path_clone, "")
-                        .map_err(|e| format!("PDF extraction failed: {}", e))
-                })
-                .await
-                .map_err(|e| e.to_string())??
-            }
-        };
-        let text = crate::validate::clean_ligatures(&text);
-        if text.trim().is_empty() {
-            return Err("File is empty or contains only unextractable images.".to_string());
-        }
-        vec![PageInput {
-            kind: crate::pipeline::PageInputKind::TextOnly,
-            text,
-        }]
-    };
+    let filename = std::path::Path::new(&file_path)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("document.pdf");
 
-    let diagrams_dir = app.path().app_data_dir().map(|d| d.join("diagrams")).ok();
-
-    let mut config = PipelineConfig::new(
-        model_name.clone(),
-        paper_name.trim().to_string(),
-        "MarkScheme".into(),
-        "MarkScheme".into(),
-        Some(std::path::PathBuf::from(&file_path)),
-    );
-    config.diagrams_dir = diagrams_dir;
-    config.max_repairs = 2;
-    config.max_output_tokens = 32768;
-
-    let (route, client) = resolve_llm_client(&state, model_name.clone())
+    let markdown = crate::docling_client::extract_pdf(bytes, filename)
         .await
-        .map_err(|e| e.hint.unwrap_or(e.message))?;
+        .map_err(|e| format!("Docling extraction failed: {}", e))?;
 
-    let progress = TauriProgress { app: app.clone() };
-    let (drafts, report): (Vec<AnswerDraft>, ImportReport) =
-        pipeline::run_markscheme_pipeline(&client, &pages, &config, &progress, &state.cancel_flag)
-            .await?;
-
-    let _ = app.emit("import-report", &report);
-
-    let pool = state.db.lock().await;
-
-    // Increment free uploads if we used the Free Tier
-    if matches!(route, crate::billing::BillingRoute::FreeTier { .. }) {
-        let _ = crate::db::increment_free_uploads(&pool).await;
+    let chunks = chunk_markdown_paper(&markdown);
+    
+    if chunks.is_empty() {
+        return Err("No answers could be extracted from this document.".to_string());
     }
 
-    if drafts.is_empty() {
-        return Err("No answers could be extracted from this document. It may be unreadable, or contain no mark-scheme content.".to_string());
-    }
-
-    // ── Match answers to DB questions for this paper ────────────────────────
     let pool = state.db.lock().await;
     let questions: Vec<Question> =
         sqlx::query_as("SELECT * FROM questions WHERE paper_name = ? ORDER BY rowid ASC")
@@ -1554,21 +1345,30 @@ pub async fn parse_mark_scheme_vision(
     }
 
     let mut proposed_mappings: Vec<ProposedMapping> = Vec::new();
-    for ans in drafts {
-        let q_num = ans.question_number as i64;
+    
+    for (i, chunk) in chunks.into_iter().enumerate() {
+        let mut md = chunk;
+        md = crate::validate::clean_question_content(&md);
+        md = crate::validate::harden_line_breaks(&md);
+        md = crate::validate::sanitize_markdown_math(&md);
+
+        let mut q_num = (i + 1) as i64;
+        if let Some(cap) = leading_num_re.captures(&md) {
+             if let Ok(n) = cap[1].parse::<i64>() {
+                 q_num = n;
+             }
+        }
+
         match q_by_number.get(&q_num) {
             Some(q) => {
-                // If a previous DB answer exists (older import), propose the
-                // fresh transcription as the replacement — the review modal
-                // shows both.
                 let initial_answer = if let Some(ref db_ans) = q.answer_content {
                     if !db_ans.trim().is_empty() {
-                        format!("{}\n\n{}", db_ans, ans.markdown)
+                        format!("{}\n\n{}", db_ans, md)
                     } else {
-                        ans.markdown.clone()
+                        md.clone()
                     }
                 } else {
-                    ans.markdown.clone()
+                    md.clone()
                 };
                 proposed_mappings.push(ProposedMapping {
                     question_id: q.id.clone(),
@@ -1585,6 +1385,9 @@ pub async fn parse_mark_scheme_vision(
             }
         }
     }
+
+    let report = ImportReport::default();
+    let _ = app.emit("import-report", &report);
 
     Ok(proposed_mappings)
 }
@@ -2164,7 +1967,6 @@ pub async fn generate_topics_for_module(
     base_url: String,
     model_name: String,
 ) -> Result<Vec<String>, String> {
-    use crate::llm::{LlmClient, LlmConfig, ReqwestLlm};
     use crate::AppState;
     use serde_json::json;
     use tauri::Manager;
@@ -2186,14 +1988,6 @@ pub async fn generate_topics_for_module(
     // Drop the lock before await
     drop(pool);
 
-    let config = LlmConfig {
-        base_url,
-        api_key,
-        model: model_name.clone(),
-        timeout: crate::billing::REQUEST_TIMEOUT,
-    };
-    let client = ReqwestLlm::new(config);
-
     let system_prompt = "You are an educational taxonomy assistant. Your job is to output a JSON array of curriculum topics for a given module and subject. Output ONLY a valid JSON array of strings.";
     let user_prompt = format!("Subject: {}\nModule: {}\n\nAct strictly according to the official syllabus and textbook chapters for this specific subject and module. Provide an exhaustive list of core topics covered in this module as a JSON array of strings.\n\nCRITICAL INSTRUCTIONS:\n- Output ONLY the exact, short, high-level chapter names (e.g. \"Complex Numbers\", \"Matrices\", \"Proof by Induction\").\n- Do NOT include parentheses, subtopics, or any explanatory descriptions.\n- Output nothing but the JSON array.", subject_name, module_name);
 
@@ -2206,17 +2000,32 @@ pub async fn generate_topics_for_module(
         "temperature": 0.2
     });
 
-    let result = client
-        .chat(&request_body)
-        .await
-        .map_err(|e| format!("LLM request failed: {:?}", e))?;
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .map_err(|e| e.to_string())?;
 
-    let content = crate::llm::message_content(&result)
-        .map_err(|e| format!("Failed to extract content: {:?}", e))?;
+    let url = format!("{}/chat/completions", base_url.trim_end_matches('/'));
+
+    let res = client
+        .post(&url)
+        .header("Authorization", format!("Bearer {}", api_key))
+        .json(&request_body)
+        .send()
+        .await
+        .map_err(|e| format!("LLM request failed: {}", e))?;
+
+    if !res.status().is_success() {
+        let err = res.text().await.unwrap_or_default();
+        return Err(format!("API error: {}", err));
+    }
+
+    let json: serde_json::Value = res.json().await.map_err(|e| e.to_string())?;
+    let content = json["choices"][0]["message"]["content"]
+        .as_str()
+        .ok_or_else(|| "Invalid LLM response format".to_string())?;
 
     let mut json_str = content.trim();
-    
-    // Find the first '[' and last ']' to extract the JSON array robustly
     if let (Some(start), Some(end)) = (json_str.find('['), json_str.rfind(']')) {
         if start <= end {
             json_str = &json_str[start..=end];
@@ -2226,7 +2035,6 @@ pub async fn generate_topics_for_module(
     let topics: Vec<String> = serde_json::from_str(json_str)
         .map_err(|e| format!("Failed to parse JSON array from LLM. Raw content: {}\nError: {}", content, e))?;
 
-    // Save topics to DB
     let pool = state.db.lock().await;
     for topic_name in &topics {
         let id = uuid::Uuid::new_v4().to_string();

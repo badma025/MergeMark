@@ -10,12 +10,7 @@ mod db;
 mod backup;
 mod billing;
 mod commands;
-mod doc_map;
-mod geometry;
-mod json_salvage;
-mod llm;
-mod pdf_render;
-mod pipeline;
+mod docling_client;
 mod taxonomy;
 mod validate;
 
@@ -36,6 +31,8 @@ pub struct AppState {
     
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    dotenvy::dotenv().ok();
+    
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
@@ -50,8 +47,7 @@ pub fn run() {
                 .app_data_dir()
                 .map_err(|error| format!("Failed to resolve app data directory: {error}"))?;
 
-            pdf_render::initialize_pdfium(&app_handle)
-                .map_err(|error| format!("Failed to initialize PDFium: {error}"))?;
+            // PDF rendering via PDFium is no longer required as Docling handles PDFs directly.
 
             // Initialise the connection pool and run migrations on a blocking thread
             let pool = tauri::async_runtime::block_on(db::init_db(data_dir))
