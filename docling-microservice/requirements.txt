@@ -2,3 +2,5 @@ fastapi
 uvicorn[standard]
 python-multipart
 docling
+transformers<=4.44.2
+tokenizers<=0.19.1

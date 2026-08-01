@@ -400,14 +400,21 @@ pub fn clean_question_content(content: &str) -> String {
         r"(?i)Total\s+for\s+Question\s+\d+\s+is\s+\d+\s+marks?",
         r"(?i)TOTAL\s+FOR\s+PAPER\s+IS\s+\d+\s+MARKS",
         r"(?i)Turn\s+over(\s+for\s+the\s+next\s+question)?",
-        r"(?i)BLANK\s+PAGE",
+        r"(?i)BLANK\s+PAGE.*$",
+        r"(?i)DO\s+NOT\s+WRITE\s+IN\s+THIS\s+AREA.*$",
+        r"(?i)PLEASE\s+DO\s+NOT\s+WRITE\s+ON\s+THIS\s+PAGE.*$",
+        r"(?i)END\s+OF\s+(?:QUESTION\s+PAPER|PRACTICAL\s+COMPETENCY).*$",
         r"(?im)^\s*Advantage\s*\d*\s*$",
         r"(?im)^\s*Disadvantage\s*\d*\s*$",
         r"(?im)^\s*Problem\s*\d+\s*$",
         r"(?im)^\s*Answer\s*_*\s*$",
         r"(?im)^\s*PMT\s*$",
         r"(?i)<!--\s*image\s*-->",
-        r"(?m)^\s*[-_]{4,}\s*$",
+        r"(?m)^\s*[-_]{3,}\s*$",
+        r"(?m)^\s*(?:[-_]\s*){3,}\s*$",
+        r"(?m)^\s*(?:\.\s*){4,}\s*$",
+        r"---+",
+        r"___+",
         r"(?m)^[\s\-_]*(?:🗹|□|■|☒|\d|\\|/|\s)+$",
     ];
     let mut cleaned = content.to_string();
@@ -432,6 +439,42 @@ pub fn clean_question_content(content: &str) -> String {
     
     // Automatically close any unclosed $ or $$ tags to prevent MDX parser crashes
     sanitize_markdown_math(&hardened)
+}
+
+/// Determines if a chunk contains meaningful alphanumeric question text after stripping
+/// out headings, marks allocations, and Edexcel working-out/boilerplate lines.
+/// Used to drop empty lined pages from generating blank flashcards.
+pub fn is_meaningful_question_chunk(chunk: &str) -> bool {
+    let mut s = chunk.to_string();
+
+    // Strip markdown headings like "# Question 5" or "Question 5:" or "Q5."
+    let heading_re = re(r"(?im)^\s*(#{1,4}\s*(?:Question|Q)\s*\d+|\b(?:Question|Q)\s*\d+[:.]?)\s*");
+    s = heading_re.replace_all(&s, "").into_owned();
+
+    // Strip common Edexcel and exam boilerplate
+    let boilerplate_re = re(
+        r"(?i)(?:DO\s+NOT\s+WRITE\s+IN\s+THIS\s+AREA|BLANK\s+PAGE|PLEASE\s+DO\s+NOT\s+WRITE|END\s+OF\s+(?:QUESTION\s+PAPER|PRACTICAL\s+COMPETENCY)|TURN\s+OVER|TOTAL\s+FOR\s+(?:QUESTION|PAPER)|PMT)"
+    );
+    s = boilerplate_re.replace_all(&s, "").into_owned();
+
+    // Strip mark allocations like "**[4 marks]**" or "(2 marks)"
+    let marks_re = re(r"(?i)\*?\*?(?:\[|\()\s*\d{1,2}\s*marks?\s*(?:\]|\))\*?\*?");
+    s = marks_re.replace_all(&s, "").into_owned();
+
+    // Strip lines of dashes, underscores, dots, or repeating patterns
+    let lines_re = re(r"[-_.\s]{3,}");
+    s = lines_re.replace_all(&s, "").into_owned();
+
+    // Check if chunk contains an image link
+    let has_image = re(r"!\[.*?\]\(.*?\)").is_match(chunk);
+
+    // Count remaining alphanumeric and alphabetic characters
+    let alnum_count = s.chars().filter(|c| c.is_alphanumeric()).count();
+    let alpha_count = s.chars().filter(|c| c.is_alphabetic()).count();
+
+    // Require at least 8 alphanumeric chars, 5 alphabetic chars, or an image link
+    // to qualify as a meaningful question rather than a blank lined/working-out page.
+    alnum_count >= 8 || alpha_count >= 5 || has_image
 }
 
 /// Repair common LLM/PDF LaTeX damage before balancing Markdown delimiters.
@@ -2045,5 +2088,27 @@ N
         assert_eq!(repaired.matches("$$").count(), 2, "Should have exactly one opening and one closing $$");
         assert!(repaired.contains("\\lambda"), "Should preserve the lambda symbol");
         assert!(repaired.contains("\\begin{pmatrix}"), "Should preserve both matrices");
+    }
+
+    #[test]
+    fn strips_edexcel_working_out_lines_and_boilerplate() {
+        let source = "# Question 3\nCalculate the force.\n-------------------\n-------------------\nDO NOT WRITE IN THIS AREA\n___________________\n[2 marks]";
+        let cleaned = clean_question_content(source);
+        assert!(cleaned.contains("Calculate the force."), "{cleaned}");
+        assert!(!cleaned.contains("---"), "{cleaned}");
+        assert!(!cleaned.contains("___"), "{cleaned}");
+        assert!(!cleaned.contains("DO NOT WRITE IN THIS AREA"), "{cleaned}");
+    }
+
+    #[test]
+    fn drops_blank_lined_pages_and_keeps_meaningful_questions() {
+        let blank_page = "# Question 5\n---------------------------------------\n---------------------------------------\nDO NOT WRITE IN THIS AREA\n_______________________________________";
+        assert!(!is_meaningful_question_chunk(blank_page), "Blank lined page should be dropped");
+
+        let short_question = "# Question 2\nSolve $x = 4$. [1 mark]";
+        assert!(is_meaningful_question_chunk(short_question), "Valid question should be kept");
+
+        let diagram_only_question = "# Question 6\n![Diagram](/path/to/diagram.png)";
+        assert!(is_meaningful_question_chunk(diagram_only_question), "Diagram question should be kept");
     }
 }

@@ -31,7 +31,10 @@ pub fn chunk_markdown_paper(markdown: &str) -> Vec<String> {
         if mat.start() > last_start {
             let chunk = &markdown[last_start..mat.start()];
             if !chunk.trim().is_empty() {
-                chunks.push(chunk.trim().to_string());
+                let cleaned = crate::validate::clean_question_content(chunk);
+                if crate::validate::is_meaningful_question_chunk(&cleaned) {
+                    chunks.push(chunk.trim().to_string());
+                }
             }
         }
         last_start = mat.start();
@@ -40,7 +43,10 @@ pub fn chunk_markdown_paper(markdown: &str) -> Vec<String> {
     if last_start < markdown.len() {
         let chunk = &markdown[last_start..];
         if !chunk.trim().is_empty() {
-            chunks.push(chunk.trim().to_string());
+            let cleaned = crate::validate::clean_question_content(chunk);
+            if crate::validate::is_meaningful_question_chunk(&cleaned) {
+                chunks.push(chunk.trim().to_string());
+            }
         }
     }
     
@@ -1064,7 +1070,7 @@ pub async fn parse_pdf_vision(
         .and_then(|n| n.to_str())
         .unwrap_or("document.pdf");
 
-    let markdown = crate::docling_client::extract_pdf(bytes, filename)
+    let markdown = crate::docling_client::extract_pdf(bytes, filename, &app)
         .await
         .map_err(|e| format!("Docling extraction failed: {}", e))?;
 
@@ -1310,7 +1316,7 @@ pub async fn parse_mark_scheme_vision(
         .and_then(|n| n.to_str())
         .unwrap_or("document.pdf");
 
-    let markdown = crate::docling_client::extract_pdf(bytes, filename)
+    let markdown = crate::docling_client::extract_pdf(bytes, filename, &app)
         .await
         .map_err(|e| format!("Docling extraction failed: {}", e))?;
 
