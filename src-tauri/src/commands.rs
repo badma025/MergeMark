@@ -21,31 +21,7 @@ pub struct TimingRecord {
     pub milliseconds: u64,
 }
 
-pub fn chunk_markdown_paper(markdown: &str) -> Vec<String> {
-    let re = regex::Regex::new(r"(?m)^\s*(#{1,4}\s*(?:Question|Q)\s*\d+)").unwrap();
-    
-    let mut chunks = Vec::new();
-    let mut last_start = 0;
-    
-    for mat in re.find_iter(markdown) {
-        if mat.start() > last_start {
-            let chunk = &markdown[last_start..mat.start()];
-            if !chunk.trim().is_empty() {
-                chunks.push(chunk.trim().to_string());
-            }
-        }
-        last_start = mat.start();
-    }
-    
-    if last_start < markdown.len() {
-        let chunk = &markdown[last_start..];
-        if !chunk.trim().is_empty() {
-            chunks.push(chunk.trim().to_string());
-        }
-    }
-    
-    chunks
-}
+
 use std::time::Instant;
 use tauri::{Emitter, Manager, State};
 
@@ -1064,9 +1040,9 @@ pub async fn parse_pdf_vision(
         .and_then(|n| n.to_str())
         .unwrap_or("document.pdf");
 
-    let markdown = crate::docling_client::extract_pdf(bytes, filename)
+    let markdown = crate::mineru_client::extract_pdf(bytes, filename, &app)
         .await
-        .map_err(|e| format!("Docling extraction failed: {}", e))?;
+        .map_err(|e| format!("Marker extraction failed: {}", e))?;
 
     let pool = state.db.lock().await;
     let module_id = module_override
@@ -1088,7 +1064,7 @@ pub async fn parse_pdf_vision(
         .ok_or_else(|| "Selected subject not found in database.".to_string())?;
     drop(pool);
 
-    let chunks = chunk_markdown_paper(&markdown);
+    let chunks = crate::validate::chunk_markdown_paper(&markdown);
     
     let mut final_questions = Vec::with_capacity(chunks.len());
     let mut question_number = 1;
@@ -1310,11 +1286,11 @@ pub async fn parse_mark_scheme_vision(
         .and_then(|n| n.to_str())
         .unwrap_or("document.pdf");
 
-    let markdown = crate::docling_client::extract_pdf(bytes, filename)
+    let markdown = crate::mineru_client::extract_pdf(bytes, filename, &app)
         .await
-        .map_err(|e| format!("Docling extraction failed: {}", e))?;
+        .map_err(|e| format!("Marker extraction failed: {}", e))?;
 
-    let chunks = chunk_markdown_paper(&markdown);
+    let chunks = crate::validate::chunk_markdown_paper(&markdown);
     
     if chunks.is_empty() {
         return Err("No answers could be extracted from this document.".to_string());

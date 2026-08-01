@@ -407,8 +407,9 @@ pub fn clean_question_content(content: &str) -> String {
         r"(?im)^\s*Answer\s*_*\s*$",
         r"(?im)^\s*PMT\s*$",
         r"(?i)<!--\s*image\s*-->",
-        r"(?m)^\s*[-_]{4,}\s*$",
+        r"(?m)^\s*[-_]{3,}\s*$",
         r"(?m)^[\s\-_]*(?:🗹|□|■|☒|\d|\\|/|\s)+$",
+        r"(?im)^\s*PAGE\s*\d+\s*$",
     ];
     let mut cleaned = content.to_string();
     for p in patterns {
@@ -2046,4 +2047,42 @@ N
         assert!(repaired.contains("\\lambda"), "Should preserve the lambda symbol");
         assert!(repaired.contains("\\begin{pmatrix}"), "Should preserve both matrices");
     }
+}
+
+pub fn chunk_markdown_paper(markdown: &str) -> Vec<String> {
+    // MinerU structural markdown might use plain headers `# 1` or `## 1.` or `1.`
+    // We match any heading containing just a number, or "Question", or a digit followed by a dot at start of line
+    let re = regex::Regex::new(r"(?m)^\s*(?:#{1,4}\s*(?:Question|Q)?\.?\s*\d+|\d+\.)").unwrap();
+    
+    let mut chunks = Vec::new();
+    let mut last_start = 0;
+    
+    let mut add_chunk = |text: &str| {
+        let trimmed = text.trim();
+        if trimmed.is_empty() {
+            return;
+        }
+        
+        // Aggressively drop chunks that consist solely of Edexcel blank working lines
+        // e.g., ---------- or page break markers
+        let cleaned = crate::validate::clean_question_content(trimmed);
+        if !cleaned.trim().is_empty() {
+            chunks.push(trimmed.to_string());
+        }
+    };
+    
+    for mat in re.find_iter(markdown) {
+        if mat.start() > last_start {
+            let chunk = &markdown[last_start..mat.start()];
+            add_chunk(chunk);
+        }
+        last_start = mat.start();
+    }
+    
+    if last_start < markdown.len() {
+        let chunk = &markdown[last_start..];
+        add_chunk(chunk);
+    }
+    
+    chunks
 }

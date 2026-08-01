@@ -10,7 +10,7 @@ mod db;
 mod backup;
 mod billing;
 mod commands;
-mod docling_client;
+mod mineru_client;
 mod taxonomy;
 mod validate;
 
