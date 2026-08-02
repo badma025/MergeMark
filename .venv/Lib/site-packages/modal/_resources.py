@@ -1,0 +1,52 @@
+# Copyright Modal Labs 2024
+
+
+from modal_proto import api_pb2
+
+from ._utils.function_utils import parse_gpu_config
+from .exception import InvalidError
+
+
+def convert_fn_config_to_resources_config(
+    *,
+    cpu: float | tuple[float, float] | None,
+    memory: int | tuple[int, int] | None,
+    gpu: str | None,
+    ephemeral_disk: int | None = None,
+    rdma: bool | None = None,
+) -> api_pb2.Resources:
+    if cpu and isinstance(cpu, tuple):
+        if not cpu[0]:
+            raise InvalidError("CPU request must be a positive number")
+        elif not cpu[1]:
+            raise InvalidError("CPU limit must be a positive number")
+        milli_cpu = int(1000 * cpu[0])
+        milli_cpu_max = int(1000 * cpu[1])
+        if milli_cpu_max < milli_cpu:
+            raise InvalidError(f"Cannot specify a CPU limit lower than request: {milli_cpu_max} < {milli_cpu}")
+    elif cpu and isinstance(cpu, (float, int)):
+        milli_cpu = int(1000 * cpu)
+        milli_cpu_max = 0
+    else:
+        milli_cpu = 0
+        milli_cpu_max = 0
+
+    if memory and isinstance(memory, int):
+        memory_mb = memory
+        memory_mb_max = 0  # no limit
+    elif memory and isinstance(memory, tuple):
+        memory_mb, memory_mb_max = memory
+        if memory_mb_max < memory_mb:
+            raise InvalidError(f"Cannot specify a memory limit lower than request: {memory_mb_max} < {memory_mb}")
+    else:
+        memory_mb = 0
+        memory_mb_max = 0
+    return api_pb2.Resources(
+        milli_cpu=milli_cpu,
+        milli_cpu_max=milli_cpu_max,
+        gpu_config=parse_gpu_config(gpu),
+        memory_mb=memory_mb,
+        memory_mb_max=memory_mb_max,
+        ephemeral_disk_mb=ephemeral_disk or 0,
+        rdma=rdma or False,
+    )

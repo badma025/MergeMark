@@ -21,32 +21,7 @@ pub struct TimingRecord {
     pub milliseconds: u64,
 }
 
-pub fn chunk_markdown_paper(markdown: &str) -> Vec<String> {
-    let re = regex::Regex::new(r"(?m)^\s*(#{1,4}\s*(?:Question|Q)\s*\d+)").unwrap();
-    
-    let mut chunks = Vec::new();
-    let mut last_start = 0;
-    
-    for mat in re.find_iter(markdown) {
-        if mat.start() > last_start {
-            let chunk = &markdown[last_start..mat.start()];
-            if !chunk.trim().is_empty() {
-                chunks.push(chunk.trim().to_string());
-            }
-        }
-        last_start = mat.start();
-    }
-    
-    if last_start < markdown.len() {
-        let chunk = &markdown[last_start..];
-        if !chunk.trim().is_empty() {
-            chunks.push(chunk.trim().to_string());
-        }
-    }
-    
-    chunks
-}
-use std::time::Instant;
+pub use crate::validate::chunk_markdown_paper;
 use tauri::{Emitter, Manager, State};
 
 // ── Shared data model ─────────────────────────────────────────────────────────
@@ -962,8 +937,9 @@ pub async fn compile_worksheet(
     std::fs::write(&answer_key_tex, &answer_latex)
         .map_err(|e| format!("Failed to write answer key file: {}", e))?;
 
-    let pdflatex_path = find_pdflatex()
-        .ok_or_else(|| "pdflatex was not found in the standard installation paths or PATH".to_string())?;
+    let pdflatex_path = find_pdflatex().ok_or_else(|| {
+        "pdflatex was not found in the standard installation paths or PATH".to_string()
+    })?;
 
     run_pdflatex(&pdflatex_path, &work_dir, &worksheet_tex).await?;
 
@@ -1053,7 +1029,9 @@ pub async fn parse_pdf_vision(
         "Another extraction is already in progress. Please wait for it to finish.".to_string()
     })?;
 
-    state.cancel_flag.store(false, std::sync::atomic::Ordering::Relaxed);
+    state
+        .cancel_flag
+        .store(false, std::sync::atomic::Ordering::Relaxed);
 
     let bytes = tokio::fs::read(&file_path)
         .await
@@ -1064,9 +1042,9 @@ pub async fn parse_pdf_vision(
         .and_then(|n| n.to_str())
         .unwrap_or("document.pdf");
 
-    let markdown = crate::docling_client::extract_pdf(bytes, filename)
+    let markdown = crate::marker_client::extract_pdf(bytes, filename)
         .await
-        .map_err(|e| format!("Docling extraction failed: {}", e))?;
+        .map_err(|e| format!("Marker extraction failed: {}", e))?;
 
     let pool = state.db.lock().await;
     let module_id = module_override
@@ -1089,7 +1067,7 @@ pub async fn parse_pdf_vision(
     drop(pool);
 
     let chunks = chunk_markdown_paper(&markdown);
-    
+
     let mut final_questions = Vec::with_capacity(chunks.len());
     let mut question_number = 1;
 
@@ -1299,7 +1277,9 @@ pub async fn parse_mark_scheme_vision(
         "Another extraction is already in progress. Please wait for it to finish.".to_string()
     })?;
 
-    state.cancel_flag.store(false, std::sync::atomic::Ordering::Relaxed);
+    state
+        .cancel_flag
+        .store(false, std::sync::atomic::Ordering::Relaxed);
 
     let bytes = tokio::fs::read(&file_path)
         .await
@@ -1310,12 +1290,12 @@ pub async fn parse_mark_scheme_vision(
         .and_then(|n| n.to_str())
         .unwrap_or("document.pdf");
 
-    let markdown = crate::docling_client::extract_pdf(bytes, filename)
+    let markdown = crate::marker_client::extract_pdf(bytes, filename)
         .await
-        .map_err(|e| format!("Docling extraction failed: {}", e))?;
+        .map_err(|e| format!("Marker extraction failed: {}", e))?;
 
     let chunks = chunk_markdown_paper(&markdown);
-    
+
     if chunks.is_empty() {
         return Err("No answers could be extracted from this document.".to_string());
     }
@@ -1345,7 +1325,7 @@ pub async fn parse_mark_scheme_vision(
     }
 
     let mut proposed_mappings: Vec<ProposedMapping> = Vec::new();
-    
+
     for (i, chunk) in chunks.into_iter().enumerate() {
         let mut md = chunk;
         md = crate::validate::clean_question_content(&md);
@@ -1354,9 +1334,9 @@ pub async fn parse_mark_scheme_vision(
 
         let mut q_num = (i + 1) as i64;
         if let Some(cap) = leading_num_re.captures(&md) {
-             if let Ok(n) = cap[1].parse::<i64>() {
-                 q_num = n;
-             }
+            if let Ok(n) = cap[1].parse::<i64>() {
+                q_num = n;
+            }
         }
 
         match q_by_number.get(&q_num) {
@@ -1412,10 +1392,7 @@ pub async fn commit_mark_schemes(
 }
 
 #[tauri::command]
-pub async fn mark_question_verified(
-    id: String,
-    state: State<'_, AppState>,
-) -> Result<(), String> {
+pub async fn mark_question_verified(id: String, state: State<'_, AppState>) -> Result<(), String> {
     let pool = state.db.lock().await;
     sqlx::query("UPDATE questions SET needs_review = 0, answer_stale = 0 WHERE id = ?")
         .bind(id)
@@ -1857,9 +1834,14 @@ pub async fn export_flashcards(
         if let Some(q) = q {
             let mut front = crate::validate::sanitize_markdown_math(&q.content);
             if !q.math_snippet.is_empty() {
-                front = format!("{}\n\n{}", front, crate::validate::sanitize_markdown_math(&q.math_snippet));
+                front = format!(
+                    "{}\n\n{}",
+                    front,
+                    crate::validate::sanitize_markdown_math(&q.math_snippet)
+                );
             }
-            let back = crate::validate::sanitize_markdown_math(&q.answer_content.unwrap_or_default());
+            let back =
+                crate::validate::sanitize_markdown_math(&q.answer_content.unwrap_or_default());
 
             let mut tags = vec![q.subject.clone()];
             if let Some(m) = &q.module {
@@ -2032,8 +2014,12 @@ pub async fn generate_topics_for_module(
         }
     }
 
-    let topics: Vec<String> = serde_json::from_str(json_str)
-        .map_err(|e| format!("Failed to parse JSON array from LLM. Raw content: {}\nError: {}", content, e))?;
+    let topics: Vec<String> = serde_json::from_str(json_str).map_err(|e| {
+        format!(
+            "Failed to parse JSON array from LLM. Raw content: {}\nError: {}",
+            content, e
+        )
+    })?;
 
     let pool = state.db.lock().await;
     for topic_name in &topics {

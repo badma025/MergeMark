@@ -393,21 +393,115 @@ pub fn harden_line_breaks(content: &str) -> String {
     re(r"\n{3,}").replace_all(&out, "\n\n").to_string()
 }
 
+/// Chunks a full Markdown paper into individual question chunks.
+/// Adapts to Marker v2 structure (# Question 1, ## Question 1, **Question 1**, # 1., etc.)
+/// and avoids false splits on continuation headers like "Question 1 continued".
+pub fn chunk_markdown_paper(raw_markdown: &str) -> Vec<String> {
+    let normalized = raw_markdown.replace("\r\n", "\n").replace('\r', "\n");
+    let markdown = normalized.as_str();
+    if markdown.trim().is_empty() {
+        return Vec::new();
+    }
+
+    // Regex matching candidate question starts in Marker v2 Markdown:
+    // - "# Question 1", "## Question 1", "### Question 1", "#### Question 1"
+    // - "**Question 1**", "**Question 1:**", "**Question 1.**"
+    // - "Question 1:", "Question 1."
+    // - "# Q1", "## Q1", "**Q1**"
+    // - "# 1.", "## 1.", "# 1"
+    // - "1. ", "2. ", "10. " (Marker v2 numbered lists / questions)
+    let re_q = re(
+        r"(?im)^[ \t]*(?:(?:#{1,4}[ \t]+)?(?:\*\*)?(?:Question|Q\.?)[ \t]*\d+(?:\*\*)?(?:[ \t]*[:.\-])?|(?:#{1,4}[ \t]+)?(?:\*\*)?\d{1,2}[\.\)](?:\*\*)?(?:[ \t]+|$))"
+    );
+
+    let mut chunks = Vec::new();
+    let mut match_indices: Vec<usize> = Vec::new();
+
+    for mat in re_q.find_iter(markdown) {
+        let end_pos = mat.end();
+        // Find full line boundaries around the match
+        let line_start = markdown[..end_pos].rfind('\n').map(|idx| idx + 1).unwrap_or(0);
+        let line_end = markdown[end_pos..]
+            .find('\n')
+            .map(|idx| end_pos + idx)
+            .unwrap_or(markdown.len());
+        let line = markdown[line_start..line_end].trim();
+        let line_lower = line.to_lowercase();
+
+        if line_lower.contains("continued")
+            || line_lower.contains("contd")
+            || line_lower.contains("cont.")
+            || line_lower.contains("answer all questions")
+            || line_lower.contains("use black ink")
+            || line_lower.contains("fill in the boxes")
+        {
+            continue;
+        }
+
+        match_indices.push(line_start);
+    }
+
+    if match_indices.is_empty() {
+        let trimmed = markdown.trim();
+        if !trimmed.is_empty() {
+            chunks.push(trimmed.to_string());
+        }
+        return chunks;
+    }
+
+    // If there is content before the first question start (e.g. cover page):
+    // only retain it if it contains marks or question content.
+    if match_indices[0] > 0 {
+        let prelude = markdown[..match_indices[0]].trim();
+        if sum_inline_marks(prelude) > 0 {
+            chunks.push(prelude.to_string());
+        }
+    }
+
+    for i in 0..match_indices.len() {
+        let start = match_indices[i];
+        let end = if i + 1 < match_indices.len() {
+            match_indices[i + 1]
+        } else {
+            markdown.len()
+        };
+
+        let chunk = markdown[start..end].trim();
+        if !chunk.is_empty() {
+            chunks.push(chunk.to_string());
+        }
+    }
+
+    chunks
+}
+
 pub fn clean_question_content(content: &str) -> String {
     let patterns: &[&str] = &[
-        r"(?i)Question\s+\d+\s+continued",
+        r"(?i)\(?\s*Question\s+\d+\s+continued\s*\)?",
         r"(?i)\(Total\s+for\s+Question\s+\d+\s+is\s+\d+\s+marks?\)",
         r"(?i)Total\s+for\s+Question\s+\d+\s+is\s+\d+\s+marks?",
+        r"(?i)\(Total\s+\d+\s+marks?\)",
         r"(?i)TOTAL\s+FOR\s+PAPER\s+IS\s+\d+\s+MARKS",
+        r"(?i)TOTAL\s+FOR\s+SECTION\s+[A-Z]\s+IS\s+\d+\s+MARKS",
         r"(?i)Turn\s+over(\s+for\s+the\s+next\s+question)?",
         r"(?i)BLANK\s+PAGE",
+        r"(?i)DO\s+NOT\s+WRITE\s+IN\s+THIS\s+AREA",
+        r"(?i)DO\s+NOT\s+WRITE\s+ON\s+THIS\s+PAGE",
+        r"(?i)Leave\s+blank",
         r"(?im)^\s*Advantage\s*\d*\s*$",
         r"(?im)^\s*Disadvantage\s*\d*\s*$",
         r"(?im)^\s*Problem\s*\d+\s*$",
         r"(?im)^\s*Answer\s*_*\s*$",
         r"(?im)^\s*PMT\s*$",
-        r"(?i)<!--\s*image\s*-->",
-        r"(?m)^\s*[-_]{4,}\s*$",
+        r"(?i)<!--\s*(?:image|figure)\s*-->",
+        // Blank Edexcel working lines: sequential hyphens, underscores, en-dashes, em-dashes
+        r"(?m)^\s*[-_–—]{3,}\s*$",
+        // Spaced dashes, dots, underscores e.g. "- - - - - -", ". . . . ."
+        r"(?m)^\s*(?:[-_–—\.]\s*){4,}\s*$",
+        // Empty table rows with dashed cells or spaces
+        r"(?m)^\s*\|\s*(?:[-_–—\s]+\|)+\s*$",
+        // Edexcel booklet codes like *P66789A0124* or P66789A0124
+        r"(?m)^\s*\*?P\d{5}[A-Z0-9]*\*?\s*$",
         r"(?m)^[\s\-_]*(?:🗹|□|■|☒|\d|\\|/|\s)+$",
     ];
     let mut cleaned = content.to_string();
@@ -2046,4 +2140,74 @@ N
         assert!(repaired.contains("\\lambda"), "Should preserve the lambda symbol");
         assert!(repaired.contains("\\begin{pmatrix}"), "Should preserve both matrices");
     }
+
+    #[test]
+    fn chunks_marker_v2_headings_and_avoids_continuation_split() {
+        let md = r#"# Pearson Edexcel Level 3 GCE Further Mathematics
+Paper 1: Core Pure Mathematics 1
+
+## Question 1
+(a) Find the general solution of the differential equation
+$$\frac{\mathrm{d}^2y}{\mathrm{d}x^2} + 4y = \sin(2x)$$
+**[5 marks]**
+
+## Question 1 continued
+(b) Hence find the particular solution given $y=0$ at $x=0$.
+**[3 marks]**
+
+--------------------------------------------------
+- - - - - - - - - - - - - - - - - - - - - - - - -
+__________________________________________________
+
+## Question 2
+The matrix $\mathbf{M}$ is given by
+$$\mathbf{M} = \begin{pmatrix} 2 & 1 \\ 0 & 3 \end{pmatrix}$$
+Find $\mathbf{M}^{-1}$. **[2 marks]**
+"#;
+
+        let chunks = chunk_markdown_paper(md);
+        assert_eq!(chunks.len(), 2, "Should have exactly 2 questions, not splitting on Question 1 continued");
+        assert!(chunks[0].contains("Question 1"), "Chunk 0 should contain Question 1");
+        assert!(chunks[0].contains("Question 1 continued"), "Chunk 0 should include continuation content");
+        assert!(chunks[0].contains(r"\frac{\mathrm{d}^2y}{\mathrm{d}x^2}"), "Chunk 0 should contain part (a)");
+        assert!(chunks[0].contains("particular solution"), "Chunk 0 should contain part (b)");
+        assert!(chunks[1].contains("Question 2"), "Chunk 1 should contain Question 2");
+        assert!(chunks[1].contains(r"\mathbf{M}"), "Chunk 1 should contain matrix question");
+    }
+
+    #[test]
+    fn cleans_edexcel_blank_working_lines_and_noise() {
+        let raw = r#"## Question 3
+Solve the equation $z^3 = 8\mathrm{i}$. **[4 marks]**
+
+--------------------------------------------------
+- - - - - - - - - - - - - - - - - - - - - - - - -
+__________________________________________________
+––––––––––––––––––––––––––––––––––––––––––––––––––
+..................................................
+. . . . . . . . . . . . . . . . . . . . . . . . .
+
+DO NOT WRITE IN THIS AREA
+DO NOT WRITE ON THIS PAGE
+Leave blank
+*P66789A0124*
+(Total for Question 3 is 4 marks)
+Turn over for the next question
+"#;
+
+        let cleaned = clean_question_content(raw);
+        assert!(cleaned.contains("Solve the equation $z^3 = 8\\mathrm{i}$."), "{cleaned}");
+        assert!(cleaned.contains("**[4 marks]**"), "{cleaned}");
+        assert!(!cleaned.contains("DO NOT WRITE IN THIS AREA"), "{cleaned}");
+        assert!(!cleaned.contains("DO NOT WRITE ON THIS PAGE"), "{cleaned}");
+        assert!(!cleaned.contains("Leave blank"), "{cleaned}");
+        assert!(!cleaned.contains("Total for Question 3"), "{cleaned}");
+        assert!(!cleaned.contains("Turn over"), "{cleaned}");
+        assert!(!cleaned.contains("*P66789A0124*"), "{cleaned}");
+        assert!(!cleaned.contains("----------------"), "{cleaned}");
+        assert!(!cleaned.contains("________________"), "{cleaned}");
+        assert!(!cleaned.contains("- - - - -"), "{cleaned}");
+        assert!(!cleaned.contains(". . . . ."), "{cleaned}");
+    }
 }
+
