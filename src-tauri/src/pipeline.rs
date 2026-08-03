@@ -302,7 +302,11 @@ async fn prepare_chunk_images(
                     ));
                     use image::codecs::jpeg::JpegEncoder;
                     use image::ImageEncoder;
-                    let enc = JpegEncoder::new_with_quality(&mut buf, 92);
+                    // Quality 80: visually identical for text/line-art OCR but
+                    // ~35% smaller than 92. Reduces upload + provider processing
+                    // time across all API calls. Diagram crops written to disk
+                    // are unaffected (those go through save_diagram at full res).
+                    let enc = JpegEncoder::new_with_quality(&mut buf, 80);
                     if enc
                         .write_image(
                             &resized,

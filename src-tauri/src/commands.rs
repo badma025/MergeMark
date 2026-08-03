@@ -1111,15 +1111,28 @@ pub async fn parse_pdf_vision(
     // modest cost (output tokens are the expensive part, but a truncated
     // question that requires a full retry is far more expensive).
     config.max_output_tokens = 32768;
-    config.parallelism = std::env::var("MERGEMARK_PARALLELISM")
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-        .map(|v| v.clamp(1, 8))
-        .unwrap_or(4);
 
     let (route, client) = resolve_llm_client(&state, model_name.clone())
         .await
         .map_err(|e| e.hint.unwrap_or(e.message))?;
+
+    // Use higher parallelism for BYOK (user controls their own rate limits);
+    // conservative for the shared Free Tier key. The 429 retry loop in
+    // llm.rs handles backpressure automatically if the provider throttles.
+    config.parallelism = match &route {
+        crate::billing::BillingRoute::FreeTier { .. } => {
+            std::env::var("MERGEMARK_PARALLELISM")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .map(|v| v.clamp(1, 4))
+                .unwrap_or(4)
+        }
+        _ => std::env::var("MERGEMARK_PARALLELISM")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .map(|v| v.clamp(1, 16))
+            .unwrap_or(8),
+    };
 
     let progress = TauriProgress { app: app.clone() };
     let (built, mut report): (Vec<BuiltQuestion>, ImportReport) =
@@ -1459,6 +1472,22 @@ pub async fn parse_mark_scheme_vision(
     let (route, client) = resolve_llm_client(&state, model_name.clone())
         .await
         .map_err(|e| e.hint.unwrap_or(e.message))?;
+
+    // Route-aware parallelism: higher for BYOK, conservative for Free Tier.
+    config.parallelism = match &route {
+        crate::billing::BillingRoute::FreeTier { .. } => {
+            std::env::var("MERGEMARK_PARALLELISM")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .map(|v| v.clamp(1, 4))
+                .unwrap_or(4)
+        }
+        _ => std::env::var("MERGEMARK_PARALLELISM")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .map(|v| v.clamp(1, 16))
+            .unwrap_or(8),
+    };
 
     let progress = TauriProgress { app: app.clone() };
     let (drafts, report): (Vec<AnswerDraft>, ImportReport) =
