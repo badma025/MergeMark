@@ -183,6 +183,23 @@ pub async fn init_db(app_data_dir: PathBuf) -> Result<SqlitePool, sqlx::Error> {
         "#
     ).execute(&pool).await?;
 
+    // ── Extraction cache for instant re-ingestion ──────────────────────────
+    // Stores completed extraction results keyed by (file_content_hash,
+    // model, paper_name, cache_version). When a user re-ingests the same
+    // paper with the same model, the pipeline is skipped entirely and the
+    // cached questions are returned directly.
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS extraction_cache (
+            cache_key    TEXT PRIMARY KEY,
+            questions    TEXT NOT NULL,
+            created_at   INTEGER NOT NULL DEFAULT 0
+        );
+        "#,
+    )
+    .execute(&pool)
+    .await?;
+
     // Seed taxonomy if completely empty
     let count: (i64,) = sqlx::query_as("SELECT count(*) FROM subjects").fetch_one(&pool).await?;
     if count.0 == 0 {
@@ -284,6 +301,74 @@ pub async fn set_byok_api_key(
     )
     .bind(key)
     .bind(base_url)
+    .bind(now)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+// ── Extraction cache helpers ─────────────────────────────────────────────
+//
+// Content-addressed cache for completed extraction results. When a user
+// re-ingests the same PDF with the same model, the pipeline is skipped
+// entirely and cached questions are returned instantly.
+//
+// Bump EXTRACTION_CACHE_VERSION when the extraction logic, validation
+// rules, or prompt templates change in a way that would produce different
+// output for the same input.
+
+/// Bump this to invalidate all cached extraction results after logic changes.
+pub const EXTRACTION_CACHE_VERSION: u32 = 1;
+
+/// Compute a deterministic cache key from file content + parameters.
+/// Uses a fast FNV-1a hash of the file bytes (not cryptographic, just
+/// collision-resistant enough for a local cache).
+pub fn extraction_cache_key(
+    file_bytes: &[u8],
+    model: &str,
+    paper_name: &str,
+) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    file_bytes.hash(&mut hasher);
+    model.hash(&mut hasher);
+    paper_name.hash(&mut hasher);
+    EXTRACTION_CACHE_VERSION.hash(&mut hasher);
+    format!("{:016x}", hasher.finish())
+}
+
+/// Look up a cached extraction result. Returns `Some(json_string)` if found.
+pub async fn get_cached_extraction(
+    pool: &SqlitePool,
+    cache_key: &str,
+) -> Result<Option<String>, sqlx::Error> {
+    let row: Option<(String,)> = sqlx::query_as(
+        "SELECT questions FROM extraction_cache WHERE cache_key = ?",
+    )
+    .bind(cache_key)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.map(|(q,)| q))
+}
+
+/// Store a completed extraction result in the cache.
+pub async fn store_cached_extraction(
+    pool: &SqlitePool,
+    cache_key: &str,
+    questions_json: &str,
+) -> Result<(), sqlx::Error> {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    sqlx::query(
+        r#"
+        INSERT OR REPLACE INTO extraction_cache (cache_key, questions, created_at)
+        VALUES (?, ?, ?)
+        "#,
+    )
+    .bind(cache_key)
+    .bind(questions_json)
     .bind(now)
     .execute(pool)
     .await?;

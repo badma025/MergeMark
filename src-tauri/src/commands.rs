@@ -1135,6 +1135,27 @@ pub async fn parse_pdf_vision(
     };
 
     let progress = TauriProgress { app: app.clone() };
+
+    // ── Extraction cache: skip the pipeline if we've seen this input before ──
+    // Compute a content-addressed cache key from the PDF bytes + model +
+    // paper name. On cache hit, return the stored questions immediately
+    // without making any API calls — re-ingestion becomes instant.
+    let file_bytes = std::fs::read(&file_path).unwrap_or_default();
+    let cache_key = crate::db::extraction_cache_key(
+        &file_bytes,
+        &model_name,
+        paper_name.trim(),
+    );
+    let pool_check = state.db.lock().await;
+    if let Ok(Some(cached_json)) = crate::db::get_cached_extraction(&pool_check, &cache_key).await {
+        if let Ok(cached_questions) = serde_json::from_str::<Vec<Question>>(&cached_json) {
+            progress.stage("Loaded from cache — skipping extraction.");
+            drop(pool_check);
+            return Ok(cached_questions);
+        }
+    }
+    drop(pool_check);
+
     let (built, mut report): (Vec<BuiltQuestion>, ImportReport) =
         pipeline::run_question_pipeline(&client, &pages, &config, &progress, &state.cancel_flag)
             .await?;
@@ -1232,6 +1253,14 @@ pub async fn parse_pdf_vision(
             needs_review: q.needs_review,
             answer_stale: false,
         });
+    }
+
+    // ── Store in extraction cache for instant re-ingestion ────────────────
+    if !final_questions.is_empty() {
+        if let Ok(questions_json) = serde_json::to_string(&final_questions) {
+            let pool_cache = state.db.lock().await;
+            let _ = crate::db::store_cached_extraction(&pool_cache, &cache_key, &questions_json).await;
+        }
     }
 
     Ok(final_questions)

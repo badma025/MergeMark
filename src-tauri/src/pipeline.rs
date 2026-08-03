@@ -183,6 +183,40 @@ async fn chat_with_permit<C: LlmClient>(
     client.chat(body).await
 }
 
+/// Shared cache for decoded page images. The same page is often decoded
+/// multiple times during a pipeline run (once for API downsampling in
+/// `prepare_chunk_images`, again for diagram cropping in `save_diagram`).
+/// This cache ensures each page is decoded from base64 at most once.
+pub struct PageImageCache {
+    pages: std::sync::Mutex<std::collections::HashMap<usize, Arc<image::DynamicImage>>>,
+}
+
+impl PageImageCache {
+    pub fn new() -> Self {
+        Self {
+            pages: std::sync::Mutex::new(std::collections::HashMap::new()),
+        }
+    }
+
+    /// Return a cached decoded page image, decoding and caching it on first access.
+    pub fn get_or_decode(&self, page_idx: usize, b64: &str) -> Option<Arc<image::DynamicImage>> {
+        // Fast path: check cache first (brief lock).
+        {
+            let pages = self.pages.lock().ok()?;
+            if let Some(img) = pages.get(&page_idx) {
+                return Some(Arc::clone(img));
+            }
+        }
+        // Slow path: decode outside the lock so other threads can read the cache.
+        let decoded = Arc::new(geometry::decode_page_image(b64)?);
+        // Store in cache.
+        if let Ok(mut pages) = self.pages.lock() {
+            pages.entry(page_idx).or_insert_with(|| Arc::clone(&decoded));
+        }
+        Some(decoded)
+    }
+}
+
 struct ChunkImageInput {
     chunk_idx: usize,
     b64: String,
@@ -247,7 +281,9 @@ async fn persist_diagrams(
 async fn prepare_chunk_images(
     chunk_len: usize,
     inputs: Vec<ChunkImageInput>,
+    page_cache: &Arc<PageImageCache>,
 ) -> Result<PreparedChunk, tokio::task::JoinError> {
+    let page_cache = Arc::clone(page_cache);
     tokio::task::spawn_blocking(move || {
         let mut images = Vec::with_capacity(inputs.len());
         let mut local_to_chunk = Vec::with_capacity(inputs.len());
@@ -256,7 +292,10 @@ async fn prepare_chunk_images(
         let mut decoded_pages = vec![None; chunk_len];
 
         for input in inputs {
-            let decoded = geometry::decode_page_image(&input.b64).map(Arc::new);
+            // Use the shared decode cache: each page is decoded from base64
+            // at most once per pipeline run, then reused for all subsequent
+            // chunk preparations and diagram crops.
+            let decoded = page_cache.get_or_decode(input.chunk_idx, &input.b64);
             let mut final_b64 = input.b64;
             let mut crop_offset = (0.0_f32, 1.0_f32);
 
@@ -912,6 +951,7 @@ pub async fn run_question_pipeline<C: LlmClient, P: Progress>(
         PAGE_RENDER_CACHE_CAPACITY,
     ));
     let request_semaphore = Arc::new(Semaphore::new(config.parallelism.max(1)));
+    let page_image_cache = Arc::new(PageImageCache::new());
 
     // Prefer the free PDF text layer: it avoids one vision request per page.
     let page_texts: Vec<String> = pages.iter().map(|p| p.text.clone()).collect();
@@ -1184,6 +1224,7 @@ pub async fn run_question_pipeline<C: LlmClient, P: Progress>(
                 i,
                 batch_next_allowed,
                 &page_render_cache,
+                &page_image_cache,
                 &request_semaphore,
             ).map(move |result| (position, result))
         }))
@@ -1218,6 +1259,7 @@ pub async fn run_question_pipeline<C: LlmClient, P: Progress>(
                                     i,
                                     next_allowed,
                                         &page_render_cache,
+                                        &page_image_cache,
                                         &request_semaphore,
                                     )
                                 .await;
@@ -1314,6 +1356,7 @@ pub async fn run_question_pipeline<C: LlmClient, P: Progress>(
                 job.1,
                 &job.2,
                 &page_render_cache,
+                &page_image_cache,
                 &request_semaphore,
             )
             .map(move |result| (position, result))
@@ -1395,6 +1438,7 @@ async fn extract_span<C: LlmClient>(
     span: &QuestionSpan,
     span_pages: &[(usize, &PageInput)],
     page_render_cache: &Arc<crate::pdf_render::PageRenderCache>,
+    page_image_cache: &Arc<PageImageCache>,
     request_semaphore: &Arc<Semaphore>,
 ) -> (Option<BuiltQuestion>, ImportReport) {
     // Own, local report: spans now run in parallel batches, so each unit
@@ -1463,7 +1507,7 @@ async fn extract_span<C: LlmClient>(
                 });
             }
         }
-        let prepared = match prepare_chunk_images(chunk.len(), preparation_inputs).await {
+        let prepared = match prepare_chunk_images(chunk.len(), preparation_inputs, page_image_cache).await {
             Ok(prepared) => prepared,
             Err(error) => {
                 report.anomalies.push(format!(
@@ -2728,6 +2772,7 @@ async fn extract_fallback_page<C: LlmClient>(
     page_idx: usize,
     next_allowed: u32,
     page_render_cache: &Arc<crate::pdf_render::PageRenderCache>,
+    page_image_cache: &Arc<PageImageCache>,
     request_semaphore: &Arc<Semaphore>,
 ) -> (Option<Vec<BuiltQuestion>>, ImportReport) {
     // Own, local report: pages now run in parallel batches.
@@ -2762,7 +2807,7 @@ RULES:
         }],
         PageInputKind::TextOnly => Vec::new(),
     };
-    let prepared = match prepare_chunk_images(1, preparation_inputs).await {
+    let prepared = match prepare_chunk_images(1, preparation_inputs, page_image_cache).await {
         Ok(prepared) => prepared,
         Err(error) => {
             report.anomalies.push(format!(
@@ -3771,7 +3816,7 @@ mod tests {
         ));
         let semaphore = Arc::new(Semaphore::new(1));
         let (built_opt, report) =
-            extract_span(&mock, &config(), &span, &span_pages, &cache, &semaphore).await;
+            extract_span(&mock, &config(), &span, &span_pages, &cache, &Arc::new(PageImageCache::new()), &semaphore).await;
         let built = built_opt.expect("question must build after the repair round");
 
         assert_eq!(mock.remaining(), 0, "both attempts consumed");
@@ -3818,7 +3863,7 @@ mod tests {
         ));
         let semaphore = Arc::new(Semaphore::new(1));
         let (built_opt, report) =
-            extract_span(&mock, &config(), &span, &span_pages, &cache, &semaphore).await;
+            extract_span(&mock, &config(), &span, &span_pages, &cache, &Arc::new(PageImageCache::new()), &semaphore).await;
         let built = built_opt.expect("split span must build");
 
         assert!(built.content.contains("First page content."));
@@ -3885,7 +3930,7 @@ mod tests {
         ));
         let semaphore = Arc::new(Semaphore::new(1));
         let (built_opt, report) =
-            extract_span(&mock, &config(), &span, &span_pages, &cache, &semaphore).await;
+            extract_span(&mock, &config(), &span, &span_pages, &cache, &Arc::new(PageImageCache::new()), &semaphore).await;
         let built = built_opt.expect("transcription must survive even when boxes never pass");
 
         assert!(
