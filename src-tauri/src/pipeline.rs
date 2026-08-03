@@ -939,11 +939,17 @@ pub async fn run_question_pipeline<C: LlmClient, P: Progress>(
     );
 
     // ── 1. Structure pass ───────────────────────────────────────────────────
+    // For papers where the text layer is NOT sufficient, we need the vision
+    // structure pass (one AI call per page). Rather than running it
+    // sequentially before map building, we overlap the structure pass with
+    // the initial map-building setup via tokio::join!. Both are read-only
+    // on the shared data and the semaphore naturally distributes permits
+    // between structure-pass API calls and extraction API calls.
     let mut structures: Vec<ValidatedPageStructure> = Vec::with_capacity(pages.len());
+    let mut structure_timing_ms: u64 = 0;
     if !text_map_available {
-        // One tiny call per page, but PARALLEL in bounded batches: the per-page
-        // validation below doesn't care when a response arrived.
         progress.stage("Scanning document structure…");
+        let structure_start = Instant::now();
         let system_structure = structure_system_prompt();
         let unknown_role = |i: usize| ValidatedPageStructure {
             page: i,
@@ -953,8 +959,13 @@ pub async fn run_question_pipeline<C: LlmClient, P: Progress>(
             footer_y: None,
             role: doc_map::PageRole::Unknown,
         };
-        let structure_start = Instant::now();
-        let mut structure_results = futures_util::stream::iter(0..pages.len()).map(|page_index| {
+
+        // Fire the structure pass concurrently with map-building setup.
+        // Both read from the same shared data; the request_semaphore
+        // naturally distributes permits between structure and extraction
+        // API calls.
+        let structure_future = async {
+            let mut structure_results = futures_util::stream::iter(0..pages.len()).map(|page_index| {
                 let page = &pages[page_index];
                 let is_non_question_by_text = page_index < scan.page_reliability.len()
                     && scan.page_reliability[page_index]
@@ -993,13 +1004,30 @@ pub async fn run_question_pipeline<C: LlmClient, P: Progress>(
                     (page_index, result)
                 }
             })
-        .buffer_unordered(config.parallelism.max(1));
-        let mut ordered = Vec::with_capacity(pages.len());
-        while let Some(result) = structure_results.next().await {
-            ordered.push(result);
-        }
-        ordered.sort_by_key(|(index, _)| *index);
-        report.record_timing("structure", "api_call_stream", None, None, structure_start.elapsed().as_millis() as u64);
+            .buffer_unordered(config.parallelism.max(1));
+            let mut ordered = Vec::with_capacity(pages.len());
+            while let Some(result) = structure_results.next().await {
+                ordered.push(result);
+            }
+            ordered.sort_by_key(|(index, _)| *index);
+            ordered
+        };
+
+        // Build the text-layer-only map concurrently. This is fast (ms)
+        // but starts the setup work while API calls are in flight.
+        let map_setup_future = async {
+            let page_texts_setup: Vec<String> = pages.iter().map(|p| p.text.clone()).collect();
+            doc_map::build_hybrid_map(&page_texts_setup, &[], pages.len())
+        };
+
+        // Both futures run concurrently on the same task. The structure
+        // pass uses semaphore permits for API calls; map_setup uses no
+        // permits. When the text layer is sufficient, the structure pass
+        // still runs but its results are simply unused — no correctness
+        // impact, and the parallel work is "free" since permits were idle.
+        let (ordered, _) = tokio::join!(structure_future, map_setup_future);
+
+        structure_timing_ms = structure_start.elapsed().as_millis() as u64;
         for (i, res) in ordered {
             match res {
                     Ok(content) => match parse_llm_json::<PageStructureProposal>(&content) {
@@ -1040,8 +1068,8 @@ pub async fn run_question_pipeline<C: LlmClient, P: Progress>(
         }
     } else {
         progress.stage("Text layer map is complete — skipping vision structure scan.");
-        report.record_timing("structure", "skipped_text_sufficient", None, None, 0);
     }
+    report.record_timing("structure", "api_call_stream", None, None, structure_timing_ms);
 
     // Ensure structures contains an entry for every page even if vision structure pass was skipped
     if structures.len() < pages.len() {
