@@ -51,6 +51,8 @@ function DiagramImg({
         <img
           src={resolved}
           alt={alt}
+          loading="lazy"
+          decoding="async"
           className="max-w-full rounded-md cursor-zoom-in ring-1 ring-border/60 hover:ring-primary/40 transition-shadow"
           onError={(e) => {
             console.error("Failed to load diagram:", src, resolved);
@@ -151,18 +153,52 @@ export function preprocessMath(raw: string, isCode?: boolean, subject?: string):
       const cells = line.split('|').slice(1, -1).map((c: string) => c.trim());
       
       const latexCells = cells.map((cell: string) => {
-        const parts = cell.split(/(\$[^$]+\$)/g);
+        let trimmed = cell.trim();
+        if (!trimmed) return '';
+
+        // Handle bold/italic math like **$x$** or *$x$*
+        trimmed = trimmed.replace(/\*\*\s*\$([^$]+)\$\s*\*\*/g, '$\\mathbf{$1}$');
+        trimmed = trimmed.replace(/\*\s*\$([^$]+)\$\s*\*/g, '$\\mathit{$1}$');
+
+        const parts = trimmed.split(/(\$[^$]+\$)/g);
         return parts.map((part: string) => {
+          if (!part) return '';
           if (part.startsWith('$') && part.endsWith('$')) {
-            return part.slice(1, -1);
-          } else if (part !== '') {
-            // Escape & and % which break LaTeX arrays, wrap in \text{}
-            let text = part.replace(/&/g, '\\&').replace(/%/g, '\\%').replace(/\$/g, '\\$');
-            // KaTeX \text{} preserves spaces but we must ensure it doesn't break
-            return `\\text{${text}}`;
+            return part.slice(1, -1).trim();
           }
-          return '';
-        }).join(' ');
+
+          // Escape special characters for LaTeX array / KaTeX
+          let text = part
+            .replace(/&/g, '\\&')
+            .replace(/%/g, '\\%')
+            .replace(/#/g, '\\#');
+
+          // Tokenize markdown bold, italic, and code formatting
+          const tokenRegex = /(\*\*\*[\s\S]+?\*\*\*|___[\s\S]+?___|\*\*[\s\S]+?\*\*|__[\s\S]+?__|`[\s\S]+?`|\*[^\*]+?\*|(?<=^|\s)_[^_]+?_(?=\s|$|[.,;:!?]))/g;
+          const chunks = text.split(tokenRegex);
+
+          return chunks.map((chunk) => {
+            if (!chunk) return '';
+            if ((chunk.startsWith('***') && chunk.endsWith('***')) || (chunk.startsWith('___') && chunk.endsWith('___'))) {
+              const inner = chunk.slice(3, -3).trim();
+              return `\\textbf{\\textit{${inner}}}`;
+            }
+            if ((chunk.startsWith('**') && chunk.endsWith('**')) || (chunk.startsWith('__') && chunk.endsWith('__'))) {
+              const inner = chunk.slice(2, -2).trim();
+              return `\\textbf{${inner}}`;
+            }
+            if ((chunk.startsWith('*') && chunk.endsWith('*')) || (chunk.startsWith('_') && chunk.endsWith('_'))) {
+              const inner = chunk.slice(1, -1).trim();
+              return `\\textit{${inner}}`;
+            }
+            if (chunk.startsWith('`') && chunk.endsWith('`')) {
+              const inner = chunk.slice(1, -1).trim();
+              return `\\texttt{${inner}}`;
+            }
+            // Plain text wrapped in \text{}
+            return `\\text{${chunk}}`;
+          }).join('');
+        }).join(' ').trim();
       });
 
       latex += latexCells.join(' & ') + ' \\\\\n\\hline\n';
@@ -179,6 +215,11 @@ export function preprocessMath(raw: string, isCode?: boolean, subject?: string):
   // Helper to format block math with aligned environment if it has multiple lines
   const formatBlock = (inner: string) => {
     let clean = fixSlashes(inner.trim());
+    // Convert any stray markdown formatting inside math blocks to valid LaTeX
+    clean = clean.replace(/\*\*\*([^*]+)\*\*\*/g, "\\textbf{\\textit{$1}}");
+    clean = clean.replace(/\*\*([^*]+)\*\*/g, "\\textbf{$1}");
+    clean = clean.replace(/(?<!\\)\*([^*]+)\*/g, "\\textit{$1}");
+
     // If it has multiple lines and isn't already using an environment, wrap in aligned
     if (clean.includes("\n") && !clean.includes("\\begin{")) {
       // Replace newlines with \\ so KaTeX renders them on separate lines
@@ -326,118 +367,123 @@ export function QuestionCard(props: QuestionCardProps) {
         className
       )}
     >
-      {/* ── Action buttons — top-right corner, visible on hover ── */}
-      <div className="absolute top-3 right-3 flex gap-1 opacity-0 group-hover:opacity-100 focus-within:opacity-100 transition-all duration-150 z-10">
-        {!isEditing && (
+      {/* ── Header: Badges & Action Buttons ── */}
+      <div className="flex items-start justify-between gap-3 min-w-0">
+        {/* Left: Badges (wrap naturally without overlapping actions) */}
+        <div className="flex flex-wrap items-center gap-1.5 min-w-0 flex-1">
+          {needsReview && (
+            <Badge className="text-xs font-semibold tracking-wide bg-amber-500/15 text-amber-700 dark:text-amber-400 border-amber-500/30 hover:bg-amber-500/25 cursor-help shrink-0" title="Extracted with vision fallback or low confidence">
+              <AlertTriangle className="size-3 mr-1 inline" />
+              REVIEW
+            </Badge>
+          )}
+          <Badge
+            className="text-xs font-medium tracking-wide bg-zinc-800 text-zinc-50 hover:bg-zinc-800/90 dark:bg-zinc-200 dark:text-zinc-900 dark:hover:bg-zinc-200/90 shrink-0"
+          >
+            {displaySubject}
+          </Badge>
+          {module && module !== "General" && module !== "Unknown" && (
+            <Badge
+              className="text-xs font-medium tracking-wide bg-purple-900/50 text-purple-200 border-purple-800 hover:bg-purple-900/60 shrink-0"
+            >
+              {module}
+            </Badge>
+          )}
+          {parsedTopics.map((topic, i) => (
+            <Badge
+              key={i}
+              variant="outline"
+              className="text-xs font-medium bg-blue-900/50 text-blue-200 border-blue-800 shrink-0"
+            >
+              {topic}
+            </Badge>
+          ))}
+          <Badge className="bg-primary/15 text-primary hover:bg-primary/20 border-primary/20 text-xs font-semibold shrink-0">
+            {marks} {marks === 1 ? "mark" : "marks"}
+          </Badge>
+        </div>
+
+        {/* Right: Action buttons (never squished, distinct hover styling) */}
+        <div className="flex items-center gap-1 shrink-0 opacity-0 group-hover:opacity-100 focus-within:opacity-100 transition-opacity duration-150 -mr-1 -mt-1">
+          {!isEditing && (
+            <button
+              type="button"
+              onClick={(e) => {
+                e.stopPropagation();
+                setEditContent(displayContent);
+                setEditMarks(marks);
+                setEditAnswerContent(strippedAnswerContent);
+                setEditTopics(parsedTopics);
+                setIsEditing(true);
+              }}
+              title="Edit Question"
+              aria-label={`Edit question ${id}`}
+              className={cn(
+                "flex items-center justify-center rounded-md p-1.5",
+                "text-muted-foreground transition-all duration-150",
+                "hover:bg-primary/10 hover:text-primary",
+                "focus-visible:opacity-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/60"
+              )}
+            >
+              <Pencil className="size-4" />
+            </button>
+          )}
+          {!isEditing && needsReview && (
+            <button
+              type="button"
+              onClick={async (e) => {
+                e.stopPropagation();
+                try {
+                  await invoke("mark_question_verified", { id });
+                  setNeedsReview(false);
+                  setAnswerStale(false);
+                  toast.success("Question marked as verified");
+                } catch (e: any) {
+                  toast.error(e.toString());
+                }
+              }}
+              aria-label={`Mark question ${id} as verified`}
+              className={cn(
+                "flex items-center justify-center rounded-md p-1.5",
+                "text-emerald-600 transition-all duration-150",
+                "hover:bg-emerald-500/10 hover:text-emerald-500",
+                "focus-visible:opacity-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-500/60"
+              )}
+              title="Mark as Verified"
+            >
+              <ShieldCheck className="size-4" />
+            </button>
+          )}
           <button
+            id={`delete-question-${id}`}
             type="button"
             onClick={(e) => {
               e.stopPropagation();
-              setEditContent(displayContent);
-              setEditMarks(marks);
-              setEditAnswerContent(strippedAnswerContent);
-              setEditTopics(parsedTopics);
-              setIsEditing(true);
+              onDelete?.(id);
             }}
-            aria-label={`Edit question ${id}`}
+            title="Delete Question"
+            aria-label={`Delete question ${id}`}
             className={cn(
               "flex items-center justify-center rounded-md p-1.5",
-              "text-muted-foreground/40 transition-all duration-150",
-              "hover:bg-primary/10 hover:text-primary hover:opacity-100",
-              "focus-visible:opacity-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/60"
+              "text-muted-foreground transition-all duration-150",
+              "hover:bg-destructive/10 hover:text-destructive",
+              "focus-visible:opacity-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-destructive/60"
             )}
           >
-            <Pencil className="size-3.5" />
+            <Trash2 className="size-4" />
           </button>
-        )}
-        {!isEditing && needsReview && (
-          <button
-            type="button"
-            onClick={async (e) => {
-              e.stopPropagation();
-              try {
-                await invoke("mark_question_verified", { id });
-                setNeedsReview(false);
-                setAnswerStale(false);
-                toast.success("Question marked as verified");
-              } catch (e: any) {
-                toast.error(e.toString());
-              }
-            }}
-            aria-label={`Mark question ${id} as verified`}
-            className={cn(
-              "flex items-center justify-center rounded-md p-1.5",
-              "text-emerald-600/60 transition-all duration-150",
-              "hover:bg-emerald-500/10 hover:text-emerald-500 hover:opacity-100",
-              "focus-visible:opacity-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-500/60"
-            )}
-            title="Mark as Verified"
-          >
-            <ShieldCheck className="size-3.5" />
-          </button>
-        )}
-        <button
-          id={`delete-question-${id}`}
-          type="button"
-          onClick={(e) => {
-            e.stopPropagation();
-            onDelete?.(id);
-          }}
-          aria-label={`Delete question ${id}`}
-          className={cn(
-            "flex items-center justify-center rounded-md p-1.5",
-            "text-muted-foreground/40 transition-all duration-150",
-            "hover:bg-destructive/10 hover:text-destructive hover:opacity-100",
-            "focus-visible:opacity-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-destructive/60"
-          )}
-        >
-          <Trash2 className="size-3.5" />
-        </button>
+        </div>
       </div>
 
       {/* ── Stale Answer Warning Banner ── */}
       {answerStale && (
-        <div className="flex items-center gap-2 bg-amber-500/10 border border-amber-500/20 text-amber-700 dark:text-amber-400 p-2.5 rounded-lg text-sm -mx-1 mt-1 mb-2">
+        <div className="flex items-center gap-2 bg-amber-500/10 border border-amber-500/20 text-amber-700 dark:text-amber-400 p-2.5 rounded-lg text-sm -mx-1 mt-0 mb-1">
           <AlertTriangle className="size-4 shrink-0" />
           <div className="flex-1">
             <strong>Stale Answer:</strong> This mark scheme answer may be out of date compared to the recently updated question content.
           </div>
         </div>
       )}
-
-      {/* ── Badge row ── */}
-      <div className="flex flex-wrap items-center gap-2 pr-7">
-        {needsReview && (
-          <Badge className="text-xs font-semibold tracking-wide bg-amber-500/15 text-amber-700 dark:text-amber-400 border-amber-500/30 hover:bg-amber-500/25 cursor-help" title="Extracted with vision fallback or low confidence">
-            <AlertTriangle className="size-3 mr-1 inline" />
-            REVIEW
-          </Badge>
-        )}
-        <Badge
-          className="text-xs font-medium tracking-wide bg-zinc-800 text-zinc-50 hover:bg-zinc-800/90 dark:bg-zinc-200 dark:text-zinc-900 dark:hover:bg-zinc-200/90"
-        >
-          {displaySubject}
-        </Badge>
-        {module && module !== "General" && module !== "Unknown" && (
-          <Badge
-            className="text-xs font-medium tracking-wide bg-purple-900/50 text-purple-200 border-purple-800 hover:bg-purple-900/60"
-          >
-            {module}
-          </Badge>
-        )}
-        {parsedTopics.map((topic, i) => (
-          <Badge
-            key={i}
-            variant="outline"
-            className="text-xs font-medium bg-blue-900/50 text-blue-200 border-blue-800"
-          >
-            {topic}
-          </Badge>
-        ))}
-        <Badge className="ml-auto bg-primary/15 text-primary hover:bg-primary/20 border-primary/20 text-xs font-semibold">
-          {marks} {marks === 1 ? "mark" : "marks"}
-        </Badge>
-      </div>
 
       {/* ── Question content ── */}
       {/* ── Question / Answer Content (Crossfade) ── */}
@@ -504,9 +550,9 @@ export function QuestionCard(props: QuestionCardProps) {
           <DialogHeader>
             <DialogTitle>Edit Question</DialogTitle>
           </DialogHeader>
-          <div className="flex flex-col gap-4 py-2 flex-1 min-h-0 overflow-y-auto pr-2">
+          <div className="flex flex-col gap-4 py-2 flex-1 min-h-0 overflow-y-auto pr-2 pb-6">
             {/* Top Controls Row */}
-            <div className="flex items-center gap-4 flex-wrap bg-muted/30 p-3 rounded-lg border border-border/50">
+            <div className="flex items-center gap-4 flex-wrap bg-muted/30 p-3 rounded-lg border border-border/50 shrink-0">
               <div className="flex items-center gap-2">
                 <label className="text-sm font-semibold text-foreground whitespace-nowrap">Marks:</label>
                 <input
@@ -521,7 +567,7 @@ export function QuestionCard(props: QuestionCardProps) {
             </div>
 
             {/* Topics selection */}
-            <div className="flex flex-col gap-2">
+            <div className="flex flex-col gap-2 shrink-0">
               <label className="text-sm font-semibold text-foreground">Topics:</label>
               <div className="flex flex-wrap items-center gap-1.5">
                 {(() => {
@@ -555,25 +601,28 @@ export function QuestionCard(props: QuestionCardProps) {
             </div>
 
             {/* Content Editors */}
-            <div className="grid grid-cols-1 md:grid-cols-2 gap-4 flex-1 min-h-[300px] px-1 pb-1">
-              <div className="flex flex-col gap-2 h-full">
-                <div>
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-4 flex-1 min-h-[320px] p-0.5">
+              <div className="flex flex-col gap-1.5 flex-1 min-h-0">
+                <div className="min-h-[44px] flex flex-col justify-end">
                   <label className="text-sm font-semibold text-foreground">Question Content:</label>
                   <p className="text-xs text-muted-foreground">Markdown supported. Inline math: $...$, Block math: $$...$$</p>
                 </div>
                 <RichTextEditor 
                   markdown={editContent}
                   onChange={setEditContent}
-                  className="flex-1 w-full h-full"
+                  className="flex-1 w-full min-h-[300px]"
                 />
               </div>
-              <div className="flex flex-col gap-2 h-full">
-                <label className="text-sm font-semibold text-foreground">Mark Scheme Answer (Optional):</label>
+              <div className="flex flex-col gap-1.5 flex-1 min-h-0">
+                <div className="min-h-[44px] flex flex-col justify-end">
+                  <label className="text-sm font-semibold text-foreground">Mark Scheme Answer (Optional):</label>
+                  <p className="text-xs text-muted-foreground">Markdown supported. Optional mark scheme or model answer.</p>
+                </div>
                 <RichTextEditor 
                   markdown={editAnswerContent}
                   onChange={setEditAnswerContent}
                   placeholder="Paste or edit the mark scheme answer here..."
-                  className="flex-1 w-full h-full mt-[18px]"
+                  className="flex-1 w-full min-h-[300px]"
                 />
               </div>
             </div>

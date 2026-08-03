@@ -134,6 +134,8 @@ export function ReviewSyncModal({ mappings, onClose, onSuccess }: ReviewSyncModa
                                         {...props}
                                         src={assetUrl}
                                         alt={props.alt || "Diagram"}
+                                        loading="lazy"
+                                        decoding="async"
                                         className="max-w-full rounded-md my-4"
                                         onError={(e) => {
                                           console.error("Failed to load image via asset protocol:", props.src, assetUrl);
@@ -151,7 +153,7 @@ export function ReviewSyncModal({ mappings, onClose, onSuccess }: ReviewSyncModa
                                   return <div className="text-sm text-destructive border border-destructive/20 p-2 rounded-md bg-destructive/10 text-center">Failed to convert diagram URL: {props.alt || "Image"}</div>;
                                 }
                               }
-                              return <img {...props} alt={props.alt || "Diagram"} className="max-w-full rounded-md my-4" />;
+                              return <img {...props} alt={props.alt || "Diagram"} loading="lazy" decoding="async" className="max-w-full rounded-md my-4" />;
                             }
                           }}
                         >
@@ -204,6 +206,8 @@ export function ReviewSyncModal({ mappings, onClose, onSuccess }: ReviewSyncModa
                                       {...props}
                                       src={assetUrl}
                                       alt={props.alt || "Diagram"}
+                                      loading="lazy"
+                                      decoding="async"
                                       className="max-w-full rounded-md my-4"
                                       onError={() => console.error("Failed to load image via asset protocol:", props.src)}
                                     />
@@ -212,7 +216,7 @@ export function ReviewSyncModal({ mappings, onClose, onSuccess }: ReviewSyncModa
                                   return <div className="text-sm text-destructive border border-destructive/20 p-2 rounded-md bg-destructive/10 text-center">Failed to convert diagram URL: {props.alt || "Image"}</div>;
                                 }
                               }
-                              return <img {...props} alt={props.alt || "Diagram"} className="max-w-full rounded-md my-4" />;
+                              return <img {...props} alt={props.alt || "Diagram"} loading="lazy" decoding="async" className="max-w-full rounded-md my-4" />;
                             }
                           }}
                         >

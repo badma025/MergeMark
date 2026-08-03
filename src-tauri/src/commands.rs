@@ -1039,13 +1039,26 @@ pub async fn parse_pdf_vision(
                 .collect()
         },
         None => {
-            if file_path.to_lowercase().ends_with(".pdf") {
+            let ext = std::path::Path::new(&file_path)
+                .extension()
+                .and_then(|e| e.to_str())
+                .unwrap_or("")
+                .to_lowercase();
+            let is_image = ext == "png" || ext == "jpg" || ext == "jpeg" || ext == "webp";
+
+            if ext == "pdf" {
                 let path_clone = file_path.clone();
                 tokio::task::spawn_blocking(move || crate::pdf_render::render_pdf_pages(std::path::Path::new(&path_clone)))
                     .await
                     .map_err(|e| format!("Thread-pool error: {}", e))??
+            } else if is_image {
+                let path_clone = file_path.clone();
+                let page_input = tokio::task::spawn_blocking(move || crate::pdf_render::load_and_optimize_image_file(std::path::Path::new(&path_clone)))
+                    .await
+                    .map_err(|e| format!("Thread-pool error: {}", e))??;
+                vec![page_input]
             } else {
-                return Err("No rasterized PDF pages provided and file is not a PDF.".into());
+                return Err("Unsupported file format. Please upload a PDF or image file.".into());
             }
         }
     };
@@ -1399,15 +1412,11 @@ pub async fn parse_mark_scheme_vision(
             .await
             .map_err(|e| format!("Thread-pool error: {}", e))??
     } else if is_image {
-        use base64::Engine;
-        let image_bytes = tokio::fs::read(&file_path)
+        let path_clone = file_path.clone();
+        let page_input = tokio::task::spawn_blocking(move || crate::pdf_render::load_and_optimize_image_file(std::path::Path::new(&path_clone)))
             .await
-            .map_err(|e| format!("Failed to read image: {}", e))?;
-        let b64 = base64::engine::general_purpose::STANDARD.encode(&image_bytes);
-        vec![PageInput {
-            kind: crate::pipeline::PageInputKind::Image { b64 },
-            text: String::new(),
-        }]
+            .map_err(|e| format!("Thread-pool error: {}", e))??;
+        vec![page_input]
     } else {
         // Plain-text source: one synthetic page carrying the whole text.
         let text = match ext.as_str() {

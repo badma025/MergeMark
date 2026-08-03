@@ -89,7 +89,7 @@ export function RichTextEditor({ markdown, onChange, placeholder, className }: R
   const sanitizedMarkdown = sanitizeMarkdownMath(markdown);
   
   return (
-    <div className={cn("w-full border border-border rounded-md bg-transparent focus-within:ring-1 focus-within:ring-primary flex flex-col min-h-0 overflow-y-auto relative", className)}>
+    <div className={cn("w-full border border-border rounded-md bg-transparent focus-within:border-white focus-within:ring-1 focus-within:ring-white flex flex-col min-h-0 overflow-y-auto relative transition-colors", className)}>
       <MDXErrorBoundary fallback={
         <div className="flex flex-col flex-1 h-full relative">
           <div className="p-2 bg-destructive/10 text-destructive text-[11px] font-semibold border-b border-destructive/20">

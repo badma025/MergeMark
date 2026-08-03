@@ -111,9 +111,9 @@ export function AddQuestionModal({ open, onOpenChange, onSuccess }: AddQuestionM
           </DialogTitle>
         </DialogHeader>
 
-        <div className="flex flex-col gap-4 py-2 flex-1 min-h-0 overflow-y-auto pr-2">
+        <div className="flex flex-col gap-4 py-2 flex-1 min-h-0 overflow-y-auto pr-2 pb-6">
           {/* Top Controls Row */}
-          <div className="flex items-center gap-4 flex-wrap bg-muted/30 p-3 rounded-lg border border-border/50">
+          <div className="flex items-center gap-4 flex-wrap bg-muted/30 p-3 rounded-lg border border-border/50 shrink-0">
             <div className="flex items-center gap-2">
               <label className="text-sm font-semibold text-foreground whitespace-nowrap">Subject:</label>
               <select
@@ -157,7 +157,7 @@ export function AddQuestionModal({ open, onOpenChange, onSuccess }: AddQuestionM
           </div>
 
           {/* Topics selection */}
-          <div className="flex flex-col gap-2">
+          <div className="flex flex-col gap-2 shrink-0">
             <label className="text-sm font-semibold text-foreground">Topics:</label>
             <div className="flex flex-wrap items-center gap-1.5">
               {availableTopics.length === 0 && (
@@ -189,25 +189,28 @@ export function AddQuestionModal({ open, onOpenChange, onSuccess }: AddQuestionM
           </div>
 
           {/* Content Editors */}
-          <div className="grid grid-cols-1 md:grid-cols-2 gap-4 flex-1 min-h-[300px] px-1 pb-1">
-            <div className="flex flex-col gap-2 h-full">
-              <div>
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-4 flex-1 min-h-[320px] p-0.5">
+            <div className="flex flex-col gap-1.5 flex-1 min-h-0">
+              <div className="min-h-[44px] flex flex-col justify-end">
                 <label className="text-sm font-semibold text-foreground">Question Content:</label>
                 <p className="text-xs text-muted-foreground">Markdown supported. Inline math: $...$, Block math: $$...$$</p>
               </div>
               <RichTextEditor
                 markdown={content}
                 onChange={setContent}
-                className="flex-1 w-full h-full"
+                className="flex-1 w-full min-h-[300px]"
               />
             </div>
-            <div className="flex flex-col gap-2 h-full">
-              <label className="text-sm font-semibold text-foreground">Mark Scheme Answer (Optional):</label>
+            <div className="flex flex-col gap-1.5 flex-1 min-h-0">
+              <div className="min-h-[44px] flex flex-col justify-end">
+                <label className="text-sm font-semibold text-foreground">Mark Scheme Answer (Optional):</label>
+                <p className="text-xs text-muted-foreground">Markdown supported. Optional mark scheme or model answer.</p>
+              </div>
               <RichTextEditor
                 markdown={answerContent}
                 onChange={setAnswerContent}
                 placeholder="Type or paste the answer scheme here..."
-                className="flex-1 w-full h-full mt-[18px]"
+                className="flex-1 w-full min-h-[300px]"
               />
             </div>
           </div>

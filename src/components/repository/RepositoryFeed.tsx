@@ -319,7 +319,7 @@ export function RepositoryFeed({ isActive = true, onAddToWorksheet }: Repository
             aria-label="Question cards"
           >
             {filtered.map((q) => (
-              <li key={q.id}>
+              <li key={q.id} className="min-w-0" style={{ contentVisibility: "auto", containIntrinsicSize: "0 350px" }}>
                 <QuestionCard
                   {...q}
                   onAddToWorksheet={handleAdd}

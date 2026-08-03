@@ -4,7 +4,7 @@ use std::sync::{Arc, Mutex};
 use pdfium_render::prelude::*;
 use crate::pipeline::{PageInput, PageInputKind};
 use base64::Engine;
-use image::{DynamicImage, ImageFormat};
+use image::DynamicImage;
 use std::io::Cursor;
 use std::sync::OnceLock;
 
@@ -111,20 +111,11 @@ pub fn render_pdf_pages(path: &Path) -> Result<Vec<PageInput>, String> {
             .map_err(|e| format!("Failed to convert bitmap to image on page {}: {:?}", i, e))?;
         
         let mut buf = Cursor::new(Vec::new());
-        let format_str;
-        if has_images || has_vectors {
-            img.write_to(&mut buf, ImageFormat::Png)
-                .map_err(|e| format!("Failed to encode image on page {}: {:?}", i, e))?;
-            format_str = "png";
-        } else {
-            let mut encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut buf, 92);
-            encoder.encode_image(&img)
-                .map_err(|e| format!("Failed to encode jpeg on page {}: {:?}", i, e))?;
-            format_str = "jpeg";
-        }
+        let mut encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut buf, 88);
+        encoder.encode_image(&img)
+            .map_err(|e| format!("Failed to encode jpeg on page {}: {:?}", i, e))?;
         
-        let b64 = format!("data:image/{};base64,{}", 
-            format_str,
+        let b64 = format!("data:image/jpeg;base64,{}", 
             base64::engine::general_purpose::STANDARD.encode(buf.into_inner())
         );
 
@@ -137,6 +128,40 @@ pub fn render_pdf_pages(path: &Path) -> Result<Vec<PageInput>, String> {
     }
 
     Ok(pages)
+}
+
+pub fn load_and_optimize_image_file(path: &Path) -> Result<PageInput, String> {
+    let img = image::open(path).map_err(|e| format!("Failed to open image: {}", e))?;
+    let (w, h) = (img.width(), img.height());
+    let max_dim: u32 = 2048;
+    let final_img = if w > max_dim || h > max_dim {
+        let scale = max_dim as f32 / (w.max(h) as f32);
+        let new_w = (w as f32 * scale).round().max(1.0) as u32;
+        let new_h = (h as f32 * scale).round().max(1.0) as u32;
+        image::DynamicImage::ImageRgba8(image::imageops::resize(
+            &img,
+            new_w,
+            new_h,
+            image::imageops::FilterType::Triangle,
+        ))
+    } else {
+        img
+    };
+
+    let mut buf = Cursor::new(Vec::new());
+    let mut encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut buf, 88);
+    encoder.encode_image(&final_img)
+        .map_err(|e| format!("Failed to encode jpeg: {}", e))?;
+
+    let b64 = format!(
+        "data:image/jpeg;base64,{}",
+        base64::engine::general_purpose::STANDARD.encode(buf.into_inner())
+    );
+
+    Ok(PageInput {
+        kind: PageInputKind::Image { b64 },
+        text: String::new(),
+    })
 }
 
 pub fn render_pdf_page_at_300dpi(path: &Path, page_idx: usize) -> Result<image::DynamicImage, String> {

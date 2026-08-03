@@ -1898,7 +1898,7 @@ async fn extract_span<C: LlmClient>(
                     span.number,
                     page_items.items.len()
                 );
-                let collateral_numbers: Vec<String> = raw_numbers
+                let _collateral_numbers: Vec<String> = raw_numbers
                     .iter()
                     .filter(|&&n| n != span.number)
                     .map(|n| n.to_string())
@@ -2455,19 +2455,13 @@ fn audit_diagram_boxes(
         };
         for (bi, bbox) in bboxes.iter_mut().enumerate() {
             let label = format!("item {} diagram {}", ii + 1, bi + 1);
-            if bbox.len() != 4 {
+            if bbox.len() != 4 || bbox.iter().any(|v| !v.is_finite() || *v < 0.0) {
                 bad.push((ii, bi));
                 issues.push(format!(
-                    "{label}: bbox must be exactly [x, y, w, h] (4 numbers)"
+                    "{label}: bbox must be exactly [x, y, w, h] (4 finite non-negative numbers)"
                 ));
                 continue;
             }
-            
-            // Ensure all bounding box coordinates are clamped to valid positive area within [0.0, 1.0]
-            bbox[0] = bbox[0].clamp(0.0, 0.999);
-            bbox[1] = bbox[1].clamp(0.0, 0.999);
-            bbox[2] = bbox[2].clamp(0.001, 1.0 - bbox[0]);
-            bbox[3] = bbox[3].clamp(0.001, 1.0 - bbox[1]);
 
             let model_idx = indexes.get(bi).and_then(|v| value_to_usize(v)).unwrap_or(0);
             if model_idx >= local_to_chunk.len() {
@@ -2655,7 +2649,24 @@ fn save_diagram(
     let dir = config.diagrams_dir.as_ref()?;
     let _ = std::fs::create_dir_all(dir);
     let path = dir.join(format!("{}.png", uuid::Uuid::new_v4()));
-    if cropped.save(&path).is_err() {
+
+    let (cw, ch) = (cropped.width(), cropped.height());
+    let max_crop_dim: u32 = 1600;
+    let final_crop = if cw > max_crop_dim || ch > max_crop_dim {
+        let scale = max_crop_dim as f32 / (cw.max(ch) as f32);
+        let new_w = (cw as f32 * scale).round().max(1.0) as u32;
+        let new_h = (ch as f32 * scale).round().max(1.0) as u32;
+        image::imageops::resize(
+            &cropped,
+            new_w,
+            new_h,
+            image::imageops::FilterType::Triangle,
+        )
+    } else {
+        cropped
+    };
+
+    if final_crop.save(&path).is_err() {
         report.crop_rejections += 1;
         return None;
     }
