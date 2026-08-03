@@ -115,7 +115,6 @@ export function IngestionDropzone({ isActive = false, onSuccess }: IngestionDrop
       const r = event.payload as ImportReport;
       setReports(prev => [r, ...prev]);
       const warnings: number = r.quarantined.length;
-      const checksumFailed = r.marksChecksumOk === false;
       
       // Build timing summary
       const timingSummary = buildTimingSummary(r.timings);
@@ -124,7 +123,7 @@ export function IngestionDropzone({ isActive = false, onSuccess }: IngestionDrop
         ? `\n\nTiming: ${timingSummary.join(", ")} (total: ${(totalMs / 1000).toFixed(1)}s)`
         : "";
       
-      if (warnings === 0 && !checksumFailed) {
+      if (warnings === 0) {
         if (r.repairs > 0 || r.salvageEvents > 0 || r.cropRejections > 0) {
           toast.success("Import complete", {
             description: `${r.paperName}: all checks passed (${r.repairs} auto-repairs, ${r.salvageEvents} truncations salvaged, ${r.cropRejections} bad crops rejected).${timingStr}`,
@@ -137,17 +136,16 @@ export function IngestionDropzone({ isActive = false, onSuccess }: IngestionDrop
       if (r.questionsExpected > 0) {
         parts.push(`${r.questionsExtracted}/${r.questionsExpected} questions extracted`);
       }
-      if (checksumFailed) parts.push("marks don't match the printed paper total");
       if (warnings > 0) {
         const where = r.quarantined
           .slice(0, 3)
           .map(q => q.questionNumber ? `Q${q.questionNumber}` : q.page ? `page ${q.page}` : q.scope)
           .join(", ");
         const firstReason = r.quarantined[0]?.reason || "unknown";
-        parts.push(`${warnings} item${warnings > 1 ? "s" : ""} quarantined (${where}). First error: ${firstReason}`);
+        parts.push(`${warnings} item${warnings > 1 ? "s" : ""} flagged for review (${where}). Reason: ${firstReason}`);
       }
-      toast.warning("Import finished with warnings", {
-        description: `${r.paperName}: ${parts.join(" · ")}. Review flagged cards before building worksheets.${timingStr}`,
+      toast.warning("Import finished with review items", {
+        description: `${r.paperName}: ${parts.join(" · ")}. Flagged cards are preserved in repository for review.${timingStr}`,
         duration: 15000,
       });
     });

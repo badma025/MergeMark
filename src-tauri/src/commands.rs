@@ -1258,8 +1258,7 @@ pub async fn parse_pdf_vision(
     // ── Store in extraction cache for instant re-ingestion ────────────────
     if !final_questions.is_empty() {
         if let Ok(questions_json) = serde_json::to_string(&final_questions) {
-            let pool_cache = state.db.lock().await;
-            let _ = crate::db::store_cached_extraction(&pool_cache, &cache_key, &questions_json).await;
+            let _ = crate::db::store_cached_extraction(&pool, &cache_key, &questions_json).await;
         }
     }
 

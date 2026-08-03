@@ -1394,11 +1394,49 @@ pub async fn run_question_pipeline<C: LlmClient, P: Progress>(
                             );
                         }
                     }
-                    report.quarantined.push(QuarantineEvent {
-                        scope: "question".to_string(),
-                        page: Some(span.start_page + 1),
-                        question_number: Some(span.number),
-                        reason,
+                    if !report.quarantined.iter().any(|q| q.question_number == Some(span.number)) {
+                        report.quarantined.push(QuarantineEvent {
+                            scope: "question".to_string(),
+                            page: Some(span.start_page + 1),
+                            question_number: Some(span.number),
+                            reason,
+                        });
+                    }
+
+                    // Create a fallback question card so no question is ever lost from the repository
+                    let fallback_text = sp
+                        .iter()
+                        .map(|p| p.1.text.trim())
+                        .filter(|t| !t.is_empty())
+                        .collect::<Vec<_>>()
+                        .join("\n\n");
+
+                    let fallback_content = if !fallback_text.is_empty() {
+                        format!(
+                            "**[Question {} - Needs Review]**\n\n*(Extraction incomplete. Raw text extracted from original page(s) {}-{} below:)*\n\n{}",
+                            span.number,
+                            span.start_page + 1,
+                            span.end_page + 1,
+                            fallback_text
+                        )
+                    } else {
+                        format!(
+                            "**[Question {} - Needs Review]**\n\n*(Extraction incomplete. Please check original paper page(s) {}-{} and edit this question card).* ",
+                            span.number,
+                            span.start_page + 1,
+                            span.end_page + 1
+                        )
+                    };
+
+                    built.push(BuiltQuestion {
+                        marks: span.expected_marks.unwrap_or(0) as i32,
+                        content: fallback_content,
+                        question_number: span.number,
+                        topics: vec!["Needs Review".to_string()],
+                        module: config.module_name.clone(),
+                        is_code: false,
+                        needs_review: true,
+                        notes: vec!["Fallback card created due to incomplete extraction".to_string()],
                     });
                 }
             }
@@ -1407,10 +1445,8 @@ pub async fn run_question_pipeline<C: LlmClient, P: Progress>(
 
     report.questions_extracted = built.len();
     report.extracted_total_marks = built.iter().map(|q| q.marks.max(0) as u32).sum();
-    report.marks_checksum_ok = match (report.paper_total_marks, map.spans.is_empty()) {
-        (Some(total), false) => Some(report.extracted_total_marks == total),
-        _ => None,
-    };
+    // Removed printed paper total checksum warning as requested
+    report.marks_checksum_ok = None;
 
     Ok((built, report))
 }
@@ -1946,13 +1982,22 @@ async fn extract_span<C: LlmClient>(
                     contents.len()
                 );
                 eprintln!("WARNING: Question {} extraction returned an empty items array.", span.number);
-                report.quarantined.push(QuarantineEvent {
-                    scope: "question".to_string(),
-                    page: Some(span.start_page + 1),
-                    question_number: Some(span.number),
-                    reason: "No content extracted for this span".to_string(),
-                });
-                return (None, report);
+                if attempt < config.max_repairs {
+                    last_error = format!(
+                        "Extraction for Question {} returned an empty items array. Please transcribe Question {} and all its sub-parts from the provided page(s).",
+                        span.number, span.number
+                    );
+                    report.repairs += 1;
+                    continue;
+                } else {
+                    report.quarantined.push(QuarantineEvent {
+                        scope: "question".to_string(),
+                        page: Some(span.start_page + 1),
+                        question_number: Some(span.number),
+                        reason: "No content extracted for this span".to_string(),
+                    });
+                    return (None, report);
+                }
             }
 
             // AUDITABLE RETENTION: collect collateral numbers, quote them in repair,
