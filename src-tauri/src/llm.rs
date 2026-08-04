@@ -141,6 +141,24 @@ pub fn message_content(resp: &serde_json::Value) -> Result<String, LlmError> {
 
 // ── Real client ─────────────────────────────────────────────────────────────
 
+/// Shared HTTP client with connection pooling. All `ReqwestLlm` instances
+/// reuse the same underlying connection pool, so parallel API calls to the
+/// same host avoid repeated TCP + TLS handshakes. The pool supports up to
+/// 8 idle connections per host (matching typical BYOK parallelism) and
+/// keeps them alive for 90 seconds.
+fn shared_http_client() -> &'static reqwest::Client {
+    use std::sync::OnceLock;
+    static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+    CLIENT.get_or_init(|| {
+        reqwest::Client::builder()
+            .pool_max_idle_per_host(8)
+            .pool_idle_timeout(std::time::Duration::from_secs(90))
+            .tcp_keepalive(std::time::Duration::from_secs(30))
+            .build()
+            .expect("failed to build shared HTTP client")
+    })
+}
+
 pub struct ReqwestLlm {
     client: reqwest::Client,
     config: LlmConfig,
@@ -149,7 +167,7 @@ pub struct ReqwestLlm {
 impl ReqwestLlm {
     pub fn new(config: LlmConfig) -> Self {
         Self {
-            client: reqwest::Client::new(),
+            client: shared_http_client().clone(),
             config,
         }
     }

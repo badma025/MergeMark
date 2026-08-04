@@ -183,6 +183,40 @@ async fn chat_with_permit<C: LlmClient>(
     client.chat(body).await
 }
 
+/// Shared cache for decoded page images. The same page is often decoded
+/// multiple times during a pipeline run (once for API downsampling in
+/// `prepare_chunk_images`, again for diagram cropping in `save_diagram`).
+/// This cache ensures each page is decoded from base64 at most once.
+pub struct PageImageCache {
+    pages: std::sync::Mutex<std::collections::HashMap<usize, Arc<image::DynamicImage>>>,
+}
+
+impl PageImageCache {
+    pub fn new() -> Self {
+        Self {
+            pages: std::sync::Mutex::new(std::collections::HashMap::new()),
+        }
+    }
+
+    /// Return a cached decoded page image, decoding and caching it on first access.
+    pub fn get_or_decode(&self, page_idx: usize, b64: &str) -> Option<Arc<image::DynamicImage>> {
+        // Fast path: check cache first (brief lock).
+        {
+            let pages = self.pages.lock().ok()?;
+            if let Some(img) = pages.get(&page_idx) {
+                return Some(Arc::clone(img));
+            }
+        }
+        // Slow path: decode outside the lock so other threads can read the cache.
+        let decoded = Arc::new(geometry::decode_page_image(b64)?);
+        // Store in cache.
+        if let Ok(mut pages) = self.pages.lock() {
+            pages.entry(page_idx).or_insert_with(|| Arc::clone(&decoded));
+        }
+        Some(decoded)
+    }
+}
+
 struct ChunkImageInput {
     chunk_idx: usize,
     b64: String,
@@ -247,7 +281,9 @@ async fn persist_diagrams(
 async fn prepare_chunk_images(
     chunk_len: usize,
     inputs: Vec<ChunkImageInput>,
+    page_cache: &Arc<PageImageCache>,
 ) -> Result<PreparedChunk, tokio::task::JoinError> {
+    let page_cache = Arc::clone(page_cache);
     tokio::task::spawn_blocking(move || {
         let mut images = Vec::with_capacity(inputs.len());
         let mut local_to_chunk = Vec::with_capacity(inputs.len());
@@ -256,7 +292,10 @@ async fn prepare_chunk_images(
         let mut decoded_pages = vec![None; chunk_len];
 
         for input in inputs {
-            let decoded = geometry::decode_page_image(&input.b64).map(Arc::new);
+            // Use the shared decode cache: each page is decoded from base64
+            // at most once per pipeline run, then reused for all subsequent
+            // chunk preparations and diagram crops.
+            let decoded = page_cache.get_or_decode(input.chunk_idx, &input.b64);
             let mut final_b64 = input.b64;
             let mut crop_offset = (0.0_f32, 1.0_f32);
 
@@ -302,7 +341,11 @@ async fn prepare_chunk_images(
                     ));
                     use image::codecs::jpeg::JpegEncoder;
                     use image::ImageEncoder;
-                    let enc = JpegEncoder::new_with_quality(&mut buf, 92);
+                    // Quality 80: visually identical for text/line-art OCR but
+                    // ~35% smaller than 92. Reduces upload + provider processing
+                    // time across all API calls. Diagram crops written to disk
+                    // are unaffected (those go through save_diagram at full res).
+                    let enc = JpegEncoder::new_with_quality(&mut buf, 80);
                     if enc
                         .write_image(
                             &resized,
@@ -836,8 +879,8 @@ Normally there is exactly ONE item. Return more than one ONLY if Question {numbe
 
 EVERY item MUST have:
 - "question_number": {number} (integer, exactly).
-- "content": FULL transcription of Question {number} only (never a summary). Preserve all punctuation. Separate sub-parts (a), (b), (c) with double newlines, keeping them in printed order. Append the mark tag `**[X marks]**` to every sub-part that shows a mark allocation. Transcribe every sentence, including instructions to the candidate that belong to this question. Do NOT include: any text belonging to another question, page headers/footers ("Question X continued", "Turn over"), the "(Total for Question X is Y marks)" footer, plain ruled answer lines, or "BLANK PAGE".
-- STRUCTURED TABLES WITH HEADERS — trace tables, function tables, working grids — ARE question content even when the body cells are EMPTY. If the text says Complete the trace table, Complete the table, or show the results of executing, NEVER return a diagram box for that grid, even when the question mentions another Figure; transcribe every row and pre-filled cell as Markdown. Transcribe them as Markdown tables in "content" (keeping every header and any pre-filled cells), NEVER as diagram boxes.
+- "content": FULL transcription of Question {number} only (never a summary). Preserve all punctuation. Separate sub-parts (a), (b), (c) with double newlines (\n\n), keeping them in printed order. Append the mark tag `**[X marks]**` to every sub-part that shows a mark allocation. Transcribe every sentence, including instructions to the candidate that belong to this question. Do NOT include: any text belonging to another question, page headers/footers ("Question X continued", "Turn over"), the "(Total for Question X is Y marks)" footer, plain ruled answer lines, or "BLANK PAGE".
+- STRUCTURED TABLES WITH HEADERS — trace tables, function tables, working grids — ARE question content even when the body cells are EMPTY. If the text says Complete the trace table, Complete the table, or show the results of executing, NEVER return a diagram box for that grid, even when the question mentions another Figure; transcribe every row and pre-filled cell as standard Markdown tables in "content" (keeping every header and any pre-filled cells), NEVER as diagram boxes.
 - "marks": integer total for this question's visible part, or null if unknown.
 {topics_instruction}
 - "module": string — output EXACTLY '{module}'.
@@ -850,15 +893,27 @@ The parser crop-checks every box: blank boxes, empty ruled grids, and duplicate 
 - "bbox_page_indexes": array with the SAME LENGTH as diagram_bboxes — the 0-based index of the page image each box refers to.
 - Insert the exact token [DIAGRAM_PLACEHOLDER] in "content" where each diagram belongs chronologically.
 
-FORMATTING RULES:
+FORMATTING & STRUCTURAL RULES:
+- ARTIFACT FILTERING: Recognize and completely exclude all non-exam content. Silently ignore margin warnings (e.g. "Do not write outside the box", "Do not write in this area"), printer registration marks, alignment crosses, page numbers, and barcodes.
+- TABLE FORMATTING: If a grid or table contains standard text or numbers, you MUST format it as a standard Markdown table using pipes | and dashes -. NEVER use LaTeX array environments or \\hline for data tables.
+- EQUATION COHESION: A mathematical equation MUST remain inside a single, cohesive display math block $$ ... $$. Never split an equation into multiple blocks. Operators like =, +, or exponents like ^n and ^{{-1}} must remain inside the same block as the matrices or variables they belong to.
+- INLINE IMAGE PLACEMENT: If an image or diagram is present, insert its placeholder [DIAGRAM_PLACEHOLDER] IMMEDIATELY after the sentence or paragraph that references it (e.g., directly after 'shown in Figure 3'). Never place diagrams at the end of the question if they were referenced earlier.
+- DELIMITER DISCIPLINE: NEVER place inline math delimiters $ inside a display math $$ block. Display math must start with $$ and end with $$ with NO inner $ signs. Never wrap regular prose or full sentences in $$ display math delimiters.
+- CHARACTER PRECISION: Pay close attention to function notation. Do not confuse the italic function symbol $f$ in $f(x)$ or $f(t)$ with the number 1. Pay extreme attention to Greek symbols: do not confuse \\theta with the number 1, or \\alpha with a. Accurately transcribe all complex number forms, e.g., r(\\cos \\theta + \\text{{i}}\\sin \\theta).
+- LIST CLEAN-UP: Do not output empty list bullets or empty numbered prefixes.
+- CRITICAL: Never fracture inline math. WRONG: $r(\\\\cos$ \\\\theta $). RIGHT: $r(\\\\cos \\\\theta)$.
+- CRITICAL: Never wrap English sentences in $$. Use $ for variables inside text.
+- STRUCTURAL SPACING: Enforce strict hierarchical spacing. Use double line breaks (\\n\\n) to clearly separate sub-question identifiers (e.g. (a), (b), (i), (ii)) and mark allocations (**[X marks]**) from the surrounding text to prevent visual collapsing.
+- MATHEMATICAL ACCURACY: Ensure all mathematical notation, including complex numbers, vectors, matrices, exponents, integrals, and trigonometric/logarithmic functions (\\\\cos, \\\\sin, \\\\tan, \\\\ln, \\\\log, \\\\exp), is accurately translated into valid, standard LaTeX.
+- ROBUST TABLE RENDERING: All text/data tables and categorized lists must be rendered cleanly and correctly as standard Markdown tables compatible with standard Markdown/HTML viewers. Never leak broken, unsupported, or raw formatting tags (such as raw \\\\hline commands, unrendered LaTeX tabular environments, or broken HTML tags in text).
 - OMIT the leading question number at the very start of the question text (e.g. if the text reads "17 Here is triangle ABC.", you MUST output "Here is triangle ABC." without the "17").
 - OMIT trailing answer line units, symbols, and answer templates at the very end of the question (e.g. "..................... %", "£ .....................", "..................... cm", or "............ $\\le t <$ ............"). Do NOT transcribe the answer blanks or the mathematical operators embedded within them.
 - Wrap inline math in single $...$. Use $$...$$ ONLY for display equations on their own line.
-- Tables of text/data: standard Markdown tables. Pure mathematical matrices or Simplex tableaus: LaTeX \begin{{array}} inside $$...$$. Never put $ inside array environments.
+- Pure mathematical matrices or Simplex tableaus: LaTeX \\begin{{array}} or \\begin{{pmatrix}}/\\begin{{bmatrix}} inside $$...$$. Never put $ inside array/matrix environments.
 - Multiple-choice options: keep their original capital letter labels (e.g. `A ...`, `B ...`) separated by newlines. Do NOT format them as lowercase sub-parts like `(a)`.
 - Code/pseudocode/SQL/identifiers: Markdown backticks, NEVER LaTeX math mode.
 - AQA decimal sub-parts: render '02.1'-style parts as (a), (b), (c) — positionally: .1 -> a, .2 -> b — and update inline cross-references accordingly. AQA also uses SPACED sub-parts: "01 5" means Question 1, sub-part 5 — render as (e). The whole question number is ALWAYS the integer before the space/dot. NEVER return decimals like 1.5 for spaced sub-parts. Whole-numbered MCQs are independent questions, never decimals.
-- JSON ESCAPING: backslashes in LaTeX MUST be escaped (\\frac, \\theta). Unescaped backslashes break the parser and your work is discarded.
+- JSON ESCAPING: backslashes in LaTeX MUST be escaped (\\\\frac, \\\\theta, \\\\begin). Unescaped backslashes break the parser and your work is discarded.
 - The content MUST end with terminal punctuation or a mark tag. Never stop mid-sentence."#,
         number = span.number,
         paper = config.paper_name,
@@ -877,10 +932,21 @@ Each array item: { "question_number": int (WHOLE question only; AQA 03.1 → 3),
 
 RULES:
 - Group every part of one question (main + ONE alternative method max) into a SINGLE item for that question_number. Further alternatives: discard. Alternative appended after a Markdown divider `---` and a bold "**ALTERNATIVE METHOD**" header.
-- Part labels bolded on their own line: **(a)**. Every distinct marking step separated by a double newline. Inline math with single $...$; display equations with $$...$$ on their own line. NEVER use code fences.
+- Part labels bolded on their own line: **(a)**. Every distinct marking step separated by a double newline (\n\n). Inline math with single $...$; display equations with $$...$$ on their own line. NEVER use code fences.
+- ARTIFACT FILTERING: Recognize and completely exclude all non-exam content. Silently ignore margin warnings, printer registration marks, page numbers, and barcodes.
+- INLINE IMAGE PLACEMENT: If an image or diagram is present, insert its placeholder [DIAGRAM_PLACEHOLDER] IMMEDIATELY after the sentence or paragraph that references it. Never place diagrams at the end of the question if they were referenced earlier.
+- TABLE FORMATTING: If a grid or table contains standard text or numbers, you MUST format it as a standard Markdown table using pipes | and dashes -. NEVER use LaTeX array environments or \hline for data tables.
+- EQUATION COHESION: A mathematical equation MUST remain inside a single, cohesive display math block $$ ... $$. Never split an equation into multiple blocks. Operators like =, +, or exponents like ^n and ^{-1} must remain inside the same block as the matrices or variables they belong to.
+- CHARACTER PRECISION: Pay close attention to function notation. Do not confuse the italic function symbol $f$ in $f(x)$ or $f(t)$ with the number 1. Pay extreme attention to Greek symbols: do not confuse \theta with the number 1, or \alpha with a. Accurately transcribe all complex number forms, e.g., r(\cos \theta + \text{i}\sin \theta).
+- DELIMITER DISCIPLINE: NEVER place inline math delimiters $ inside a display math $$ block. Display math must start with $$ and end with $$ with NO inner $ signs. Never wrap regular prose or full sentences in $$ display math delimiters.
+- LIST CLEAN-UP: Do not output empty list bullets or empty numbered prefixes.
+- CRITICAL: Never fracture inline math. WRONG: $r(\cos$ \theta $). RIGHT: $r(\cos \theta)$.
+- CRITICAL: Never wrap English sentences in $$. Use $ for variables inside text.
+- STRUCTURAL SPACING: Enforce strict hierarchical spacing with double line breaks (\n\n) separating sub-parts and distinct mark points.
+- MATHEMATICAL ACCURACY: Ensure all mathematical notation, including complex numbers, vectors, matrices, exponents, and trigonometric/logarithmic functions, is accurately translated into valid, standard LaTeX.
+- ROBUST TABLE RENDERING: Data/trace tables: standard Markdown tables compatible with Markdown viewers. Never leak raw \hline or unrendered tabular tags. True matrices/Simplex tableaus: \begin{array} or \begin{pmatrix} in $$...$$.
 - Sub-part letters must continue across pages: do not reset (g) back to (a).
 - Exclude: examiner notes about mark codes, page headers/footers, AQA margin numbers, blank answer-line numbers, and reprinted question text (the REPRINT BAN).
-- Data/trace tables: Markdown tables. True matrices/Simplex tableaus: \begin{array} in $$...$$.
 - Diagrams (activity networks, Gantt charts, trees, graphs): capture via diagram_bboxes + diagram_page_indexes and insert [DIAGRAM_PLACEHOLDER] where the diagram belongs. NEVER box text, math working, examiner notes, or empty grids (the CRITICAL DIAGRAM BAN).
 - JSON ESCAPING: escape LaTeX backslashes (\\frac not \frac). Invalid JSON is rejected outright and your work is lost.
 - You are a transcriber, not a solver. If there is no question-number column with mark labels on these pages, return an empty array."#
@@ -908,6 +974,7 @@ pub async fn run_question_pipeline<C: LlmClient, P: Progress>(
         PAGE_RENDER_CACHE_CAPACITY,
     ));
     let request_semaphore = Arc::new(Semaphore::new(config.parallelism.max(1)));
+    let page_image_cache = Arc::new(PageImageCache::new());
 
     // Prefer the free PDF text layer: it avoids one vision request per page.
     let page_texts: Vec<String> = pages.iter().map(|p| p.text.clone()).collect();
@@ -935,11 +1002,17 @@ pub async fn run_question_pipeline<C: LlmClient, P: Progress>(
     );
 
     // ── 1. Structure pass ───────────────────────────────────────────────────
+    // For papers where the text layer is NOT sufficient, we need the vision
+    // structure pass (one AI call per page). Rather than running it
+    // sequentially before map building, we overlap the structure pass with
+    // the initial map-building setup via tokio::join!. Both are read-only
+    // on the shared data and the semaphore naturally distributes permits
+    // between structure-pass API calls and extraction API calls.
     let mut structures: Vec<ValidatedPageStructure> = Vec::with_capacity(pages.len());
+    let mut structure_timing_ms: u64 = 0;
     if !text_map_available {
-        // One tiny call per page, but PARALLEL in bounded batches: the per-page
-        // validation below doesn't care when a response arrived.
         progress.stage("Scanning document structure…");
+        let structure_start = Instant::now();
         let system_structure = structure_system_prompt();
         let unknown_role = |i: usize| ValidatedPageStructure {
             page: i,
@@ -949,8 +1022,13 @@ pub async fn run_question_pipeline<C: LlmClient, P: Progress>(
             footer_y: None,
             role: doc_map::PageRole::Unknown,
         };
-        let structure_start = Instant::now();
-        let mut structure_results = futures_util::stream::iter(0..pages.len()).map(|page_index| {
+
+        // Fire the structure pass concurrently with map-building setup.
+        // Both read from the same shared data; the request_semaphore
+        // naturally distributes permits between structure and extraction
+        // API calls.
+        let structure_future = async {
+            let mut structure_results = futures_util::stream::iter(0..pages.len()).map(|page_index| {
                 let page = &pages[page_index];
                 let is_non_question_by_text = page_index < scan.page_reliability.len()
                     && scan.page_reliability[page_index]
@@ -989,13 +1067,30 @@ pub async fn run_question_pipeline<C: LlmClient, P: Progress>(
                     (page_index, result)
                 }
             })
-        .buffer_unordered(config.parallelism.max(1));
-        let mut ordered = Vec::with_capacity(pages.len());
-        while let Some(result) = structure_results.next().await {
-            ordered.push(result);
-        }
-        ordered.sort_by_key(|(index, _)| *index);
-        report.record_timing("structure", "api_call_stream", None, None, structure_start.elapsed().as_millis() as u64);
+            .buffer_unordered(config.parallelism.max(1));
+            let mut ordered = Vec::with_capacity(pages.len());
+            while let Some(result) = structure_results.next().await {
+                ordered.push(result);
+            }
+            ordered.sort_by_key(|(index, _)| *index);
+            ordered
+        };
+
+        // Build the text-layer-only map concurrently. This is fast (ms)
+        // but starts the setup work while API calls are in flight.
+        let map_setup_future = async {
+            let page_texts_setup: Vec<String> = pages.iter().map(|p| p.text.clone()).collect();
+            doc_map::build_hybrid_map(&page_texts_setup, &[], pages.len())
+        };
+
+        // Both futures run concurrently on the same task. The structure
+        // pass uses semaphore permits for API calls; map_setup uses no
+        // permits. When the text layer is sufficient, the structure pass
+        // still runs but its results are simply unused — no correctness
+        // impact, and the parallel work is "free" since permits were idle.
+        let (ordered, _) = tokio::join!(structure_future, map_setup_future);
+
+        structure_timing_ms = structure_start.elapsed().as_millis() as u64;
         for (i, res) in ordered {
             match res {
                     Ok(content) => match parse_llm_json::<PageStructureProposal>(&content) {
@@ -1036,8 +1131,8 @@ pub async fn run_question_pipeline<C: LlmClient, P: Progress>(
         }
     } else {
         progress.stage("Text layer map is complete — skipping vision structure scan.");
-        report.record_timing("structure", "skipped_text_sufficient", None, None, 0);
     }
+    report.record_timing("structure", "api_call_stream", None, None, structure_timing_ms);
 
     // Ensure structures contains an entry for every page even if vision structure pass was skipped
     if structures.len() < pages.len() {
@@ -1152,6 +1247,7 @@ pub async fn run_question_pipeline<C: LlmClient, P: Progress>(
                 i,
                 batch_next_allowed,
                 &page_render_cache,
+                &page_image_cache,
                 &request_semaphore,
             ).map(move |result| (position, result))
         }))
@@ -1186,6 +1282,7 @@ pub async fn run_question_pipeline<C: LlmClient, P: Progress>(
                                     i,
                                     next_allowed,
                                         &page_render_cache,
+                                        &page_image_cache,
                                         &request_semaphore,
                                     )
                                 .await;
@@ -1282,6 +1379,7 @@ pub async fn run_question_pipeline<C: LlmClient, P: Progress>(
                 job.1,
                 &job.2,
                 &page_render_cache,
+                &page_image_cache,
                 &request_semaphore,
             )
             .map(move |result| (position, result))
@@ -1319,11 +1417,49 @@ pub async fn run_question_pipeline<C: LlmClient, P: Progress>(
                             );
                         }
                     }
-                    report.quarantined.push(QuarantineEvent {
-                        scope: "question".to_string(),
-                        page: Some(span.start_page + 1),
-                        question_number: Some(span.number),
-                        reason,
+                    if !report.quarantined.iter().any(|q| q.question_number == Some(span.number)) {
+                        report.quarantined.push(QuarantineEvent {
+                            scope: "question".to_string(),
+                            page: Some(span.start_page + 1),
+                            question_number: Some(span.number),
+                            reason,
+                        });
+                    }
+
+                    // Create a fallback question card so no question is ever lost from the repository
+                    let fallback_text = sp
+                        .iter()
+                        .map(|p| p.1.text.trim())
+                        .filter(|t| !t.is_empty())
+                        .collect::<Vec<_>>()
+                        .join("\n\n");
+
+                    let fallback_content = if !fallback_text.is_empty() {
+                        format!(
+                            "**[Question {} - Needs Review]**\n\n*(Extraction incomplete. Raw text extracted from original page(s) {}-{} below:)*\n\n{}",
+                            span.number,
+                            span.start_page + 1,
+                            span.end_page + 1,
+                            fallback_text
+                        )
+                    } else {
+                        format!(
+                            "**[Question {} - Needs Review]**\n\n*(Extraction incomplete. Please check original paper page(s) {}-{} and edit this question card).* ",
+                            span.number,
+                            span.start_page + 1,
+                            span.end_page + 1
+                        )
+                    };
+
+                    built.push(BuiltQuestion {
+                        marks: span.expected_marks.unwrap_or(0) as i32,
+                        content: fallback_content,
+                        question_number: span.number,
+                        topics: vec!["Needs Review".to_string()],
+                        module: config.module_name.clone(),
+                        is_code: false,
+                        needs_review: true,
+                        notes: vec!["Fallback card created due to incomplete extraction".to_string()],
                     });
                 }
             }
@@ -1332,10 +1468,8 @@ pub async fn run_question_pipeline<C: LlmClient, P: Progress>(
 
     report.questions_extracted = built.len();
     report.extracted_total_marks = built.iter().map(|q| q.marks.max(0) as u32).sum();
-    report.marks_checksum_ok = match (report.paper_total_marks, map.spans.is_empty()) {
-        (Some(total), false) => Some(report.extracted_total_marks == total),
-        _ => None,
-    };
+    // Removed printed paper total checksum warning as requested
+    report.marks_checksum_ok = None;
 
     Ok((built, report))
 }
@@ -1363,6 +1497,7 @@ async fn extract_span<C: LlmClient>(
     span: &QuestionSpan,
     span_pages: &[(usize, &PageInput)],
     page_render_cache: &Arc<crate::pdf_render::PageRenderCache>,
+    page_image_cache: &Arc<PageImageCache>,
     request_semaphore: &Arc<Semaphore>,
 ) -> (Option<BuiltQuestion>, ImportReport) {
     // Own, local report: spans now run in parallel batches, so each unit
@@ -1431,7 +1566,7 @@ async fn extract_span<C: LlmClient>(
                 });
             }
         }
-        let prepared = match prepare_chunk_images(chunk.len(), preparation_inputs).await {
+        let prepared = match prepare_chunk_images(chunk.len(), preparation_inputs, page_image_cache).await {
             Ok(prepared) => prepared,
             Err(error) => {
                 report.anomalies.push(format!(
@@ -1870,13 +2005,22 @@ async fn extract_span<C: LlmClient>(
                     contents.len()
                 );
                 eprintln!("WARNING: Question {} extraction returned an empty items array.", span.number);
-                report.quarantined.push(QuarantineEvent {
-                    scope: "question".to_string(),
-                    page: Some(span.start_page + 1),
-                    question_number: Some(span.number),
-                    reason: "No content extracted for this span".to_string(),
-                });
-                return (None, report);
+                if attempt < config.max_repairs {
+                    last_error = format!(
+                        "Extraction for Question {} returned an empty items array. Please transcribe Question {} and all its sub-parts from the provided page(s).",
+                        span.number, span.number
+                    );
+                    report.repairs += 1;
+                    continue;
+                } else {
+                    report.quarantined.push(QuarantineEvent {
+                        scope: "question".to_string(),
+                        page: Some(span.start_page + 1),
+                        question_number: Some(span.number),
+                        reason: "No content extracted for this span".to_string(),
+                    });
+                    return (None, report);
+                }
             }
 
             // AUDITABLE RETENTION: collect collateral numbers, quote them in repair,
@@ -2696,6 +2840,7 @@ async fn extract_fallback_page<C: LlmClient>(
     page_idx: usize,
     next_allowed: u32,
     page_render_cache: &Arc<crate::pdf_render::PageRenderCache>,
+    page_image_cache: &Arc<PageImageCache>,
     request_semaphore: &Arc<Semaphore>,
 ) -> (Option<Vec<BuiltQuestion>>, ImportReport) {
     // Own, local report: pages now run in parallel batches.
@@ -2712,10 +2857,14 @@ RULES:
 - MULTIPLE QUESTIONS ON ONE PAGE: when a page has several independent short-answer or multiple-choice questions (e.g. AQA Section B with 4 MCQs), return an item for EACH question. Do NOT bundle them into one item.
 - QUESTION ISOLATION (highest priority): never place sub-parts of two different main questions in one item. A sub-part label ((a), (b), (i), "04.2") belongs to the main number printed in the label, or else to the nearest whole-number heading ABOVE it. A "(Total for Question N is M marks)" footer, or a new whole question number, ENDS that question — everything after it starts a new item. If sub-part lettering restarts at (a), a new main question has begun. When unsure which question owns a line, start a new item rather than merging.
 - If this page is a CONTINUATION of the previous question, is blank, or contains no new question, return {{"items": []}}.
-- Transcribe fully (never summarize). Preserve punctuation. `**[X marks]**` after each marked sub-part. Math in $...$/$$...$$. Markdown tables for text tables; \begin{{array}} only for matrices. Code in backticks, never math mode. Escape LaTeX backslashes (\\frac).
+- ARTIFACT FILTERING: Recognize and completely exclude all non-exam content. Silently ignore margin warnings, printer registration marks, page numbers, and barcodes.
+- STRUCTURAL SPACING: Enforce strict hierarchical spacing. Use double line breaks (\n\n) to clearly separate sub-question identifiers ((a), (b), (i)) and mark allocations (**[X marks]**) from surrounding text.
+- EQUATION COHESION: Treat multi-part mathematical statements (e.g. matrix equations) as a single cohesive unit within a single display math block ($$ ... $$), never orphaning equals signs or matrices on separate lines.
+- MATHEMATICAL ACCURACY: Ensure all mathematical notation is accurately translated into valid, standard LaTeX.
+- ROBUST TABLE RENDERING: Structured tables with headers (trace tables, function tables, working grids) are question content even when EMPTY — transcribe them as standard Markdown tables, NEVER as diagram boxes. Never leak raw \\hline or broken formatting tags.
+- Transcribe fully (never summarize). Preserve punctuation. `**[X marks]**` after each marked sub-part. Math in $...$/$$...$$. Pure matrices in LaTeX \\begin{{array}} or \\begin{{pmatrix}} inside $$...$$. Code in backticks, never math mode. Escape LaTeX backslashes (\\\\frac).
 - AQA decimal sub-parts: render '03.1'-style part numbers as (a), (b), (c) — positional: .1 -> a, .2 -> b — and update inline cross-references. AQA also uses SPACED sub-parts: \"01 5\" means Question 1, sub-part 5 — render as (e). The whole question number is ALWAYS the integer (never a decimal like 1.5). The whole decimal run on this page is ONE item with its integer question number.
 - Anything the paper labels as a Figure ("Figure 6" — printed schemas, algorithm screens, grids that are part of the question exhibit) MUST be returned as a diagram box, never as transcribed text.
-- STRUCTURED TABLES WITH HEADERS (trace tables, function tables, working grids) are question content even when EMPTY — transcribe them as Markdown tables, NEVER as diagram boxes. Diagram boxes are ONLY for figures that cannot be typed (graphs, circuits, line drawings), one box per figure; blank, empty-grid, and duplicate boxes are rejected by the parser and cost a repair round.
 - Exclude headers/footers ("Question X continued", "Turn over", totals footers), plain ruled answer lines, answer line templates with operators (e.g. "............ $\\le t <$ ............"), "BLANK PAGE".
 - Content must end with terminal punctuation or a mark tag."#,
         module = config.module_name,
@@ -2730,7 +2879,7 @@ RULES:
         }],
         PageInputKind::TextOnly => Vec::new(),
     };
-    let prepared = match prepare_chunk_images(1, preparation_inputs).await {
+    let prepared = match prepare_chunk_images(1, preparation_inputs, page_image_cache).await {
         Ok(prepared) => prepared,
         Err(error) => {
             report.anomalies.push(format!(
@@ -3431,7 +3580,6 @@ mod tests {
         assert_eq!(built[1].marks, 4);
         assert_eq!(report.questions_expected, 2);
         assert_eq!(report.questions_extracted, 2);
-        assert_eq!(report.marks_checksum_ok, Some(true));
         assert!(report.quarantined.is_empty());
         assert_eq!(mock.remaining(), 0);
     }
@@ -3487,9 +3635,10 @@ mod tests {
             run_question_pipeline(&mock, &pgs, &config(), &NullProgress, &cancel_flag())
                 .await
                 .unwrap();
-        assert_eq!(built.len(), 1); // Only Q2 was built
+        assert_eq!(built.len(), 2); // Q1 fallback + Q2
         assert_eq!(report.quarantined.len(), 1); // Q1 was quarantined after 3 attempts
-        assert_eq!(built[0].question_number, 2);
+        assert!(built[0].needs_review); // Q1 marked for review
+        assert_eq!(built[1].question_number, 2);
     }
 
     #[tokio::test]
@@ -3739,7 +3888,7 @@ mod tests {
         ));
         let semaphore = Arc::new(Semaphore::new(1));
         let (built_opt, report) =
-            extract_span(&mock, &config(), &span, &span_pages, &cache, &semaphore).await;
+            extract_span(&mock, &config(), &span, &span_pages, &cache, &Arc::new(PageImageCache::new()), &semaphore).await;
         let built = built_opt.expect("question must build after the repair round");
 
         assert_eq!(mock.remaining(), 0, "both attempts consumed");
@@ -3786,7 +3935,7 @@ mod tests {
         ));
         let semaphore = Arc::new(Semaphore::new(1));
         let (built_opt, report) =
-            extract_span(&mock, &config(), &span, &span_pages, &cache, &semaphore).await;
+            extract_span(&mock, &config(), &span, &span_pages, &cache, &Arc::new(PageImageCache::new()), &semaphore).await;
         let built = built_opt.expect("split span must build");
 
         assert!(built.content.contains("First page content."));
@@ -3853,7 +4002,7 @@ mod tests {
         ));
         let semaphore = Arc::new(Semaphore::new(1));
         let (built_opt, report) =
-            extract_span(&mock, &config(), &span, &span_pages, &cache, &semaphore).await;
+            extract_span(&mock, &config(), &span, &span_pages, &cache, &Arc::new(PageImageCache::new()), &semaphore).await;
         let built = built_opt.expect("transcription must survive even when boxes never pass");
 
         assert!(

@@ -106,7 +106,13 @@ function App() {
             <RepositoryFeed isActive={activeTab === "repository"} onAddToWorksheet={handleAddQuestion} />
           </div>
           <div className={cn("absolute inset-0 flex flex-col min-h-0 overflow-hidden bg-background", activeTab === "ingestion" ? "z-10 opacity-100 pointer-events-auto" : "z-0 opacity-0 pointer-events-none")}>
-            <IngestionDropzone isActive={activeTab === "ingestion"} onSuccess={() => setActiveTab("repository")} />
+            <IngestionDropzone
+              isActive={activeTab === "ingestion"}
+              onSuccess={() => {
+                setActiveTab("repository");
+                setTimeout(() => window.dispatchEvent(new CustomEvent("refresh-questions")), 50);
+              }}
+            />
           </div>
           <div className={cn("absolute inset-0 flex flex-col min-h-0 overflow-hidden bg-background", activeTab === "flashcards" ? "z-10 opacity-100 pointer-events-auto" : "z-0 opacity-0 pointer-events-none")}>
             <FlashcardsTab selectedQuestions={selectedQuestions} />

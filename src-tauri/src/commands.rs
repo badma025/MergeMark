@@ -430,10 +430,30 @@ async fn insert_questions_from_text(
 #[tauri::command]
 pub async fn get_all_questions(state: State<'_, AppState>) -> Result<Vec<Question>, String> {
     let pool = state.db.lock().await;
-    let questions = sqlx::query_as::<_, Question>("SELECT * FROM questions")
-        .fetch_all(&*pool)
-        .await
-        .map_err(|e| e.to_string())?;
+    let questions = sqlx::query_as::<_, Question>(
+        r#"
+        SELECT 
+            id,
+            COALESCE(subject, 'Mathematics') AS subject,
+            COALESCE(subtopic, '') AS subtopic,
+            COALESCE(marks, 0) AS marks,
+            COALESCE(content, '') AS content,
+            COALESCE(math_snippet, '') AS math_snippet,
+            COALESCE(is_code, 0) AS is_code,
+            answer_content,
+            topics,
+            COALESCE(paper_name, '') AS paper_name,
+            question_number,
+            module,
+            COALESCE(needs_review, 0) AS needs_review,
+            COALESCE(answer_stale, 0) AS answer_stale
+        FROM questions 
+        ORDER BY rowid DESC
+        "#
+    )
+    .fetch_all(&*pool)
+    .await
+    .map_err(|e| e.to_string())?;
 
     Ok(questions)
 }
@@ -1111,17 +1131,83 @@ pub async fn parse_pdf_vision(
     // modest cost (output tokens are the expensive part, but a truncated
     // question that requires a full retry is far more expensive).
     config.max_output_tokens = 32768;
-    config.parallelism = std::env::var("MERGEMARK_PARALLELISM")
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-        .map(|v| v.clamp(1, 8))
-        .unwrap_or(4);
 
     let (route, client) = resolve_llm_client(&state, model_name.clone())
         .await
         .map_err(|e| e.hint.unwrap_or(e.message))?;
 
+    // Use higher parallelism for BYOK (user controls their own rate limits);
+    // conservative for the shared Free Tier key. The 429 retry loop in
+    // llm.rs handles backpressure automatically if the provider throttles.
+    config.parallelism = match &route {
+        crate::billing::BillingRoute::FreeTier { .. } => {
+            std::env::var("MERGEMARK_PARALLELISM")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .map(|v| v.clamp(1, 4))
+                .unwrap_or(4)
+        }
+        _ => std::env::var("MERGEMARK_PARALLELISM")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .map(|v| v.clamp(1, 16))
+            .unwrap_or(8),
+    };
+
     let progress = TauriProgress { app: app.clone() };
+
+    // ── Extraction cache: skip the pipeline if we've seen this input before ──
+    // Compute a content-addressed cache key from the PDF bytes + model +
+    // paper name. On cache hit, return the stored questions immediately
+    // without making any API calls — re-ingestion becomes instant.
+    let file_bytes = std::fs::read(&file_path).unwrap_or_default();
+    let cache_key = crate::db::extraction_cache_key(
+        &file_bytes,
+        &model_name,
+        paper_name.trim(),
+    );
+    let pool_check = state.db.lock().await;
+    if let Ok(Some(cached_json)) = crate::db::get_cached_extraction(&pool_check, &cache_key).await {
+        if let Ok(cached_questions) = serde_json::from_str::<Vec<Question>>(&cached_json) {
+            progress.stage("Loaded from cache — syncing to repository.");
+            for q in &cached_questions {
+                let topics_json = q.topics.as_deref().unwrap_or("[]");
+                let subtopic = if q.subtopic.is_empty() { "Imported" } else { &q.subtopic };
+                let _ = sqlx::query(
+                    r#"
+                    INSERT INTO questions (id, subject, subtopic, topics, marks, content, math_snippet, is_code, paper_name, question_number, module, needs_review, answer_stale)
+                    VALUES (?, ?, ?, ?, ?, ?, '', ?, ?, ?, ?, ?, 0)
+                    ON CONFLICT(paper_name, question_number) DO UPDATE SET
+                        subject = excluded.subject,
+                        subtopic = excluded.subtopic,
+                        topics = CASE WHEN excluded.topics != '[]' THEN excluded.topics ELSE questions.topics END,
+                        marks = excluded.marks,
+                        content = excluded.content,
+                        is_code = excluded.is_code,
+                        module = COALESCE(excluded.module, questions.module),
+                        needs_review = excluded.needs_review
+                    "#,
+                )
+                .bind(&q.id)
+                .bind(&config.subject)
+                .bind(subtopic)
+                .bind(topics_json)
+                .bind(q.marks)
+                .bind(&q.content)
+                .bind(q.is_code)
+                .bind(&config.paper_name)
+                .bind(q.question_number)
+                .bind(&q.module)
+                .bind(q.needs_review)
+                .execute(&*pool_check)
+                .await;
+            }
+            drop(pool_check);
+            return Ok(cached_questions);
+        }
+    }
+    drop(pool_check);
+
     let (built, mut report): (Vec<BuiltQuestion>, ImportReport) =
         pipeline::run_question_pipeline(&client, &pages, &config, &progress, &state.cancel_flag)
             .await?;
@@ -1221,6 +1307,13 @@ pub async fn parse_pdf_vision(
         });
     }
 
+    // ── Store in extraction cache for instant re-ingestion ────────────────
+    if !final_questions.is_empty() {
+        if let Ok(questions_json) = serde_json::to_string(&final_questions) {
+            let _ = crate::db::store_cached_extraction(&pool, &cache_key, &questions_json).await;
+        }
+    }
+
     Ok(final_questions)
 }
 
@@ -1286,6 +1379,9 @@ pub async fn delete_all_questions(state: State<'_, AppState>) -> Result<bool, St
         .execute(&*pool)
         .await
         .map_err(|e| e.to_string())?;
+    let _ = sqlx::query("DELETE FROM extraction_cache")
+        .execute(&*pool)
+        .await;
     Ok(true)
 }
 
@@ -1306,6 +1402,10 @@ pub async fn delete_questions_by_paper(
             .execute(&*pool)
             .await
             .map_err(|e| e.to_string())?;
+
+    let _ = sqlx::query("DELETE FROM extraction_cache")
+        .execute(&*pool)
+        .await;
 
     Ok(result.rows_affected() as i64)
 }
@@ -1459,6 +1559,22 @@ pub async fn parse_mark_scheme_vision(
     let (route, client) = resolve_llm_client(&state, model_name.clone())
         .await
         .map_err(|e| e.hint.unwrap_or(e.message))?;
+
+    // Route-aware parallelism: higher for BYOK, conservative for Free Tier.
+    config.parallelism = match &route {
+        crate::billing::BillingRoute::FreeTier { .. } => {
+            std::env::var("MERGEMARK_PARALLELISM")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .map(|v| v.clamp(1, 4))
+                .unwrap_or(4)
+        }
+        _ => std::env::var("MERGEMARK_PARALLELISM")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .map(|v| v.clamp(1, 16))
+            .unwrap_or(8),
+    };
 
     let progress = TauriProgress { app: app.clone() };
     let (drafts, report): (Vec<AnswerDraft>, ImportReport) =
