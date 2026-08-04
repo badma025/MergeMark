@@ -11,8 +11,9 @@ import rehypeKatex from "rehype-katex";
 import remarkGfm from "remark-gfm";
 import { cn, preprocessMathString } from "@/lib/utils";
 import { remarkMathFix } from "@/lib/remark-math-fix";
-import { convertFileSrc } from "@tauri-apps/api/core";
+import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 import { useTaxonomy } from "@/lib/TaxonomyContext";
+import { toast } from "sonner";
 import Zoom from "react-medium-image-zoom";
 import "react-medium-image-zoom/dist/styles.css";
 
@@ -73,7 +74,6 @@ export function stripAnswerSpaces(raw: string): string {
   return s;
 }
 
-
 export interface QuestionCardProps {
   id: string;
   subject: string;
@@ -115,10 +115,10 @@ export function QuestionCard(props: QuestionCardProps) {
   const { subjects, topicsBySubject } = useTaxonomy();
   const displaySubject = subjects.find(s => s.id === subject)?.name || subject;
   const [isEditing, setIsEditing] = useState(false);
-  const [isShowingAnswer] = useState(false);
-  const [needsReview] = useState(!!initialNeedsReview);
-  const [answerStale] = useState(!!initialAnswerStale);
-    let parsedTopics: string[] = [];
+  const [isShowingAnswer, setIsShowingAnswer] = useState(false);
+  const [needsReview, setNeedsReview] = useState(!!initialNeedsReview);
+  const [answerStale, setAnswerStale] = useState(!!initialAnswerStale);
+  let parsedTopics: string[] = [];
   try {
     if (topics) {
       parsedTopics = JSON.parse(topics);
@@ -179,66 +179,131 @@ export function QuestionCard(props: QuestionCardProps) {
         {/* Left: Badges (wrap naturally without overlapping actions) */}
         <div className="flex flex-wrap items-center gap-1.5 min-w-0 flex-1">
           {needsReview && (
-            <Badge variant="outline" className="bg-warning/10 text-warning border-warning/30 text-xs gap-1">
-              <AlertTriangle className="size-3" />
+            <Badge className="text-xs font-semibold tracking-wide bg-amber-500/15 text-amber-700 dark:text-amber-400 border-amber-500/30 hover:bg-amber-500/25 cursor-help shrink-0" title="Extracted with vision fallback or low confidence">
+              <AlertTriangle className="size-3 mr-1 inline" />
               REVIEW
             </Badge>
           )}
-          {answerStale && (
-            <Badge variant="outline" className="bg-destructive/10 text-destructive border-destructive/30 text-xs gap-1">
-              <ShieldCheck className="size-3" />
-              STALE ANSWER
+          <Badge
+            className="text-xs font-medium tracking-wide bg-zinc-800 text-zinc-50 hover:bg-zinc-800/90 dark:bg-zinc-200 dark:text-zinc-900 dark:hover:bg-zinc-200/90 shrink-0"
+          >
+            {displaySubject}
+          </Badge>
+          {module && module !== "General" && module !== "Unknown" && (
+            <Badge
+              className="text-xs font-medium tracking-wide bg-purple-900/50 text-purple-200 border-purple-800 hover:bg-purple-900/60 shrink-0"
+            >
+              {module}
             </Badge>
           )}
+          {parsedTopics.map((topic, i) => (
+            <Badge
+              key={i}
+              variant="outline"
+              className="text-xs font-medium bg-blue-900/50 text-blue-200 border-blue-800 shrink-0"
+            >
+              {topic}
+            </Badge>
+          ))}
+          <Badge className="bg-primary/15 text-primary hover:bg-primary/20 border-primary/20 text-xs font-semibold shrink-0">
+            {marks} {marks === 1 ? "mark" : "marks"}
+          </Badge>
         </div>
 
-        {/* Right: Action Buttons */}
-        <div className="flex items-center gap-1.5 shrink-0">
-          {onAddToWorksheet && (
-            <Button
-              variant="ghost"
-              size="sm"
-              onClick={(e) => { e.stopPropagation(); onAddToWorksheet?.(id); }}
-              aria-label="Add to worksheet"
-              className="h-7 w-7 p-0"
+        {/* Right: Action buttons (never squished, distinct hover styling) */}
+        <div className="flex items-center gap-1 shrink-0 opacity-0 group-hover:opacity-100 focus-within:opacity-100 transition-opacity duration-150 -mr-1 -mt-1">
+          {!isEditing && (
+            <button
+              type="button"
+              onClick={(e) => {
+                e.stopPropagation();
+                setEditContent(displayContent);
+                setEditMarks(marks);
+                setEditAnswerContent(strippedAnswerContent);
+                setEditTopics(parsedTopics);
+                setIsEditing(true);
+              }}
+              title="Edit Question"
+              aria-label={`Edit question ${id}`}
+              className={cn(
+                "flex items-center justify-center rounded-md p-1.5",
+                "text-muted-foreground transition-all duration-150",
+                "hover:bg-primary/10 hover:text-primary",
+                "focus-visible:opacity-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/60"
+              )}
             >
-              <Plus className="size-4" />
-            </Button>
+              <Pencil className="size-4" />
+            </button>
           )}
-          <Button
-            variant="ghost"
-            size="sm"
-            onClick={(e) => { e.stopPropagation(); setIsEditing(true); }}
-            aria-label="Edit question"
-            className="h-7 w-7 p-0"
+          {!isEditing && needsReview && (
+            <button
+              type="button"
+              onClick={async (e) => {
+                e.stopPropagation();
+                try {
+                  await invoke("mark_question_verified", { id });
+                  setNeedsReview(false);
+                  setAnswerStale(false);
+                  toast.success("Question marked as verified");
+                } catch (e: any) {
+                  toast.error(e.toString());
+                }
+              }}
+              aria-label={`Mark question ${id} as verified`}
+              className={cn(
+                "flex items-center justify-center rounded-md p-1.5",
+                "text-emerald-600 transition-all duration-150",
+                "hover:bg-emerald-500/10 hover:text-emerald-500",
+                "focus-visible:opacity-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-500/60"
+              )}
+              title="Mark as Verified"
+            >
+              <ShieldCheck className="size-4" />
+            </button>
+          )}
+          <button
+            id={`delete-question-${id}`}
+            type="button"
+            onClick={(e) => {
+              e.stopPropagation();
+              onDelete?.(id);
+            }}
+            title="Delete Question"
+            aria-label={`Delete question ${id}`}
+            className={cn(
+              "flex items-center justify-center rounded-md p-1.5",
+              "text-muted-foreground transition-all duration-150",
+              "hover:bg-destructive/10 hover:text-destructive",
+              "focus-visible:opacity-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-destructive/60"
+            )}
           >
-            <Pencil className="size-4" />
-          </Button>
-          {onDelete && (
-            <Button
-              variant="ghost"
-              size="sm"
-              onClick={(e) => { e.stopPropagation(); onDelete?.(id); }}
-              aria-label="Delete question"
-              className="h-7 w-7 p-0 text-destructive hover:bg-destructive/10"
-            >
-              <Trash2 className="size-4" />
-            </Button>
-          )}
+            <Trash2 className="size-4" />
+          </button>
         </div>
       </div>
 
-      {/* ── Question & Answer ── */}
-      <div className="relative">
+      {/* ── Stale Answer Warning Banner ── */}
+      {answerStale && (
+        <div className="flex items-center gap-2 bg-amber-500/10 border border-amber-500/20 text-amber-700 dark:text-amber-400 p-2.5 rounded-lg text-sm -mx-1 mt-0 mb-1">
+          <AlertTriangle className="size-4 shrink-0" />
+          <div className="flex-1">
+            <strong>Stale Answer:</strong> This mark scheme answer may be out of date compared to the recently updated question content.
+          </div>
+        </div>
+      )}
+
+      {/* ── Question / Answer Content (Crossfade) ── */}
+      <div className="relative text-sm leading-relaxed text-foreground prose prose-sm dark:prose-invert max-w-none prose-p:my-1 prose-pre:my-1 break-words">
+        
         {/* Question Content */}
-        <div
+        <div 
           className={cn(
             "transition-opacity duration-200 ease-in-out overflow-x-auto",
             isShowingAnswer ? "opacity-0 absolute inset-0 pointer-events-none" : "opacity-100 relative"
           )}
         >
-          <ReactMarkdown
-            remarkPlugins={[remarkMath, remarkGfm, remarkMathFix]}
+          <ReactMarkdown 
+            remarkPlugins={[remarkMath, remarkGfm, remarkMathFix]} 
             rehypePlugins={[[rehypeKatex, { throwOnError: false, strict: false }]]}
             urlTransform={(value) => value}
             components={{
@@ -258,15 +323,15 @@ export function QuestionCard(props: QuestionCardProps) {
         </div>
 
         {/* Answer Content */}
-        <div
+        <div 
           className={cn(
             "transition-opacity duration-200 ease-in-out overflow-x-auto",
             isShowingAnswer ? "opacity-100 relative" : "opacity-0 absolute inset-0 pointer-events-none"
           )}
         >
           <div className="font-semibold text-xs text-muted-foreground mb-2 uppercase tracking-wider">Mark Scheme Answer</div>
-          <ReactMarkdown
-            remarkPlugins={[remarkMath, remarkGfm, remarkMathFix]}
+          <ReactMarkdown 
+            remarkPlugins={[remarkMath, remarkGfm, remarkMathFix]} 
             rehypePlugins={[[rehypeKatex, { throwOnError: false, strict: false }]]}
             urlTransform={(value) => value}
             components={{
@@ -342,36 +407,77 @@ export function QuestionCard(props: QuestionCardProps) {
               </div>
             </div>
 
-            {/* Question Content Editor */}
-            <div className="flex flex-col gap-2 flex-1 min-h-0">
-              <label className="text-sm font-semibold text-foreground">Question:</label>
-              <RichTextEditor
-                markdown={editContent}
-                onChange={setEditContent}
-                placeholder="Enter the question text with LaTeX math..."
-                className="flex-1 min-h-[200px]"
-              />
+            {/* Content Editors */}
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-4 flex-1 min-h-[320px] p-0.5">
+              <div className="flex flex-col gap-1.5 flex-1 min-h-0">
+                <div className="min-h-[44px] flex flex-col justify-end">
+                  <label className="text-sm font-semibold text-foreground">Question Content:</label>
+                  <p className="text-xs text-muted-foreground">Markdown supported. Inline math: $...$, Block math: $$...$$</p>
+                </div>
+                <RichTextEditor 
+                  markdown={editContent}
+                  onChange={setEditContent}
+                  className="flex-1 w-full min-h-[300px]"
+                />
+              </div>
+              <div className="flex flex-col gap-1.5 flex-1 min-h-0">
+                <div className="min-h-[44px] flex flex-col justify-end">
+                  <label className="text-sm font-semibold text-foreground">Mark Scheme Answer (Optional):</label>
+                  <p className="text-xs text-muted-foreground">Markdown supported. Optional mark scheme or model answer.</p>
+                </div>
+                <RichTextEditor 
+                  markdown={editAnswerContent}
+                  onChange={setEditAnswerContent}
+                  placeholder="Paste or edit the mark scheme answer here..."
+                  className="flex-1 w-full min-h-[300px]"
+                />
+              </div>
             </div>
+          </div>
 
-            {/* Answer Content Editor */}
-            <div className="flex flex-col gap-2 shrink-0">
-              <label className="text-sm font-semibold text-foreground">Mark Scheme Answer:</label>
-              <RichTextEditor
-                markdown={editAnswerContent}
-                onChange={setEditAnswerContent}
-                placeholder="Enter the mark scheme answer with LaTeX math..."
-                className="flex-1 min-h-[120px]"
-              />
-            </div>
-
-            {/* Dialog Actions */}
-            <div className="flex justify-end gap-2 shrink-0 pt-2 border-t">
-              <Button variant="outline" onClick={handleCancel}>Cancel</Button>
-              <Button onClick={handleSave}>Save Changes</Button>
-            </div>
+          <div className="flex justify-end gap-2 mt-auto pt-4 border-t border-border shrink-0">
+            <Button variant="outline" onClick={handleCancel}>Cancel</Button>
+            <Button onClick={handleSave}>Save Changes</Button>
           </div>
         </DialogContent>
       </Dialog>
+
+      {/* ── Footer: Add to Worksheet & Show Answer ── */}
+      <div className="flex items-center justify-between pt-1">
+        <div>
+          {answerContent && answerContent.trim() !== "" && (
+            <Button
+              variant="secondary"
+              size="sm"
+              className="text-xs h-7 px-3 transition-colors"
+              onClick={(e) => {
+                e.stopPropagation();
+                setIsShowingAnswer(!isShowingAnswer);
+              }}
+            >
+              {isShowingAnswer ? "Show Question" : "Show Answer"}
+            </Button>
+          )}
+        </div>
+        <Button
+          id={`add-to-worksheet-${id}`}
+          size="sm"
+          className={cn(
+            "gap-1.5 text-xs font-semibold",
+            "bg-primary text-primary-foreground",
+            "opacity-0 translate-y-1 transition-all duration-200",
+            "group-hover:opacity-100 group-hover:translate-y-0"
+          )}
+          onClick={(e) => {
+            e.stopPropagation();
+            onAddToWorksheet?.(id);
+          }}
+          aria-label={`Add question ${id} to worksheet`}
+        >
+          <Plus className="size-3.5" />
+          Add to Worksheet
+        </Button>
+      </div>
     </article>
   );
 }
