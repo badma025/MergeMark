@@ -32,6 +32,8 @@ function fixSpacedCommands(text: string): string {
 /**
  * State machine to track if we're inside a math environment
  * and collapse double newlines to single newlines inside them
+ * Only tracks \begin{env}...\end{env} environments, NOT $$...$$ blocks
+ * (those are handled by wrapBareMathEnvs)
  */
 function collapseBlankLinesInMathEnvs(text: string): string {
   const lines = text.split('\n');
@@ -86,6 +88,7 @@ function collapseBlankLinesInMathEnvs(text: string): string {
 /**
  * Wrap bare matrix/math environments in $$...$$
  * Uses a state machine to track if we're already inside math delimiters
+ * Also handles Issue 1: auto-close unclosed $$ blocks at paragraph breaks
  */
 function wrapBareMathEnvs(text: string): string {
   const lines = text.split('\n');
@@ -101,22 +104,49 @@ function wrapBareMathEnvs(text: string): string {
     const line = lines[i];
     const trimmed = line.trim();
 
-    // Track display math ($$ ... $$)
-    if (trimmed === '$$') {
-      inDisplayMath = !inDisplayMath;
-      // If closing display math and we have a buffered env, flush it
-      if (!inDisplayMath && inMathEnv) {
-        // Find the start of the env in result and wrap it
-        for (let j = envStartIdx; j < result.length; j++) {
-          if (result[j].trim().startsWith(`\\begin{${mathEnvName}}`)) {
-            result[j] = `$$\n${result[j]}`;
-            break;
+    // Track display math ($$ ... $$) - detect delimiters anywhere in line
+    // We need to count unescaped $$ pairs to toggle state correctly
+    if (!inDisplayMath) {
+      // Count unescaped $$ in the entire line (not just at start)
+      let dollarCount = 0;
+      for (let charIdx = 0; charIdx < line.length;) {
+        if (line[charIdx] === '$') {
+          const isEscaped = charIdx > 0 && line[charIdx - 1] === '\\';
+          const isDouble = charIdx + 1 < line.length && line[charIdx + 1] === '$';
+          if (!isEscaped && isDouble) {
+            dollarCount++;
+            charIdx += 2;
+          } else {
+            charIdx++;
           }
+        } else {
+          charIdx++;
         }
-        result[result.length - 1] = `${result[result.length - 1]}\n$$`;
-        inMathEnv = false;
-        mathEnvName = null;
-        envStartIdx = -1;
+      }
+      // If odd number of $$, we enter display math
+      if (dollarCount % 2 === 1) {
+        inDisplayMath = true;
+      }
+    } else {
+      // We're already in display math - check for closing $$
+      let dollarCount = 0;
+      for (let charIdx = 0; charIdx < line.length;) {
+        if (line[charIdx] === '$') {
+          const isEscaped = charIdx > 0 && line[charIdx - 1] === '\\';
+          const isDouble = charIdx + 1 < line.length && line[charIdx + 1] === '$';
+          if (!isEscaped && isDouble) {
+            dollarCount++;
+            charIdx += 2;
+          } else {
+            charIdx++;
+          }
+        } else {
+          charIdx++;
+        }
+      }
+      // If odd number of $$, we close display math
+      if (dollarCount % 2 === 1) {
+        inDisplayMath = false;
       }
     }
 
@@ -135,6 +165,23 @@ function wrapBareMathEnvs(text: string): string {
           charIdx++;
         }
       }
+    }
+
+    // Issue 1 Fix: If we're in an open $$ block and encounter an empty line (paragraph break),
+    // auto-close the $$ block at the end of the previous line.
+    // Since blank lines inside math environments are already stripped by collapseBlankLinesInMathEnvs,
+    // any empty line encountered while inDisplayMath is a guaranteed paragraph break where VLM forgot to close.
+    if (inDisplayMath && trimmed === '') {
+      inDisplayMath = false;
+      // Add closing $$ to the previous non-empty line in result
+      for (let j = result.length - 1; j >= 0; j--) {
+        if (result[j].trim() !== '') {
+          result[j] = `${result[j]}\n$$`;
+          break;
+        }
+      }
+      // Don't add the empty line to result (it's the paragraph break)
+      continue;
     }
 
     // Check for math environment start (only if not already in math mode)
@@ -176,6 +223,62 @@ function wrapBareMathEnvs(text: string): string {
     }
 
     result.push(line);
+  }
+
+  return result.join('\n');
+}
+
+/**
+ * Issue 2 Fix: Wrap orphaned equations (standalone lines with heavy LaTeX syntax
+ * but no $ delimiters) in $$...$$
+ *
+ * Detects lines that:
+ * - Sit on their own line (surrounded by \n\n or start/end of text)
+ * - Contain NO $ delimiters
+ * - Contain heavy LaTeX syntax (\cos, \sin, \frac, \left, \le, \ge, \int, etc.)
+ */
+function wrapOrphanedMath(text: string): string {
+  // Regex for heavy LaTeX math syntax indicators
+  const mathSyntaxRegex = /\\(?:cos|sin|tan|sec|csc|cot|cosh|sinh|tanh|frac|dfrac|cfrac|sqrt|left|right|le|ge|leq|geq|int|iint|iiint|oint|sum|prod|lim|vec|hat|bar|dot|ddot|tilde|binom|quad|qquad|overrightarrow|overleftarrow|overbrace|underbrace|widehat|widetilde|overline|underline)\b/;
+
+  // Also check for common math symbols that indicate an equation
+  const mathSymbolRegex = /[=<>≤≥≠≈±×÷∂∇∞∫∑∏√]/;
+
+  const lines = text.split('\n');
+  const result: string[] = [];
+
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    const trimmed = line.trim();
+    const prevLine = i > 0 ? lines[i - 1].trim() : '';
+    const nextLine = i < lines.length - 1 ? lines[i + 1].trim() : '';
+
+    // Check if this line is a standalone line (surrounded by empty lines or boundaries)
+    const isStandalone = (prevLine === '' || i === 0) && (nextLine === '' || i === lines.length - 1);
+
+    // Check if line contains NO $ delimiters (unescaped)
+    const hasNoDelimiters = !/[^\\]\$/.test(line) && !/^\$/.test(line);
+
+    // Check if line contains heavy LaTeX math syntax
+    const hasMathSyntax = mathSyntaxRegex.test(trimmed) || mathSymbolRegex.test(trimmed);
+
+    // Skip if line is already inside a math environment (starts with \begin or \end)
+    const isMathEnvMarker = trimmed.startsWith('\\begin{') || trimmed.startsWith('\\end{');
+
+    // Skip if line is just a bare $$ delimiter
+    const isDelimiterOnly = trimmed === '$$' || trimmed === '$';
+
+    // Skip if line is empty
+    const isEmpty = trimmed === '';
+
+    if (isStandalone && hasNoDelimiters && hasMathSyntax && !isMathEnvMarker && !isDelimiterOnly && !isEmpty) {
+      // Wrap this orphaned equation in $$...$$
+      result.push('$$');
+      result.push(line);
+      result.push('$$');
+    } else {
+      result.push(line);
+    }
   }
 
   return result.join('\n');
@@ -237,13 +340,16 @@ export function preprocessMathString(raw: string): string {
   // 2. Collapse blank lines inside math environments (prevents <p> injection)
   s = collapseBlankLinesInMathEnvs(s);
 
-  // 3. Wrap bare math environments in $$...$$
+  // 3. Wrap bare math environments in $$...$$ (includes Issue 1: auto-close at double newlines)
   s = wrapBareMathEnvs(s);
 
-  // 4. Balance any unclosed delimiters
+  // 4. Wrap orphaned equations (Issue 2: standalone lines with heavy LaTeX syntax)
+  s = wrapOrphanedMath(s);
+
+  // 5. Balance any unclosed delimiters
   s = balanceDelimiters(s);
 
-  // 5. Collapse 3+ newlines to 2 (clean up)
+  // 6. Collapse 3+ newlines to 2 (clean up)
   s = s.replace(/\n{3,}/g, '\n\n');
 
   return s.trim();
