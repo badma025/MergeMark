@@ -662,7 +662,7 @@ pub async fn compile_worksheet(
 
         if let Some(question) = q {
             question_num += 1;
-            let mut content = crate::validate::sanitize_markdown_math(&question.content);
+            let mut content = crate::validate::sanitize_for_latex(&question.content);
             content = content.replace("\r\n", "\n");
 
             // Format markdown to LaTeX
@@ -803,7 +803,7 @@ pub async fn compile_worksheet(
             ));
 
             if let Some(raw_ans) = question.answer_content {
-                let mut ans_content = crate::validate::sanitize_markdown_math(&raw_ans);
+                let mut ans_content = crate::validate::sanitize_for_latex(&raw_ans);
                 ans_content = ans_content.replace("\r\n", "\n");
                 ans_content = bold_re
                     .replace_all(&ans_content, r"\textbf{${1}}")
@@ -1044,7 +1044,7 @@ pub async fn parse_pdf_vision(
             let page_texts = tokio::task::spawn_blocking(move || extract_page_texts(&path_clone, num_pages))
                 .await
                 .map_err(|e| format!("Thread-pool error: {}", e))?;
-            
+
             pdf_pages
                 .into_iter()
                 .enumerate()
@@ -1082,6 +1082,55 @@ pub async fn parse_pdf_vision(
             }
         }
     };
+
+    // ── Fast path: pure-text PDF (all pages TextOnly) → heuristic extraction ──
+    // If every page is TextOnly (no rendered images = no diagrams, no visual
+    // elements), we can skip the expensive PVRV vision pipeline entirely and
+    // use the SubjectClassifier heuristic on the combined text layer. This
+    // avoids all LLM calls for pure-text PDFs while still classifying subject,
+    // extracting marks, and inserting into the repository.
+    let all_text_only = pages.iter().all(|p| matches!(p.kind, crate::pipeline::PageInputKind::TextOnly));
+    if all_text_only && !pages.is_empty() {
+        let combined_text = pages.iter().map(|p| p.text.as_str()).collect::<Vec<_>>().join("\n\n");
+        let cleaned = combined_text
+            .lines()
+            .map(|l| l.trim())
+            .collect::<Vec<_>>()
+            .join("\n");
+        let cleaned = regex::Regex::new(r"\n{3,}")
+            .unwrap()
+            .replace_all(&cleaned, "\n\n")
+            .to_string();
+
+        let classifier = SubjectClassifier::new();
+        let state_clone = state.clone();
+        let app_clone = app.clone();
+        let pool = state_clone.db.lock().await;
+        let inserted = insert_questions_from_text(&*pool, &cleaned, &classifier).await?;
+        drop(pool);
+
+        // Emit a progress event so the UI knows we're done
+        let _ = app_clone.emit("import-report", &serde_json::json!({
+            "paper_name": paper_name,
+            "kind": "questions",
+            "pages_total": pages.len(),
+            "pages_processed": pages.len(),
+            "questions_extracted": inserted,
+            "anomalies": ["Used pure-text fast path (no vision pipeline)"]
+        }));
+
+        // Return the inserted questions (they're already in the DB; fetch them)
+        let pool = state.db.lock().await;
+        let questions: Vec<Question> = sqlx::query_as(
+            "SELECT * FROM questions WHERE paper_name = ? ORDER BY question_number ASC"
+        )
+        .bind(&paper_name)
+        .fetch_all(&*pool)
+        .await
+        .map_err(|e| e.to_string())?;
+        drop(pool);
+        return Ok(questions);
+    }
 
     let diagrams_dir = app.path().app_data_dir().map(|d| d.join("diagrams")).ok();
 
@@ -2104,11 +2153,11 @@ pub async fn export_flashcards(
             .map_err(|e| e.to_string())?;
 
         if let Some(q) = q {
-            let mut front = crate::validate::sanitize_markdown_math(&q.content);
+            let mut front = crate::validate::sanitize_for_latex(&q.content);
             if !q.math_snippet.is_empty() {
-                front = format!("{}\n\n{}", front, crate::validate::sanitize_markdown_math(&q.math_snippet));
+                front = format!("{}\n\n{}", front, crate::validate::sanitize_for_latex(&q.math_snippet));
             }
-            let back = crate::validate::sanitize_markdown_math(&q.answer_content.unwrap_or_default());
+            let back = crate::validate::sanitize_for_latex(&q.answer_content.unwrap_or_default());
 
             let mut tags = vec![q.subject.clone()];
             if let Some(m) = &q.module {

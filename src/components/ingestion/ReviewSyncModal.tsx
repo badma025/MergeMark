@@ -8,7 +8,8 @@ import remarkMath from "remark-math";
 import rehypeKatex from "rehype-katex";
 import remarkGfm from "remark-gfm";
 import "katex/dist/katex.min.css";
-import { preprocessMath } from "@/components/repository/QuestionCard";
+import { preprocessMathString } from '@/lib/utils';
+import { remarkMathFix } from '@/lib/remark-math-fix';
 import { Loader2 } from "lucide-react";
 
 export interface ProposedMapping {
@@ -120,7 +121,7 @@ export function ReviewSyncModal({ mappings, onClose, onSuccess }: ReviewSyncModa
                         Question {qNum}
                       </div>
                       <ReactMarkdown 
-                        remarkPlugins={[remarkMath, remarkGfm]} 
+                        remarkPlugins={[remarkMath, remarkGfm, remarkMathFix]} 
                         rehypePlugins={[[rehypeKatex, { throwOnError: false, strict: false }]]}
                         urlTransform={(value) => value}
                         components={{
@@ -157,7 +158,7 @@ export function ReviewSyncModal({ mappings, onClose, onSuccess }: ReviewSyncModa
                             }
                           }}
                         >
-                        {preprocessMath(m.rawContent)}
+                        {preprocessMathString(m.rawContent)}
                       </ReactMarkdown>
                     </div>
 
@@ -193,7 +194,7 @@ export function ReviewSyncModal({ mappings, onClose, onSuccess }: ReviewSyncModa
                         </div>
                       </div>
                       <ReactMarkdown 
-                        remarkPlugins={[remarkMath, remarkGfm]} 
+                        remarkPlugins={[remarkMath, remarkGfm, remarkMathFix]} 
                         rehypePlugins={[[rehypeKatex, { throwOnError: false, strict: false }]]}
                         urlTransform={(value) => value}
                         components={{
@@ -220,7 +221,7 @@ export function ReviewSyncModal({ mappings, onClose, onSuccess }: ReviewSyncModa
                             }
                           }}
                         >
-                        {preprocessMath(m.proposedAnswer)}
+                        {preprocessMathString(m.proposedAnswer)}
                       </ReactMarkdown>
                     </div>
                   </div>

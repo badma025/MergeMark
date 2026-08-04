@@ -4,8 +4,8 @@ import remarkMath from 'remark-math';
 import rehypeKatex from 'rehype-katex';
 import remarkGfm from 'remark-gfm';
 import 'katex/dist/katex.min.css';
-import { cn } from '@/lib/utils';
-import { preprocessMath } from './QuestionCard';
+import { cn, preprocessMathString } from '@/lib/utils';
+import { remarkMathFix } from '@/lib/remark-math-fix';
 import {
   Bold,
   Italic,
@@ -437,11 +437,11 @@ export function RichTextEditor({ markdown, onChange, placeholder, className }: R
             {markdown?.trim() ? (
               <div className="text-sm leading-relaxed text-foreground prose prose-sm dark:prose-invert max-w-none prose-p:my-1 prose-pre:my-1 break-words">
                 <ReactMarkdown
-                  remarkPlugins={[remarkMath, remarkGfm]}
+                  remarkPlugins={[remarkMath, remarkGfm, remarkMathFix]}
                   rehypePlugins={[[rehypeKatex, { throwOnError: false, strict: false }]]}
                   urlTransform={(value) => value}
                 >
-                  {preprocessMath(markdown)}
+                  {preprocessMathString(markdown)}
                 </ReactMarkdown>
               </div>
             ) : (

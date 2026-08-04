@@ -344,6 +344,10 @@ pub fn normalize_decimal_parts(content: &str, question_number: u32) -> String {
         .into_owned()
 }
 
+// ══════════════════════════════════════════════════════════════════════════
+// Deterministic content validators (moved from earlier)
+// ══════════════════════════════════════════════════════════════════════════
+
 // ── Source line preservation ────────────────────────────────────────────────
 //
 // Markdown collapses single newlines into one flowing paragraph. Exam
@@ -412,7 +416,7 @@ pub fn clean_question_content(content: &str) -> String {
     for p in patterns {
         cleaned = re(p).replace_all(&cleaned, "").into_owned();
     }
-    
+
     // Strip trailing inequality answer templates (e.g., "$... \le t < ...$ [2 marks]") while preserving the marks
     let ineq_re = regex::Regex::new(r"(?im)^[\s\.\$]*(?:\\\\?leq?|\\\\?geq?|<|>)\s*[a-zA-Z]\s*(?:\\\\?leq?|\\\\?geq?|<|>)\s*(.*?)\s*\$?\s*$").unwrap();
     cleaned = ineq_re.replace_all(&cleaned, "$1").into_owned();
@@ -424,101 +428,20 @@ pub fn clean_question_content(content: &str) -> String {
     // Collapse runs of 3+ newlines left by removals.
     let collapse = re(r"\n{3,}");
     let collapsed = collapse.replace_all(&cleaned, "\n\n").trim().to_string();
-    // Run organic VLM marker cleaning (matrix rows, fractured equations, hierarchical spacing, delimiter nesting)
-    let marker_cleaned = crate::marker_client::clean_marker_markdown(&collapsed);
-    // Source lines are meaningful — don't let Markdown reflow them into a
-    // single blob (schemas, algorithms, multi-part stems).
-    let hardened = harden_line_breaks(&marker_cleaned);
-    
-    // Automatically close any unclosed $ or $$ tags to prevent MDX parser crashes
-    sanitize_markdown_math(&hardened)
+
+    // Minimal cleanup: ligatures, harden line breaks (preserve source lines)
+    let with_ligatures = clean_ligatures(&collapsed);
+    harden_line_breaks(&with_ligatures)
 }
 
-/// Repair common LLM/PDF LaTeX damage before balancing Markdown delimiters.
-///
-/// This deliberately handles structure rather than trying to be a LaTeX
-/// compiler: malformed prose inside `aligned`, bare display formulas, arrays
-/// outside math mode, and line-oriented trace tables are all common outputs
-/// from PDF transcription and can be repaired without changing ordinary text.
-pub fn repair_latex_syntax(text: &str) -> String {
-    let mut text = crate::marker_client::fix_matrix_rows(text);
-    text = crate::marker_client::merge_fractured_equations(&text);
-    text = normalize_trace_table(&text);
-
-    // 1. Fix space after backslash for LaTeX keywords: "\ begin" -> "\begin", "\ sqrt" -> "\sqrt", etc.
-    let re_spaced_bs = re(r"\\ +(begin|end|frac|dfrac|cfrac|sqrt|text|textbf|textit|mathbf|mathit|mathrm|mathbb|mathcal|operatorname|pmatrix|bmatrix|vmatrix|matrix|array|cases|aligned|theta|lambda|alpha|beta|gamma|delta|Delta|pi|mu|sigma|omega|Omega|phi|Phi|psi|Psi|times|div|pm|mp|leq|geq|neq|approx|sim|equiv|subset|supset|subseteq|supseteq|in|notin|forall|exists|infty|partial|nabla|cos|sin|tan|sec|csc|cot|cosh|sinh|tanh|ln|log|exp|int|iint|iiint|oint|sum|prod|lim|vec|hat|bar|dot|ddot|tilde|binom|quad|qquad)\b");
-    text = re_spaced_bs.replace_all(&text, r"\$1").to_string();
-
-    // 2. Fix multiple backslashes before commands: "\\begin" -> "\begin", "\\pmatrix" -> "\pmatrix"
-    let re_multi_bs = re(r"\\{2,}(begin|end|frac|dfrac|cfrac|sqrt|text|textbf|textit|mathbf|mathit|mathrm|mathbb|mathcal|operatorname|pmatrix|bmatrix|vmatrix|matrix|array|cases|aligned|theta|lambda|alpha|beta|gamma|delta|Delta|pi|mu|sigma|omega|Omega|phi|Phi|psi|Psi|times|div|pm|mp|leq|geq|neq|approx|sim|equiv|in|forall|exists|infty|partial|nabla|cos|sin|tan|cosh|sinh|tanh|ln|log|exp|int|sum|prod|lim|vec|hat|bar|dot|ddot|tilde|binom)\b");
-    text = re_multi_bs.replace_all(&text, r"\$1").to_string();
-
-    let mut out = Vec::new();
-    let mut in_array = false;
-    let mut array_lines: Vec<String> = Vec::new();
-
-    for raw_line in text.lines() {
-        let mut line = raw_line.to_string();
-        let has_aligned = line.contains(r"\begin{aligned}") || line.contains(r"\end{aligned}");
-
-        // `aligned` is a math environment. If an LLM put prose and inline `$`
-        // math inside it, unwrap the environment and turn row separators into
-        // ordinary line breaks instead of emitting invalid nested math.
-        if has_aligned && (line.contains('$') || line.contains(" where ") || line.contains(" is ")) {
-            line = line.replace(r"\begin{aligned}", "");
-            line = line.replace(r"\end{aligned}", "");
-            line = line.replace(r"\ \ ", "\n");
-            line = line.replace(r"\\", "\n");
-            for part in line.split('\n') {
-                if !part.trim().is_empty() {
-                    out.push(part.trim().to_string());
-                }
-            }
-            continue;
-        }
-
-        let is_env_start = line.contains(r"\begin{array}") || line.contains(r"\begin{matrix}") || line.contains(r"\begin{pmatrix}") || line.contains(r"\begin{bmatrix}") || line.contains(r"\begin{vmatrix}") || line.contains(r"\begin{cases}");
-        let is_env_end = line.contains(r"\end{array}") || line.contains(r"\end{matrix}") || line.contains(r"\end{pmatrix}") || line.contains(r"\end{bmatrix}") || line.contains(r"\end{vmatrix}") || line.contains(r"\end{cases}");
-
-        if is_env_start {
-            in_array = true;
-            array_lines.push(line);
-            if is_env_end {
-                append_array_block(&mut out, &mut array_lines);
-                in_array = false;
-            }
-            continue;
-        }
-        if in_array {
-            array_lines.push(line);
-            if is_env_end {
-                append_array_block(&mut out, &mut array_lines);
-                in_array = false;
-            }
-            continue;
-        }
-
-        let trimmed = line.trim();
-        let bare_math = trimmed.starts_with(r"\left")
-            || trimmed.starts_with(r"\frac")
-            || trimmed.starts_with(r"\sqrt")
-            || trimmed.starts_with(r"\begin{");
-        if bare_math && !trimmed.contains('$') {
-            line = format!("$$\n{}\n$$", trimmed);
-        }
-        out.push(line);
+/// Minimal sanitization for LaTeX export - just cleans ligatures and line breaks.
+/// The full math sanitization is now handled by the frontend (preprocess-math.ts + remark-math-fix.ts).
+pub fn sanitize_for_latex(content: &str) -> String {
+    if content.trim().is_empty() {
+        return String::new();
     }
-
-    if in_array && !array_lines.is_empty() {
-        // Complete an accidentally truncated array rather than leaving an
-        // unterminated environment for the Markdown/LaTeX renderer.
-        if !array_lines.iter().any(|line| line.contains(r"\end{")) {
-            array_lines.push(r"\end{pmatrix}".to_string());
-        }
-        append_array_block(&mut out, &mut array_lines);
-    }
-
-    out.join("\n")
+    let with_ligatures = clean_ligatures(content);
+    harden_line_breaks(&with_ligatures)
 }
 
 fn append_array_block(out: &mut Vec<String>, lines: &mut Vec<String>) {
@@ -631,58 +554,6 @@ fn clean_table_cell(value: &str) -> Option<String> {
     } else {
         None
     }
-}
-
-/// Automatically repair malformed LaTeX and close missing inline `$`/block
-/// `$$` tags.
-pub fn sanitize_markdown_math(text: &str) -> String {
-    let text = repair_latex_syntax(text);
-    let mut in_block = false;
-    let mut lines = Vec::new();
-
-    for line in text.lines() {
-        let trimmed = line.trim();
-        if trimmed == "$$" {
-            in_block = !in_block;
-            lines.push(line.to_string());
-            continue;
-        }
-
-        if in_block {
-            lines.push(line.to_string());
-            continue;
-        }
-
-        let mut inline_count = 0;
-        let chars: Vec<char> = line.chars().collect();
-        let mut i = 0;
-        while i < chars.len() {
-            if chars[i] == '$' {
-                let escaped = i > 0 && chars[i-1] == '\\';
-                let double = i + 1 < chars.len() && chars[i+1] == '$';
-                if !escaped {
-                    if double {
-                        i += 1;
-                    } else {
-                        inline_count += 1;
-                    }
-                }
-            }
-            i += 1;
-        }
-
-        if inline_count % 2 != 0 {
-            lines.push(format!("{}$", line));
-        } else {
-            lines.push(line.to_string());
-        }
-    }
-
-    if in_block {
-        lines.push("$$".to_string());
-    }
-
-    lines.join("\n")
 }
 
 // ── Figure/diagram referral consistency ─────────────────────────────────────

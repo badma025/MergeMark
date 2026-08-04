@@ -41,6 +41,15 @@ pub struct LlmConfig {
     pub timeout: std::time::Duration,
 }
 
+/// Response format for structured outputs. Some providers (OpenAI, some
+/// OpenRouter models) support JSON Schema via the `response_format`
+/// parameter. Use `JsonSchema` to request strict schema-validated output.
+#[derive(Debug, Clone)]
+pub enum ResponseFormat {
+    JsonObject,
+    JsonSchema { schema: serde_json::Value },
+}
+
 /// One chat completion call. The caller awaits the boxed future — this keeps
 /// the trait object-safe without pulling in an extra crate.
 pub trait LlmClient: Send + Sync {
@@ -61,6 +70,7 @@ pub fn chat_body<S: AsRef<str>>(
     images: &[S],
     text: Option<&str>,
     max_tokens: u32,
+    response_format: Option<ResponseFormat>,
 ) -> serde_json::Value {
     let mut content: Vec<serde_json::Value> = Vec::new();
     if let Some(t) = text {
@@ -111,6 +121,14 @@ pub fn chat_body<S: AsRef<str>>(
         serde_json::json!(content)
     };
 
+    let rf = match response_format {
+        Some(ResponseFormat::JsonSchema { schema }) => serde_json::json!({
+            "type": "json_schema",
+            "json_schema": schema
+        }),
+        _ => serde_json::json!({ "type": "json_object" }),
+    };
+
     serde_json::json!({
         "model": model,
         "messages": [
@@ -119,7 +137,7 @@ pub fn chat_body<S: AsRef<str>>(
         ],
         "temperature": 0.1,
         "max_tokens": max_tokens,
-        "response_format": { "type": "json_object" }
+        "response_format": rf
     })
 }
 
@@ -378,21 +396,21 @@ mod tests {
     #[test]
     fn chat_body_preserves_png_data_url() {
         let images = ["data:image/png;base64,AAAA"];
-        let body = chat_body("model", "system", &images, None, 100);
+        let body = chat_body("model", "system", &images, None, 100, None);
         assert_eq!(image_url(&body), images[0]);
     }
 
     #[test]
     fn chat_body_preserves_jpeg_data_url() {
         let images = ["data:image/jpeg;base64,BBBB"];
-        let body = chat_body("model", "system", &images, None, 100);
+        let body = chat_body("model", "system", &images, None, 100, None);
         assert_eq!(image_url(&body), images[0]);
     }
 
     #[test]
     fn chat_body_defaults_raw_base64_to_jpeg() {
         let images = ["CCCC"];
-        let body = chat_body("model", "system", &images, None, 100);
+        let body = chat_body("model", "system", &images, None, 100, None);
         assert_eq!(image_url(&body), "data:image/jpeg;base64,CCCC");
     }
 }

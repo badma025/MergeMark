@@ -9,25 +9,12 @@ import ReactMarkdown from "react-markdown";
 import remarkMath from "remark-math";
 import rehypeKatex from "rehype-katex";
 import remarkGfm from "remark-gfm";
-import { cn, sanitizeMarkdownMath } from "@/lib/utils";
-import { convertFileSrc, invoke } from "@tauri-apps/api/core";
+import { cn, preprocessMathString } from "@/lib/utils";
+import { remarkMathFix } from "@/lib/remark-math-fix";
+import { convertFileSrc } from "@tauri-apps/api/core";
 import { useTaxonomy } from "@/lib/TaxonomyContext";
-import { toast } from "sonner";
 import Zoom from "react-medium-image-zoom";
 import "react-medium-image-zoom/dist/styles.css";
-
-/**
- * Regex that matches display-worthy LaTeX operators.
- * \\{1,2} handles both \int (1 backslash) and \\int (AI double-escaping in JSON).
- * (?![a-z]) prevents matching longer names like \integer but allows \int_2, \int^n etc.
- */
-const DISPLAY_OP_RE =
-  /\\{1,2}(?:int|iint|iiint|oint|sum|prod|coprod|lim|limsup|liminf|bigcup|bigcap|bigsqcup|bigvee|bigwedge|frac|dfrac|cfrac|binom|sqrt|pmatrix|bmatrix|vmatrix|Vmatrix|matrix|array|cases|aligned|gathered|begin\{(?:pmatrix|bmatrix|vmatrix|matrix|array|cases|aligned)\})(?![a-z])/;
-
-/** Convert \\cmd → \cmd (AI sometimes double-escapes backslashes from JSON) without destroying matrix \\ rowbreaks */
-function fixSlashes(s: string): string {
-  return s.replace(/\\{2}(frac|sqrt|mathbf|mathit|mathrm|mathbb|mathcal|operatorname|cos|cosh|sin|sinh|tan|tanh|ln|log|exp|int|sum|prod|lim|begin|end|vec|alpha|beta|gamma|theta|pi|partial)/g, "\\$1");
-}
 
 /**
  * Phase 0: Diagram renderer with click-to-enlarge.
@@ -67,20 +54,7 @@ function DiagramImg({
 }
 
 /**
- * Normalise content so every display-worthy equation is wrapped in $$...$$
- * before ReactMarkdown + rehype-katex see it.
- *
- * Uses global multiline regex passes (not line-by-line) so patterns that span
- * multiple lines are handled correctly in a single replacement call.
- *
- * Patterns handled (all AI inconsistencies we have observed):
- *   A) $$ expr $$           — already correct, left alone
- *   B) $              ← AI using $ on its own line as a "block" delimiter
- *      \int expr
- *      $
- *   C) $\int expr$          — single-line inline wrapping a display expr
- *   D) \int expr            — raw LaTeX with no delimiters at all
- *   E) text $\int expr$ text — display expr embedded mid-sentence
+ * Strip Answer Spaces (dots, underscores, coordinate tuples)
  */
 export function stripAnswerSpaces(raw: string): string {
   if (!raw) return "";
@@ -98,196 +72,6 @@ export function stripAnswerSpaces(raw: string): string {
 
   return s;
 }
-
-export function preprocessMath(raw: string, isCode?: boolean, subject?: string): string {
-  if (!raw) return "";
-
-  let s = raw.trim();
-
-  // ── Strip Answer Spaces (Dots and Underscores) ──────────────────────────
-  s = stripAnswerSpaces(s);
-
-
-  // ── 0: Convert Markdown Code Blocks to LaTeX Math Blocks ───────────────
-  // If the AI outputs ```latex ... ```, ReactMarkdown treats it as a `<pre>` block,
-  // preventing Katex from rendering it. We swap them for `$$` blocks.
-  if (!isCode && subject !== "Computer Science") {
-    // Match ```latex, ```math, ```tex, or just empty ``` if it's not a code question
-    // We also match any stray `$` signs OUTSIDE the backticks so they get absorbed and removed!
-    s = s.replace(/\$*\s*```(?:latex|math|tex)?\s*\n([\s\S]*?)\n```\s*\$*/gi, (_m, inner) => {
-      // Sometimes the AI accidentally includes `$$` inside the code block. Strip them.
-      const clean = inner.replace(/^\s*\$+\s*/, '').replace(/\s*\$+\s*$/, '').trim();
-      return `\n\n$$${clean}$$\n\n`;
-    });
-    
-    // Replace inline single backticks, absorbing stray `$` signs outside them
-    // E.g. `\ln|u| + C`$$ -> $$ \ln|u| + C $$
-    s = s.replace(/\$*\s*`([^`]+)`\s*\$*/g, (_m, inner) => {
-      const clean = inner.replace(/^\s*\$+\s*/, '').replace(/\s*\$+\s*$/, '').trim();
-      return `$$${clean}$$`;
-    });
-  }
-
-  // ── 0.5: Convert Markdown Tables to LaTeX Arrays ─────────────────────────
-  // The system should render tables automatically in latex (KaTeX arrays)
-  s = s.replace(/(?:^|\n)((?:[ \t]*\|[^\n]+\|[ \t]*(?:\n|$))+)/g, (match, tableBlock) => {
-    const lines = tableBlock.trim().split('\n');
-    if (lines.length < 3) return match; 
-    
-    const divider = lines[1];
-    if (!/^[ \t]*\|(?:[ \t]*:?-+:?[ \t]*\|)+[ \t]*$/.test(divider)) return match;
-
-    const cols = divider.split('|').slice(1, -1).map((c: string) => c.trim());
-    const format = cols.map((c: string) => {
-      if (c.startsWith(':') && c.endsWith(':')) return 'c';
-      if (c.endsWith(':')) return 'r';
-      return 'l';
-    }).join('|');
-
-    let latex = `\n\n$$\n\\begin{array}{|${format}|}\n\\hline\n`;
-
-    for (let i = 0; i < lines.length; i++) {
-      if (i === 1) continue; // skip divider
-      
-      const line = lines[i];
-      const cells = line.split('|').slice(1, -1).map((c: string) => c.trim());
-      
-      const latexCells = cells.map((cell: string) => {
-        let trimmed = cell.trim();
-        if (!trimmed) return '';
-
-        // Handle bold/italic math like **$x$** or *$x$*
-        trimmed = trimmed.replace(/\*\*\s*\$([^$]+)\$\s*\*\*/g, '$\\mathbf{$1}$');
-        trimmed = trimmed.replace(/\*\s*\$([^$]+)\$\s*\*/g, '$\\mathit{$1}$');
-
-        const parts = trimmed.split(/(\$[^$]+\$)/g);
-        return parts.map((part: string) => {
-          if (!part) return '';
-          if (part.startsWith('$') && part.endsWith('$')) {
-            return part.slice(1, -1).trim();
-          }
-
-          // Escape special characters for LaTeX array / KaTeX
-          let text = part
-            .replace(/&/g, '\\&')
-            .replace(/%/g, '\\%')
-            .replace(/#/g, '\\#');
-
-          // Tokenize markdown bold, italic, and code formatting
-          const tokenRegex = /(\*\*\*[\s\S]+?\*\*\*|___[\s\S]+?___|\*\*[\s\S]+?\*\*|__[\s\S]+?__|`[\s\S]+?`|\*[^\*]+?\*|(?<=^|\s)_[^_]+?_(?=\s|$|[.,;:!?]))/g;
-          const chunks = text.split(tokenRegex);
-
-          return chunks.map((chunk) => {
-            if (!chunk) return '';
-            if ((chunk.startsWith('***') && chunk.endsWith('***')) || (chunk.startsWith('___') && chunk.endsWith('___'))) {
-              const inner = chunk.slice(3, -3).trim();
-              return `\\textbf{\\textit{${inner}}}`;
-            }
-            if ((chunk.startsWith('**') && chunk.endsWith('**')) || (chunk.startsWith('__') && chunk.endsWith('__'))) {
-              const inner = chunk.slice(2, -2).trim();
-              return `\\textbf{${inner}}`;
-            }
-            if ((chunk.startsWith('*') && chunk.endsWith('*')) || (chunk.startsWith('_') && chunk.endsWith('_'))) {
-              const inner = chunk.slice(1, -1).trim();
-              return `\\textit{${inner}}`;
-            }
-            if (chunk.startsWith('`') && chunk.endsWith('`')) {
-              const inner = chunk.slice(1, -1).trim();
-              return `\\texttt{${inner}}`;
-            }
-            // Plain text wrapped in \text{}
-            return `\\text{${chunk}}`;
-          }).join('');
-        }).join(' ').trim();
-      });
-
-      latex += latexCells.join(' & ') + ' \\\\\n\\hline\n';
-    }
-
-    latex += `\\end{array}\n$$\n\n`;
-    return (match.startsWith('\n') ? '\n' : '') + latex;
-  });
-
-  // ── Pre-sanitize: repair escaped equals, corrupted braces, single-slash matrix breaks ─
-  s = sanitizeMarkdownMath(s);
-
-  // ── A: protect already-correct $$ blocks from further processing ──────────
-  // We mark them with a placeholder, restore at end.
-  const blocks: string[] = [];
-  
-  // Helper to format block math safely without corrupting markdown or prose
-  const formatBlock = (inner: string) => {
-    let clean = fixSlashes(inner.trim());
-
-    // If the captured text contains multiple markdown paragraphs with standard prose words,
-    // it was caused by an unbalanced $$ in the source text swallowing markdown paragraphs.
-    if (/\n\s*\n/.test(clean) && /\b(?:determine|calculate|explain|find|show|hence|given|vertices|coordinates|transformation|represented|marks?)\b/i.test(clean) && !/\\(?:begin|frac|int|sum|pmatrix|bmatrix)/i.test(clean)) {
-      return inner;
-    }
-
-    // Convert any stray markdown formatting inside math blocks to valid LaTeX
-    clean = clean.replace(/\*\*\*([^*]+)\*\*\*/g, "\\textbf{\\textit{$1}}");
-    clean = clean.replace(/\*\*([^*]+)\*\*/g, "\\textbf{$1}");
-    clean = clean.replace(/(?<!\\)\*([^*]+)\*/g, "\\textit{$1}");
-
-    // If it has multiple lines and isn't already using an environment, only wrap in aligned if it's pure equations
-    if (clean.includes("\n") && !clean.includes("\\begin{")) {
-      const lines = clean.split("\n").map(l => l.trim()).filter(Boolean);
-      const isPureEquations = lines.every(l => /[=><\\]/.test(l) || /^\(?\d+\)?$/.test(l));
-      if (isPureEquations) {
-        clean = `\\begin{aligned}\n${lines.join(" \\\\\n")}\n\\end{aligned}`;
-      }
-    }
-    const idx = blocks.length;
-    blocks.push(`\n\n$$\n${clean}\n$$\n\n`);
-    return `\x00BLOCK${idx}\x00`;
-  };
-
-  // First, fix AI generating unmatched delimiters: $ ... $$ or $$ ... $
-  s = s.replace(/(?:^|\n)[ \t]*\$[ \t]*\n([\s\S]*?)\n[ \t]*\$\$[ \t]*(?=\n|$)/gm, (_m, inner) => `\n\n$$${inner}$$\n\n`);
-  s = s.replace(/(?:^|\n)[ \t]*\$\$[ \t]*\n([\s\S]*?)\n[ \t]*\$[ \t]*(?=\n|$)/gm, (_m, inner) => `\n\n$$${inner}$$\n\n`);
-
-  s = s.replace(/\$\$([\s\S]*?)\$\$/g, (_m, inner) => formatBlock(inner));
-
-  // ── B: $ on its own line used as block delimiter ──────────────────────────
-  s = s.replace(
-    /(?:^|\n)[ \t]*\$[ \t]*\n([\s\S]*?)\n[ \t]*\$[ \t]*(?=\n|$)/gm,
-    (_m, inner) => `\n\n${formatBlock(inner)}\n\n`
-  );
-
-  // ── C: inline $...$ (single-line) containing a display operator ─────────
-  s = s.replace(/\$([^$\n]+)\$/g, (match, expr) => {
-    if (DISPLAY_OP_RE.test(expr)) {
-      return `\n\n${formatBlock(expr)}\n\n`;
-    }
-    return match;
-  });
-
-  // ── D: raw LaTeX line (no $ at all) containing display operators or equations ─
-  s = s.replace(
-    /^(?!\s*\x00BLOCK)(.*?(?:\\begin\{(?:pmatrix|bmatrix|vmatrix|matrix|array|cases|aligned)\}|\\{1,2}(?:int|iint|iiint|oint|sum|prod|coprod|lim|limsup|liminf|bigcup|bigcap|bigsqcup|bigvee|bigwedge|frac|dfrac|cfrac|binom|sqrt)|(?:\b(?:64\s*)?\\cosh\b|\b\cos\b|\b\sin\b|\b\tan\b|\b\ln\b|\b\exp\b)[^\n$]*=[^\n$]*).*)$/gm,
-    (match, line) => {
-      // Only wrap if it looks like an equation / formula line and not a plain sentence
-      if (/\b(?:the|which|where|and|that|show|determine|find|given|calculate|hence|answer|mark|marks)\b/i.test(line) && !/\\(?:begin|frac|int|sum|pmatrix|bmatrix)/.test(line)) {
-        return match;
-      }
-      return `\n\n${formatBlock(line)}\n\n`;
-    }
-  );
-
-  // ── E: Auto-wrap standalone unwrapped inline LaTeX commands ──────────────
-  s = s.replace(
-    /(?<!\$|\w|\\)(\\(?:mathbf|mathit|mathrm|mathbb|mathcal|operatorname|vec|hat|bar|dot|ddot|tilde|frac|sqrt|pmatrix|binom)\{[^{}]+\}(?:\^\{[^{}]+\}|_[^{}]|\^[0-9a-zA-Z]|_[0-9a-zA-Z])?|\\(?:alpha|beta|gamma|theta|pi|lambda|sigma|mu|omega|Delta|nabla|partial|times|div|pm|leq|geq|neq|approx|infty)(?![a-z]))(?!\$)/g,
-    "$$1$"
-  );
-
-  // ── Restore protected $$ blocks ───────────────────────────────────────────
-  s = s.replace(/\x00BLOCK(\d+)\x00/g, (_m, idx) => blocks[Number(idx)]);
-
-  // Collapse 3+ blank lines to 2
-  return s.replace(/\n{3,}/g, "\n\n").trim();
-}
-
 
 
 export interface QuestionCardProps {
@@ -319,7 +103,6 @@ export function QuestionCard(props: QuestionCardProps) {
     module,
     marks,
     content,
-    isCode,
     topics,
     answerContent,
     className,
@@ -332,9 +115,9 @@ export function QuestionCard(props: QuestionCardProps) {
   const { subjects, topicsBySubject } = useTaxonomy();
   const displaySubject = subjects.find(s => s.id === subject)?.name || subject;
   const [isEditing, setIsEditing] = useState(false);
-  const [isShowingAnswer, setIsShowingAnswer] = useState(false);
-  const [needsReview, setNeedsReview] = useState(!!initialNeedsReview);
-  const [answerStale, setAnswerStale] = useState(!!initialAnswerStale);
+  const [isShowingAnswer] = useState(false);
+  const [needsReview] = useState(!!initialNeedsReview);
+  const [answerStale] = useState(!!initialAnswerStale);
     let parsedTopics: string[] = [];
   try {
     if (topics) {
@@ -347,7 +130,7 @@ export function QuestionCard(props: QuestionCardProps) {
 
   let displayContent = stripAnswerSpaces(content ?? "");
   const strippedAnswerContent = stripAnswerSpaces(answerContent ?? "");
-  
+
   // Task 4: math_snippet logic removed — content is the single source of truth.
   // The DB migration sets math_snippet = '' for all existing rows.
 
@@ -396,132 +179,66 @@ export function QuestionCard(props: QuestionCardProps) {
         {/* Left: Badges (wrap naturally without overlapping actions) */}
         <div className="flex flex-wrap items-center gap-1.5 min-w-0 flex-1">
           {needsReview && (
-            <Badge className="text-xs font-semibold tracking-wide bg-amber-500/15 text-amber-700 dark:text-amber-400 border-amber-500/30 hover:bg-amber-500/25 cursor-help shrink-0" title="Extracted with vision fallback or low confidence">
-              <AlertTriangle className="size-3 mr-1 inline" />
+            <Badge variant="outline" className="bg-warning/10 text-warning border-warning/30 text-xs gap-1">
+              <AlertTriangle className="size-3" />
               REVIEW
             </Badge>
           )}
-          <Badge
-            className="text-xs font-medium tracking-wide bg-zinc-800 text-zinc-50 hover:bg-zinc-800/90 dark:bg-zinc-200 dark:text-zinc-900 dark:hover:bg-zinc-200/90 shrink-0"
-          >
-            {displaySubject}
-          </Badge>
-          {module && module !== "General" && module !== "Unknown" && (
-            <Badge
-              className="text-xs font-medium tracking-wide bg-purple-900/50 text-purple-200 border-purple-800 hover:bg-purple-900/60 shrink-0"
-            >
-              {module}
+          {answerStale && (
+            <Badge variant="outline" className="bg-destructive/10 text-destructive border-destructive/30 text-xs gap-1">
+              <ShieldCheck className="size-3" />
+              STALE ANSWER
             </Badge>
           )}
-          {parsedTopics.map((topic, i) => (
-            <Badge
-              key={i}
-              variant="outline"
-              className="text-xs font-medium bg-blue-900/50 text-blue-200 border-blue-800 shrink-0"
-            >
-              {topic}
-            </Badge>
-          ))}
-          <Badge className="bg-primary/15 text-primary hover:bg-primary/20 border-primary/20 text-xs font-semibold shrink-0">
-            {marks} {marks === 1 ? "mark" : "marks"}
-          </Badge>
         </div>
 
-        {/* Right: Action buttons (never squished, distinct hover styling) */}
-        <div className="flex items-center gap-1 shrink-0 opacity-0 group-hover:opacity-100 focus-within:opacity-100 transition-opacity duration-150 -mr-1 -mt-1">
-          {!isEditing && (
-            <button
-              type="button"
-              onClick={(e) => {
-                e.stopPropagation();
-                setEditContent(displayContent);
-                setEditMarks(marks);
-                setEditAnswerContent(strippedAnswerContent);
-                setEditTopics(parsedTopics);
-                setIsEditing(true);
-              }}
-              title="Edit Question"
-              aria-label={`Edit question ${id}`}
-              className={cn(
-                "flex items-center justify-center rounded-md p-1.5",
-                "text-muted-foreground transition-all duration-150",
-                "hover:bg-primary/10 hover:text-primary",
-                "focus-visible:opacity-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/60"
-              )}
+        {/* Right: Action Buttons */}
+        <div className="flex items-center gap-1.5 shrink-0">
+          {onAddToWorksheet && (
+            <Button
+              variant="ghost"
+              size="sm"
+              onClick={(e) => { e.stopPropagation(); onAddToWorksheet?.(id); }}
+              aria-label="Add to worksheet"
+              className="h-7 w-7 p-0"
             >
-              <Pencil className="size-4" />
-            </button>
+              <Plus className="size-4" />
+            </Button>
           )}
-          {!isEditing && needsReview && (
-            <button
-              type="button"
-              onClick={async (e) => {
-                e.stopPropagation();
-                try {
-                  await invoke("mark_question_verified", { id });
-                  setNeedsReview(false);
-                  setAnswerStale(false);
-                  toast.success("Question marked as verified");
-                } catch (e: any) {
-                  toast.error(e.toString());
-                }
-              }}
-              aria-label={`Mark question ${id} as verified`}
-              className={cn(
-                "flex items-center justify-center rounded-md p-1.5",
-                "text-emerald-600 transition-all duration-150",
-                "hover:bg-emerald-500/10 hover:text-emerald-500",
-                "focus-visible:opacity-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-500/60"
-              )}
-              title="Mark as Verified"
-            >
-              <ShieldCheck className="size-4" />
-            </button>
-          )}
-          <button
-            id={`delete-question-${id}`}
-            type="button"
-            onClick={(e) => {
-              e.stopPropagation();
-              onDelete?.(id);
-            }}
-            title="Delete Question"
-            aria-label={`Delete question ${id}`}
-            className={cn(
-              "flex items-center justify-center rounded-md p-1.5",
-              "text-muted-foreground transition-all duration-150",
-              "hover:bg-destructive/10 hover:text-destructive",
-              "focus-visible:opacity-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-destructive/60"
-            )}
+          <Button
+            variant="ghost"
+            size="sm"
+            onClick={(e) => { e.stopPropagation(); setIsEditing(true); }}
+            aria-label="Edit question"
+            className="h-7 w-7 p-0"
           >
-            <Trash2 className="size-4" />
-          </button>
+            <Pencil className="size-4" />
+          </Button>
+          {onDelete && (
+            <Button
+              variant="ghost"
+              size="sm"
+              onClick={(e) => { e.stopPropagation(); onDelete?.(id); }}
+              aria-label="Delete question"
+              className="h-7 w-7 p-0 text-destructive hover:bg-destructive/10"
+            >
+              <Trash2 className="size-4" />
+            </Button>
+          )}
         </div>
       </div>
 
-      {/* ── Stale Answer Warning Banner ── */}
-      {answerStale && (
-        <div className="flex items-center gap-2 bg-amber-500/10 border border-amber-500/20 text-amber-700 dark:text-amber-400 p-2.5 rounded-lg text-sm -mx-1 mt-0 mb-1">
-          <AlertTriangle className="size-4 shrink-0" />
-          <div className="flex-1">
-            <strong>Stale Answer:</strong> This mark scheme answer may be out of date compared to the recently updated question content.
-          </div>
-        </div>
-      )}
-
-      {/* ── Question content ── */}
-      {/* ── Question / Answer Content (Crossfade) ── */}
-      <div className="relative text-sm leading-relaxed text-foreground prose prose-sm dark:prose-invert max-w-none prose-p:my-1 prose-pre:my-1 break-words">
-        
+      {/* ── Question & Answer ── */}
+      <div className="relative">
         {/* Question Content */}
-        <div 
+        <div
           className={cn(
             "transition-opacity duration-200 ease-in-out overflow-x-auto",
             isShowingAnswer ? "opacity-0 absolute inset-0 pointer-events-none" : "opacity-100 relative"
           )}
         >
-          <ReactMarkdown 
-            remarkPlugins={[remarkMath, remarkGfm]} 
+          <ReactMarkdown
+            remarkPlugins={[remarkMath, remarkGfm, remarkMathFix]}
             rehypePlugins={[[rehypeKatex, { throwOnError: false, strict: false }]]}
             urlTransform={(value) => value}
             components={{
@@ -536,20 +253,20 @@ export function QuestionCard(props: QuestionCardProps) {
               },
             }}
           >
-            {preprocessMath(displayContent, isCode, displaySubject)}
+            {preprocessMathString(displayContent)}
           </ReactMarkdown>
         </div>
 
         {/* Answer Content */}
-        <div 
+        <div
           className={cn(
             "transition-opacity duration-200 ease-in-out overflow-x-auto",
             isShowingAnswer ? "opacity-100 relative" : "opacity-0 absolute inset-0 pointer-events-none"
           )}
         >
           <div className="font-semibold text-xs text-muted-foreground mb-2 uppercase tracking-wider">Mark Scheme Answer</div>
-          <ReactMarkdown 
-            remarkPlugins={[remarkMath, remarkGfm]} 
+          <ReactMarkdown
+            remarkPlugins={[remarkMath, remarkGfm, remarkMathFix]}
             rehypePlugins={[[rehypeKatex, { throwOnError: false, strict: false }]]}
             urlTransform={(value) => value}
             components={{
@@ -564,10 +281,11 @@ export function QuestionCard(props: QuestionCardProps) {
               },
             }}
           >
-            {preprocessMath(answerContent ?? "", isCode, displaySubject)}
+            {preprocessMathString(answerContent ?? "")}
           </ReactMarkdown>
         </div>
       </div>
+
       {/* ── Edit Modal ── */}
       <Dialog open={isEditing} onOpenChange={(open) => { if (!open) handleCancel(); }}>
         <DialogContent className="max-w-[95vw] sm:max-w-[95vw] h-[95vh] w-full flex flex-col p-6">
@@ -624,78 +342,36 @@ export function QuestionCard(props: QuestionCardProps) {
               </div>
             </div>
 
-            {/* Content Editors */}
-            <div className="grid grid-cols-1 md:grid-cols-2 gap-4 flex-1 min-h-[320px] p-0.5">
-              <div className="flex flex-col gap-1.5 flex-1 min-h-0">
-                <div className="min-h-[44px] flex flex-col justify-end">
-                  <label className="text-sm font-semibold text-foreground">Question Content:</label>
-                  <p className="text-xs text-muted-foreground">Markdown supported. Inline math: $...$, Block math: $$...$$</p>
-                </div>
-                <RichTextEditor 
-                  markdown={editContent}
-                  onChange={setEditContent}
-                  className="flex-1 w-full min-h-[300px]"
-                />
-              </div>
-              <div className="flex flex-col gap-1.5 flex-1 min-h-0">
-                <div className="min-h-[44px] flex flex-col justify-end">
-                  <label className="text-sm font-semibold text-foreground">Mark Scheme Answer (Optional):</label>
-                  <p className="text-xs text-muted-foreground">Markdown supported. Optional mark scheme or model answer.</p>
-                </div>
-                <RichTextEditor 
-                  markdown={editAnswerContent}
-                  onChange={setEditAnswerContent}
-                  placeholder="Paste or edit the mark scheme answer here..."
-                  className="flex-1 w-full min-h-[300px]"
-                />
-              </div>
+            {/* Question Content Editor */}
+            <div className="flex flex-col gap-2 flex-1 min-h-0">
+              <label className="text-sm font-semibold text-foreground">Question:</label>
+              <RichTextEditor
+                markdown={editContent}
+                onChange={setEditContent}
+                placeholder="Enter the question text with LaTeX math..."
+                className="flex-1 min-h-[200px]"
+              />
             </div>
-          </div>
 
-          <div className="flex justify-end gap-2 mt-auto pt-4 border-t border-border shrink-0">
-            <Button variant="outline" onClick={handleCancel}>Cancel</Button>
-            <Button onClick={handleSave}>Save Changes</Button>
+            {/* Answer Content Editor */}
+            <div className="flex flex-col gap-2 shrink-0">
+              <label className="text-sm font-semibold text-foreground">Mark Scheme Answer:</label>
+              <RichTextEditor
+                markdown={editAnswerContent}
+                onChange={setEditAnswerContent}
+                placeholder="Enter the mark scheme answer with LaTeX math..."
+                className="flex-1 min-h-[120px]"
+              />
+            </div>
+
+            {/* Dialog Actions */}
+            <div className="flex justify-end gap-2 shrink-0 pt-2 border-t">
+              <Button variant="outline" onClick={handleCancel}>Cancel</Button>
+              <Button onClick={handleSave}>Save Changes</Button>
+            </div>
           </div>
         </DialogContent>
       </Dialog>
-      {/* ── Footer: Add to Worksheet & Show Answer ── */}
-      <div className="flex items-center justify-between pt-1">
-        <div>
-          {answerContent && answerContent.trim() !== "" && (
-            <Button
-              variant="secondary"
-              size="sm"
-              className="text-xs h-7 px-3 transition-colors"
-              onClick={(e) => {
-                e.stopPropagation();
-                setIsShowingAnswer(!isShowingAnswer);
-              }}
-            >
-              {isShowingAnswer ? "Show Question" : "Show Answer"}
-            </Button>
-          )}
-        </div>
-        <Button
-          id={`add-to-worksheet-${id}`}
-          size="sm"
-          className={cn(
-            "gap-1.5 text-xs font-semibold",
-            "bg-primary text-primary-foreground",
-            "opacity-0 translate-y-1 transition-all duration-200",
-            "group-hover:opacity-100 group-hover:translate-y-0"
-          )}
-          onClick={(e) => {
-            e.stopPropagation();
-            onAddToWorksheet?.(id);
-          }}
-          aria-label={`Add question ${id} to worksheet`}
-        >
-          <Plus className="size-3.5" />
-          Add to Worksheet
-        </Button>
-      </div>
-
-      
     </article>
   );
 }

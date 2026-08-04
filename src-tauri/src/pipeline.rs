@@ -806,6 +806,94 @@ RULES:
         .to_string()
 }
 
+/// JSON Schema for the structure pass output
+fn structure_json_schema() -> serde_json::Value {
+    serde_json::json!({
+        "name": "PageStructureProposal",
+        "strict": true,
+        "schema": {
+            "type": "object",
+            "properties": {
+                "question_numbers_visible": {
+                    "type": "array",
+                    "items": { "type": "integer", "minimum": 1, "maximum": 100 }
+                },
+                "question_y_fracs": {
+                    "type": "array",
+                    "items": {
+                        "type": "array",
+                        "items": { "type": "number", "minimum": 0.0, "maximum": 1.0 },
+                        "minItems": 2,
+                        "maxItems": 2
+                    }
+                },
+                "total_marks_footer": {
+                    "type": ["array", "null"],
+                    "items": { "type": "integer" },
+                    "minItems": 2,
+                    "maxItems": 2
+                },
+                "total_marks_footer_y": {
+                    "type": ["number", "null"],
+                    "minimum": 0.0,
+                    "maximum": 1.0
+                },
+                "page_role": {
+                    "type": "string",
+                    "enum": ["QUESTION", "COVER", "INSTRUCTIONS", "BLANK", "ANSWER_BOOKLET", "REFERENCE"]
+                }
+            },
+            "required": ["question_numbers_visible", "question_y_fracs", "total_marks_footer", "total_marks_footer_y", "page_role"],
+            "additionalProperties": false
+        }
+    })
+}
+
+/// JSON Schema for the extraction pass output
+fn extraction_json_schema() -> serde_json::Value {
+    serde_json::json!({
+        "name": "QuestionExtraction",
+        "strict": true,
+        "schema": {
+            "type": "object",
+            "properties": {
+                "items": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "question_number": { "type": "integer", "minimum": 1, "maximum": 100 },
+                            "content": { "type": "string" },
+                            "marks": { "type": ["integer", "null"], "minimum": 0 },
+                            "topics": { "type": "array", "items": { "type": "string" } },
+                            "module": { "type": "string" },
+                            "is_code": { "type": "boolean" },
+                            "diagram_bboxes": {
+                                "type": "array",
+                                "items": {
+                                    "type": "array",
+                                    "items": { "type": "number", "minimum": 0.0, "maximum": 1.0 },
+                                    "minItems": 4,
+                                    "maxItems": 4
+                                }
+                            },
+                            "diagram_captions": { "type": "array", "items": { "type": "string" } },
+                            "diagram_kinds": { "type": "array", "items": { "type": "string" } },
+                            "bbox_page_indexes": { "type": "array", "items": { "type": "integer" } },
+                            "math_snippet": { "type": "string" },
+                            "visual_options": { "type": ["string", "null"] }
+                        },
+                        "required": ["question_number", "content", "marks", "topics", "module", "is_code", "diagram_bboxes", "diagram_captions", "diagram_kinds", "bbox_page_indexes", "math_snippet", "visual_options"],
+                        "additionalProperties": false
+                    }
+                }
+            },
+            "required": ["items"],
+            "additionalProperties": false
+        }
+    })
+}
+
 /// Phase 1: describe the vertical clip for each page (if any) in the
 /// user-facing transcription prompt. This is the CHEAP alternative to
 /// physically cropping the page image: we tell the model exactly which
@@ -854,6 +942,31 @@ fn extraction_system_prompt(config: &PipelineConfig, span: &QuestionSpan) -> Str
             config.allowed_topics
         )
     };
+
+    const FEW_SHOT: &str = r#"
+═══ FEW-SHOT EXAMPLES — Study these input/output pairs carefully ═══
+Example 1 — Pure math with sub-parts
+Input page (Question 4): "4 (a) Solve 2x^2 - 5x + 2 = 0. [3 marks]\n(b) Hence solve 2y^4 - 5y^2 + 2 = 0. [2 marks]"
+Output: {"items": [{"question_number": 4, "content": "(a) Solve $2x^2 - 5x + 2 = 0$.\n\n**[3 marks]**\n\n(b) Hence solve $2y^4 - 5y^2 + 2 = 0$.\n\n**[2 marks]**", "marks": 5, "topics": ["algebra", "quadratics"], "module": "Pure Mathematics", "is_code": false, "diagram_bboxes": [], "diagram_captions": [], "diagram_kinds": [], "bbox_page_indexes": [], "math_snippet": "2x^2 - 5x + 2 = 0", "visual_options": null}]}
+
+Example 2 — Question with a graph figure
+Input page (Question 7): "7 The graph of y = f(x) is shown below.\nFigure 2\n(a) Write down the coordinates of the turning point. [1 mark]\n(b) State the range of f. [1 mark]"
+Output: {"items": [{"question_number": 7, "content": "The graph of $y = f(x)$ is shown below.\n\n[DIAGRAM_PLACEHOLDER]\n\n(a) Write down the coordinates of the turning point.\n\n**[1 mark]**\n\n(b) State the range of $f$.\n\n**[1 mark]**", "marks": 2, "topics": ["functions", "graphs"], "module": "Pure Mathematics", "is_code": false, "diagram_bboxes": [[0.15, 0.20, 0.70, 0.45]], "diagram_captions": ["Graph of y = f(x)"], "diagram_kinds": ["graph"], "bbox_page_indexes": [0], "math_snippet": "y = f(x)", "visual_options": null}]}
+
+Example 3 — Structured table (trace table) — transcribe as Markdown table, NOT diagram
+Input page (Question 12): "12 Complete the trace table for the algorithm below.\n\n| i | condition | output |\n|---|---|---|\n| 1 | true | 3 |\n| 2 |  |  |\n| 3 |  |  |"
+Output: {"items": [{"question_number": 12, "content": "Complete the trace table for the algorithm below.\n\n| i | condition | output |\n|---|---|---|\n| 1 | true | 3 |\n| 2 |  |  |\n| 3 |  |  |", "marks": 4, "topics": ["algorithms", "trace tables"], "module": "Computer Science", "is_code": false, "diagram_bboxes": [], "diagram_captions": [], "diagram_kinds": [], "bbox_page_indexes": [], "math_snippet": "", "visual_options": null}]}
+
+Example 4 — Multiple-choice with visual options (composite)
+Input page (Question 15): "15 Which graph represents y = sin(x)/x?\nA [graph A]\nB [graph B]\nC [graph C]\nD [graph D]"
+Output: {"items": [{"question_number": 15, "content": "Which graph represents $y = \\frac{\\sin x}{x}$?\n\nA [DIAGRAM_PLACEHOLDER]\nB [DIAGRAM_PLACEHOLDER]\nC [DIAGRAM_PLACEHOLDER]\nD [DIAGRAM_PLACEHOLDER]", "marks": 1, "topics": ["trigonometry", "graphs"], "module": "Pure Mathematics", "is_code": false, "diagram_bboxes": [[0.10, 0.25, 0.80, 0.65]], "diagram_captions": ["Options A, B, C, D"], "diagram_kinds": ["composite_visual_options"], "bbox_page_indexes": [0], "math_snippet": "sin(x)/x", "visual_options": "composite_visual_options"}]}
+
+Example 5 — Question continues from previous page
+Input page (Question 9 continued): "(c) Find the exact value of the integral. [4 marks]\n\n(Total for Question 9 is 10 marks)\n\n10 (a) ..."
+Output: {"items": [{"question_number": 9, "content": "(c) Find the exact value of the integral.\n\n**[4 marks]**", "marks": 4, "topics": ["calculus", "integration"], "module": "Pure Mathematics", "is_code": false, "diagram_bboxes": [], "diagram_captions": [], "diagram_kinds": [], "bbox_page_indexes": [], "math_snippet": "", "visual_options": null}]}
+
+END OF EXAMPLES — Follow the same JSON structure, escaping rules, and isolation discipline exactly.
+"#;
 
     format!(
         r#"You are a precise mathematical OCR engine transcribing exactly ONE exam question. Output ONLY a valid JSON object of the form {{"items": [ ... ]}}.
@@ -914,11 +1027,13 @@ FORMATTING & STRUCTURAL RULES:
 - Code/pseudocode/SQL/identifiers: Markdown backticks, NEVER LaTeX math mode.
 - AQA decimal sub-parts: render '02.1'-style parts as (a), (b), (c) — positionally: .1 -> a, .2 -> b — and update inline cross-references accordingly. AQA also uses SPACED sub-parts: "01 5" means Question 1, sub-part 5 — render as (e). The whole question number is ALWAYS the integer before the space/dot. NEVER return decimals like 1.5 for spaced sub-parts. Whole-numbered MCQs are independent questions, never decimals.
 - JSON ESCAPING: backslashes in LaTeX MUST be escaped (\\\\frac, \\\\theta, \\\\begin). Unescaped backslashes break the parser and your work is discarded.
-- The content MUST end with terminal punctuation or a mark tag. Never stop mid-sentence."#,
+- The content MUST end with terminal punctuation or a mark tag. Never stop mid-sentence.{few_shot}
+"#,
         number = span.number,
         paper = config.paper_name,
         module = config.module_name,
         topics_instruction = topics_instruction,
+        few_shot = FEW_SHOT,
     )
 }
 
@@ -1058,6 +1173,7 @@ pub async fn run_question_pipeline<C: LlmClient, P: Progress>(
                         img_slice,
                         text_opt,
                         750,
+                        Some(llm::ResponseFormat::JsonSchema { schema: structure_json_schema() }),
                     );
                     let result = match chat_with_permit(client, &body, &semaphore).await {
                         Ok(resp) => llm::message_content(&resp)
@@ -1647,6 +1763,8 @@ async fn extract_span<C: LlmClient>(
         }
 
         let system = extraction_system_prompt(config, span);
+        // JSON Schema for structured extraction output
+        let extraction_schema = extraction_json_schema();
         let mut last_error = String::new();
         let mut accepted: Option<(Vec<AiQuestion>, bool)> = None; // (items, salvaged_truncated)
 
@@ -1687,6 +1805,9 @@ async fn extract_span<C: LlmClient>(
                 &images,
                 Some(&user_text),
                 config.max_output_tokens,
+                Some(llm::ResponseFormat::JsonSchema {
+                    schema: extraction_schema.clone(),
+                }),
             );
 
             let api_start = Instant::now();
@@ -1760,6 +1881,9 @@ async fn extract_span<C: LlmClient>(
                             user_text, span.number
                         )),
                         config.max_output_tokens,
+                        Some(llm::ResponseFormat::JsonSchema {
+                            schema: extraction_schema.clone(),
+                        }),
                     );
 
                     let api_start = Instant::now();
@@ -2920,6 +3044,7 @@ RULES:
             &page_images,
             Some(&user_text),
             config.max_output_tokens,
+            Some(llm::ResponseFormat::JsonSchema { schema: extraction_json_schema() }),
         );
         let resp = match chat_with_permit(client, &body, request_semaphore).await {
             Ok(r) => r,
@@ -3247,6 +3372,7 @@ async fn read_markscheme_window<C: LlmClient>(
             &images,
             Some(&text),
             config.max_output_tokens,
+            Some(llm::ResponseFormat::JsonSchema { schema: extraction_json_schema() }),
         );
         let resp = match chat_with_permit(client, &body, request_semaphore).await {
             Ok(r) => r,
@@ -3470,7 +3596,7 @@ pub async fn run_markscheme_pipeline<C: LlmClient, P: Progress>(
                 md = md.replace("[DIAGRAM_PLACEHOLDER]", "");
                 md = validate::normalize_decimal_parts(&md, q_num);
                 md = validate::harden_line_breaks(&md);
-                md = validate::sanitize_markdown_math(&md);
+                md = validate::sanitize_for_latex(&md);
                 md = validate::normalize_mark_scheme_chunk(&md);
 
                 // Dedupe/stitch: containment-based, not a brittle prefix fingerprint.
