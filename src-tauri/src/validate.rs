@@ -15,9 +15,11 @@ fn re(pattern: &'static str) -> &'static regex::Regex {
         std::sync::Mutex<std::collections::HashMap<&'static str, &'static regex::Regex>>,
     > = OnceLock::new();
     let cache = CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
-    let mut guard = cache.lock().unwrap();
+    let mut guard = cache.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     let slot = guard.entry(pattern).or_insert_with(|| {
-        Box::leak(Box::new(regex::Regex::new(pattern).unwrap())) as &'static regex::Regex
+        Box::leak(Box::new(regex::Regex::new(pattern).unwrap_or_else(|e| {
+            panic!("Invalid regex pattern {:?}: {}", pattern, e);
+        }))) as &'static regex::Regex
     });
     *slot
 }
@@ -422,9 +424,11 @@ pub fn clean_question_content(content: &str) -> String {
     // Collapse runs of 3+ newlines left by removals.
     let collapse = re(r"\n{3,}");
     let collapsed = collapse.replace_all(&cleaned, "\n\n").trim().to_string();
+    // Run organic VLM marker cleaning (matrix rows, fractured equations, hierarchical spacing, delimiter nesting)
+    let marker_cleaned = crate::marker_client::clean_marker_markdown(&collapsed);
     // Source lines are meaningful — don't let Markdown reflow them into a
     // single blob (schemas, algorithms, multi-part stems).
-    let hardened = harden_line_breaks(&collapsed);
+    let hardened = harden_line_breaks(&marker_cleaned);
     
     // Automatically close any unclosed $ or $$ tags to prevent MDX parser crashes
     sanitize_markdown_math(&hardened)
@@ -437,7 +441,18 @@ pub fn clean_question_content(content: &str) -> String {
 /// outside math mode, and line-oriented trace tables are all common outputs
 /// from PDF transcription and can be repaired without changing ordinary text.
 pub fn repair_latex_syntax(text: &str) -> String {
-    let text = normalize_trace_table(text);
+    let mut text = crate::marker_client::fix_matrix_rows(text);
+    text = crate::marker_client::merge_fractured_equations(&text);
+    text = normalize_trace_table(&text);
+
+    // 1. Fix space after backslash for LaTeX keywords: "\ begin" -> "\begin", "\ sqrt" -> "\sqrt", etc.
+    let re_spaced_bs = re(r"\\ +(begin|end|frac|dfrac|cfrac|sqrt|text|textbf|textit|mathbf|mathit|mathrm|mathbb|mathcal|operatorname|pmatrix|bmatrix|vmatrix|matrix|array|cases|aligned|theta|lambda|alpha|beta|gamma|delta|Delta|pi|mu|sigma|omega|Omega|phi|Phi|psi|Psi|times|div|pm|mp|leq|geq|neq|approx|sim|equiv|subset|supset|subseteq|supseteq|in|notin|forall|exists|infty|partial|nabla|cos|sin|tan|sec|csc|cot|cosh|sinh|tanh|ln|log|exp|int|iint|iiint|oint|sum|prod|lim|vec|hat|bar|dot|ddot|tilde|binom|quad|qquad)\b");
+    text = re_spaced_bs.replace_all(&text, r"\$1").to_string();
+
+    // 2. Fix multiple backslashes before commands: "\\begin" -> "\begin", "\\pmatrix" -> "\pmatrix"
+    let re_multi_bs = re(r"\\{2,}(begin|end|frac|dfrac|cfrac|sqrt|text|textbf|textit|mathbf|mathit|mathrm|mathbb|mathcal|operatorname|pmatrix|bmatrix|vmatrix|matrix|array|cases|aligned|theta|lambda|alpha|beta|gamma|delta|Delta|pi|mu|sigma|omega|Omega|phi|Phi|psi|Psi|times|div|pm|mp|leq|geq|neq|approx|sim|equiv|in|forall|exists|infty|partial|nabla|cos|sin|tan|cosh|sinh|tanh|ln|log|exp|int|sum|prod|lim|vec|hat|bar|dot|ddot|tilde|binom)\b");
+    text = re_multi_bs.replace_all(&text, r"\$1").to_string();
+
     let mut out = Vec::new();
     let mut in_array = false;
     let mut array_lines: Vec<String> = Vec::new();
@@ -462,19 +477,21 @@ pub fn repair_latex_syntax(text: &str) -> String {
             continue;
         }
 
-        if line.contains(r"\begin{array}") || line.contains(r"\begin{matrix}") {
+        let is_env_start = line.contains(r"\begin{array}") || line.contains(r"\begin{matrix}") || line.contains(r"\begin{pmatrix}") || line.contains(r"\begin{bmatrix}") || line.contains(r"\begin{vmatrix}") || line.contains(r"\begin{cases}");
+        let is_env_end = line.contains(r"\end{array}") || line.contains(r"\end{matrix}") || line.contains(r"\end{pmatrix}") || line.contains(r"\end{bmatrix}") || line.contains(r"\end{vmatrix}") || line.contains(r"\end{cases}");
+
+        if is_env_start {
             in_array = true;
             array_lines.push(line);
-            if array_lines.last().is_some_and(|s| s.contains(r"\end{array}") || s.contains(r"\end{matrix}")) {
+            if is_env_end {
                 append_array_block(&mut out, &mut array_lines);
                 in_array = false;
             }
             continue;
         }
         if in_array {
-            let closes_array = line.contains(r"\end{array}") || line.contains(r"\end{matrix}");
             array_lines.push(line);
-            if closes_array {
+            if is_env_end {
                 append_array_block(&mut out, &mut array_lines);
                 in_array = false;
             }
@@ -485,8 +502,7 @@ pub fn repair_latex_syntax(text: &str) -> String {
         let bare_math = trimmed.starts_with(r"\left")
             || trimmed.starts_with(r"\frac")
             || trimmed.starts_with(r"\sqrt")
-            || trimmed.starts_with(r"\begin{array}")
-            || trimmed.starts_with(r"\begin{matrix}");
+            || trimmed.starts_with(r"\begin{");
         if bare_math && !trimmed.contains('$') {
             line = format!("$$\n{}\n$$", trimmed);
         }
@@ -496,8 +512,8 @@ pub fn repair_latex_syntax(text: &str) -> String {
     if in_array && !array_lines.is_empty() {
         // Complete an accidentally truncated array rather than leaving an
         // unterminated environment for the Markdown/LaTeX renderer.
-        if !array_lines.iter().any(|line| line.contains(r"\end{array}")) {
-            array_lines.push(r"\end{array}".to_string());
+        if !array_lines.iter().any(|line| line.contains(r"\end{")) {
+            array_lines.push(r"\end{pmatrix}".to_string());
         }
         append_array_block(&mut out, &mut array_lines);
     }

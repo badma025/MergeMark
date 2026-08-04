@@ -430,10 +430,30 @@ async fn insert_questions_from_text(
 #[tauri::command]
 pub async fn get_all_questions(state: State<'_, AppState>) -> Result<Vec<Question>, String> {
     let pool = state.db.lock().await;
-    let questions = sqlx::query_as::<_, Question>("SELECT * FROM questions")
-        .fetch_all(&*pool)
-        .await
-        .map_err(|e| e.to_string())?;
+    let questions = sqlx::query_as::<_, Question>(
+        r#"
+        SELECT 
+            id,
+            COALESCE(subject, 'Mathematics') AS subject,
+            COALESCE(subtopic, '') AS subtopic,
+            COALESCE(marks, 0) AS marks,
+            COALESCE(content, '') AS content,
+            COALESCE(math_snippet, '') AS math_snippet,
+            COALESCE(is_code, 0) AS is_code,
+            answer_content,
+            topics,
+            COALESCE(paper_name, '') AS paper_name,
+            question_number,
+            module,
+            COALESCE(needs_review, 0) AS needs_review,
+            COALESCE(answer_stale, 0) AS answer_stale
+        FROM questions 
+        ORDER BY rowid DESC
+        "#
+    )
+    .fetch_all(&*pool)
+    .await
+    .map_err(|e| e.to_string())?;
 
     Ok(questions)
 }
@@ -1149,7 +1169,39 @@ pub async fn parse_pdf_vision(
     let pool_check = state.db.lock().await;
     if let Ok(Some(cached_json)) = crate::db::get_cached_extraction(&pool_check, &cache_key).await {
         if let Ok(cached_questions) = serde_json::from_str::<Vec<Question>>(&cached_json) {
-            progress.stage("Loaded from cache — skipping extraction.");
+            progress.stage("Loaded from cache — syncing to repository.");
+            for q in &cached_questions {
+                let topics_json = q.topics.as_deref().unwrap_or("[]");
+                let subtopic = if q.subtopic.is_empty() { "Imported" } else { &q.subtopic };
+                let _ = sqlx::query(
+                    r#"
+                    INSERT INTO questions (id, subject, subtopic, topics, marks, content, math_snippet, is_code, paper_name, question_number, module, needs_review, answer_stale)
+                    VALUES (?, ?, ?, ?, ?, ?, '', ?, ?, ?, ?, ?, 0)
+                    ON CONFLICT(paper_name, question_number) DO UPDATE SET
+                        subject = excluded.subject,
+                        subtopic = excluded.subtopic,
+                        topics = CASE WHEN excluded.topics != '[]' THEN excluded.topics ELSE questions.topics END,
+                        marks = excluded.marks,
+                        content = excluded.content,
+                        is_code = excluded.is_code,
+                        module = COALESCE(excluded.module, questions.module),
+                        needs_review = excluded.needs_review
+                    "#,
+                )
+                .bind(&q.id)
+                .bind(&config.subject)
+                .bind(subtopic)
+                .bind(topics_json)
+                .bind(q.marks)
+                .bind(&q.content)
+                .bind(q.is_code)
+                .bind(&config.paper_name)
+                .bind(q.question_number)
+                .bind(&q.module)
+                .bind(q.needs_review)
+                .execute(&*pool_check)
+                .await;
+            }
             drop(pool_check);
             return Ok(cached_questions);
         }
@@ -1327,6 +1379,9 @@ pub async fn delete_all_questions(state: State<'_, AppState>) -> Result<bool, St
         .execute(&*pool)
         .await
         .map_err(|e| e.to_string())?;
+    let _ = sqlx::query("DELETE FROM extraction_cache")
+        .execute(&*pool)
+        .await;
     Ok(true)
 }
 
@@ -1347,6 +1402,10 @@ pub async fn delete_questions_by_paper(
             .execute(&*pool)
             .await
             .map_err(|e| e.to_string())?;
+
+    let _ = sqlx::query("DELETE FROM extraction_cache")
+        .execute(&*pool)
+        .await;
 
     Ok(result.rows_affected() as i64)
 }

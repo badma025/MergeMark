@@ -22,11 +22,11 @@ import "react-medium-image-zoom/dist/styles.css";
  * (?![a-z]) prevents matching longer names like \integer but allows \int_2, \int^n etc.
  */
 const DISPLAY_OP_RE =
-  /\\{1,2}(?:int|iint|iiint|oint|sum|prod|coprod|lim|bigcup|bigcap|bigsqcup|bigvee|bigwedge)(?![a-z])/;
+  /\\{1,2}(?:int|iint|iiint|oint|sum|prod|coprod|lim|limsup|liminf|bigcup|bigcap|bigsqcup|bigvee|bigwedge|frac|dfrac|cfrac|binom|sqrt|pmatrix|bmatrix|vmatrix|Vmatrix|matrix|array|cases|aligned|gathered|begin\{(?:pmatrix|bmatrix|vmatrix|matrix|array|cases|aligned)\})(?![a-z])/;
 
-/** Convert \\cmd → \cmd (AI sometimes double-escapes backslashes from JSON) */
+/** Convert \\cmd → \cmd (AI sometimes double-escapes backslashes from JSON) without destroying matrix \\ rowbreaks */
 function fixSlashes(s: string): string {
-  return s.replace(/\\{2}([a-zA-Z])/g, "\\$1");
+  return s.replace(/\\{2}(frac|sqrt|mathbf|mathit|mathrm|mathbb|mathcal|operatorname|cos|cosh|sin|sinh|tan|tanh|ln|log|exp|int|sum|prod|lim|begin|end|vec|alpha|beta|gamma|theta|pi|partial)/g, "\\$1");
 }
 
 /**
@@ -208,22 +208,35 @@ export function preprocessMath(raw: string, isCode?: boolean, subject?: string):
     return (match.startsWith('\n') ? '\n' : '') + latex;
   });
 
+  // ── Pre-sanitize: repair escaped equals, corrupted braces, single-slash matrix breaks ─
+  s = sanitizeMarkdownMath(s);
+
   // ── A: protect already-correct $$ blocks from further processing ──────────
   // We mark them with a placeholder, restore at end.
   const blocks: string[] = [];
   
-  // Helper to format block math with aligned environment if it has multiple lines
+  // Helper to format block math safely without corrupting markdown or prose
   const formatBlock = (inner: string) => {
     let clean = fixSlashes(inner.trim());
+
+    // If the captured text contains multiple markdown paragraphs with standard prose words,
+    // it was caused by an unbalanced $$ in the source text swallowing markdown paragraphs.
+    if (/\n\s*\n/.test(clean) && /\b(?:determine|calculate|explain|find|show|hence|given|vertices|coordinates|transformation|represented|marks?)\b/i.test(clean) && !/\\(?:begin|frac|int|sum|pmatrix|bmatrix)/i.test(clean)) {
+      return inner;
+    }
+
     // Convert any stray markdown formatting inside math blocks to valid LaTeX
     clean = clean.replace(/\*\*\*([^*]+)\*\*\*/g, "\\textbf{\\textit{$1}}");
     clean = clean.replace(/\*\*([^*]+)\*\*/g, "\\textbf{$1}");
     clean = clean.replace(/(?<!\\)\*([^*]+)\*/g, "\\textit{$1}");
 
-    // If it has multiple lines and isn't already using an environment, wrap in aligned
+    // If it has multiple lines and isn't already using an environment, only wrap in aligned if it's pure equations
     if (clean.includes("\n") && !clean.includes("\\begin{")) {
-      // Replace newlines with \\ so KaTeX renders them on separate lines
-      clean = `\\begin{aligned}\n${clean.replace(/\n/g, " \\\\\n")}\n\\end{aligned}`;
+      const lines = clean.split("\n").map(l => l.trim()).filter(Boolean);
+      const isPureEquations = lines.every(l => /[=><\\]/.test(l) || /^\(?\d+\)?$/.test(l));
+      if (isPureEquations) {
+        clean = `\\begin{aligned}\n${lines.join(" \\\\\n")}\n\\end{aligned}`;
+      }
     }
     const idx = blocks.length;
     blocks.push(`\n\n$$\n${clean}\n$$\n\n`);
@@ -242,7 +255,7 @@ export function preprocessMath(raw: string, isCode?: boolean, subject?: string):
     (_m, inner) => `\n\n${formatBlock(inner)}\n\n`
   );
 
-  // ── C+E: inline $...$ (single-line) containing a display operator ─────────
+  // ── C: inline $...$ (single-line) containing a display operator ─────────
   s = s.replace(/\$([^$\n]+)\$/g, (match, expr) => {
     if (DISPLAY_OP_RE.test(expr)) {
       return `\n\n${formatBlock(expr)}\n\n`;
@@ -250,18 +263,29 @@ export function preprocessMath(raw: string, isCode?: boolean, subject?: string):
     return match;
   });
 
-  // ── D: raw LaTeX line (no $ at all) with a display operator ──────────────
+  // ── D: raw LaTeX line (no $ at all) containing display operators or equations ─
   s = s.replace(
-    /^(?!\s*\x00BLOCK)([^\n$]*(?:\\{1,2}(?:int|iint|iiint|oint|sum|prod|coprod|lim|bigcup|bigcap|bigsqcup|bigvee|bigwedge)(?![a-z]))[^\n$]*)$/gm,
-    (_m, line) => `\n\n${formatBlock(line)}\n\n`
+    /^(?!\s*\x00BLOCK)(.*?(?:\\begin\{(?:pmatrix|bmatrix|vmatrix|matrix|array|cases|aligned)\}|\\{1,2}(?:int|iint|iiint|oint|sum|prod|coprod|lim|limsup|liminf|bigcup|bigcap|bigsqcup|bigvee|bigwedge|frac|dfrac|cfrac|binom|sqrt)|(?:\b(?:64\s*)?\\cosh\b|\b\cos\b|\b\sin\b|\b\tan\b|\b\ln\b|\b\exp\b)[^\n$]*=[^\n$]*).*)$/gm,
+    (match, line) => {
+      // Only wrap if it looks like an equation / formula line and not a plain sentence
+      if (/\b(?:the|which|where|and|that|show|determine|find|given|calculate|hence|answer|mark|marks)\b/i.test(line) && !/\\(?:begin|frac|int|sum|pmatrix|bmatrix)/.test(line)) {
+        return match;
+      }
+      return `\n\n${formatBlock(line)}\n\n`;
+    }
+  );
+
+  // ── E: Auto-wrap standalone unwrapped inline LaTeX commands ──────────────
+  s = s.replace(
+    /(?<!\$|\w|\\)(\\(?:mathbf|mathit|mathrm|mathbb|mathcal|operatorname|vec|hat|bar|dot|ddot|tilde|frac|sqrt|pmatrix|binom)\{[^{}]+\}(?:\^\{[^{}]+\}|_[^{}]|\^[0-9a-zA-Z]|_[0-9a-zA-Z])?|\\(?:alpha|beta|gamma|theta|pi|lambda|sigma|mu|omega|Delta|nabla|partial|times|div|pm|leq|geq|neq|approx|infty)(?![a-z]))(?!\$)/g,
+    "$$1$"
   );
 
   // ── Restore protected $$ blocks ───────────────────────────────────────────
   s = s.replace(/\x00BLOCK(\d+)\x00/g, (_m, idx) => blocks[Number(idx)]);
 
   // Collapse 3+ blank lines to 2
-  const result = s.replace(/\n{3,}/g, "\n\n").trim();
-  return sanitizeMarkdownMath(result);
+  return s.replace(/\n{3,}/g, "\n\n").trim();
 }
 
 
@@ -498,7 +522,7 @@ export function QuestionCard(props: QuestionCardProps) {
         >
           <ReactMarkdown 
             remarkPlugins={[remarkMath, remarkGfm]} 
-            rehypePlugins={[rehypeKatex]}
+            rehypePlugins={[[rehypeKatex, { throwOnError: false, strict: false }]]}
             urlTransform={(value) => value}
             components={{
               img: ({ node, ...props }) => {
@@ -526,7 +550,7 @@ export function QuestionCard(props: QuestionCardProps) {
           <div className="font-semibold text-xs text-muted-foreground mb-2 uppercase tracking-wider">Mark Scheme Answer</div>
           <ReactMarkdown 
             remarkPlugins={[remarkMath, remarkGfm]} 
-            rehypePlugins={[rehypeKatex]}
+            rehypePlugins={[[rehypeKatex, { throwOnError: false, strict: false }]]}
             urlTransform={(value) => value}
             components={{
               img: ({ node, ...props }) => {

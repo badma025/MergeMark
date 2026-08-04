@@ -46,13 +46,18 @@ export function RepositoryFeed({ isActive = true, onAddToWorksheet }: Repository
     if (isActive) {
       fetchQuestions();
     }
+    const handleRefresh = () => {
+      fetchQuestions();
+    };
+    window.addEventListener("refresh-questions", handleRefresh);
+    return () => window.removeEventListener("refresh-questions", handleRefresh);
   }, [isActive]);
 
   async function fetchQuestions() {
     setLoading(true);
     try {
       const data = await invoke<Omit<QuestionCardProps, "onAddToWorksheet" | "onDelete">[]>("get_all_questions");
-      setQuestions(data);
+      setQuestions(data || []);
     } catch (error) {
       console.error("Failed to fetch questions:", error);
       toast.error("Failed to load questions", { description: String(error) });
@@ -88,15 +93,16 @@ export function RepositoryFeed({ isActive = true, onAddToWorksheet }: Repository
   }
 
   const filtered = questions.filter((q) => {
-    const term = search.toLowerCase();
+    const term = search.toLowerCase().trim();
     const matchesSearch = term === "" ||
-      q.subject.toLowerCase().includes(term) ||
-      q.subtopic.toLowerCase().includes(term) ||
-      q.content.toLowerCase().includes(term) ||
-      q.mathSnippet.toLowerCase().includes(term);
+      (q.subject || "").toLowerCase().includes(term) ||
+      (q.subtopic || "").toLowerCase().includes(term) ||
+      (q.content || "").toLowerCase().includes(term) ||
+      ((q as any).paperName || "").toLowerCase().includes(term) ||
+      ((q as any).mathSnippet || "").toLowerCase().includes(term);
 
-    const resolvedSubject = subjects.find(s => s.id === q.subject)?.name || q.subject;
-    const matchesSubject = selectedSubject === "All" || resolvedSubject === selectedSubject;
+    const resolvedSubject = subjects.find(s => s.id === q.subject || s.name.toLowerCase() === (q.subject || "").toLowerCase())?.name || q.subject || "";
+    const matchesSubject = selectedSubject === "All" || resolvedSubject.toLowerCase() === selectedSubject.toLowerCase();
 
     let matchesTopicFilter = true;
     if (selectedTopics.length > 0) {
@@ -309,9 +315,28 @@ export function RepositoryFeed({ isActive = true, onAddToWorksheet }: Repository
             <p className="text-sm">Loading questions...</p>
           </div>
         ) : filtered.length === 0 ? (
-          <div className="flex flex-col items-center justify-center h-48 text-muted-foreground gap-2">
+          <div className="flex flex-col items-center justify-center h-48 text-muted-foreground gap-3">
             <Search className="size-8 opacity-30" />
-            <p className="text-sm">No questions match your search.</p>
+            <p className="text-sm">
+              {questions.length > 0
+                ? `No questions match your current filters (${questions.length} total questions available).`
+                : "No questions in repository yet. Import a PDF to get started."}
+            </p>
+            {questions.length > 0 && (
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={() => {
+                  setSearch("");
+                  setSelectedSubject("All");
+                  setSelectedModule("All");
+                  setSelectedTopics([]);
+                  setReviewFilter("All");
+                }}
+              >
+                Clear All Filters
+              </Button>
+            )}
           </div>
         ) : (
           <ul

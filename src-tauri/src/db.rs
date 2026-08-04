@@ -67,8 +67,32 @@ pub async fn init_db(app_data_dir: PathBuf) -> Result<SqlitePool, sqlx::Error> {
         .execute(&pool)
         .await;
 
-    // Task 4: Legacy cleanup
-    let _ = sqlx::query("UPDATE questions SET math_snippet = '' WHERE math_snippet IS NOT NULL AND math_snippet != ''")
+    // Task 4: Legacy cleanup & NULL sanitization
+    let _ = sqlx::query("UPDATE questions SET math_snippet = '' WHERE math_snippet IS NULL OR math_snippet != ''")
+        .execute(&pool)
+        .await;
+    let _ = sqlx::query("UPDATE questions SET subject = 'Mathematics' WHERE subject IS NULL")
+        .execute(&pool)
+        .await;
+    let _ = sqlx::query("UPDATE questions SET subtopic = '' WHERE subtopic IS NULL")
+        .execute(&pool)
+        .await;
+    let _ = sqlx::query("UPDATE questions SET marks = 0 WHERE marks IS NULL")
+        .execute(&pool)
+        .await;
+    let _ = sqlx::query("UPDATE questions SET content = '' WHERE content IS NULL")
+        .execute(&pool)
+        .await;
+    let _ = sqlx::query("UPDATE questions SET is_code = 0 WHERE is_code IS NULL")
+        .execute(&pool)
+        .await;
+    let _ = sqlx::query("UPDATE questions SET paper_name = '' WHERE paper_name IS NULL")
+        .execute(&pool)
+        .await;
+    let _ = sqlx::query("UPDATE questions SET needs_review = 0 WHERE needs_review IS NULL")
+        .execute(&pool)
+        .await;
+    let _ = sqlx::query("UPDATE questions SET answer_stale = 0 WHERE answer_stale IS NULL")
         .execute(&pool)
         .await;
 
@@ -318,7 +342,7 @@ pub async fn set_byok_api_key(
 // output for the same input.
 
 /// Bump this to invalidate all cached extraction results after logic changes.
-pub const EXTRACTION_CACHE_VERSION: u32 = 1;
+pub const EXTRACTION_CACHE_VERSION: u32 = 2;
 
 /// Compute a deterministic cache key from file content + parameters.
 /// Uses a fast FNV-1a hash of the file bytes (not cryptographic, just

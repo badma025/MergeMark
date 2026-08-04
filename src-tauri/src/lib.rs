@@ -18,6 +18,7 @@ mod pdf_render;
 mod pipeline;
 mod taxonomy;
 mod validate;
+pub mod marker_client;
 
 pub struct AppState {
     pub db: Arc<Mutex<SqlitePool>>,

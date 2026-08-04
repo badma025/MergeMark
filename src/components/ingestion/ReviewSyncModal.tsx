@@ -121,7 +121,7 @@ export function ReviewSyncModal({ mappings, onClose, onSuccess }: ReviewSyncModa
                       </div>
                       <ReactMarkdown 
                         remarkPlugins={[remarkMath, remarkGfm]} 
-                        rehypePlugins={[rehypeKatex]}
+                        rehypePlugins={[[rehypeKatex, { throwOnError: false, strict: false }]]}
                         urlTransform={(value) => value}
                         components={{
                           img: ({ node, ...props }) => {
@@ -194,7 +194,7 @@ export function ReviewSyncModal({ mappings, onClose, onSuccess }: ReviewSyncModa
                       </div>
                       <ReactMarkdown 
                         remarkPlugins={[remarkMath, remarkGfm]} 
-                        rehypePlugins={[rehypeKatex]}
+                        rehypePlugins={[[rehypeKatex, { throwOnError: false, strict: false }]]}
                         urlTransform={(value) => value}
                         components={{
                           img: ({ node, ...props }) => {
