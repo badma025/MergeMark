@@ -2357,10 +2357,24 @@ async fn extract_span<C: LlmClient>(
             let audit_local_to_chunk = local_to_chunk.clone();
             let audit_page_bands = page_bands.clone();
             let audit_decoded_pages = decoded_pages.clone();
+
+            // Build page_texts aligned with local_to_chunk (model-visible order)
+            let audit_page_texts: Vec<String> = local_to_chunk
+                .iter()
+                .map(|&chunk_idx| {
+                    if chunk_idx < chunk.len() {
+                        chunk[chunk_idx].1.text.clone()
+                    } else {
+                        String::new()
+                    }
+                })
+                .collect();
+
             let (audited_items, bad, box_issues) = match tokio::task::spawn_blocking(move || {
                 let mut items = audit_items;
                 let (bad, issues) = audit_diagram_boxes(
                     &audit_decoded_pages,
+                    &audit_page_texts,
                     &mut items,
                     &audit_local_to_chunk,
                     &audit_page_bands,
@@ -2442,7 +2456,7 @@ async fn extract_span<C: LlmClient>(
             break;
         }
 
-        let (items, salvaged) = match accepted {
+        let (mut items, salvaged) = match accepted {
             Some(v) => v,
             None => {
                 eprintln!("WARNING: Question {} extraction failed: {}", span.number, last_error);
@@ -2452,6 +2466,20 @@ async fn extract_span<C: LlmClient>(
                 return (None, report);
             }
         };
+
+        // Split compound figures (e.g., "Figure 4 and Figure 5" in one bbox)
+        // Build page_texts aligned with local_to_chunk
+        let page_texts: Vec<String> = local_to_chunk
+            .iter()
+            .map(|&chunk_idx| {
+                if chunk_idx < chunk.len() {
+                    chunk[chunk_idx].1.text.clone()
+                } else {
+                    String::new()
+                }
+            })
+            .collect();
+        split_compound_figures_if_needed(&mut items, &page_texts, &local_to_chunk);
 
         for item in items {
             let mut item_content = item.content.unwrap_or_default();
@@ -2575,6 +2603,11 @@ async fn extract_span<C: LlmClient>(
     content = validate::clean_question_content(&content);
     // One labelling scheme forever: AQA '3 . 1'-style decimals → (a), (b), (c).
     content = validate::normalize_decimal_parts(&content, span.number);
+    // Comprehensive post-processing for the 6 extraction/formatting failure modes:
+    // 1. Artifact boilerplate bleed, 2. Number-agnostic AQA decimal failures,
+    // 3. MCQ option flattening, 4. Tabular option destruction, 5. Visual MCQ
+    // gibberish, 6. Mark allocation misplacement.
+    content = crate::marker_client::clean_marker_markdown(&content);
 
     if content.trim().is_empty() && span.expected_marks.unwrap_or(0) > 0 {
         // A marked question with no content is a hard failure.
@@ -2696,18 +2729,28 @@ fn validate_span_items(page: &AiQuestionPage, span: &QuestionSpan) -> Vec<String
 ///   3. y-band check: the box's CENTER y must lie within this question's
 ///      vertical band on that page (±3% slack), otherwise the AI is boxing
 ///      a figure that belongs to a neighboring question
-///   4. crop sanity (degenerate / blank / answer-grid)
-///   5. near-duplicate signature check
+///   4. boilerplate exclusion: the box must not contain page-level text
+///      (margin warnings, footers, continuation markers, mark allocations)
+///   5. answer space exclusion: the box must not cover student answer areas
+///      (underscores, blank horizontal rules, empty grid space)
+///   6. compound asset splitting: multi-caption boxes are split on whitespace
+///      gutters
+///   7. crop sanity (degenerate / blank / answer-grid)
+///   8. near-duplicate signature check
 ///
 /// `page_bands` is parallel to `chunk`; entries are `Some((low, high))`
 /// when the page was given a vertical band hint. A None entry means the
 /// whole page belongs to this span (no y-band restriction).
+///
+/// `page_texts` holds the OCR text for each page in the chunk, used for
+/// boilerplate detection within proposed bboxes.
 ///
 /// Returns the indices of offending boxes `(item_idx, bbox_idx)` plus a
 /// quoted feedback message per violation for the repair loop. The AI draws
 /// boxes; Rust decides which ones may ever become files.
 fn audit_diagram_boxes(
     decoded_pages: &[Option<Arc<image::DynamicImage>>],
+    page_texts: &[String],  // OCR text for each page in the chunk
     items: &mut [AiQuestion],
     local_to_chunk: &[usize],
     _page_bands: &[Option<(f32, f32)>],
@@ -2757,6 +2800,13 @@ fn audit_diagram_boxes(
                 // still applies, so nothing bad can reach disk.
                 _ => continue,
             };
+
+            // Get OCR text for this page to check for boilerplate in the bbox region
+            let page_text = if chunk_idx < page_texts.len() {
+                &page_texts[chunk_idx]
+            } else {
+                ""
+            };
             let content = item.content.as_deref().unwrap_or("");
             let ignore_grid = validate::figure_references(content) > 0 && !validate::is_answer_grid_request(content);
 
@@ -2772,6 +2822,51 @@ fn audit_diagram_boxes(
                         || kind.contains("composite_visual_options")
                 })
                 .unwrap_or(false);
+
+            // NEW: Check if bbox contains boilerplate text that should be excluded
+            if geometry::bbox_contains_boilerplate(page_text, bbox) {
+                bad.push((ii, bi));
+                issues.push(format!(
+                    "{label}: the box covers page-level boilerplate (margin warnings, footers, continuation markers, or mark allocations) — redraw tightly around the visual asset only, or delete the box AND its [DIAGRAM_PLACEHOLDER]"
+                ));
+                continue;
+            }
+
+            // NEW: Check if bbox covers answer space (blank lines, underscores, ruled grids)
+            let cropped_for_check = match geometry::crop_diagram_with_options(
+                img,
+                bbox,
+                10,  // minimal padding for check
+                ignore_grid,
+                graph_like,
+            ) {
+                Ok(c) => c,
+                Err(geometry::CropReject::BadBox) => {
+                    bad.push((ii, bi));
+                    issues.push(format!(
+                        "{label}: the box is unusable (degenerate or outside the page) — redraw it tightly around the figure, or delete the box AND its [DIAGRAM_PLACEHOLDER]"
+                    ));
+                    continue;
+                }
+                Err(geometry::CropReject::AnswerGrid) => {
+                    bad.push((ii, bi));
+                    issues.push(format!(
+                        "{label}: the box covers an EMPTY RULED ANSWER GRID (trace table / working grid). Never box these — transcribe the grid as a Markdown table inside \"content\" (keeping any pre-filled cells) and delete the box AND its [DIAGRAM_PLACEHOLDER]"
+                    ));
+                    continue;
+                }
+            };
+
+            // Check if the cropped region looks like answer space
+            if geometry::looks_like_answer_space(&cropped_for_check) {
+                bad.push((ii, bi));
+                issues.push(format!(
+                    "{label}: the box covers STUDENT ANSWER SPACE (blank lines, underscores, or ruled working area). Never box these — the question prompt text belongs in \"content\"; visual diagrams only get boxes. Redraw tightly around the actual figure, or delete the box AND its [DIAGRAM_PLACEHOLDER]"
+                ));
+                continue;
+            }
+
+            // Now do the full crop with proper padding for the final audit
             let cropped = match geometry::crop_diagram_with_options(
                 img,
                 bbox,
@@ -2861,6 +2956,49 @@ fn prune_bad_diagram_boxes(
 /// `saved` carries the (signature, link) pairs already persisted for this
 /// unit of work — a near-identical crop reuses the stored file instead of
 /// writing yet another PNG of the same figure.
+
+/// Check if a question's diagram bboxes contain compound figures (multiple
+/// captions in one bbox) and split them into separate assets.
+/// This runs after the diagram audit but before saving.
+fn split_compound_figures_if_needed(
+    items: &mut [AiQuestion],
+    page_texts: &[String],
+    _local_to_chunk: &[usize],
+) {
+    for item in items.iter_mut() {
+        let Some(bboxes) = &item.diagram_bboxes else {
+            continue;
+        };
+        if bboxes.is_empty() {
+            continue;
+        }
+
+        let indexes = item.bbox_page_indexes.clone().unwrap_or_default();
+        let captions = item.diagram_captions.clone().unwrap_or_default();
+        let kinds = item.diagram_kinds.clone().unwrap_or_default();
+
+        // Use the geometry module's split function
+        let split_figures = geometry::split_compound_figure(bboxes, &captions, &kinds, page_texts);
+
+        if split_figures.len() > bboxes.len() {
+            // We split a compound figure - update the item
+            let new_bboxes: Vec<Vec<f32>> = split_figures.iter().map(|f| f.bbox.clone()).collect();
+            let new_captions: Vec<String> = split_figures.iter().filter_map(|f| f.caption.clone()).collect();
+            let new_kinds: Vec<String> = split_figures.iter().map(|f| f.kind.clone()).collect();
+
+            // For page indexes, we use the first page index for all split figures
+            // since they came from the same original bbox
+            let first_idx = indexes.first().cloned().unwrap_or(serde_json::json!(0));
+            let new_indexes: Vec<serde_json::Value> = (0..new_bboxes.len()).map(|_| first_idx.clone()).collect();
+
+            item.diagram_bboxes = Some(new_bboxes);
+            item.diagram_captions = Some(new_captions);
+            item.diagram_kinds = Some(new_kinds);
+            item.bbox_page_indexes = Some(new_indexes);
+        }
+    }
+}
+
 fn save_diagram(
     global_page_idx: usize,
     page_b64: Option<&str>,
@@ -3163,10 +3301,17 @@ RULES:
         let audit_local_to_chunk = local_to_chunk.clone();
         let audit_page_bands = page_bands.clone();
         let audit_decoded_pages = decoded_pages.clone();
+        // Build page_texts aligned with local_to_chunk (model-visible order)
+        // For fallback, we only have one page, so create a single-element array
+        let audit_page_texts: Vec<String> = local_to_chunk
+            .iter()
+            .map(|_| page.text.clone())
+            .collect();
         let (mut items, bad, box_issues) = match tokio::task::spawn_blocking(move || {
             let mut items = audit_items;
             let (bad, issues) = audit_diagram_boxes(
                 &audit_decoded_pages,
+                &audit_page_texts,
                 &mut items,
                 &audit_local_to_chunk,
                 &audit_page_bands,
@@ -3277,10 +3422,16 @@ RULES:
 
             let built = BuiltQuestion {
                 question_number: number,
-                content: validate::normalize_decimal_parts(
-                    &validate::clean_question_content(&item_content),
-                    number,
-                ),
+                content: {
+                    let mut content = validate::clean_question_content(&item_content);
+                    content = validate::normalize_decimal_parts(&content, number);
+                    // Comprehensive post-processing for the 6 extraction/formatting failure modes:
+                    // 1. Artifact boilerplate bleed, 2. Number-agnostic AQA decimal failures,
+                    // 3. MCQ option flattening, 4. Tabular option destruction, 5. Visual MCQ
+                    // 6. Mark allocation misplacement.
+                    content = crate::marker_client::clean_marker_markdown(&content);
+                    content
+                },
                 marks: item
                     .marks
                     .as_ref()
@@ -3973,8 +4124,10 @@ mod tests {
         // Tests send no sentinel pages, so identity map + no bands.
         let l2c: Vec<usize> = (0..decoded_pages.len()).collect();
         let bands: Vec<Option<(f32, f32)>> = vec![None; decoded_pages.len()];
+        // Empty page_texts for test (no boilerplate in test images)
+        let page_texts: Vec<String> = vec![String::new(); decoded_pages.len()];
         let (bad, issues) =
-            audit_diagram_boxes(&decoded_pages, &mut [item], &l2c, &bands);
+            audit_diagram_boxes(&decoded_pages, &page_texts, &mut [item], &l2c, &bands);
         assert!(bad.contains(&(0, 0)), "trace-table box must be rejected");
         assert!(
             bad.contains(&(0, 2)),

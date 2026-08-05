@@ -17,7 +17,7 @@ import { restrictToVerticalAxis, restrictToParentElement } from "@dnd-kit/modifi
 import { useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { toast } from "sonner";
-import { FileText, Clock, Hash, Loader2 } from "lucide-react";
+import { FileText, Clock, Hash, Loader2, X } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogDescription, DialogFooter } from "@/components/ui/dialog";
 import { WorksheetItem, type WorksheetItemData } from "./WorksheetItem";
@@ -56,9 +56,11 @@ export interface WorksheetBuilderProps {
   selectedQuestions: WorksheetItemData[];
   onRemove: (id: string) => void;
   onReorder: (newItems: WorksheetItemData[]) => void;
+  onClose?: () => void;
+  className?: string;
 }
 
-export function WorksheetBuilder({ selectedQuestions, onRemove, onReorder }: WorksheetBuilderProps) {
+export function WorksheetBuilder({ selectedQuestions, onRemove, onReorder, onClose, className }: WorksheetBuilderProps) {
   const totalMarks = selectedQuestions.reduce((acc, q) => acc + q.marks, 0);
   const estMinutes = totalMarks; // 1 min per mark heuristic
   const [isCompiling, setIsCompiling] = useState(false);
@@ -137,32 +139,45 @@ export function WorksheetBuilder({ selectedQuestions, onRemove, onReorder }: Wor
   return (
     <aside
       className={cn(
-        "flex w-80 flex-shrink-0 flex-col border-l border-border bg-background",
-        "h-screen" // full viewport height
+        "flex w-full h-full flex-col border-l border-border bg-background min-h-0 overflow-hidden",
+        className
       )}
       aria-label="Worksheet Builder"
     >
       {/* ── Header ── */}
-      <div className="flex flex-col gap-1 border-b border-border px-4 pt-4 pb-3">
-        <div className="flex items-center gap-2">
-          <FileText className="size-4 text-primary flex-shrink-0" />
-          <h2 className="text-sm font-semibold tracking-tight text-foreground">
-            Current Worksheet
-          </h2>
+      <div className="flex items-center justify-between border-b border-border px-4 py-3 shrink-0">
+        <div className="flex flex-col gap-0.5 min-w-0">
+          <div className="flex items-center gap-2">
+            <FileText className="size-4 text-primary flex-shrink-0" />
+            <h2 className="text-sm font-semibold tracking-tight text-foreground truncate">
+              Current Worksheet
+            </h2>
+          </div>
+          <p className="text-[0.7rem] text-muted-foreground pl-6">
+            {selectedQuestions.length} question{selectedQuestions.length !== 1 ? "s" : ""}
+          </p>
         </div>
-        <p className="text-[0.7rem] text-muted-foreground pl-6">
-          {selectedQuestions.length} question{selectedQuestions.length !== 1 ? "s" : ""}
-        </p>
+        {onClose && (
+          <Button
+            variant="ghost"
+            size="icon"
+            onClick={onClose}
+            className="size-8 rounded-lg text-muted-foreground hover:text-foreground shrink-0"
+            aria-label="Close worksheet builder drawer"
+          >
+            <X className="size-4" />
+          </Button>
+        )}
       </div>
 
       {/* ── Stats row ── */}
-      <div className="flex gap-2 px-4 py-3 border-b border-border">
+      <div className="flex gap-2 px-4 py-3 border-b border-border shrink-0">
         <StatChip icon={Hash} label="Total Marks" value={`${totalMarks}`} />
         <StatChip icon={Clock} label="Est. Time" value={`${estMinutes}m`} />
       </div>
 
       {/* ── Scrollable sortable list ── */}
-      <div className="flex-1 overflow-y-auto px-4 py-3">
+      <div className="flex-1 min-h-0 overflow-y-auto px-4 py-3">
         {selectedQuestions.length === 0 ? (
           <div className="flex flex-col items-center justify-center h-32 gap-2 text-muted-foreground">
             <FileText className="size-8 opacity-25" />
@@ -198,7 +213,7 @@ export function WorksheetBuilder({ selectedQuestions, onRemove, onReorder }: Wor
       </div>
 
       {/* ── Pinned compile button ── */}
-      <div className="border-t border-border px-4 py-3 bg-background flex flex-col gap-2">
+      <div className="border-t border-border px-4 py-3 bg-background flex flex-col gap-2 shrink-0">
         <div className="flex flex-col gap-1">
           <label
             htmlFor="worksheet-file-name"

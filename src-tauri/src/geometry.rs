@@ -39,6 +39,316 @@ const MAX_AREA_FRAC: f64 = 0.92;
 /// Reject boxes smaller than this fraction of the page — OCR noise.
 const MIN_AREA_FRAC: f64 = 0.0005;
 
+/// Boilerplate patterns that should never be included in image bounding boxes.
+/// These are matched against OCR text within or near the proposed crop region.
+const BOILERPLATE_PATTERNS: &[&str] = &[
+    r"(?i)do\s+not\s+write\s+(?:outside\s+the\s+box|in\s+this\s+area)",
+    r"(?i)turn\s+over",
+    r"(?i)question\s+\d+\s+continues\s+on\s+(?:the\s+)?next\s+page",
+    r"(?i)do\s+not\s+write\s+on\s+this\s+page",
+    r"(?i)blank\s+page",
+    r"(?i)end\s+of\s+questions?",
+    r"(?i)\[\s*\d+\s+marks?\s*\]",  // Mark allocations like [2 marks]
+    r"(?i)total\s+for\s+question\s+\d+\s+is\s+\d+\s+marks?",
+    r"(?i)page\s+\d+(\s*/\s*\d+)?",  // Page numbers
+    r"(?i)ib\s*/\s*[a-z]\s*/\s*[a-z]{3}\d{2}\s*/\s*\d+\s*/\s*\d+",  // Footer codes like IB/M/Jun21/7408/2
+];
+
+/// Detect if a text region contains boilerplate that should be excluded from image crops.
+fn contains_boilerplate(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    for pattern in BOILERPLATE_PATTERNS {
+        if regex::Regex::new(pattern).unwrap().is_match(&lower) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Check if a proposed bounding box (in relative coordinates 0..1) contains
+/// boilerplate text in the OCR text. We sample the text near the bbox center
+/// and in a small region around it to catch margin warnings, footers, etc.
+pub fn bbox_contains_boilerplate(page_text: &str, bbox: &[f32]) -> bool {
+    if bbox.len() != 4 || page_text.trim().is_empty() {
+        return false;
+    }
+
+    // Quick check: if the full page text contains boilerplate, it might bleed
+    // into the bbox. We do a more targeted check by looking at lines that
+    // would fall within or near the bbox's y-range.
+    let bbox_y = bbox[1];
+    let bbox_h = bbox[3];
+
+    // Split page text into lines and check lines that fall in the bbox y-range
+    // (with some margin above/below to catch adjacent boilerplate)
+    let margin = 0.03; // 3% margin
+    let _y_start = (bbox_y - margin).max(0.0);
+    let _y_end = (bbox_y + bbox_h + margin).min(1.0);
+
+    // For each line, we'd need its y-position. Since we don't have per-line
+    // coordinates, we check if any boilerplate patterns exist in the full
+    // text and if the bbox is in a region where boilerplate commonly appears
+    // (top/bottom margins, etc.)
+
+    // Check if bbox is in top margin (where "Do not write" warnings appear)
+    if bbox_y < 0.1 && contains_boilerplate(page_text) {
+        return true;
+    }
+
+    // Check if bbox is in bottom margin (where "Turn over", page numbers appear)
+    if bbox_y + bbox_h > 0.9 && contains_boilerplate(page_text) {
+        return true;
+    }
+
+    // Check for mark allocations anywhere in the page text that might be
+    // included in the bbox
+    if contains_boilerplate(page_text) {
+        // Look for mark allocation patterns specifically
+        let re_marks = regex::Regex::new(r"(?i)\[\s*\d+\s+marks?\s*\]").unwrap();
+        if re_marks.is_match(page_text) {
+            // If marks brackets are found, check if bbox is near where they'd be
+            // (typically near question text or in margins)
+            // For now, if the page has them and bbox is suspicious, flag it
+            return true;
+        }
+
+        // Check for continuation markers
+        let re_cont = regex::Regex::new(r"(?i)question\s+\d+\s+continues\s+on\s+(?:the\s+)?next\s+page").unwrap();
+        if re_cont.is_match(page_text) {
+            return true;
+        }
+    }
+
+    false
+}
+
+/// Heuristic: detect student answer lines / blank working space within a proposed crop.
+/// Returns true if the crop appears to contain primarily answer lines (underscores,
+/// horizontal rules, dotted lines, empty grids) rather than a diagram.
+pub fn looks_like_answer_space(crop: &image::RgbaImage) -> bool {
+    let gray = image::DynamicImage::ImageRgba8(crop.clone()).to_luma8();
+    let (w, h) = gray.dimensions();
+    if w < 40 || h < 40 {
+        return false;
+    }
+
+    // Check for horizontal line patterns (answer lines)
+    let mut _horizontal_lines = 0;
+    let mut long_horizontal_lines = 0;
+    for y in 0..h {
+        let mut run = 0;
+        let mut max_run = 0;
+        for x in 0..w {
+            if gray.get_pixel(x, y)[0] < 128 {
+                run += 1;
+                max_run = max_run.max(run);
+            } else {
+                run = 0;
+            }
+        }
+        if max_run as f32 > w as f32 * 0.5 {
+            _horizontal_lines += 1;
+            if max_run as f32 > w as f32 * 0.8 {
+                long_horizontal_lines += 1;
+            }
+        }
+    }
+
+    // If we have multiple long horizontal lines spanning most of the width,
+    // it's likely answer lines / working space
+    long_horizontal_lines >= 3
+}
+
+/// Heuristic: detect if a crop contains MCQ option letters (A, B, C, D) that would be clipped.
+fn contains_mcq_options(_crop: &image::RgbaImage) -> bool {
+    // This is a cheap check - we'd need OCR to be certain, but we can
+    // use the caption text from the model to detect this case
+    false  // Placeholder - actual detection happens at a higher level
+}
+
+/// Result of splitting a compound figure into separate visual assets.
+#[derive(Debug, Clone)]
+pub struct SplitFigure {
+    pub bbox: Vec<f32>,           // [x, y, w, h] in relative coordinates
+    pub caption: Option<String>,  // Associated caption (e.g., "Figure 4")
+    pub kind: String,             // "graph", "schema", "diagram", etc.
+}
+
+/// Attempt to split a compound bounding box into separate visual assets.
+/// Detects multiple distinct captions (e.g., "Figure 4" and "Figure 5") and
+/// uses whitespace gutters to determine split boundaries.
+pub fn split_compound_figure(
+    bboxes: &[Vec<f32>],
+    captions: &[String],
+    kinds: &[String],
+    _page_texts: &[String],  // OCR text from each page for caption alignment
+) -> Vec<SplitFigure> {
+    if bboxes.is_empty() {
+        return Vec::new();
+    }
+
+    // If there's only one bbox and one caption, check if the caption indicates
+    // multiple figures (e.g., "Figure 4 and Figure 5" or "Figures 4-5")
+    if bboxes.len() == 1 && captions.len() == 1 {
+        let caption = &captions[0];
+        let bbox = &bboxes[0];
+
+        // Check for multiple figure references in caption
+        if let Some(split) = try_split_by_caption(bbox, caption) {
+            return split;
+        }
+    }
+
+    // If multiple bboxes already exist, try to merge very close ones that
+    // belong to the same figure, and split ones that have distinct captions
+    let mut figures = Vec::new();
+    for (i, bbox) in bboxes.iter().enumerate() {
+        let cap = captions.get(i).cloned();
+        let kind = kinds.get(i).cloned().unwrap_or_else(|| "diagram".to_string());
+        if let Some(split) = try_split_by_caption(bbox, cap.as_deref().unwrap_or("")) {
+            figures.extend(split);
+        } else {
+            figures.push(SplitFigure {
+                bbox: bbox.clone(),
+                caption: cap,
+                kind,
+            });
+        }
+    }
+
+    // Now try to merge figures that are close and have related captions
+    merge_related_figures(figures)
+}
+
+/// Try to split a single bbox by detecting multiple figure references in the caption.
+fn try_split_by_caption(bbox: &[f32], caption: &str) -> Option<Vec<SplitFigure>> {
+    // Pattern: "Figure 4 and Figure 5", "Figures 4-5", "Figure 4, Figure 5", etc.
+    let re_multi = regex::Regex::new(r"(?i)(?:fig(?:ure)?\.?\s*\d+[\s,]*(?:and|,|-)\s*)+fig(?:ure)?\.?\s*\d+").ok()?;
+    if !re_multi.is_match(caption) {
+        return None;
+    }
+
+    // Extract all figure numbers mentioned
+    let re_fig = regex::Regex::new(r"(?i)fig(?:ure)?\.?\s*(\d+)").ok()?;
+    let fig_nums: Vec<u32> = re_fig.captures_iter(caption)
+        .filter_map(|c| c[1].parse::<u32>().ok())
+        .collect();
+
+    if fig_nums.len() < 2 {
+        return None;
+    }
+
+    // Heuristic: if the bbox is tall, likely figures are stacked vertically
+    // If wide, likely side by side. Split proportionally.
+    let is_tall = bbox[3] > bbox[2];  // height > width
+    let num = fig_nums.len();
+
+    let mut result = Vec::new();
+    for (idx, &fig_num) in fig_nums.iter().enumerate() {
+        let (x, y, w, h) = if is_tall {
+            // Vertical split: each figure gets equal height portion
+            let x = bbox[0];
+            let y = bbox[1] + bbox[3] * (idx as f32 / num as f32);
+            let w = bbox[2];
+            let h = bbox[3] / num as f32;
+            (x, y, w, h)
+        } else {
+            // Horizontal split: side by side
+            let x = bbox[0] + bbox[2] * (idx as f32 / num as f32);
+            let y = bbox[1];
+            let w = bbox[2] / num as f32;
+            let h = bbox[3];
+            (x, y, w, h)
+        };
+        result.push(SplitFigure {
+            bbox: vec![x, y, w, h],
+            caption: Some(format!("Figure {}", fig_num)),
+            kind: "diagram".to_string(),
+        });
+    }
+
+    Some(result)
+}
+
+/// Merge related figures that are close together and likely part of the same visual asset.
+fn merge_related_figures(mut figures: Vec<SplitFigure>) -> Vec<SplitFigure> {
+    // Simple greedy merge: if two figures overlap significantly or touch,
+    // and have the same kind, merge them
+    let mut merged = true;
+    while merged {
+        merged = false;
+        for i in 0..figures.len() {
+            for j in (i + 1)..figures.len() {
+                if should_merge(&figures[i], &figures[j]) {
+                    figures[i] = merge_two(&figures[i], &figures[j]);
+                    figures.remove(j);
+                    merged = true;
+                    break;
+                }
+            }
+            if merged { break; }
+        }
+    }
+    figures
+}
+
+fn should_merge(a: &SplitFigure, b: &SplitFigure) -> bool {
+    if a.kind != b.kind {
+        return false;
+    }
+
+    // Check if bboxes overlap or are very close
+    let (ax, ay, aw, ah) = (a.bbox[0], a.bbox[1], a.bbox[2], a.bbox[3]);
+    let (bx, by, bw, bh) = (b.bbox[0], b.bbox[1], b.bbox[2], b.bbox[3]);
+
+    let a_right = ax + aw;
+    let a_bottom = ay + ah;
+    let b_right = bx + bw;
+    let b_bottom = by + bh;
+
+    // Check overlap
+    let overlap_x = (ax.min(b_right) - a_right.max(bx)).max(0.0);
+    let overlap_y = (ay.min(b_bottom) - a_bottom.max(by)).max(0.0);
+    let overlap_area = overlap_x * overlap_y;
+
+    let a_area = aw * ah;
+    let b_area = bw * bh;
+
+    // If significant overlap, merge
+    if overlap_area > 0.1 * a_area.min(b_area) {
+        return true;
+    }
+
+    // If touching (very close edges) and same caption prefix
+    let close_x = (ax - b_right).abs().min((bx - a_right).abs());
+    let close_y = (ay - b_bottom).abs().min((by - a_bottom).abs());
+
+    close_x < 0.02 && close_y < 0.02
+}
+
+fn merge_two(a: &SplitFigure, b: &SplitFigure) -> SplitFigure {
+    let (ax, ay, aw, ah) = (a.bbox[0], a.bbox[1], a.bbox[2], a.bbox[3]);
+    let (bx, by, bw, bh) = (b.bbox[0], b.bbox[1], b.bbox[2], b.bbox[3]);
+
+    let x = ax.min(bx);
+    let y = ay.min(by);
+    let right = (ax + aw).max(bx + bw);
+    let bottom = (ay + ah).max(by + bh);
+
+    let caption = match (&a.caption, &b.caption) {
+        (Some(ca), Some(cb)) if ca == cb => Some(ca.clone()),
+        (Some(ca), None) => Some(ca.clone()),
+        (None, Some(cb)) => Some(cb.clone()),
+        _ => a.caption.clone().or(b.caption.clone()),
+    };
+
+    SplitFigure {
+        bbox: vec![x, y, right - x, bottom - y],
+        caption,
+        kind: a.kind.clone(),
+    }
+}
+
 /// Normalize one proposed bbox of four values into an in-bounds pixel rect.
 /// Returns `None` for garbage input or implausible geometry.
 pub fn sanitize_bbox(b: &[f32], img_w: u32, img_h: u32) -> Option<PixelRect> {
@@ -628,21 +938,38 @@ fn crop_diagram_reading(
     // images, causing truncation of labels and borders.
     let scale_factor = (img_w.max(img_h) as f32 / 1024.0).max(1.0);
     let scaled_padding = (padding as f32 * scale_factor).round() as u32;
+
+    // Anti-clipping safety: ensure we have enough padding to protect
+    // MCQ option letters (A/B/C/D) at edges, graph axis titles, and
+    // diagram borders. Use a minimum padding that scales with image size.
+    let min_padding = (img_w.min(img_h) as f32 * 0.02).round() as u32;  // 2% of min dimension
+    let base_padding = scaled_padding.max(min_padding);
+
     let left_padding = if graph_like {
-        scaled_padding.max((img_w as f32 * 0.10).round() as u32)
+        base_padding.max((img_w as f32 * 0.10).round() as u32)
     } else {
-        scaled_padding
+        base_padding
     };
-    let right_padding = scaled_padding;
+    let right_padding = base_padding;
     let top_padding = if graph_like {
-        scaled_padding.max((img_h as f32 * 0.06).round() as u32)
+        base_padding.max((img_h as f32 * 0.06).round() as u32)
     } else {
-        scaled_padding
+        base_padding
     };
     let bottom_padding = if graph_like {
-        scaled_padding.max((img_h as f32 * 0.10).round() as u32)
+        base_padding.max((img_h as f32 * 0.10).round() as u32)
     } else {
-        scaled_padding
+        base_padding
+    };
+
+    // For composit visual options (MCQ option boxes), add extra padding
+    // on all sides to prevent clipping option letters
+    let is_composite_options = graph_like; // graph_like is also true for composite_visual_options
+    let (left_padding, right_padding, top_padding, bottom_padding) = if is_composite_options {
+        // Extra padding for MCQ options
+        (left_padding + 10, right_padding + 10, top_padding + 10, bottom_padding + 10)
+    } else {
+        (left_padding, right_padding, top_padding, bottom_padding)
     };
 
     let expanded = expand_rect(

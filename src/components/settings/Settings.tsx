@@ -186,7 +186,7 @@ export function Settings() {
 
   return (
     <section
-      className="flex flex-1 flex-col items-center justify-start h-full min-h-0 px-8 py-12 bg-background overflow-y-auto"
+      className="flex flex-1 flex-col items-center justify-start h-full min-h-0 px-4 sm:px-8 py-6 sm:py-12 bg-background overflow-y-auto"
       aria-label="Settings"
     >
       <div className="w-full max-w-md flex flex-col items-center mt-4 mb-8 text-center space-y-1 select-none">

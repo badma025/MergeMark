@@ -293,12 +293,12 @@ export function QuestionCard(props: QuestionCardProps) {
       )}
 
       {/* ── Question / Answer Content (Crossfade) ── */}
-      <div className="relative text-sm leading-relaxed text-foreground prose prose-sm dark:prose-invert max-w-none prose-p:my-1 prose-pre:my-1 break-words">
+      <div className="relative text-sm leading-relaxed text-foreground prose prose-sm dark:prose-invert max-w-none prose-p:my-1 prose-pre:my-1 break-words [overflow-wrap:anywhere] min-w-0">
         
         {/* Question Content */}
         <div 
           className={cn(
-            "transition-opacity duration-200 ease-in-out overflow-x-auto",
+            "transition-opacity duration-200 ease-in-out overflow-x-auto min-w-0 max-w-full",
             isShowingAnswer ? "opacity-0 absolute inset-0 pointer-events-none" : "opacity-100 relative"
           )}
         >
@@ -325,7 +325,7 @@ export function QuestionCard(props: QuestionCardProps) {
         {/* Answer Content */}
         <div 
           className={cn(
-            "transition-opacity duration-200 ease-in-out overflow-x-auto",
+            "transition-opacity duration-200 ease-in-out overflow-x-auto min-w-0 max-w-full",
             isShowingAnswer ? "opacity-100 relative" : "opacity-0 absolute inset-0 pointer-events-none"
           )}
         >

@@ -62,7 +62,7 @@ export function FlashcardsTab({ selectedQuestions }: FlashcardsTabProps) {
   }
 
   return (
-    <div className="flex-1 overflow-y-auto px-8 py-10 bg-background">
+    <div className="flex-1 overflow-y-auto px-4 sm:px-8 py-6 sm:py-10 bg-background">
       <div className="max-w-2xl mx-auto flex flex-col gap-8">
         <div>
           <h2 className="text-2xl font-bold tracking-tight mb-2">Flashcard Integrations</h2>

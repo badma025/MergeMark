@@ -360,7 +360,7 @@ export function IngestionDropzone({ isActive = false, onSuccess }: IngestionDrop
 
   return (
     <section
-      className="flex flex-1 flex-col items-center justify-center h-full min-h-0 px-8 py-12 bg-background"
+      className="flex flex-1 flex-col items-center justify-start sm:justify-center h-full min-h-0 px-4 sm:px-8 py-6 sm:py-12 bg-background overflow-y-auto"
       aria-label="PDF Ingestion"
     >
       {/* Page heading */}
@@ -375,8 +375,8 @@ export function IngestionDropzone({ isActive = false, onSuccess }: IngestionDrop
       </div>
 
       {/* ── Controls (Mode & Subject) ── */}
-      <div className="flex flex-col items-center gap-4 mb-6">
-        <div className="flex items-center justify-center bg-muted/30 p-1 rounded-lg border border-border/50">
+      <div className="flex flex-col items-center gap-4 mb-6 w-full max-w-md">
+        <div className="flex flex-wrap items-center justify-center bg-muted/30 p-1 rounded-lg border border-border/50">
           <button
             onClick={() => setImportMode("questions")}
             className={cn(
@@ -401,8 +401,8 @@ export function IngestionDropzone({ isActive = false, onSuccess }: IngestionDrop
           </button>
         </div>
 
-        <div className="flex flex-col gap-3">
-          <div className="flex items-center gap-3">
+        <div className="flex flex-col gap-3 w-full">
+          <div className="flex flex-wrap sm:flex-nowrap items-center gap-2 sm:gap-3">
             <label htmlFor="subject-select" className="text-sm font-medium text-foreground min-w-[100px]">
               Paper Subject:
             </label>
@@ -411,7 +411,7 @@ export function IngestionDropzone({ isActive = false, onSuccess }: IngestionDrop
               value={subject}
               onChange={(e) => setSubject(e.target.value)}
               disabled={isProcessing}
-              className="h-9 w-[300px] rounded-md border border-input bg-background px-3 py-1 text-sm shadow-sm transition-colors focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring disabled:cursor-not-allowed disabled:opacity-50"
+              className="h-9 w-full sm:w-[300px] rounded-md border border-input bg-background px-3 py-1 text-sm shadow-sm transition-colors focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring disabled:cursor-not-allowed disabled:opacity-50"
             >
               {subjects.map((s) => (
                 <option key={s.id} value={s.id}>{s.name}</option>
@@ -420,7 +420,7 @@ export function IngestionDropzone({ isActive = false, onSuccess }: IngestionDrop
           </div>
 
           {importMode === "questions" && availableModules.length > 0 && (
-            <div className="flex items-center gap-3">
+            <div className="flex flex-wrap sm:flex-nowrap items-center gap-2 sm:gap-3">
               <label htmlFor="module-override" className="text-sm font-medium text-foreground min-w-[100px]">
                 Paper Module:
               </label>
@@ -429,7 +429,7 @@ export function IngestionDropzone({ isActive = false, onSuccess }: IngestionDrop
                 value={moduleOverride}
                 onChange={(e) => setModuleOverride(e.target.value)}
                 disabled={isProcessing}
-                className="h-9 w-[300px] rounded-md border border-input bg-background px-3 py-1 text-sm shadow-sm transition-colors focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring disabled:cursor-not-allowed disabled:opacity-50"
+                className="h-9 w-full sm:w-[300px] rounded-md border border-input bg-background px-3 py-1 text-sm shadow-sm transition-colors focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring disabled:cursor-not-allowed disabled:opacity-50"
               >
                 {availableModules.map((m: any) => (
                   <option key={m.id} value={m.id}>{m.name}</option>

@@ -1,6 +1,6 @@
 import { useState } from "react";
 import { Toaster } from "sonner";
-import { LayoutGrid, UploadCloud, Settings as SettingsIcon, BookOpen } from "lucide-react";
+import { LayoutGrid, UploadCloud, Settings as SettingsIcon, BookOpen, FileText } from "lucide-react";
 import { RepositoryFeed } from "@/components/repository/RepositoryFeed";
 import { WorksheetBuilder } from "@/components/worksheet/WorksheetBuilder";
 import { IngestionDropzone } from "@/components/ingestion/IngestionDropzone";
@@ -9,6 +9,7 @@ import { type QuestionCardProps } from "@/components/repository/QuestionCard";
 import { type WorksheetItemData } from "@/components/worksheet/WorksheetItem";
 import { UploadCounter, useUploadCounter } from "@/components/UploadCounter";
 import { TaxonomyProvider } from "@/lib/TaxonomyContext";
+import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
 import { FlashcardsTab } from "@/components/flashcards/FlashcardsTab";
 
@@ -26,13 +27,9 @@ const TABS: { id: Tab; label: string; icon: React.ElementType }[] = [
 function App() {
   const [activeTab, setActiveTab] = useState<Tab>("repository");
   const [selectedQuestions, setSelectedQuestions] = useState<WorksheetItemData[]>([]);
+  const [isWorksheetDrawerOpen, setIsWorksheetDrawerOpen] = useState(false);
 
   // ── Free-tier upload counter ──────────────────────────────────────────
-  // `status` is the live SQLite snapshot of `usage_config.free_uploads_used`.
-  // The hook also subscribes to a window-level "usage changed" event, so any
-  // component that successfully invokes `generate_worksheet_from_pdf` can
-  // call `notifyUsageChanged()` and the badge will tick down without
-  // forcing the teacher to restart the app.
   const { status: usageStatus, loading: usageLoading } = useUploadCounter();
 
   function handleAddQuestion(question: SelectedQuestion) {
@@ -60,78 +57,133 @@ function App() {
 
   return (
     <TaxonomyProvider>
-      <div className="flex h-screen w-full overflow-hidden bg-background text-foreground">
-        {/* ── Left: tabbed main area ── */}
-      <div className="flex flex-col flex-1 min-w-0 overflow-hidden">
+      <div className="grid h-full w-full flex-1 grid-cols-1 lg:grid-cols-[1fr_350px] grid-rows-[1fr] overflow-hidden bg-background text-foreground">
+        {/* ── Left / Main Content Column ── */}
+        <div className="flex flex-col min-w-0 min-h-0 h-full overflow-hidden">
+          {/* Top navigation header */}
+          <nav
+            className="flex items-center justify-between flex-wrap gap-2.5 border-b border-border px-4 py-2.5 bg-background/80 backdrop-blur-sm shrink-0"
+            aria-label="Main navigation"
+          >
+            {/* Left: Brand Logo & Navigation Tabs */}
+            <div className="flex items-center gap-3 sm:gap-6 flex-wrap min-w-0">
+              <div className="flex items-center py-0.5 shrink-0">
+                {/* Full logo for medium and larger viewports */}
+                <img
+                  src="/mergemark-full.svg"
+                  alt="MergeMark Logo"
+                  className="h-8 w-auto hidden md:block"
+                />
+                {/* Compact icon mark when viewport is thinner */}
+                <img
+                  src="/mergemark.svg"
+                  alt="MergeMark Logo"
+                  className="h-8 w-8 object-contain rounded-md block md:hidden"
+                />
+              </div>
 
-        {/* Tab bar */}
-        <nav
-          className="flex items-end gap-1 border-b border-border px-4 pt-4 bg-background/80 backdrop-blur-sm"
-          aria-label="Main navigation"
-        >
-          <div className="flex items-center mr-8 pb-2 pt-1">
-            <img src="/mergemark-full.svg" alt="MergeMark Logo" className="h-9 w-auto" />
-          </div>
+              <div className="flex items-center gap-1 flex-wrap" role="tablist">
+                {TABS.map(({ id, label, icon: Icon }) => (
+                  <button
+                    key={id}
+                    id={`tab-${id}`}
+                    type="button"
+                    role="tab"
+                    aria-selected={activeTab === id}
+                    onClick={() => setActiveTab(id)}
+                    className={cn(
+                      "flex items-center gap-1.5 px-3 py-1.5 text-xs sm:text-sm font-medium rounded-lg",
+                      "transition-colors duration-150 shrink-0",
+                      activeTab === id
+                        ? "bg-primary/10 text-primary font-semibold"
+                        : "text-muted-foreground hover:text-foreground hover:bg-muted/50"
+                    )}
+                  >
+                    <Icon className="size-4 shrink-0" aria-hidden />
+                    <span>{label}</span>
+                  </button>
+                ))}
+              </div>
+            </div>
 
-          {TABS.map(({ id, label, icon: Icon }) => (
-            <button
-              key={id}
-              id={`tab-${id}`}
-              type="button"
-              role="tab"
-              aria-selected={activeTab === id}
-              onClick={() => setActiveTab(id)}
-              className={cn(
-                "flex items-center gap-2 px-4 py-2 text-sm font-medium rounded-t-lg",
-                "transition-colors duration-150 border-b-2 -mb-[1px] translate-y-[1px]",
-                activeTab === id
-                  ? "border-primary text-primary bg-primary/5"
-                  : "border-transparent text-muted-foreground hover:text-foreground hover:bg-muted/40"
-              )}
-            >
-              <Icon className="size-4" aria-hidden />
-              {label}
-            </button>
-          ))}
+            {/* Right: Counter & Mobile Worksheet Toggle */}
+            <div className="flex items-center gap-2 shrink-0 ml-auto">
+              <UploadCounter status={usageStatus} loading={usageLoading} />
 
-          {/* Free-tier counter — pushed to the right edge of the tab bar. */}
-          <div className="ml-auto pr-1 pb-1 pt-1.5">
-            <UploadCounter status={usageStatus} loading={usageLoading} />
-          </div>
-        </nav>
+              {/* Mobile/Tablet Drawer Toggle Button (only on screens < 1024px) */}
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={() => setIsWorksheetDrawerOpen(true)}
+                className="flex lg:hidden items-center gap-1.5 text-xs font-semibold h-8 relative shrink-0"
+                aria-label="Open worksheet builder drawer"
+              >
+                <FileText className="size-3.5 text-primary shrink-0" />
+                <span>Worksheet</span>
+                {selectedQuestions.length > 0 && (
+                  <span className="ml-0.5 inline-flex items-center justify-center bg-primary text-primary-foreground text-[10px] font-bold rounded-full size-4">
+                    {selectedQuestions.length}
+                  </span>
+                )}
+              </Button>
+            </div>
+          </nav>
 
-        {/* Tab panels */}
-        <div className="flex flex-col flex-1 min-h-0 overflow-hidden relative">
-          <div className={cn("absolute inset-0 flex flex-col min-h-0 overflow-hidden bg-background", activeTab === "repository" ? "z-10 opacity-100 pointer-events-auto" : "z-0 opacity-0 pointer-events-none")}>
-            <RepositoryFeed isActive={activeTab === "repository"} onAddToWorksheet={handleAddQuestion} />
-          </div>
-          <div className={cn("absolute inset-0 flex flex-col min-h-0 overflow-hidden bg-background", activeTab === "ingestion" ? "z-10 opacity-100 pointer-events-auto" : "z-0 opacity-0 pointer-events-none")}>
-            <IngestionDropzone
-              isActive={activeTab === "ingestion"}
-              onSuccess={() => {
-                setActiveTab("repository");
-                setTimeout(() => window.dispatchEvent(new CustomEvent("refresh-questions")), 50);
-              }}
-            />
-          </div>
-          <div className={cn("absolute inset-0 flex flex-col min-h-0 overflow-hidden bg-background", activeTab === "flashcards" ? "z-10 opacity-100 pointer-events-auto" : "z-0 opacity-0 pointer-events-none")}>
-            <FlashcardsTab selectedQuestions={selectedQuestions} />
-          </div>
-          <div className={cn("absolute inset-0 flex flex-col min-h-0 overflow-hidden bg-background", activeTab === "settings" ? "z-10 opacity-100 pointer-events-auto" : "z-0 opacity-0 pointer-events-none")}>
-            <Settings />
-          </div>
+          {/* Tab panels container */}
+          <main className="flex-1 min-h-0 min-w-0 overflow-hidden relative">
+            <div className={cn("absolute inset-0 flex flex-col min-h-0 min-w-0 overflow-hidden bg-background", activeTab === "repository" ? "z-10 opacity-100 pointer-events-auto" : "z-0 opacity-0 pointer-events-none")}>
+              <RepositoryFeed isActive={activeTab === "repository"} onAddToWorksheet={handleAddQuestion} />
+            </div>
+            <div className={cn("absolute inset-0 flex flex-col min-h-0 min-w-0 overflow-hidden bg-background", activeTab === "ingestion" ? "z-10 opacity-100 pointer-events-auto" : "z-0 opacity-0 pointer-events-none")}>
+              <IngestionDropzone
+                isActive={activeTab === "ingestion"}
+                onSuccess={() => {
+                  setActiveTab("repository");
+                  setTimeout(() => window.dispatchEvent(new CustomEvent("refresh-questions")), 50);
+                }}
+              />
+            </div>
+            <div className={cn("absolute inset-0 flex flex-col min-h-0 min-w-0 overflow-hidden bg-background", activeTab === "flashcards" ? "z-10 opacity-100 pointer-events-auto" : "z-0 opacity-0 pointer-events-none")}>
+              <FlashcardsTab selectedQuestions={selectedQuestions} />
+            </div>
+            <div className={cn("absolute inset-0 flex flex-col min-h-0 min-w-0 overflow-hidden bg-background", activeTab === "settings" ? "z-10 opacity-100 pointer-events-auto" : "z-0 opacity-0 pointer-events-none")}>
+              <Settings />
+            </div>
+          </main>
         </div>
-      </div>
 
-      {/* ── Right: worksheet builder (always visible) ── */}
-      <WorksheetBuilder
-        selectedQuestions={selectedQuestions}
-        onRemove={handleRemoveQuestion}
-        onReorder={handleReorderQuestions}
-      />
+        {/* ── Right Column: Worksheet Builder on Desktop (>= 1024px) ── */}
+        <div className="hidden lg:flex flex-col h-full w-full min-h-0 overflow-hidden">
+          <WorksheetBuilder
+            selectedQuestions={selectedQuestions}
+            onRemove={handleRemoveQuestion}
+            onReorder={handleReorderQuestions}
+          />
+        </div>
 
-      {/* Global toast notifications */}
-      <Toaster theme="dark" richColors position="bottom-right" />
+        {/* ── Mobile/Tablet Slide-Over Drawer (< 1024px) ── */}
+        {isWorksheetDrawerOpen && (
+          <div className="fixed inset-0 z-50 flex justify-end lg:hidden" role="dialog" aria-modal="true" aria-label="Worksheet builder drawer">
+            {/* Backdrop */}
+            <div
+              className="fixed inset-0 bg-black/60 backdrop-blur-xs transition-opacity animate-in fade-in"
+              onClick={() => setIsWorksheetDrawerOpen(false)}
+              aria-hidden="true"
+            />
+            {/* Drawer Panel */}
+            <div className="relative z-10 w-[350px] max-w-[85vw] h-full bg-background shadow-2xl animate-in slide-in-from-right duration-200">
+              <WorksheetBuilder
+                selectedQuestions={selectedQuestions}
+                onRemove={handleRemoveQuestion}
+                onReorder={handleReorderQuestions}
+                onClose={() => setIsWorksheetDrawerOpen(false)}
+              />
+            </div>
+          </div>
+        )}
+
+        {/* Global toast notifications */}
+        <Toaster theme="dark" richColors position="bottom-right" />
       </div>
     </TaxonomyProvider>
   );

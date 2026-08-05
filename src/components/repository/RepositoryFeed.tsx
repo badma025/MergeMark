@@ -162,13 +162,14 @@ export function RepositoryFeed({ isActive = true, onAddToWorksheet }: Repository
 
   return (
     <section
-      className="flex flex-col flex-1 min-w-0 overflow-hidden"
+      className="flex flex-col flex-1 h-full min-h-0 min-w-0 overflow-hidden"
       aria-label="Question Repository"
     >
-      {/* ── Sticky search bar & Controls ── */}
-      <div className="sticky top-0 z-10 border-b border-border bg-background/80 backdrop-blur-sm px-6 py-3">
-        <div className="flex items-center justify-between gap-4">
-          <div className="relative max-w-xl flex-1">
+      {/* ── Search bar & Controls ── */}
+      <div className="shrink-0 border-b border-border bg-background/80 backdrop-blur-sm px-4 sm:px-6 py-3">
+        <div className="flex flex-wrap items-center justify-between gap-3 sm:gap-4">
+          {/* Search bar: drops to full width on < 768px screens */}
+          <div className="relative w-full order-3 md:order-none md:flex-1 md:w-auto min-w-[200px] max-w-xl">
             <Search className="pointer-events-none absolute left-3 top-1/2 -translate-y-1/2 size-4 text-muted-foreground" />
             <Input
               id="repository-search"
@@ -176,16 +177,17 @@ export function RepositoryFeed({ isActive = true, onAddToWorksheet }: Repository
               placeholder="Search extracted questions..."
               value={search}
               onChange={(e) => setSearch(e.target.value)}
-              className="pl-9 bg-muted/40 border-border/60 focus-visible:bg-background"
+              className="pl-9 bg-muted/40 border-border/60 focus-visible:bg-background w-full"
               aria-label="Search questions"
             />
           </div>
           
-          <div className="flex items-center gap-4">
-            <span className="text-sm text-muted-foreground whitespace-nowrap hidden md:inline-block">
+          {/* Action buttons & filters */}
+          <div className="flex flex-wrap items-center gap-2 sm:gap-3 order-1 md:order-none ml-auto md:ml-0">
+            <span className="text-sm text-muted-foreground whitespace-nowrap hidden xl:inline-block">
               Total Questions: <span className="font-semibold text-foreground">{filtered.length}</span>
             </span>
-            <div className="w-[140px]">
+            <div className="w-[130px] sm:w-[140px]">
               <Select
                 value={reviewFilter}
                 onValueChange={(v) => {
@@ -205,24 +207,26 @@ export function RepositoryFeed({ isActive = true, onAddToWorksheet }: Repository
             <Button
               onClick={() => setShowAddModal(true)}
               size="sm"
-              className="gap-2"
+              className="gap-1.5 text-xs sm:text-sm h-8"
             >
               <Plus className="size-4" />
-              Add Question
+              <span className="hidden sm:inline">Add Question</span>
+              <span className="sm:hidden">Add</span>
             </Button>
             <Button
               onClick={() => setShowManagePapers(true)}
               size="sm"
               variant="outline"
-              className="gap-2"
+              className="gap-1.5 text-xs sm:text-sm h-8"
             >
-              Manage PDFs
+              <span className="hidden sm:inline">Manage PDFs</span>
+              <span className="sm:hidden">PDFs</span>
             </Button>
           </div>
         </div>
         
         {/* Subject Filter */}
-        <div className="mt-3 flex flex-wrap gap-1.5 border-b border-border/50 pb-3">
+        <div className="mt-3 flex flex-wrap items-center gap-2 border-b border-border/50 pb-3">
           {["All", ...subjectNames].map((subject) => {
             const isSelected = selectedSubject === subject;
             return (
@@ -230,7 +234,7 @@ export function RepositoryFeed({ isActive = true, onAddToWorksheet }: Repository
                 key={subject}
                 variant={isSelected ? "default" : "secondary"}
                 className={cn(
-                  "cursor-pointer transition-colors text-xs font-semibold py-1 px-3 rounded-md",
+                  "cursor-pointer transition-colors text-xs font-semibold py-1 px-3 rounded-md break-normal",
                   isSelected ? "bg-primary text-primary-foreground hover:bg-primary/90" : "hover:bg-accent hover:text-accent-foreground border border-border/50"
                 )}
                 onClick={() => {
@@ -249,7 +253,7 @@ export function RepositoryFeed({ isActive = true, onAddToWorksheet }: Repository
 
         {/* Module Filter */}
         {selectedSubject !== "All" && (
-          <div className="mt-3 flex flex-wrap gap-1.5 border-b border-border/50 pb-3">
+          <div className="mt-3 flex flex-wrap items-center gap-2 border-b border-border/50 pb-3">
             {["All", ...Object.keys(topicsBySubject[selectedSubject] || {})].map((mod) => {
               const isSelected = selectedModule === mod;
               return (
@@ -257,7 +261,7 @@ export function RepositoryFeed({ isActive = true, onAddToWorksheet }: Repository
                   key={mod}
                   variant={isSelected ? "default" : "secondary"}
                   className={cn(
-                    "cursor-pointer transition-colors text-xs font-semibold py-1 px-3 rounded-md",
+                    "cursor-pointer transition-colors text-xs font-semibold py-1 px-3 rounded-md break-normal",
                     isSelected ? "bg-purple-600 text-white hover:bg-purple-700" : "hover:bg-accent hover:text-accent-foreground border border-border/50"
                   )}
                   onClick={() => {
@@ -275,7 +279,7 @@ export function RepositoryFeed({ isActive = true, onAddToWorksheet }: Repository
         )}
 
         {/* Topics Filter */}
-        <div className="mt-3 flex flex-wrap gap-1.5 max-h-[4.5rem] overflow-y-auto">
+        <div className="mt-3 flex flex-wrap items-center gap-2 max-h-36 overflow-y-auto pr-1">
           {(() => {
             if (selectedSubject === "All") return ALL_TOPICS;
             const subjectMods = topicsBySubject[selectedSubject] || {};
@@ -290,7 +294,7 @@ export function RepositoryFeed({ isActive = true, onAddToWorksheet }: Repository
                 key={topic}
                 variant={isSelected ? "default" : "outline"}
                 className={cn(
-                  "cursor-pointer transition-colors text-xs font-medium py-0.5",
+                  "cursor-pointer transition-colors text-xs font-medium py-0.5 break-normal",
                   isSelected ? "bg-blue-600 hover:bg-blue-700 text-white border-blue-600" : "hover:bg-accent border-border"
                 )}
                 onClick={() => {
@@ -309,7 +313,7 @@ export function RepositoryFeed({ isActive = true, onAddToWorksheet }: Repository
       </div>
 
       {/* ── Scrollable question grid ── */}
-      <div className="flex-1 overflow-y-auto px-6 py-5">
+      <div className="flex-1 min-h-0 overflow-y-auto px-4 sm:px-6 py-4 sm:py-5">
         {loading ? (
           <div className="flex flex-col items-center justify-center h-48 text-muted-foreground">
             <p className="text-sm">Loading questions...</p>
@@ -317,7 +321,7 @@ export function RepositoryFeed({ isActive = true, onAddToWorksheet }: Repository
         ) : filtered.length === 0 ? (
           <div className="flex flex-col items-center justify-center h-48 text-muted-foreground gap-3">
             <Search className="size-8 opacity-30" />
-            <p className="text-sm">
+            <p className="text-sm text-center">
               {questions.length > 0
                 ? `No questions match your current filters (${questions.length} total questions available).`
                 : "No questions in repository yet. Import a PDF to get started."}
@@ -340,7 +344,7 @@ export function RepositoryFeed({ isActive = true, onAddToWorksheet }: Repository
           </div>
         ) : (
           <ul
-            className="grid gap-4 grid-cols-1 sm:grid-cols-2 xl:grid-cols-3"
+            className="grid gap-4 grid-cols-[repeat(auto-fill,minmax(320px,1fr))]"
             aria-label="Question cards"
           >
             {filtered.map((q) => (
