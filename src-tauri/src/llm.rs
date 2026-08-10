@@ -6,6 +6,8 @@
 // call site (previously the question path, mark-scheme path, classifier, and
 // tagger each had their own inconsistent handling).
 
+use tracing::{error, info, warn};
+
 #[derive(Debug, Clone)]
 pub enum LlmError {
     /// request never got a usable HTTP response
@@ -48,6 +50,129 @@ pub struct LlmConfig {
 pub enum ResponseFormat {
     JsonObject,
     JsonSchema { schema: serde_json::Value },
+}
+
+/// Circuit Breaker for LLM API calls.
+///
+/// Tracks the last 10 calls using a ring buffer. If the failure rate (non-5xx errors + rate limits)
+/// exceeds 50% over the last 10 calls, trips the breaker open for 60 seconds.
+/// While open, subsequent calls fail immediately with `LlmError::RateLimited` without
+/// making network requests, preventing cascading failures and semaphore exhaustion.
+#[derive(Debug)]
+pub struct CircuitBreaker {
+    /// Ring buffer of last 10 results (true = success, false = failure)
+    history: std::sync::atomic::AtomicU32, // bit 0 = most recent, bit 9 = oldest
+    /// Number of calls recorded so far (up to 10)
+    count: std::sync::atomic::AtomicU32,
+    /// When the breaker was tripped open (None = closed)
+    opened_at: std::sync::Mutex<Option<std::time::Instant>>,
+    /// Duration to keep breaker open
+    open_duration: std::time::Duration,
+    /// Maximum failures allowed in the window (5 out of 10 = 50%)
+    max_failures: u32,
+    /// Window size (number of calls to track)
+    window_size: u32,
+}
+
+impl Default for CircuitBreaker {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl CircuitBreaker {
+    pub fn new() -> Self {
+        Self {
+            history: std::sync::atomic::AtomicU32::new(0),
+            count: std::sync::atomic::AtomicU32::new(0),
+            opened_at: std::sync::Mutex::new(None),
+            open_duration: std::time::Duration::from_secs(60),
+            max_failures: 5,  // 50% of 10
+            window_size: 10,
+        }
+    }
+
+    /// Check if the circuit breaker is open (tripped).
+    /// If open for more than open_duration, auto-close and reset.
+    pub fn is_open(&self) -> bool {
+        let mut opened_at = self.opened_at.lock().unwrap();
+        if let Some(opened) = *opened_at {
+            if opened.elapsed() >= self.open_duration {
+                // Auto-close after timeout
+                *opened_at = None;
+                self.history.store(0, std::sync::atomic::Ordering::Relaxed);
+                self.count.store(0, std::sync::atomic::Ordering::Relaxed);
+                info!("Circuit breaker auto-closed after 60s timeout");
+                false
+            } else {
+                true
+            }
+        } else {
+            false
+        }
+    }
+
+    /// Record a successful call.
+    pub fn record_success(&self) {
+        self.record_result(true);
+    }
+
+    /// Record a failed call.
+    /// Returns true if the circuit breaker should trip open.
+    pub fn record_failure(&self) -> bool {
+        self.record_result(false)
+    }
+
+    /// Internal: record a result and check if breaker should trip.
+    fn record_result(&self, success: bool) -> bool {
+        let mut history = self.history.load(std::sync::atomic::Ordering::Relaxed);
+        let mut count = self.count.load(std::sync::atomic::Ordering::Relaxed);
+
+        // Shift history left by 1, add new result at bit 0
+        history = (history << 1) | (success as u32);
+
+        if count < self.window_size {
+            count += 1;
+        }
+
+        self.history.store(history, std::sync::atomic::Ordering::Relaxed);
+        self.count.store(count, std::sync::atomic::Ordering::Relaxed);
+
+        // Check failure rate
+        let failures = count - history.count_ones();
+        let should_trip = failures >= self.max_failures;
+
+        if should_trip {
+            let mut opened_at = self.opened_at.lock().unwrap();
+            if opened_at.is_none() {
+                *opened_at = Some(std::time::Instant::now());
+                warn!(
+                    "Circuit breaker TRIPPED OPEN: {}/{} failures in last {} calls",
+                    failures, count, self.window_size
+                );
+            }
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Determine if an error should count as a failure for circuit breaker purposes.
+    /// Non-5xx errors (client errors like 400, 401, 403, 404, 422) and rate limits (429)
+    /// are considered failures. 5xx server errors are NOT failures (they're transient).
+    pub fn is_failure_error(&self, error: &LlmError) -> bool {
+        match error {
+            LlmError::Http { status, .. } => {
+                // 4xx errors are client errors = failures
+                // 429 is rate limit = failure
+                // 5xx are server errors = transient, don't count
+                *status >= 400 && *status < 500
+            }
+            LlmError::RateLimited => true,
+            LlmError::Network(_) => false, // Network errors could be transient
+            LlmError::BadShape(_) => true, // Invalid response = likely provider issue
+        }
+    }
 }
 
 /// One chat completion call. The caller awaits the boxed future — this keeps
@@ -148,7 +273,7 @@ pub fn message_content(resp: &serde_json::Value) -> Result<String, LlmError> {
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
         .ok_or_else(|| {
-            eprintln!(
+            error!(
                 "[DIAGNOSTIC][LLM_SHAPE_ERROR] missing choices[0].message.content; raw response:\n{}",
                 serde_json::to_string_pretty(resp)
                     .unwrap_or_else(|_| format!("<unserializable response: {:?}>", resp))
@@ -180,6 +305,7 @@ fn shared_http_client() -> &'static reqwest::Client {
 pub struct ReqwestLlm {
     client: reqwest::Client,
     config: LlmConfig,
+    circuit_breaker: CircuitBreaker,
 }
 
 impl ReqwestLlm {
@@ -187,6 +313,7 @@ impl ReqwestLlm {
         Self {
             client: shared_http_client().clone(),
             config,
+            circuit_breaker: CircuitBreaker::new(),
         }
     }
 }
@@ -216,6 +343,12 @@ impl LlmClient for ReqwestLlm {
         Box<dyn std::future::Future<Output = Result<serde_json::Value, LlmError>> + Send + 'a>,
     > {
         Box::pin(async move {
+            // Check circuit breaker before making the request
+            if self.circuit_breaker.is_open() {
+                warn!("Circuit breaker is OPEN — failing fast without network request");
+                return Err(LlmError::RateLimited);
+            }
+
             let url = format!(
                 "{}/chat/completions",
                 self.config.base_url.trim_end_matches('/')
@@ -238,10 +371,12 @@ impl LlmClient for ReqwestLlm {
                         let body_text = match r.text().await {
                             Ok(body) => body,
                             Err(error) => {
-                                eprintln!(
+                                error!(
                                     "[LLM][BODY_READ_ERROR] status={} error={}",
                                     status, error
                                 );
+                                // Record failure for circuit breaker
+                                self.circuit_breaker.record_failure();
                                 return Err(LlmError::BadShape(format!(
                                     "unable to read provider response body: {}",
                                     error
@@ -252,10 +387,12 @@ impl LlmClient for ReqwestLlm {
                         if status == reqwest::StatusCode::TOO_MANY_REQUESTS
                             || status == reqwest::StatusCode::SERVICE_UNAVAILABLE
                         {
-                            eprintln!(
+                            warn!(
                                 "[LLM][RETRYABLE_HTTP] status={} raw_body:\n{}",
                                 status, body_text
                             );
+                            // Record failure for circuit breaker (rate limit = failure)
+                            self.circuit_breaker.record_failure();
                             attempt += 1;
                             if attempt > 3 {
                                 return Err(LlmError::RateLimited);
@@ -267,34 +404,47 @@ impl LlmClient for ReqwestLlm {
                             continue;
                         }
                         if !status.is_success() {
-                            eprintln!(
+                            error!(
                                 "[LLM][HTTP_ERROR] status={} raw_body:\n{}",
                                 status, body_text
                             );
-                            return Err(LlmError::Http {
+                            // Check if this is a failure error for circuit breaker
+                            let error = LlmError::Http {
                                 status: status.as_u16(),
-                                body: body_text,
-                            });
+                                body: body_text.clone(),
+                            };
+                            if self.circuit_breaker.is_failure_error(&error) {
+                                self.circuit_breaker.record_failure();
+                            }
+                            return Err(error);
                         }
                         if trimmed_body.is_empty() {
-                            eprintln!(
+                            warn!(
                                 "[LLM][EMPTY_BODY] WARN: LLM returned empty body. Check API provider for content filter flags or silent drops."
                             );
-                            return Err(LlmError::BadShape(
+                            let error = LlmError::BadShape(
                                 "provider returned an empty response body".to_string(),
-                            ));
+                            );
+                            if self.circuit_breaker.is_failure_error(&error) {
+                                self.circuit_breaker.record_failure();
+                            }
+                            return Err(error);
                         }
                         let resp: serde_json::Value = match serde_json::from_str(&body_text) {
                             Ok(value) => value,
                             Err(error) => {
-                                eprintln!(
+                                error!(
                                     "[LLM][RESPONSE_JSON_ERROR] error={} raw_body:\n{}",
                                     error, body_text
                                 );
-                                return Err(LlmError::BadShape(format!(
+                                let error = LlmError::BadShape(format!(
                                     "invalid provider response JSON: {}",
                                     error
-                                )));
+                                ));
+                                if self.circuit_breaker.is_failure_error(&error) {
+                                    self.circuit_breaker.record_failure();
+                                }
+                                return Err(error);
                             }
                         };
                         // Empty-content guard: some Kilo-Gateway providers
@@ -304,20 +454,28 @@ impl LlmClient for ReqwestLlm {
                         if message_content(&resp).is_err() {
                             attempt += 1;
                             if attempt > 3 {
-                                return Err(LlmError::BadShape(
+                                let error = LlmError::BadShape(
                                     "provider returned empty content after retries".to_string(),
-                                ));
+                                );
+                                if self.circuit_breaker.is_failure_error(&error) {
+                                    self.circuit_breaker.record_failure();
+                                }
+                                return Err(error);
                             }
                             tokio::time::sleep(std::time::Duration::from_secs(5) + retry_jitter())
                                 .await;
                             continue;
                         }
+                        // Success! Record it for circuit breaker
+                        self.circuit_breaker.record_success();
                         return Ok(resp);
                     }
                     Err(e) => {
                         attempt += 1;
                         if attempt > 2 {
-                            return Err(LlmError::Network(e.to_string()));
+                            let error = LlmError::Network(e.to_string());
+                            // Network errors are not failures for circuit breaker
+                            return Err(error);
                         }
                         tokio::time::sleep(std::time::Duration::from_secs(5) + retry_jitter()).await;
                     }

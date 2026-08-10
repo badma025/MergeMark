@@ -31,6 +31,7 @@ use std::time::Instant;
 use tokio::sync::Semaphore;
 use futures_util::{FutureExt, StreamExt};
 use image::GenericImageView;
+use tracing::{debug, error, warn};
 
 // ══════════════════════════════════════════════════════════════════════════
 // Public types
@@ -1839,7 +1840,7 @@ async fn extract_span<C: LlmClient>(
             let mut parsed = parse_llm_json::<AiQuestionPage>(&content);
 
             if let ParseOutcome::Malformed { ref error } = parsed {
-                eprintln!(
+                error!(
                     "[DIAGNOSTIC][RAW_JSON_ERROR] question={} attempt={} split_mode={} pages={}..{} error={} raw_response:\n{}",
                     span.number,
                     attempt,
@@ -1856,8 +1857,8 @@ async fn extract_span<C: LlmClient>(
             // Retry with fewer images to reduce load.
             if let ParseOutcome::Malformed { ref error } = parsed {
                 if error.contains("EOF") && images.len() >= 3 && attempt == 1 {
-                    eprintln!(
-                        "WARNING: Question {} got EOF error with {} pages, retrying with first 2 pages only",
+                    warn!(
+                        "Question {} got EOF error with {} pages, retrying with first 2 pages only",
                         span.number, images.len()
                     );
                     split_mode = true;
@@ -1986,7 +1987,7 @@ async fn extract_span<C: LlmClient>(
                     value,
                     dropped_tail,
                 } => {
-                    eprintln!(
+                    warn!(
                         "[DIAGNOSTIC][JSON_SALVAGED] question={} attempt={} split_mode={} dropped_tail={} pages={}..{} raw_response:\n{}",
                         span.number,
                         attempt,
@@ -2038,7 +2039,7 @@ async fn extract_span<C: LlmClient>(
                     .filter_map(|item| item.diagram_bboxes.as_ref())
                     .map(Vec::len)
                     .sum();
-                eprintln!(
+                debug!(
                     "[DIAGNOSTIC][RAW_CHUNK] question={} pages={}..{} items={} text_chars={} latex_chars={} bbox_count={} salvaged={}",
                     span.number,
                     chunk.first().map(|(page, _)| page + 1).unwrap_or(0),
@@ -2112,7 +2113,7 @@ async fn extract_span<C: LlmClient>(
                     span.number,
                 )];
                 let unified = &page_items.items[0];
-                eprintln!(
+                debug!(
                     "[DIAGNOSTIC][UNIFIED_OBJECT] question={} structure={:#?}",
                     span.number, unified
                 );
@@ -2123,12 +2124,12 @@ async fn extract_span<C: LlmClient>(
             }
 
             if page_items.items.is_empty() && contents.is_empty() {
-                eprintln!(
+                warn!(
                     "[DIAGNOSTIC][VALIDATION_ERROR] question={} rule=non_empty_items items=0 prior_contents={}",
                     span.number,
                     contents.len()
                 );
-                eprintln!("WARNING: Question {} extraction returned an empty items array.", span.number);
+                warn!("Question {} extraction returned an empty items array.", span.number);
                 if attempt < config.max_repairs {
                     last_error = format!(
                         "Extraction for Question {} returned an empty items array. Please transcribe Question {} and all its sub-parts from the provided page(s).",
@@ -2161,7 +2162,7 @@ async fn extract_span<C: LlmClient>(
 
             // Aggregate violation: more than one item = repair trigger.
             if page_items.items.len() > 1 {
-                eprintln!(
+                warn!(
                     "[DIAGNOSTIC][VALIDATION_ERROR] question={} rule=single_item actual_items={}",
                     span.number,
                     page_items.items.len()
@@ -2200,7 +2201,7 @@ async fn extract_span<C: LlmClient>(
             });
 
             if page_items.items.is_empty() {
-                eprintln!(
+                warn!(
                     "[DIAGNOSTIC][VALIDATION_ERROR] question={} rule=target_question_present dropped_numbers={:?}",
                     span.number,
                     dropped_numbers
@@ -2301,7 +2302,7 @@ async fn extract_span<C: LlmClient>(
             let validation_errors = validate_span_items(&page_items, span);
             if !validation_errors.is_empty() {
                 for error in &validation_errors {
-                    eprintln!(
+                    warn!(
                         "[DIAGNOSTIC][SCHEMA_VALIDATION_ERROR] question={} rule={}",
                         span.number, error
                     );
@@ -2334,7 +2335,7 @@ async fn extract_span<C: LlmClient>(
             }
             if !cons_errors.is_empty() {
                 for error in &cons_errors {
-                    eprintln!(
+                    warn!(
                         "[DIAGNOSTIC][FIGURE_CONSISTENCY_ERROR] question={} rule={}",
                         span.number, error
                     );
@@ -2392,7 +2393,7 @@ async fn extract_span<C: LlmClient>(
             };
             if !box_issues.is_empty() {
                 for error in &box_issues {
-                    eprintln!(
+                    warn!(
                         "[DIAGNOSTIC][DIAGRAM_AUDIT_ERROR] question={} rule={} bad_box_indices={:?}",
                         span.number, error, bad
                     );
@@ -2419,7 +2420,7 @@ async fn extract_span<C: LlmClient>(
                     break;
                 }
                 if unified_split {
-                    eprintln!(
+                    warn!(
                         "[DIAGNOSTIC][DIAGRAM_AUDIT_TERMINAL] question={} unified split retained; pruning invalid boxes without re-requesting the stitched span",
                         span.number
                     );
@@ -2459,7 +2460,7 @@ async fn extract_span<C: LlmClient>(
         let (mut items, salvaged) = match accepted {
             Some(v) => v,
             None => {
-                eprintln!("WARNING: Question {} extraction failed: {}", span.number, last_error);
+                warn!("Question {} extraction failed: {}", span.number, last_error);
                 report
                     .anomalies
                     .push(format!("quarantined: {}", last_error));
@@ -3848,8 +3849,8 @@ mod tests {
             run_question_pipeline(&mock, &pgs, &config(), &NullProgress, &cancel_flag())
                 .await
                 .unwrap();
-        println!("BUILT: {:#?}", built);
-        println!("REPORT: {:#?}", report);
+        debug!("BUILT: {:#?}", built);
+        debug!("REPORT: {:#?}", report);
 
         assert_eq!(built.len(), 2);
         assert_eq!(built[0].question_number, 1);

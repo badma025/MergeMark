@@ -2,10 +2,14 @@ use sqlx::SqlitePool;
 use std::sync::Arc;
 use tauri::Manager;
 use tokio::sync::Mutex;
+use tracing_subscriber::{EnvFilter, fmt, layer::SubscriberExt, util::SubscriberInitExt};
+use std::sync::OnceLock;
 
 /// Shared application state — holds the SQLite connection pool.
 /// Wrapped in Arc<Mutex<>> so it can safely be accessed from concurrent Tauri commands.
 mod db;
+
+static TRACING_GUARD: OnceLock<tracing_appender::non_blocking::WorkerGuard> = OnceLock::new();
 
 mod backup;
 mod billing;
@@ -34,8 +38,38 @@ pub struct AppState {
 // App entry point
 // ---------------------------------------------------------------------------
 
+fn init_tracing() {
+    // Initialize tracing with JSON file output for production
+    let file_appender = tracing_appender::rolling::daily("logs", "mergemark.log");
+    let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
+
+    // Store the guard to keep the file appender alive for the app lifetime
+    let _ = TRACING_GUARD.set(guard);
+
+    // EnvFilter: default to INFO, but allow RUST_LOG to override
+    let env_filter = EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| EnvFilter::new("info"));
+
+    let _ = tracing_subscriber::registry()
+        .with(env_filter)
+        .with(
+            fmt::layer()
+                .json()
+                .with_current_span(true)
+                .with_span_list(true)
+                .with_thread_ids(true)
+                .with_thread_names(true)
+                .with_writer(non_blocking),
+        )
+        .try_init();
+    // Ignore error if already initialized (tests may run multiple times)
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // Initialize tracing early
+    init_tracing();
+
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())

@@ -859,7 +859,7 @@ mod tests {
         let input = "Which diagram shows the correct shape? A) [DIAGRAM_PLACEHOLDER] B) [DIAGRAM_PLACEHOLDER]";
         let output = clean_marker_markdown(input);
         // Now uses VISUAL_MCQ_PLACEHOLDER and bold formatting
-        eprintln!("OUTPUT: {:?}", output);
+        debug!("OUTPUT: {:?}", output);
         assert!(output.contains("- **A)** [VISUAL_MCQ_PLACEHOLDER]"));
         assert!(output.contains("- **B)** [VISUAL_MCQ_PLACEHOLDER]"));
     }

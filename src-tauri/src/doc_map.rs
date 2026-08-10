@@ -19,6 +19,8 @@
 // We build spans from reliable pages, run vision only on ambiguous pages,
 // and merge monotonically.
 
+use tracing::debug;
+
 /// A regex-discovered "Total for Question …" footer.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Footer {
@@ -368,7 +370,7 @@ pub fn scan_text_layer(page_texts: &[String]) -> TextScan {
             // extracted text layer.
             let safe_start = text.ceil_char_boundary(full.start());
             let safe_end = text.ceil_char_boundary(full.end());
-            println!("DEBUG: Page {} heading match: {:?}", page, full.as_str());
+            debug!("Page {} heading match: {:?}", page, full.as_str());
 
             // --- FILTER 1: Spaced sub-part format ("01 5" -> Q1, never 15) ---
             // AQA prints sub-parts as "01 5" (zero-padded main number, space,
@@ -545,7 +547,7 @@ pub fn scan_text_layer(page_texts: &[String]) -> TextScan {
                         // is an angle/temperature, never a question heading.
                         let ends_in_degree = trailing_char == '°';
 
-                        println!("DEBUG [PAGE NUM FILTER]: match='{:?}', num={}, page={}, is_likely={}, looks_like_real={}, y_frac={}, chars_remaining={}, text_len={}, IS_PRINTED_PAGE={}", 
+                        debug!("[PAGE NUM FILTER]: match='{:?}', num={}, page={}, is_likely={}, looks_like_real={}, y_frac={}, chars_remaining={}, text_len={}, IS_PRINTED_PAGE={}",
                             full.as_str(), n, page, is_likely_page_number, looks_like_real_question, y_frac, chars_remaining, text.len(), is_printed_page_number);
 
                         if !is_quantity && !is_printed_page_number && !bare_reject && !is_isotope && !ends_in_degree {
@@ -598,7 +600,7 @@ pub fn scan_text_layer(page_texts: &[String]) -> TextScan {
             page_reliability[page] = PageReliability::NonQuestion;
         }
     }
-    println!("DEBUG: page_reliability = {:?}", page_reliability);
+    debug!("page_reliability = {:?}", page_reliability);
     TextScan {
         footers,
         paper_total,
@@ -698,7 +700,7 @@ fn build_spans_from_reliable_pages(
     let mut spans = Vec::new();
     let mut reliable_pages = std::collections::BTreeSet::new();
     
-    println!("DEBUG inside build_spans_from_reliable_pages: reliable_footers.len()={}", reliable_footers.len());
+    debug!("inside build_spans_from_reliable_pages: reliable_footers.len()={}", reliable_footers.len());
 
     // Phase 1b: we NO LONGER return early when reliable_footers is empty.
     // Pure MCQ / short-answer papers (some boards' Paper 1, Edexcel MCQ
@@ -763,7 +765,7 @@ fn build_spans_from_reliable_pages(
                     reliable_pages: span_reliable,
                     ambiguous_pages: span_ambiguous,
                 });
-                println!("DEBUG pushed Q{} to spans from footer", f.question);
+                debug!("pushed Q{} to spans from footer", f.question);
             }
         }
     }
@@ -905,12 +907,12 @@ fn append_text_only_short_answer_spans(
                 // Heading is inside the span if its y sits within [lo, hi).
                 let is_inside = h.y_frac >= lo - 0.02 && h.y_frac < hi;
                 if is_inside {
-                    println!("DEBUG: Q{} heading on page {} (y={}) is inside span Q{} (lo={}, hi={})", h.number, page, h.y_frac, s.number, lo, hi);
+                    debug!("Q{} heading on page {} (y={}) is inside span Q{} (lo={}, hi={})", h.number, page, h.y_frac, s.number, lo, hi);
                 }
                 is_inside
             });
             if inside_other_span {
-                println!("DEBUG: ignored Q{} heading on page {} because it is inside_other_span", h.number, page);
+                debug!("ignored Q{} heading on page {} because it is inside_other_span", h.number, page);
                 // Likely a cross-reference or a sub-part marker inside a
                 // long question's band — don't carve out a new span.
                 continue;
@@ -954,7 +956,7 @@ fn append_text_only_short_answer_spans(
                     .filter(|p| scan.page_reliability[*p] == PageReliability::Ambiguous)
                     .collect(),
             });
-            println!("DEBUG pushed Q{} to spans from text-heading append", h.number);
+            debug!("pushed Q{} to spans from text-heading append", h.number);
         }
     }
 
@@ -964,7 +966,7 @@ fn append_text_only_short_answer_spans(
         a.number.cmp(&b.number)
     });
     
-    println!("DEBUG spans in build_spans_from_reliable_pages: {:?}", spans.iter().map(|s| s.number).collect::<Vec<_>>());
+    debug!("spans in build_spans_from_reliable_pages: {:?}", spans.iter().map(|s| s.number).collect::<Vec<_>>());
     
 }
 
@@ -1069,15 +1071,15 @@ pub fn build_hybrid_map(
     let mut valid_spans = Vec::new();
     let mut expected_max_q = 0u32;
     
-    println!("\n=== DEBUG: MERGEMARK SPANS BEFORE FILTER ===");
+    debug!("\n=== MERGEMARK SPANS BEFORE FILTER ===");
     for s in &spans {
-        println!("DEBUG: Found Question {} (spanning pages {} to {})", s.number, s.start_page + 1, s.end_page + 1);
+        debug!("Found Question {} (spanning pages {} to {})", s.number, s.start_page + 1, s.end_page + 1);
     }
-    println!("============================================\n");
+    debug!("============================================\n");
     
     for mut span in spans {
         if expected_max_q > 0 && span.number <= expected_max_q {
-            println!("DEBUG: >> DROPPING DUPLICATE/DISJOINTED PART for Question {} (Page {}) because it was already merged into the main span above!", span.number, span.start_page + 1);
+            debug!(">> DROPPING DUPLICATE/DISJOINTED PART for Question {} (Page {}) because it was already merged into the main span above!", span.number, span.start_page + 1);
             anomalies.push(format!("dropped backwards/duplicate question Q{} (expected > {})", span.number, expected_max_q));
             continue;
         }
@@ -2056,13 +2058,13 @@ mod tests {
     /// missing or unreadable (so tests skip gracefully on CI).
     fn golden_map(path: &str) -> Option<(Vec<String>, DocumentMap)> {
         if !std::path::Path::new(path).exists() {
-            eprintln!("{} not found — skipping golden test", path);
+            warn!("{} not found — skipping golden test", path);
             return None;
         }
         let page_inputs = match crate::pdf_render::render_pdf_pages(std::path::Path::new(path)) {
             Ok(p) => p,
             Err(e) => {
-                eprintln!("pdfium load failed for {}: {} — skipping", path, e);
+                warn!("pdfium load failed for {}: {} — skipping", path, e);
                 return None;
             }
         };
@@ -2286,7 +2288,7 @@ mod tests {
                 path
             );
 
-            eprintln!(
+            info!(
                 "Edexcel {}: pages={}, text_bytes={}, images={}, text_only={}, headings={:?}",
                 year,
                 page_inputs.len(),
@@ -2333,9 +2335,9 @@ mod tests {
                 year
             );
             let span_nums: Vec<u32> = map.spans.iter().map(|s| s.number).collect();
-            eprintln!("=== physics '{}: {} spans = {:?}", year, span_nums.len(), span_nums);
+            info!("=== physics '{}': {} spans = {:?}", year, span_nums.len(), span_nums);
             for s in &map.spans {
-                eprintln!(
+                debug!(
                     "  Q{}: pages {}..={} y {:?}..{:?}",
                     s.number,
                     s.start_page + 1,

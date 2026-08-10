@@ -6,6 +6,8 @@ use crate::AppState;
 use serde::{Deserialize, Serialize};
 use std::time::Instant;
 use tauri::{Emitter, Manager, State};
+use tauri_plugin_updater::UpdaterExt;
+use tracing::warn;
 
 // ── Shared data model ─────────────────────────────────────────────────────────
 
@@ -1693,7 +1695,7 @@ pub async fn parse_mark_scheme_vision(
                 });
             }
             None => {
-                eprintln!(
+                warn!(
                     "[MergeMark] mark scheme: no question {} in paper '{}' — answer skipped",
                     q_num, paper_name
                 );
@@ -2340,4 +2342,56 @@ pub async fn generate_topics_for_module(
     }
 
     Ok(topics)
+}
+
+// ── Updater commands ────────────────────────────────────────────────────────────
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateInfo {
+    pub version: String,
+    pub body: String,
+    pub date: String,
+    pub current_version: String,
+}
+
+#[tauri::command]
+pub async fn check_for_updates(app: tauri::AppHandle) -> Result<Option<UpdateInfo>, String> {
+    let updater = app.updater().map_err(|e| format!("Failed to get updater: {}", e))?;
+    match updater.check().await {
+        Ok(Some(update)) => Ok(Some(UpdateInfo {
+            version: update.version.clone(),
+            body: update.body.clone().unwrap_or_default(),
+            date: update.date.map(|d| d.to_string()).unwrap_or_default(),
+            current_version: app.package_info().version.to_string(),
+        })),
+        Ok(None) => Ok(None),
+        Err(e) => Err(format!("Failed to check for updates: {}", e)),
+    }
+}
+
+#[tauri::command]
+pub async fn install_update(app: tauri::AppHandle) -> Result<(), String> {
+    let updater = app.updater().map_err(|e| format!("Failed to get updater: {}", e))?;
+    if let Some(update) = updater.check().await.map_err(|e| e.to_string())? {
+        update
+            .download_and_install(
+                |chunk_length, content_length| {
+                    // Progress event for frontend
+                    let _ = app.emit(
+                        "update-progress",
+                        serde_json::json!({
+                            "downloaded": chunk_length,
+                            "total": content_length.unwrap_or(0),
+                        }),
+                    );
+                },
+                || {
+                    // Download finished callback
+                },
+            )
+            .await
+            .map_err(|e| format!("Failed to download and install update: {}", e))?;
+    }
+    Ok(())
 }
