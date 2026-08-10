@@ -1,39 +1,69 @@
-# miscellaneous
-regex_test/
+# === Build outputs ===
+/dist/
+/dist-ssr/
+/build/
+/*.local
 
-# Logs
-logs
+# === Dependencies ===
+/node_modules/
+/.pnp/
+.pnp.js
+
+# === Rust / Tauri ===
+/src-tauri/target/
+/src-tauri/gen/
+/src-tauri/Cargo.lock   # optional: keep if you want reproducible builds
+
+# === OS / Editor ===
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~
+.vscode/
+.idea/
+*.code-workspace
+
+# === Logs / Cache ===
 *.log
 npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
 pnpm-debug.log*
-lerna-debug.log*
+/logs/
+/.coverage/
+.nyc_output/
 
-node_modules
-dist
-dist-ssr
-*.local
+# === Test artifacts ===
+/coverage/
+/.nyc_output/
 
-# Editor directories and files
-.vscode/*
-!.vscode/extensions.json
-.idea
-.DS_Store
-*.suo
-*.ntvs*
-*.njsproj
-*.sln
-*.sw?
+# === Temporary files ===
+*.tmp
+*.temp
+*.bak
+*.orig
+.turbo/
+.vercel
+.netlify
 
-# App data
-*.db
-*.db-journal
-src-tauri/diagrams/
+# === PDFium binaries (downloaded at build) ===
+/src-tauri/pdfium.dll
+/src-tauri/PDFiumConfig.cmake
 
-# Local experiments / one-off test scripts
-scratch/
-pull.cjs
-pull.js
-test.cjs
-test.json
+# === License dumps (generated, not tracked) ===
+/src-tauri/licenses/
+
+# === Version file (redundant; version in Cargo.toml + tauri.conf.json + package.json) ===
+/src-tauri/VERSION
+
+# === Local env ===
+.env
+.env.local
+.env.*.local
+
+# === IDE / Tooling folders ===
+.claude/
+.crush/
+.kilo/
+.scratch/

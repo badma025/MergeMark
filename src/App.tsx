@@ -12,6 +12,7 @@ import { TaxonomyProvider } from "@/lib/TaxonomyContext";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
 import { FlashcardsTab } from "@/components/flashcards/FlashcardsTab";
+import { UpdateChecker } from "@/components/UpdateChecker";
 
 export type SelectedQuestion = Omit<QuestionCardProps, "onAddToWorksheet">;
 
@@ -57,6 +58,7 @@ function App() {
 
   return (
     <TaxonomyProvider>
+      <UpdateChecker />
       <div className="grid h-full w-full flex-1 grid-cols-1 lg:grid-cols-[1fr_350px] grid-rows-[1fr] overflow-hidden bg-background text-foreground">
         {/* ── Left / Main Content Column ── */}
         <div className="flex flex-col min-w-0 min-h-0 h-full overflow-hidden">
