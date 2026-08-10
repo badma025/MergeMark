@@ -1903,6 +1903,7 @@ pub fn build_map_from_structure(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tracing::{info, warn};
 
     fn texts(pages: &[&str]) -> Vec<String> {
         pages.iter().map(|s| s.to_string()).collect()
@@ -2061,7 +2062,7 @@ mod tests {
             warn!("{} not found — skipping golden test", path);
             return None;
         }
-        let page_inputs = match crate::pdf_render::render_pdf_pages(std::path::Path::new(path)) {
+        let page_inputs = match crate::pdf_render::render_pdf_pages_for_test(std::path::Path::new(path)) {
             Ok(p) => p,
             Err(e) => {
                 warn!("pdfium load failed for {}: {} — skipping", path, e);
@@ -2157,7 +2158,7 @@ mod tests {
                 path
             );
 
-            let page_inputs = crate::pdf_render::render_pdf_pages(std::path::Path::new(&path))
+            let page_inputs = crate::pdf_render::render_pdf_pages_for_test(std::path::Path::new(&path))
                 .unwrap_or_else(|error| panic!("{} could not be rendered: {}", path, error));
             assert!(!page_inputs.is_empty(), "{} rendered zero pages", path);
 

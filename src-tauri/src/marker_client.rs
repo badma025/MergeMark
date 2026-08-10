@@ -1,5 +1,6 @@
 use regex::Regex;
 use std::sync::OnceLock;
+use tracing::debug;
 
 // ══════════════════════════════════════════════════════════════════════════
 // VLM System Prompts & Strict Formatting Rules

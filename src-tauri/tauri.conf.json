@@ -37,6 +37,9 @@
       "icons/icon.icns",
       "icons/icon.ico"
     ],
+    "resources": [
+      "resources/pdfium/**/*"
+    ],
     "createUpdaterArtifacts": true
   },
   "plugins": {

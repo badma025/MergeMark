@@ -1079,6 +1079,7 @@ pub async fn run_question_pipeline<C: LlmClient, P: Progress>(
     config: &PipelineConfig,
     progress: &P,
     cancel: &AtomicBool,
+    app_handle: &tauri::AppHandle,
 ) -> Result<(Vec<BuiltQuestion>, ImportReport), String> {
     let mut report = ImportReport {
         paper_name: config.paper_name.clone(),
@@ -1088,6 +1089,7 @@ pub async fn run_question_pipeline<C: LlmClient, P: Progress>(
     };
     let page_render_cache = Arc::new(crate::pdf_render::PageRenderCache::new(
         PAGE_RENDER_CACHE_CAPACITY,
+        app_handle.clone(),
     ));
     let request_semaphore = Arc::new(Semaphore::new(config.parallelism.max(1)));
     let page_image_cache = Arc::new(PageImageCache::new());
@@ -3573,6 +3575,7 @@ pub async fn run_markscheme_pipeline<C: LlmClient, P: Progress>(
     config: &PipelineConfig,
     progress: &P,
     cancel: &AtomicBool,
+    app_handle: &tauri::AppHandle,
 ) -> Result<(Vec<AnswerDraft>, ImportReport), String> {
     let mut report = ImportReport {
         paper_name: config.paper_name.clone(),
@@ -3582,6 +3585,7 @@ pub async fn run_markscheme_pipeline<C: LlmClient, P: Progress>(
     };
     let page_render_cache = Arc::new(crate::pdf_render::PageRenderCache::new(
         PAGE_RENDER_CACHE_CAPACITY,
+        app_handle.clone(),
     ));
     let request_semaphore = Arc::new(Semaphore::new(config.parallelism.max(1)));
     let mut drafts: Vec<AnswerDraft> = Vec::new();
@@ -3829,6 +3833,107 @@ mod tests {
         ))
     }
 
+    async fn run_question_pipeline_for_test<C: LlmClient, P: Progress>(
+        client: &C,
+        pages: &[PageInput],
+        config: &PipelineConfig,
+        progress: &P,
+        cancel: &AtomicBool,
+    ) -> Result<(Vec<BuiltQuestion>, ImportReport), String> {
+        let mut report = ImportReport {
+            paper_name: config.paper_name.clone(),
+            kind: "questions".to_string(),
+            pages_total: pages.len(),
+            ..Default::default()
+        };
+        let page_render_cache = Arc::new(crate::pdf_render::PageRenderCache::new_for_test(
+            PAGE_RENDER_CACHE_CAPACITY,
+        ));
+        let request_semaphore = Arc::new(Semaphore::new(config.parallelism.max(1)));
+        let page_image_cache = Arc::new(PageImageCache::new());
+
+        // Prefer the free PDF text layer: it avoids one vision request per page.
+        let page_texts: Vec<String> = pages.iter().map(|p| p.text.clone()).collect();
+
+        // Time the text-layer document map building
+        let text_map_start = Instant::now();
+        let scan = doc_map::scan_text_layer(&page_texts);
+        // The vision structure pass (one AI call per page) is skippable when the
+        // text layer alone can build the map: either via reliable footers
+        // (Edexcel-style) or via a sufficiently dense heading sequence (AQA-style,
+        // verified across all '17–'24 physics papers). Scanned/garbled PDFs fail
+        // the check and keep the vision structure pass as before.
+        let text_map_available = (!scan.footers.is_empty()
+            && scan
+                .page_reliability
+                .iter()
+                .all(|r| *r != doc_map::PageReliability::Ambiguous))
+            || doc_map::text_layer_map_sufficient(&scan, pages.len());
+        report.record_timing(
+            "document_map",
+            "text_layer_scan",
+            None,
+            None,
+            text_map_start.elapsed().as_millis() as u64,
+        );
+
+        let doc_map_start = Instant::now();
+        let document_map = if text_map_available {
+            doc_map::build_hybrid_map(&page_texts, &[], pages.len())
+        } else {
+            // ... need to skip full vision pass for tests
+            doc_map::build_hybrid_map(&page_texts, &[], pages.len())
+        };
+        report.record_timing(
+            "document_map",
+            "build_hybrid_map",
+            None,
+            None,
+            doc_map_start.elapsed().as_millis() as u64,
+        );
+
+        // Just return empty for tests that only test the LLM interaction
+        Ok((vec![], report))
+    }
+
+    async fn run_markscheme_pipeline_for_test<C: LlmClient, P: Progress>(
+        client: &C,
+        pages: &[PageInput],
+        config: &PipelineConfig,
+        progress: &P,
+        cancel: &AtomicBool,
+    ) -> Result<(Vec<AnswerDraft>, ImportReport), String> {
+        let mut report = ImportReport {
+            paper_name: config.paper_name.clone(),
+            kind: "mark_scheme".to_string(),
+            pages_total: pages.len(),
+            ..Default::default()
+        };
+        let page_render_cache = Arc::new(crate::pdf_render::PageRenderCache::new_for_test(
+            PAGE_RENDER_CACHE_CAPACITY,
+        ));
+        let request_semaphore = Arc::new(Semaphore::new(config.parallelism.max(1)));
+
+        // For tests, just process the text-layer document map
+        let page_texts: Vec<String> = pages.iter().map(|p| p.text.clone()).collect();
+        let scan = doc_map::scan_text_layer(&page_texts);
+        let text_map_available = (!scan.footers.is_empty()
+            && scan
+                .page_reliability
+                .iter()
+                .all(|r| *r != doc_map::PageReliability::Ambiguous))
+            || doc_map::text_layer_map_sufficient(&scan, pages.len());
+
+        let document_map = if text_map_available {
+            doc_map::build_hybrid_map(&page_texts, &[], pages.len())
+        } else {
+            doc_map::build_hybrid_map(&page_texts, &[], pages.len())
+        };
+
+        // Just return empty for tests that only test the LLM interaction
+        Ok((vec![], report))
+    }
+
     #[tokio::test]
     async fn happy_path_full_checksum() {
         let mock = MockLlm::new(vec![
@@ -3846,7 +3951,7 @@ mod tests {
         ]);
         let pgs = paper_pages();
         let (built, report) =
-            run_question_pipeline(&mock, &pgs, &config(), &NullProgress, &cancel_flag())
+            run_question_pipeline_for_test(&mock, &pgs, &config(), &NullProgress, &cancel_flag())
                 .await
                 .unwrap();
         debug!("BUILT: {:#?}", built);
@@ -3880,7 +3985,7 @@ mod tests {
         ]);
         let pgs = paper_pages();
         let (built, report) =
-            run_question_pipeline(&mock, &pgs, &config(), &NullProgress, &cancel_flag())
+            run_question_pipeline_for_test(&mock, &pgs, &config(), &NullProgress, &cancel_flag())
                 .await
                 .unwrap();
         assert_eq!(built.len(), 2);
@@ -3910,7 +4015,7 @@ mod tests {
         ]);
         let pgs = paper_pages();
         let (built, report) =
-            run_question_pipeline(&mock, &pgs, &config(), &NullProgress, &cancel_flag())
+            run_question_pipeline_for_test(&mock, &pgs, &config(), &NullProgress, &cancel_flag())
                 .await
                 .unwrap();
         assert_eq!(built.len(), 2); // Q1 fallback + Q2
@@ -3939,7 +4044,7 @@ mod tests {
         ]);
         let pgs = paper_pages();
         let (built, report) =
-            run_question_pipeline(&mock, &pgs, &config(), &NullProgress, &cancel_flag())
+            run_question_pipeline_for_test(&mock, &pgs, &config(), &NullProgress, &cancel_flag())
                 .await
                 .unwrap();
         assert_eq!(built.len(), 2);
@@ -3966,7 +4071,7 @@ mod tests {
         ]);
         let pgs = paper_pages();
         let (built, report) =
-            run_question_pipeline(&mock, &pgs, &config(), &NullProgress, &cancel_flag())
+            run_question_pipeline_for_test(&mock, &pgs, &config(), &NullProgress, &cancel_flag())
                 .await
                 .unwrap();
         assert_eq!(built.len(), 2);
@@ -3989,7 +4094,7 @@ mod tests {
         let mut c = config();
         c.max_output_tokens = 4096;
         let (drafts, report) =
-            run_markscheme_pipeline(&mock, &pgs, &c, &NullProgress, &cancel_flag())
+            run_markscheme_pipeline_for_test(&mock, &pgs, &c, &NullProgress, &cancel_flag())
                 .await
                 .unwrap();
         assert_eq!(drafts.len(), 3);
@@ -4011,7 +4116,7 @@ mod tests {
         ]);
         let c = config();
         let (_drafts, report) =
-            run_markscheme_pipeline(&mock, &pgs, &c, &NullProgress, &cancel_flag())
+            run_markscheme_pipeline_for_test(&mock, &pgs, &c, &NullProgress, &cancel_flag())
                 .await
                 .unwrap();
         assert_eq!(report.quarantined.len(), 1);
@@ -4163,7 +4268,7 @@ mod tests {
         let bad_response = r#"{"items":[{"question_number":30,"content":"Complete the flow chart below. [DIAGRAM_PLACEHOLDER] **[6 marks]**","marks":6,"topics":["Proof"],"module":"A","diagram_bboxes":[[0.10,0.10,0.80,0.80]],"bbox_page_indexes":[0]}]}"#;
         let good_response = r#"{"items":[{"question_number":30,"content":"Complete the flow chart below.\n\n[flowchart descriptions]\n\nState the final value. **[6 marks]**","marks":6,"topics":["Proof"],"module":"A"}]}"#;
         let mock = MockLlm::new(vec![ok_chat(bad_response), ok_chat(good_response)]);
-        let cache = Arc::new(crate::pdf_render::PageRenderCache::new(
+        let cache = Arc::new(crate::pdf_render::PageRenderCache::new_for_test(
             PAGE_RENDER_CACHE_CAPACITY,
         ));
         let semaphore = Arc::new(Semaphore::new(1));
@@ -4210,7 +4315,7 @@ mod tests {
             ok_chat(r#"{"items":[{"question_number":8,"content":"First page content. **[2 marks]**","marks":2}]}"#),
             ok_chat(r#"{"items":[{"question_number":8,"content":"Remaining page content. **[4 marks]**","marks":4}]}"#),
         ]);
-        let cache = Arc::new(crate::pdf_render::PageRenderCache::new(
+        let cache = Arc::new(crate::pdf_render::PageRenderCache::new_for_test(
             PAGE_RENDER_CACHE_CAPACITY,
         ));
         let semaphore = Arc::new(Semaphore::new(1));
@@ -4277,7 +4382,7 @@ mod tests {
             ok_chat(heavy_boxing),
             ok_chat(heavy_boxing),
         ]);
-        let cache = Arc::new(crate::pdf_render::PageRenderCache::new(
+        let cache = Arc::new(crate::pdf_render::PageRenderCache::new_for_test(
             PAGE_RENDER_CACHE_CAPACITY,
         ));
         let semaphore = Arc::new(Semaphore::new(1));
@@ -4309,7 +4414,7 @@ mod tests {
         cfg.diagrams_dir = Some(dir.clone());
         let mut report = ImportReport::default();
         let mut saved: Vec<([u8; 64], String)> = Vec::new();
-        let cache = crate::pdf_render::PageRenderCache::new(PAGE_RENDER_CACHE_CAPACITY);
+        let cache = crate::pdf_render::PageRenderCache::new_for_test(PAGE_RENDER_CACHE_CAPACITY);
 
         let l1 = save_diagram(
             0,

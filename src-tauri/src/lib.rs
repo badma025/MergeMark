@@ -18,6 +18,7 @@ mod doc_map;
 mod geometry;
 mod json_salvage;
 mod llm;
+mod pdfium;
 mod pdf_render;
 mod pipeline;
 mod taxonomy;

@@ -1070,7 +1070,8 @@ pub async fn parse_pdf_vision(
 
             if ext == "pdf" {
                 let path_clone = file_path.clone();
-                tokio::task::spawn_blocking(move || crate::pdf_render::render_pdf_pages(std::path::Path::new(&path_clone)))
+                let app_handle = app.clone();
+                tokio::task::spawn_blocking(move || crate::pdf_render::render_pdf_pages(&app_handle, std::path::Path::new(&path_clone)))
                     .await
                     .map_err(|e| format!("Thread-pool error: {}", e))??
             } else if is_image {
@@ -1260,7 +1261,7 @@ pub async fn parse_pdf_vision(
     drop(pool_check);
 
     let (built, mut report): (Vec<BuiltQuestion>, ImportReport) =
-        pipeline::run_question_pipeline(&client, &pages, &config, &progress, &state.cancel_flag)
+        pipeline::run_question_pipeline(&client, &pages, &config, &progress, &state.cancel_flag, &app)
             .await?;
 
     // Surface the report to the UI — nothing fails silently anymore.
@@ -1559,7 +1560,8 @@ pub async fn parse_mark_scheme_vision(
             .collect()
     } else if file_path.to_lowercase().ends_with(".pdf") {
         let path_clone = file_path.clone();
-        tokio::task::spawn_blocking(move || crate::pdf_render::render_pdf_pages(std::path::Path::new(&path_clone)))
+        let app_handle = app.clone();
+        tokio::task::spawn_blocking(move || crate::pdf_render::render_pdf_pages(&app_handle, std::path::Path::new(&path_clone)))
             .await
             .map_err(|e| format!("Thread-pool error: {}", e))??
     } else if is_image {
@@ -1629,7 +1631,7 @@ pub async fn parse_mark_scheme_vision(
 
     let progress = TauriProgress { app: app.clone() };
     let (drafts, report): (Vec<AnswerDraft>, ImportReport) =
-        pipeline::run_markscheme_pipeline(&client, &pages, &config, &progress, &state.cancel_flag)
+        pipeline::run_markscheme_pipeline(&client, &pages, &config, &progress, &state.cancel_flag, &app)
             .await?;
 
     let _ = app.emit("import-report", &report);
