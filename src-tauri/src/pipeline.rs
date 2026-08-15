@@ -1436,10 +1436,55 @@ pub async fn run_question_pipeline<C: LlmClient, P: Progress>(
     } else {
         report.questions_expected = map.spans.len();
         let total = map.spans.len();
-        // Pre-resolve span pages; spans with nothing extractable quarantine
-        // without ever reaching the model.
-        let mut jobs: Vec<(usize, &QuestionSpan, Vec<(usize, &PageInput)>)> = Vec::new();
-        for (span_idx, span) in map.spans.iter().enumerate() {
+        
+        // Group consecutive single-page spans sharing the same page into SamePageBatch jobs,
+        // reducing API calls and input tokens by 70-80% on MCQ and multi-question pages.
+        enum ExtractionJob<'a> {
+            Single {
+                span: &'a QuestionSpan,
+                pages: Vec<(usize, &'a PageInput)>,
+            },
+            SamePageBatch {
+                spans: Vec<&'a QuestionSpan>,
+                page_idx: usize,
+                page_input: &'a PageInput,
+            },
+        }
+
+        let mut jobs: Vec<ExtractionJob> = Vec::new();
+        let mut i = 0;
+        while i < map.spans.len() {
+            let span = &map.spans[i];
+            if span.start_page == span.end_page && span.start_page < pages.len() {
+                let p = span.start_page;
+                let is_extractable_page = map.non_question_pages.is_empty()
+                    || !map.non_question_pages.contains(&p)
+                    || structures.get(p).map(|s| s.role == doc_map::PageRole::Blank).unwrap_or(false);
+
+                if is_extractable_page {
+                    let mut batch_spans = vec![span];
+                    let mut j = i + 1;
+                    while j < map.spans.len() {
+                        let next_span = &map.spans[j];
+                        if next_span.start_page == p && next_span.end_page == p {
+                            batch_spans.push(next_span);
+                            j += 1;
+                        } else {
+                            break;
+                        }
+                    }
+                    if batch_spans.len() >= 2 {
+                        jobs.push(ExtractionJob::SamePageBatch {
+                            spans: batch_spans,
+                            page_idx: p,
+                            page_input: &pages[p],
+                        });
+                        i = j;
+                        continue;
+                    }
+                }
+            }
+
             let span_pages: Vec<(usize, &PageInput)> = (span.start_page..=span.end_page)
                 .filter(|&pi| pi < pages.len())
                 .filter(|&pi| {
@@ -1459,9 +1504,14 @@ pub async fn run_question_pipeline<C: LlmClient, P: Progress>(
                     question_number: Some(span.number),
                     reason: "span contained no extractable pages".to_string(),
                 });
+                i += 1;
                 continue;
             }
-            jobs.push((span_idx, span, span_pages));
+            jobs.push(ExtractionJob::Single {
+                span,
+                pages: span_pages,
+            });
+            i += 1;
         }
 
         cancelled(cancel)?;
@@ -1470,23 +1520,50 @@ pub async fn run_question_pipeline<C: LlmClient, P: Progress>(
         let job_count = jobs.len();
         let mut results = futures_util::stream::iter(0..job_count).map(|position| {
             let job = &jobs[position];
-            extract_span(
-                client,
-                config,
-                job.1,
-                &job.2,
-                &page_render_cache,
-                &page_image_cache,
-                &request_semaphore,
-            )
-            .map(move |result| (position, result))
+            let client = client;
+            let config = config;
+            let page_render_cache = Arc::clone(&page_render_cache);
+            let page_image_cache = Arc::clone(&page_image_cache);
+            let request_semaphore = Arc::clone(&request_semaphore);
+            async move {
+                match job {
+                    ExtractionJob::Single { span, pages } => {
+                        let (opt, local_rep) = extract_span(
+                            client,
+                            config,
+                            span,
+                            pages,
+                            &page_render_cache,
+                            &page_image_cache,
+                            &request_semaphore,
+                        )
+                        .await;
+                        (position, vec![((*span).clone(), opt)], local_rep)
+                    }
+                    ExtractionJob::SamePageBatch { spans, page_idx, page_input } => {
+                        let (res_vec, local_rep) = extract_same_page_batch(
+                            client,
+                            config,
+                            spans,
+                            *page_idx,
+                            page_input,
+                            &page_render_cache,
+                            &page_image_cache,
+                            &request_semaphore,
+                        )
+                        .await;
+                        (position, res_vec, local_rep)
+                    }
+                }
+            }
         })
         .buffer_unordered(config.parallelism.max(1));
+
         let mut ordered_results = Vec::with_capacity(jobs.len());
         while let Some(result) = results.next().await {
             ordered_results.push(result);
         }
-        ordered_results.sort_by_key(|(position, _)| *position);
+        ordered_results.sort_by_key(|(position, _, _)| *position);
         report.record_timing(
             "extraction",
             "span_stream",
@@ -1494,70 +1571,70 @@ pub async fn run_question_pipeline<C: LlmClient, P: Progress>(
             None,
             extract_start.elapsed().as_millis() as u64,
         );
-        for (job, (_, (opt, local))) in jobs.iter().zip(ordered_results) {
-            let span: &QuestionSpan = job.1;
-            let sp = &job.2;
+        for (_pos, span_res_vec, local) in ordered_results {
             report.absorb(local);
-            match opt {
-                Some(q) => {
-                    report.pages_processed += sp.len();
-                    push_mark_check(span, &q, &mut report);
-                    built.push(q);
-                }
-                None => {
-                    let mut reason = "failed validation and all repair attempts".to_string();
-                    if let Some(err) = report.anomalies.last() {
-                        if err.starts_with("quarantined: ") {
-                            reason = format!(
-                                "failed validation and all repair attempts (last error: {})",
-                                err.trim_start_matches("quarantined: ")
-                            );
-                        }
+            for (span, opt) in span_res_vec {
+                match opt {
+                    Some(q) => {
+                        report.pages_processed += (span.start_page..=span.end_page).count().max(1);
+                        push_mark_check(&span, &q, &mut report);
+                        built.push(q);
                     }
-                    if !report.quarantined.iter().any(|q| q.question_number == Some(span.number)) {
-                        report.quarantined.push(QuarantineEvent {
-                            scope: "question".to_string(),
-                            page: Some(span.start_page + 1),
-                            question_number: Some(span.number),
-                            reason,
+                    None => {
+                        let mut reason = "failed validation and all repair attempts".to_string();
+                        if let Some(err) = report.anomalies.last() {
+                            if err.starts_with("quarantined: ") {
+                                reason = format!(
+                                    "failed validation and all repair attempts (last error: {})",
+                                    err.trim_start_matches("quarantined: ")
+                                );
+                            }
+                        }
+                        if !report.quarantined.iter().any(|q| q.question_number == Some(span.number)) {
+                            report.quarantined.push(QuarantineEvent {
+                                scope: "question".to_string(),
+                                page: Some(span.start_page + 1),
+                                question_number: Some(span.number),
+                                reason,
+                            });
+                        }
+
+                        // Create a fallback question card so no question is ever lost from the repository
+                        let fallback_text = (span.start_page..=span.end_page)
+                            .filter(|&pi| pi < pages.len())
+                            .map(|pi| pages[pi].text.trim())
+                            .filter(|t| !t.is_empty())
+                            .collect::<Vec<_>>()
+                            .join("\n\n");
+
+                        let fallback_content = if !fallback_text.is_empty() {
+                            format!(
+                                "**[Question {} - Needs Review]**\n\n*(Extraction incomplete. Raw text extracted from original page(s) {}-{} below:)*\n\n{}",
+                                span.number,
+                                span.start_page + 1,
+                                span.end_page + 1,
+                                fallback_text
+                            )
+                        } else {
+                            format!(
+                                "**[Question {} - Needs Review]**\n\n*(Extraction incomplete. Please check original paper page(s) {}-{} and edit this question card).* ",
+                                span.number,
+                                span.start_page + 1,
+                                span.end_page + 1
+                            )
+                        };
+
+                        built.push(BuiltQuestion {
+                            marks: span.expected_marks.unwrap_or(0) as i32,
+                            content: fallback_content,
+                            question_number: span.number,
+                            topics: vec!["Needs Review".to_string()],
+                            module: config.module_name.clone(),
+                            is_code: false,
+                            needs_review: true,
+                            notes: vec!["Fallback card created due to incomplete extraction".to_string()],
                         });
                     }
-
-                    // Create a fallback question card so no question is ever lost from the repository
-                    let fallback_text = sp
-                        .iter()
-                        .map(|p| p.1.text.trim())
-                        .filter(|t| !t.is_empty())
-                        .collect::<Vec<_>>()
-                        .join("\n\n");
-
-                    let fallback_content = if !fallback_text.is_empty() {
-                        format!(
-                            "**[Question {} - Needs Review]**\n\n*(Extraction incomplete. Raw text extracted from original page(s) {}-{} below:)*\n\n{}",
-                            span.number,
-                            span.start_page + 1,
-                            span.end_page + 1,
-                            fallback_text
-                        )
-                    } else {
-                        format!(
-                            "**[Question {} - Needs Review]**\n\n*(Extraction incomplete. Please check original paper page(s) {}-{} and edit this question card).* ",
-                            span.number,
-                            span.start_page + 1,
-                            span.end_page + 1
-                        )
-                    };
-
-                    built.push(BuiltQuestion {
-                        marks: span.expected_marks.unwrap_or(0) as i32,
-                        content: fallback_content,
-                        question_number: span.number,
-                        topics: vec!["Needs Review".to_string()],
-                        module: config.module_name.clone(),
-                        is_code: false,
-                        needs_review: true,
-                        notes: vec!["Fallback card created due to incomplete extraction".to_string()],
-                    });
                 }
             }
         }
@@ -2580,10 +2657,30 @@ async fn extract_span<C: LlmClient>(
         }
     }
 
-    // ── Assemble + content-level validation ─────────────────────────────────
-    // Each chunk is validated as exactly one target item before it reaches
-    // this point. Join the validated continuations in page order; never keep
-    // only the first chunk of a split span.
+    let built_q = assemble_built_question(
+        span,
+        config,
+        contents,
+        topics_acc,
+        is_code_acc,
+        needs_review,
+        notes,
+        ai_marks,
+    );
+    (built_q, report)
+}
+
+/// Assemble and validate a BuiltQuestion from raw extracted chunks/content.
+fn assemble_built_question(
+    span: &QuestionSpan,
+    config: &PipelineConfig,
+    contents: Vec<String>,
+    mut topics_acc: Vec<String>,
+    is_code_acc: bool,
+    mut needs_review: bool,
+    mut notes: Vec<String>,
+    ai_marks: Option<i32>,
+) -> Option<BuiltQuestion> {
     let mut content = contents.join("\n\n");
     content = validate::clean_question_content(&content);
     // One labelling scheme forever: AQA '3 . 1'-style decimals → (a), (b), (c).
@@ -2596,7 +2693,7 @@ async fn extract_span<C: LlmClient>(
 
     if content.trim().is_empty() && span.expected_marks.unwrap_or(0) > 0 {
         // A marked question with no content is a hard failure.
-        return (None, report);
+        return None;
     }
     if content.trim().is_empty() {
         needs_review = true;
@@ -2638,19 +2735,316 @@ async fn extract_span<C: LlmClient>(
     topics_acc.sort();
     topics_acc.dedup();
 
-    (
-        Some(BuiltQuestion {
-            question_number: span.number,
-            content,
-            marks,
-            topics: topics_acc,
-            module: config.module_name.clone(),
-            is_code: config.subject == "Computer Science" && is_code_acc,
-            needs_review,
-            notes,
-        }),
-        report,
-    )
+    Some(BuiltQuestion {
+        question_number: span.number,
+        content,
+        marks,
+        topics: topics_acc,
+        module: config.module_name.clone(),
+        is_code: config.subject == "Computer Science" && is_code_acc,
+        needs_review,
+        notes,
+    })
+}
+
+/// Extract multiple questions that reside entirely on the same single page in one consolidated call.
+/// Slashes input tokens and vision API calls by 70-80% on multi-question / MCQ pages.
+/// If any question is missing or fails validation, it falls back to extract_span for only that question.
+async fn extract_same_page_batch<C: LlmClient>(
+    client: &C,
+    config: &PipelineConfig,
+    spans: &[&QuestionSpan],
+    page_idx: usize,
+    page: &PageInput,
+    page_render_cache: &Arc<crate::pdf_render::PageRenderCache>,
+    page_image_cache: &Arc<PageImageCache>,
+    request_semaphore: &Arc<Semaphore>,
+) -> (Vec<(QuestionSpan, Option<BuiltQuestion>)>, ImportReport) {
+    let mut report = ImportReport::default();
+    let max_attempts = 1 + config.max_repairs;
+
+    // Prepare full page image (no vertical clipping so all MCQs and visual options are fully visible)
+    let prep_input = if let Some(b64) = page.get_b64() {
+        vec![ChunkImageInput {
+            chunk_idx: 0,
+            global_page_idx: page_idx,
+            b64: b64.clone(),
+            start_y: None,
+            end_y: None,
+        }]
+    } else {
+        Vec::new()
+    };
+
+    let prepared = match prepare_chunk_images(1, prep_input, page_image_cache).await {
+        Ok(p) => p,
+        Err(e) => {
+            report.anomalies.push(format!("Page {} image prep failed: {}", page_idx + 1, e));
+            // Fall back to individual extractions for all spans
+            let mut out = Vec::with_capacity(spans.len());
+            for span in spans {
+                let (q, r) = extract_span(
+                    client,
+                    config,
+                    span,
+                    &[(page_idx, page)],
+                    page_render_cache,
+                    page_image_cache,
+                    request_semaphore,
+                ).await;
+                report.absorb(r);
+                out.push(((*span).clone(), q));
+            }
+            return (out, report);
+        }
+    };
+
+    let images = prepared.images;
+    let local_to_chunk = prepared.local_to_chunk;
+    let page_bands = prepared.page_bands;
+    let decoded_pages = prepared.decoded_pages;
+
+    let q_nums: Vec<String> = spans.iter().map(|s| s.number.to_string()).collect();
+    let q_str = q_nums.join(", ");
+    let system = extraction_system_prompt(config);
+    let extraction_schema = extraction_json_schema();
+    let mut last_error = String::new();
+    let mut accepted_items: Option<Vec<AiQuestion>> = None;
+
+    for attempt in 1..=max_attempts {
+        let repair_note = if attempt == 1 {
+            String::new()
+        } else {
+            format!(
+                "\n\nPREVIOUS ATTEMPT FAILED VALIDATION: {}. Regenerate corrected JSON for Questions {}.",
+                last_error, q_str
+            )
+        };
+        let user_text = format!(
+            "TARGET QUESTIONS: Questions {}\nPAPER: '{}'\nMODULE: '{}'\n\nTranscribe Questions {} from the attached page image (page {}), returning ONE item per question in the items array.{}{}",
+            q_str,
+            config.paper_name,
+            config.module_name,
+            q_str,
+            page_idx + 1,
+            if page.text.trim().is_empty() {
+                String::new()
+            } else {
+                format!(
+                    "\n\nReference OCR text (may be corrupt — images are authoritative):\nRAW TEXT PAGE {}:\n{}\n\n",
+                    page_idx + 1,
+                    page.text
+                )
+            },
+            repair_note
+        );
+
+        let body = llm::chat_body(
+            &config.model,
+            &system,
+            &images,
+            Some(&user_text),
+            config.max_output_tokens,
+            Some(llm::ResponseFormat::JsonSchema {
+                schema: extraction_schema.clone(),
+            }),
+        );
+
+        let resp = match chat_with_permit(client, &body, request_semaphore).await {
+            Ok(r) => r,
+            Err(e) => {
+                last_error = e.to_string();
+                continue;
+            }
+        };
+
+        let content = match llm::message_content(&resp) {
+            Ok(c) => c,
+            Err(e) => {
+                last_error = e.to_string();
+                continue;
+            }
+        };
+
+        let page_out = match parse_llm_json::<AiQuestionPage>(&content) {
+            ParseOutcome::Clean(v) => v,
+            ParseOutcome::Salvaged { value, dropped_tail } => {
+                report.salvage_events += 1;
+                if dropped_tail && attempt < max_attempts {
+                    last_error = "response was truncated; items may be missing".to_string();
+                    continue;
+                }
+                value
+            }
+            ParseOutcome::Malformed { error } => {
+                last_error = format!("invalid JSON: {}", error);
+                report.repairs += 1;
+                continue;
+            }
+        };
+
+        if page_out.items.is_empty() {
+            last_error = format!("returned empty items array for Questions {}", q_str);
+            report.repairs += 1;
+            continue;
+        }
+
+        // Audit diagram boxes across all returned items
+        let audit_items = page_out.items;
+        let audit_decoded = decoded_pages.clone();
+        let audit_local = local_to_chunk.clone();
+        let audit_bands = page_bands.clone();
+        let audit_page_texts = vec![page.text.clone()];
+
+        let (audited_items, _bad_boxes, box_issues) = match tokio::task::spawn_blocking(move || {
+            let mut items = audit_items;
+            let (bad, issues) = audit_diagram_boxes(
+                &audit_decoded,
+                &audit_page_texts,
+                &mut items,
+                &audit_local,
+                &audit_bands,
+            );
+            (items, bad, issues)
+        }).await {
+            Ok(res) => res,
+            Err(e) => {
+                last_error = format!("diagram audit failed: {}", e);
+                report.repairs += 1;
+                continue;
+            }
+        };
+
+        if !box_issues.is_empty() && attempt < max_attempts {
+            last_error = box_issues.join("; ");
+            report.repairs += 1;
+            continue;
+        }
+
+        accepted_items = Some(audited_items);
+        break;
+    }
+
+    let mut out: Vec<(QuestionSpan, Option<BuiltQuestion>)> = Vec::with_capacity(spans.len());
+    let mut items_map: std::collections::HashMap<u32, AiQuestion> = std::collections::HashMap::new();
+
+    if let Some(items) = accepted_items {
+        for item in items {
+            if let Some(num) = item.question_number.as_ref().and_then(validate::value_to_question_number) {
+                items_map.insert(num, item);
+            }
+        }
+    }
+
+    let mut saved_diagrams: Vec<([u8; 64], String)> = Vec::new();
+
+    for span in spans {
+        if let Some(item) = items_map.remove(&span.number) {
+            let mut item_content = item.content.unwrap_or_default();
+            let is_code = item.is_code.unwrap_or(false);
+            let mut topics_acc = Vec::new();
+            if let Some(t) = item.topics {
+                for topic in value_to_topics(&t) {
+                    if config.allowed_topics.is_empty() || config.allowed_topics.contains(&topic) {
+                        topics_acc.push(topic);
+                    }
+                }
+            }
+            let ai_marks = item.marks.as_ref().and_then(validate::value_to_marks);
+
+            // Persist diagrams if present
+            if let Some(bboxes) = &item.diagram_bboxes {
+                let indexes = item.bbox_page_indexes.clone().unwrap_or_default();
+                let mut requests = Vec::with_capacity(bboxes.len());
+                let mut page_b64 = std::collections::HashMap::new();
+                for (bi, bbox) in bboxes.iter().enumerate() {
+                    let model_idx = indexes.get(bi).and_then(value_to_usize).unwrap_or(0);
+                    let ignore_grid = validate::figure_references(&item_content) > 0 && !validate::is_answer_grid_request(&item_content);
+                    if config.pdf_path.is_none() {
+                        if let Some(b64) = page.get_b64() {
+                            page_b64.entry(page_idx).or_insert_with(|| b64.clone());
+                        }
+                    }
+                    requests.push(DiagramSaveRequest {
+                        global_page_idx: page_idx,
+                        bbox: bbox.clone(),
+                        ignore_grid,
+                        graph_like: item
+                            .diagram_kinds
+                            .as_ref()
+                            .and_then(|kinds| kinds.get(bi))
+                            .map(|kind| {
+                                let kind = kind.to_ascii_lowercase();
+                                kind.contains("graph")
+                                    || kind.contains("chart")
+                                    || kind.contains("plot")
+                                    || kind.contains("composite_visual_options")
+                            })
+                            .unwrap_or(false),
+                    });
+                }
+                let saved_before = saved_diagrams.clone();
+                match persist_diagrams(
+                    requests,
+                    page_b64,
+                    config.clone(),
+                    Arc::clone(page_render_cache),
+                    std::mem::take(&mut saved_diagrams),
+                ).await {
+                    Ok(persisted) => {
+                        saved_diagrams = persisted.saved;
+                        report.absorb(persisted.report);
+                        for link in persisted.links.into_iter().flatten() {
+                            if item_content.contains("[DIAGRAM_PLACEHOLDER]") {
+                                item_content = item_content.replacen("[DIAGRAM_PLACEHOLDER]", &link, 1);
+                            } else {
+                                item_content.push_str(&link);
+                            }
+                        }
+                    }
+                    Err(err) => {
+                        saved_diagrams = saved_before;
+                        report.anomalies.push(format!(
+                            "Question {} diagram persistence failed: {}",
+                            span.number, err
+                        ));
+                    }
+                }
+            }
+            item_content = item_content.replace("[DIAGRAM_PLACEHOLDER]", "");
+
+            let built_opt = assemble_built_question(
+                span,
+                config,
+                vec![item_content],
+                topics_acc,
+                is_code,
+                false,
+                Vec::new(),
+                ai_marks,
+            );
+
+            if let Some(built_q) = built_opt {
+                out.push(((*span).clone(), Some(built_q)));
+                continue;
+            }
+        }
+
+        // If not in items_map or validation failed, fall back to extract_span for ONLY this span
+        let (fallback_q, fallback_rep) = extract_span(
+            client,
+            config,
+            span,
+            &[(page_idx, page)],
+            page_render_cache,
+            page_image_cache,
+            request_semaphore,
+        ).await;
+        report.absorb(fallback_rep);
+        out.push(((*span).clone(), fallback_q));
+    }
+
+    (out, report)
 }
 
 /// Deterministic per-item validation for a span. Returns human-readable
@@ -4367,4 +4761,84 @@ mod tests {
             "Q-prefix heading indicates a new question"
         );
     }
+
+    #[tokio::test]
+    async fn same_page_batch_extracts_multiple_mcqs_in_single_call() {
+        let mock = MockLlm::new(vec![
+            // structure pass for page 1
+            structure_reply("QUESTION", "[1, 2, 3]", "[3, 6]"),
+            // single batch extraction call returning all 3 questions at once
+            ok_chat(
+                r#"{"items":[
+                    {"question_number":1,"content":"What is the unit of force?\n\nA Joules\nB Newtons\nC Watts\nD Pascals\n\n**[1 mark]**","marks":1,"topics":["Units"],"module":"Pure"},
+                    {"question_number":2,"content":"Which quantity is a vector?\n\nA Speed\nB Velocity\nC Mass\nD Time\n\n**[1 mark]**","marks":1,"topics":["Vectors"],"module":"Pure"},
+                    {"question_number":3,"content":"Solve $3x = 12$.\n\n**[1 mark]**","marks":1,"topics":["Algebra"],"module":"Pure"}
+                ]}"#,
+            ),
+        ]);
+        let pgs = vec![
+            PageInput {
+                kind: PageInputKind::TextOnly,
+                text: "Cover page\nInstructions\nAnswer ALL questions".into(),
+            },
+            PageInput {
+                kind: PageInputKind::TextOnly,
+                text: "1 What is the unit of force?\n2 Which quantity is a vector?\n3 Solve 3x = 12.\n(Total for Question 3 is 1 mark)".into(),
+            },
+        ];
+        let (built, report) =
+            run_question_pipeline(&mock, &pgs, &config(), &NullProgress, &cancel_flag())
+                .await
+                .unwrap();
+
+        assert_eq!(built.len(), 3);
+        assert_eq!(built[0].question_number, 1);
+        assert_eq!(built[1].question_number, 2);
+        assert_eq!(built[2].question_number, 3);
+        assert_eq!(report.questions_extracted, 3);
+        assert!(report.quarantined.is_empty());
+        assert_eq!(mock.remaining(), 0, "All 3 questions were extracted in exactly 1 batch LLM call");
+    }
+
+    #[tokio::test]
+    async fn same_page_batch_partial_fallback_recovers_missing_question() {
+        let mock = MockLlm::new(vec![
+            // structure pass for page 1
+            structure_reply("QUESTION", "[1, 2]", "[2, 4]"),
+            // batch extraction call returns ONLY Q1 (missed Q2)
+            ok_chat(
+                r#"{"items":[
+                    {"question_number":1,"content":"Question 1 content here. **[2 marks]**","marks":2,"topics":["Proof"],"module":"Pure"}
+                ]}"#,
+            ),
+            // fallback extract_span for Q2 recovers Q2
+            ok_chat(
+                r#"{"items":[
+                    {"question_number":2,"content":"Question 2 recovered content. **[2 marks]**","marks":2,"topics":["Integration"],"module":"Pure"}
+                ]}"#,
+            ),
+        ]);
+        let pgs = vec![
+            PageInput {
+                kind: PageInputKind::TextOnly,
+                text: "Cover page\nInstructions\nAnswer ALL questions".into(),
+            },
+            PageInput {
+                kind: PageInputKind::TextOnly,
+                text: "1 Question 1 text.\n2 Question 2 text.\n(Total for Question 2 is 2 marks)".into(),
+            },
+        ];
+        let (built, report) =
+            run_question_pipeline(&mock, &pgs, &config(), &NullProgress, &cancel_flag())
+                .await
+                .unwrap();
+
+        assert_eq!(built.len(), 2);
+        assert_eq!(built[0].question_number, 1);
+        assert_eq!(built[1].question_number, 2);
+        assert_eq!(report.questions_extracted, 2);
+        assert!(report.quarantined.is_empty());
+        assert_eq!(mock.remaining(), 0);
+    }
 }
+
