@@ -199,7 +199,7 @@ fn question_heading_regex() -> regex::Regex {
     //     start with a digit, so a plain `(?:\D|$)` tail rejects them. Allow a
     //     trailing isotope (mass number + element symbol) as well.
     regex::Regex::new(
-        r"(?mi)(?:^|\n)[ \t]*(?:box[ \t]+)?(?:Section\s+[A-Z0-9]+[ \t]+)?(?:\*+|#+)?[ \t]*(?:Q(?:uestion)?\.?[ \t]*)?0*[ \t]*([1-9](?:[ \t]*\d){0,2})(?:\*+)?[ \t]*(?:[\.\)\]\-–—:]|[ \t]+)(?:\D|$|\d{1,3}\s*(?:He|Ne|Ar|Kr|Xe|Rn|F|Cl|Br|I|O|S|Se|Te|N|P|As|Sb|C|Si|Ge|Sn|B|Al|Ga|In|Be|Mg|Ca|Sr|Ba|Li|Na|K|Rb|Cs|U|Th|Pu)\b)",
+        r"(?m)(?:^|\n)[ \t]*(?:(?:box|Section\s+[A-Z0-9]+)[ \t]+)?(?i:Q(?:uestion)?\.?[ \t]*)?0*[ \t]*([1-9](?:[ \t]*\d){0,2})(?:\*+)?[ \t]*(?:[\.\)\]\-–—:]|[ \t]+|\r?\n|$)(?:\D|$|\d{1,3}\s*(?:He|Ne|Ar|Kr|Xe|Rn|F|Cl|Br|I|O|S|Se|Te|N|P|As|Sb|C|Si|Ge|Sn|B|Al|Ga|In|Be|Mg|Ca|Sr|Ba|Li|Na|K|Rb|Cs|U|Th|Pu)\b)",
     )
     .unwrap()
 }

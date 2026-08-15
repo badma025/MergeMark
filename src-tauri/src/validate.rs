@@ -1146,4 +1146,48 @@ mod tests {
         // assert!(!repaired.contains("**1**\n**2**\n**3**\n**Mean**"), "{repaired}");
         // assert_eq!(sanitize_markdown_math(&repaired), repaired);
     }
+
+    #[test]
+    fn test_slice_page_text_by_y() {
+        let text = (1..=10).map(|i| format!("Line {}", i)).collect::<Vec<_>>().join("\n");
+        // Full page
+        assert_eq!(slice_page_text_by_y(&text, None, None), text);
+        // Top slice
+        let top = slice_page_text_by_y(&text, None, Some(0.3));
+        assert!(top.contains("Line 1"));
+        assert!(top.contains("Line 3"));
+        // Bottom slice
+        let bottom = slice_page_text_by_y(&text, Some(0.7), None);
+        assert!(bottom.contains("Line 7"));
+        assert!(bottom.contains("Line 10"));
+        // Middle slice
+        let middle = slice_page_text_by_y(&text, Some(0.4), Some(0.6));
+        assert!(middle.contains("Line 4"));
+        assert!(middle.contains("Line 6"));
+    }
+}
+
+/// Slice the page's digital OCR text according to the question's vertical bounds [start_y, end_y].
+/// If start_y or end_y are None, the respective boundary is clamped to 0.0 or 1.0.
+/// Adds a margin of safety so lines near the boundary are never clipped.
+pub fn slice_page_text_by_y(text: &str, start_y: Option<f32>, end_y: Option<f32>) -> String {
+    if (start_y.is_none() || start_y == Some(0.0)) && (end_y.is_none() || end_y == Some(1.0)) {
+        return text.to_string();
+    }
+    let lines: Vec<&str> = text.lines().collect();
+    if lines.is_empty() {
+        return String::new();
+    }
+    let total_lines = lines.len();
+    if total_lines <= 2 {
+        return text.to_string();
+    }
+
+    let s = (start_y.unwrap_or(0.0) - 0.06).max(0.0);
+    let e = (end_y.unwrap_or(1.0) + 0.06).min(1.0);
+
+    let start_line = ((total_lines as f32 * s).floor() as usize).min(total_lines.saturating_sub(1));
+    let end_line = ((total_lines as f32 * e).ceil() as usize).clamp(start_line + 1, total_lines);
+
+    lines[start_line..end_line].join("\n")
 }

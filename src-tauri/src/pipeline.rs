@@ -285,70 +285,79 @@ async fn prepare_chunk_images(
 ) -> Result<PreparedChunk, tokio::task::JoinError> {
     let page_cache = Arc::clone(page_cache);
     tokio::task::spawn_blocking(move || {
-        let mut images = Vec::with_capacity(inputs.len());
-        let mut local_to_chunk = Vec::with_capacity(inputs.len());
-        let mut page_bands = vec![None; chunk_len];
-        let mut page_crop_offsets = Vec::with_capacity(inputs.len());
-        let mut decoded_pages = vec![None; chunk_len];
+        use rayon::prelude::*;
 
-        for input in inputs {
-            // Use the shared decode cache: each page is decoded from base64
-            // at most once per pipeline run, then reused for all subsequent
-            // chunk preparations and diagram crops.
-            let decoded = page_cache.get_or_decode(input.chunk_idx, &input.b64);
-            let mut final_b64 = input.b64;
-            let mut crop_offset = (0.0_f32, 1.0_f32);
+        // Process chunk inputs concurrently across all worker cores
+        let processed: Vec<(
+            usize,
+            Option<Arc<image::DynamicImage>>,
+            String,
+            (f32, f32),
+            Option<(f32, f32)>,
+        )> = inputs
+            .into_par_iter()
+            .map(|input| {
+                let decoded = page_cache.get_or_decode(input.chunk_idx, &input.b64);
+                let mut final_b64 = input.b64;
+                let mut crop_offset = (0.0_f32, 1.0_f32);
+                let mut page_band = None;
 
-            if input.start_y.is_some() || input.end_y.is_some() {
-                let start = (input.start_y.unwrap_or(0.0) - 0.03).max(0.0);
-                let end = (input.end_y.unwrap_or(1.0) + 0.03).min(1.0);
-                if let Some(cropped) = decoded
-                    .as_deref()
-                    .and_then(|image| geometry::crop_page_vertical_from_image(image, start, end))
-                {
-                    final_b64 = cropped.b64;
-                    crop_offset = (cropped.y_offset_frac, cropped.height_frac);
-                }
-                page_bands[input.chunk_idx] = Some((
-                    input.start_y.unwrap_or(0.0),
-                    input.end_y.unwrap_or(1.0),
-                ));
-            }
-
-            // Phase 4: downsample the API image so the longest edge does not
-            // exceed 1024 px. The retained decoded page and the 300-DPI cache
-            // used by persist_diagrams remain at full resolution so physical
-            // crops preserve original precision. Bounding boxes returned by
-            // the vision model are expressed as fractions of this downsized
-            // image, but the pipeline converts them back to absolute pixels
-            // against the cached high-res page during cropping, so no
-            // coordinate remapping is needed here.
-            if let Some(img) = &decoded {
-                let (w, h) = img.dimensions();
-                let max_dim: u32 = 1024;
-                if w > max_dim || h > max_dim {
-                    let scale = max_dim as f32 / (w.max(h) as f32);
-                    let new_w = (w as f32 * scale).round().max(1.0) as u32;
-                    let new_h = (h as f32 * scale).round().max(1.0) as u32;
-                    let resized = image::imageops::resize(
-                        img.as_ref(),
-                        new_w,
-                        new_h,
-                        image::imageops::FilterType::Triangle,
-                    );
-                    let mut buf = std::io::Cursor::new(Vec::with_capacity(
-                        (new_w as usize * new_h as usize) / 8,
+                if input.start_y.is_some() || input.end_y.is_some() {
+                    let start = (input.start_y.unwrap_or(0.0) - 0.03).max(0.0);
+                    let end = (input.end_y.unwrap_or(1.0) + 0.03).min(1.0);
+                    if let Some(cropped) = decoded
+                        .as_deref()
+                        .and_then(|image| geometry::crop_page_vertical_from_image(image, start, end))
+                    {
+                        final_b64 = cropped.b64;
+                        crop_offset = (cropped.y_offset_frac, cropped.height_frac);
+                    }
+                    page_band = Some((
+                        input.start_y.unwrap_or(0.0),
+                        input.end_y.unwrap_or(1.0),
                     ));
-                    if resized.write_to(&mut buf, image::ImageFormat::WebP).is_ok() {
-                        use base64::Engine;
-                        final_b64 = base64::engine::general_purpose::STANDARD.encode(buf.into_inner());
+                }
+
+                if let Some(img) = &decoded {
+                    let (w, h) = img.dimensions();
+                    let max_dim: u32 = 1024;
+                    if w > max_dim || h > max_dim {
+                        let scale = max_dim as f32 / (w.max(h) as f32);
+                        let new_w = (w as f32 * scale).round().max(1.0) as u32;
+                        let new_h = (h as f32 * scale).round().max(1.0) as u32;
+                        let resized = image::imageops::resize(
+                            img.as_ref(),
+                            new_w,
+                            new_h,
+                            image::imageops::FilterType::Triangle,
+                        );
+                        let mut buf = std::io::Cursor::new(Vec::with_capacity(
+                            (new_w as usize * new_h as usize) / 8,
+                        ));
+                        if resized.write_to(&mut buf, image::ImageFormat::WebP).is_ok() {
+                            use base64::Engine;
+                            final_b64 = base64::engine::general_purpose::STANDARD.encode(buf.into_inner());
+                        }
                     }
                 }
-            }
 
-            decoded_pages[input.chunk_idx] = decoded;
+                (input.chunk_idx, decoded, final_b64, crop_offset, page_band)
+            })
+            .collect();
+
+        let mut images = Vec::with_capacity(processed.len());
+        let mut local_to_chunk = Vec::with_capacity(processed.len());
+        let mut page_bands = vec![None; chunk_len];
+        let mut page_crop_offsets = Vec::with_capacity(processed.len());
+        let mut decoded_pages = vec![None; chunk_len];
+
+        for (chunk_idx, decoded, final_b64, crop_offset, page_band) in processed {
+            if let Some(band) = page_band {
+                page_bands[chunk_idx] = Some(band);
+            }
+            decoded_pages[chunk_idx] = decoded;
             images.push(final_b64);
-            local_to_chunk.push(input.chunk_idx);
+            local_to_chunk.push(chunk_idx);
             page_crop_offsets.push(crop_offset);
         }
 
@@ -794,90 +803,96 @@ RULES:
 
 /// JSON Schema for the structure pass output
 fn structure_json_schema() -> serde_json::Value {
-    serde_json::json!({
-        "name": "PageStructureProposal",
-        "strict": true,
-        "schema": {
-            "type": "object",
-            "properties": {
-                "question_numbers_visible": {
-                    "type": "array",
-                    "items": { "type": "integer", "minimum": 1, "maximum": 100 }
-                },
-                "question_y_fracs": {
-                    "type": "array",
-                    "items": {
+    static SCHEMA: std::sync::OnceLock<serde_json::Value> = std::sync::OnceLock::new();
+    SCHEMA.get_or_init(|| {
+        serde_json::json!({
+            "name": "PageStructureProposal",
+            "strict": true,
+            "schema": {
+                "type": "object",
+                "properties": {
+                    "question_numbers_visible": {
                         "type": "array",
-                        "items": { "type": "number", "minimum": 0.0, "maximum": 1.0 },
+                        "items": { "type": "integer", "minimum": 1, "maximum": 100 }
+                    },
+                    "question_y_fracs": {
+                        "type": "array",
+                        "items": {
+                            "type": "array",
+                            "items": { "type": "number", "minimum": 0.0, "maximum": 1.0 },
+                            "minItems": 2,
+                            "maxItems": 2
+                        }
+                    },
+                    "total_marks_footer": {
+                        "type": ["array", "null"],
+                        "items": { "type": "integer" },
                         "minItems": 2,
                         "maxItems": 2
+                    },
+                    "total_marks_footer_y": {
+                        "type": ["number", "null"],
+                        "minimum": 0.0,
+                        "maximum": 1.0
+                    },
+                    "page_role": {
+                        "type": "string",
+                        "enum": ["QUESTION", "COVER", "INSTRUCTIONS", "BLANK", "ANSWER_BOOKLET", "REFERENCE"]
                     }
                 },
-                "total_marks_footer": {
-                    "type": ["array", "null"],
-                    "items": { "type": "integer" },
-                    "minItems": 2,
-                    "maxItems": 2
-                },
-                "total_marks_footer_y": {
-                    "type": ["number", "null"],
-                    "minimum": 0.0,
-                    "maximum": 1.0
-                },
-                "page_role": {
-                    "type": "string",
-                    "enum": ["QUESTION", "COVER", "INSTRUCTIONS", "BLANK", "ANSWER_BOOKLET", "REFERENCE"]
-                }
-            },
-            "required": ["question_numbers_visible", "question_y_fracs", "total_marks_footer", "total_marks_footer_y", "page_role"],
-            "additionalProperties": false
-        }
-    })
+                "required": ["question_numbers_visible", "question_y_fracs", "total_marks_footer", "total_marks_footer_y", "page_role"],
+                "additionalProperties": false
+            }
+        })
+    }).clone()
 }
 
 /// JSON Schema for the extraction pass output
 fn extraction_json_schema() -> serde_json::Value {
-    serde_json::json!({
-        "name": "QuestionExtraction",
-        "strict": true,
-        "schema": {
-            "type": "object",
-            "properties": {
-                "items": {
-                    "type": "array",
+    static SCHEMA: std::sync::OnceLock<serde_json::Value> = std::sync::OnceLock::new();
+    SCHEMA.get_or_init(|| {
+        serde_json::json!({
+            "name": "QuestionExtraction",
+            "strict": true,
+            "schema": {
+                "type": "object",
+                "properties": {
                     "items": {
-                        "type": "object",
-                        "properties": {
-                            "question_number": { "type": "integer", "minimum": 1, "maximum": 100 },
-                            "content": { "type": "string" },
-                            "marks": { "type": ["integer", "null"], "minimum": 0 },
-                            "topics": { "type": "array", "items": { "type": "string" } },
-                            "module": { "type": "string" },
-                            "is_code": { "type": "boolean" },
-                            "diagram_bboxes": {
-                                "type": "array",
-                                "items": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "question_number": { "type": "integer", "minimum": 1, "maximum": 100 },
+                                "content": { "type": "string" },
+                                "marks": { "type": ["integer", "null"], "minimum": 0 },
+                                "topics": { "type": "array", "items": { "type": "string" } },
+                                "module": { "type": "string" },
+                                "is_code": { "type": "boolean" },
+                                "diagram_bboxes": {
                                     "type": "array",
-                                    "items": { "type": "number", "minimum": 0.0, "maximum": 1.0 },
-                                    "minItems": 4,
-                                    "maxItems": 4
-                                }
+                                    "items": {
+                                        "type": "array",
+                                        "items": { "type": "number", "minimum": 0.0, "maximum": 1.0 },
+                                        "minItems": 4,
+                                        "maxItems": 4
+                                    }
+                                },
+                                "diagram_captions": { "type": "array", "items": { "type": "string" } },
+                                "diagram_kinds": { "type": "array", "items": { "type": "string" } },
+                                "bbox_page_indexes": { "type": "array", "items": { "type": "integer" } },
+                                "math_snippet": { "type": "string" },
+                                "visual_options": { "type": ["string", "null"] }
                             },
-                            "diagram_captions": { "type": "array", "items": { "type": "string" } },
-                            "diagram_kinds": { "type": "array", "items": { "type": "string" } },
-                            "bbox_page_indexes": { "type": "array", "items": { "type": "integer" } },
-                            "math_snippet": { "type": "string" },
-                            "visual_options": { "type": ["string", "null"] }
-                        },
-                        "required": ["question_number", "content", "marks", "topics", "module", "is_code", "diagram_bboxes", "diagram_captions", "diagram_kinds", "bbox_page_indexes", "math_snippet", "visual_options"],
-                        "additionalProperties": false
+                            "required": ["question_number", "content", "marks", "topics", "module", "is_code", "diagram_bboxes", "diagram_captions", "diagram_kinds", "bbox_page_indexes", "math_snippet", "visual_options"],
+                            "additionalProperties": false
+                        }
                     }
-                }
-            },
-            "required": ["items"],
-            "additionalProperties": false
-        }
-    })
+                },
+                "required": ["items"],
+                "additionalProperties": false
+            }
+        })
+    }).clone()
 }
 
 /// Phase 1: describe the vertical clip for each page (if any) in the
