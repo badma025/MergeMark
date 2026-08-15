@@ -999,8 +999,9 @@ OUTPUT STRUCTURE — EVERY item MUST have:
 - "module": string — output EXACTLY '{module}'.
 - "is_code": boolean (true only for code/pseudocode).
 - "diagram_bboxes": array of [x, y, w, h] boxes in full-page 0.0-1.0 relative coordinates.
-  * Box every drawn figure, chart, circuit, or schema. For graphs, include axes, tick labels, units, and captions with visible margin.
-  * NEVER box text tables, Markdown tables, or empty student answer spaces.
+  * Box every drawn figure, chart, circuit, geometric sketch, or schema. For graphs, include axes, tick labels, units, and captions with visible margin.
+  * NEVER box text tables, Markdown tables, mathematical matrices, vector equations, display formulas, or empty student answer spaces. All formulas and matrices MUST be transcribed in LaTeX math ($$ ... $$ / $ ... $), never boxed as image crops.
+  * Box ONLY the graphic itself. Do NOT include surrounding question text, equations, or prose in the diagram bounding box.
 - "diagram_captions": array of strings, one per box.
 - "diagram_kinds": array of semantic strings ("graph", "schema", "flowchart", "circuit", etc.), one per box.
 - "bbox_page_indexes": array of 0-based page image indices matching diagram_bboxes.

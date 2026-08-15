@@ -22,15 +22,19 @@ static RE_CLASSIFIER_MATH: LazyLock<regex::Regex> = LazyLock::new(|| regex::Rege
 static RE_LATEX_BOLD: LazyLock<regex::Regex> = LazyLock::new(|| regex::Regex::new(r"\*\*(.+?)\*\*").unwrap());
 static RE_LATEX_ITALIC: LazyLock<regex::Regex> = LazyLock::new(|| regex::Regex::new(r"\*([^\*]+?)\*").unwrap());
 static RE_LATEX_MULTIPLE_NL: LazyLock<regex::Regex> = LazyLock::new(|| regex::Regex::new(r"\n{3,}").unwrap());
-static RE_LATEX_INLINE_MARKS: LazyLock<regex::Regex> = LazyLock::new(|| regex::Regex::new(r"\[(\d+)\s*marks?\]").unwrap());
+static RE_LATEX_INLINE_MARKS: LazyLock<regex::Regex> = LazyLock::new(|| {
+    regex::Regex::new(r"(?i)(?:\*{0,2}[\[\(]\s*(\d+)\s*m\s*a\s*r\s*k\s*s?\s*[\]\)]\*{0,2}|\b(\d+)\s*m\s*a\s*r\s*k\s*s?\s*(?:\]|\)|$))").unwrap()
+});
+static RE_LATEX_DUPLICATE_SUBPART: LazyLock<regex::Regex> = LazyLock::new(|| regex::Regex::new(r"(?m)^[ \t]*\(([a-z])\)\s*\(([a-z])\)[ \t]+(.*)").unwrap());
 static RE_LATEX_SUBPART: LazyLock<regex::Regex> = LazyLock::new(|| regex::Regex::new(r"(?m)^[ \t]*\((i|ii|iii|iv|v|vi|vii|viii|ix|x)\)[ \t]+(.*)").unwrap());
 static RE_LATEX_PAREN_PART: LazyLock<regex::Regex> = LazyLock::new(|| regex::Regex::new(r"(?m)^[ \t]*\(([a-z])\)[ \t]+(.*)").unwrap());
 static RE_LATEX_UNPAREN_PART: LazyLock<regex::Regex> = LazyLock::new(|| regex::Regex::new(r"(?m)^[ \t]*([a-z])\)[ \t]+(.*)").unwrap());
 static RE_LATEX_LEADING_NUM: LazyLock<regex::Regex> = LazyLock::new(|| regex::Regex::new(r"^\s*\d+[\.\)\-\s]*").unwrap());
 static RE_LATEX_GREEK: LazyLock<regex::Regex> = LazyLock::new(|| {
-    regex::Regex::new(r"(?x)(^|[\s,.\-\(])\\(theta|alpha|beta|gamma|pi|mu|lambda|phi|omega|sigma|delta)([\s,.\-\)]|$)").unwrap()
+    regex::Regex::new(r"(?x)(^|[\s,.\-\(])\\(theta|alpha|beta|gamma|pi|mu|lambda|phi|omega|sigma|delta|epsilon|tau|rho|chi|psi|zeta|eta|kappa|nu|xi|Pi|Phi|Delta|Sigma|Omega|Gamma|Theta|Lambda|Psi)(_[0-9a-zA-Z]+)?([\s,.\-\)]|$)").unwrap()
 });
 static RE_LATEX_LIST: LazyLock<regex::Regex> = LazyLock::new(|| regex::Regex::new(r"(?m)^[\*\-]\s+").unwrap());
+static RE_MARKDOWN_IMG: LazyLock<regex::Regex> = LazyLock::new(|| regex::Regex::new(r"!\[.*?\]\((.*?)\)").unwrap());
 
 // ── Shared data model ─────────────────────────────────────────────────────────
 
@@ -565,6 +569,7 @@ pub async fn parse_pdf(app: tauri::AppHandle, file_path: String) -> Result<usize
 }
 
 #[derive(Debug, Clone, serde::Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
 pub struct WorksheetCompileOptions {
     pub file_name: Option<String>,
     pub exam_title: Option<String>,
@@ -665,77 +670,116 @@ pub async fn compile_worksheet(
         .unwrap_or_else(|| (total_marks as f32 * 1.2).round() as u32);
     let include_cover = opts.include_cover_page.unwrap_or(false);
     let is_lined = opts.answer_layout.as_deref() == Some("lined");
-    let default_instructions = "Answer all questions in the spaces provided.\nShow all necessary working out clearly.\nCalculators may be used where appropriate.";
     let instructions = opts
         .instructions
         .as_deref()
-        .unwrap_or(default_instructions);
+        .unwrap_or("Answer all questions in the spaces provided.\nShow all necessary working out clearly.\nCalculators may be used where appropriate.");
+
+    let header_title = if !school_name.trim().is_empty() {
+        format!("{} -- {}", school_name, exam_title)
+    } else {
+        exam_title.clone()
+    };
 
     let mut latex = String::new();
     latex.push_str("\\documentclass[11pt,a4paper]{article}\n");
-    latex.push_str("\\usepackage[top=2.2cm, bottom=2.5cm, left=2.2cm, right=2.2cm, headheight=20pt, headsep=0.8cm, footskip=1.2cm]{geometry}\n");
+    latex.push_str("\\usepackage[top=2.0cm, bottom=2.2cm, left=2.0cm, right=2.0cm, headheight=24pt, headsep=0.7cm, footskip=1.1cm]{geometry}\n");
     latex.push_str(
-        "\\usepackage{amsmath, amssymb, graphicx, xcolor, mdframed, parskip, enumitem, tabularx, lastpage, needspace}\n",
+        "\\usepackage{amsmath, amssymb, graphicx, xcolor, mdframed, parskip, enumitem, tabularx, lastpage, needspace, array}\n",
     );
     latex.push_str("\\usepackage[scaled=0.92]{helvet}\n");
     latex.push_str("\\renewcommand{\\familydefault}{\\sfdefault}\n");
     latex.push_str("\\usepackage{fancyhdr}\n");
+
+    // Professional color definitions
+    latex.push_str("\\definecolor{branddark}{HTML}{0F172A}\n");
+    latex.push_str("\\definecolor{brandgray}{HTML}{475569}\n");
+    latex.push_str("\\definecolor{lightborder}{HTML}{CBD5E1}\n");
+    latex.push_str("\\definecolor{cardbg}{HTML}{F8FAFC}\n");
+    latex.push_str("\\definecolor{ruledline}{HTML}{D1D5DB}\n");
+
+    // Ruled lines macro
+    latex.push_str("\\newcommand{\\examrule}{\\noindent\\makebox[\\linewidth]{\\color{ruledline}\\rule{\\linewidth}{0.3pt}}\\vspace{0.82cm}\\par\\nointerlineskip}\n");
+
+    // Digit boxes for Centre and Candidate Number (authentic UK exam board style)
+    latex.push_str("\\newcommand{\\digitbox}{\\framebox(13,15){}}\n");
+    latex.push_str("\\newcommand{\\centreboxes}{\\digitbox\\digitbox\\digitbox\\digitbox\\digitbox}\n");
+    latex.push_str("\\newcommand{\\candidateboxes}{\\digitbox\\digitbox\\digitbox\\digitbox}\n");
+
     latex.push_str("\\pagestyle{fancy}\n");
     latex.push_str("\\fancyhf{}\n");
     latex.push_str(&format!(
-        "\\lhead{{\\footnotesize\\textcolor{{gray!80}}{{\\textbf{{{}}}}}}}\n",
-        exam_title
+        "\\lhead{{\\footnotesize\\textcolor{{brandgray}}{{\\textbf{{{}}}}}}}\n",
+        header_title
     ));
-    latex.push_str("\\rhead{\\footnotesize\\textcolor{gray!80}{\\textbf{Page \\thepage\\ of \\pageref{LastPage}}}}\n");
-    latex.push_str("\\renewcommand{\\headrulewidth}{0.4pt}\n");
-    latex.push_str("\\renewcommand{\\headrule}{\\hbox to\\headwidth{\\color{gray!30}\\leaders\\hrule height \\headrulewidth\\hfill}}\n");
-    latex.push_str("\\cfoot{\\footnotesize\\textbf{Turn over}}\n");
+    latex.push_str("\\rhead{\\footnotesize\\textcolor{brandgray}{\\textbf{Page \\thepage\\ of \\pageref{LastPage}}}}\n");
+    latex.push_str("\\renewcommand{\\headrulewidth}{0.5pt}\n");
+    latex.push_str("\\renewcommand{\\headrule}{\\hbox to\\headwidth{\\color{lightborder}\\leaders\\hrule height \\headrulewidth\\hfill}}\n");
+    latex.push_str("\\lfoot{\\scriptsize\\textcolor{gray!60}{\\textsf{MERGEMARK ASSESSMENTS}}}\n");
+    latex.push_str("\\rfoot{\\footnotesize\\textbf{Turn over}}\n");
     latex.push_str("\\setlength{\\parskip}{0pt}\n");
     latex.push_str("\\setlength{\\parindent}{0pt}\n");
-    latex.push_str("\\setlist{topsep=0.4cm, parsep=0.2cm, itemsep=0.6cm, leftmargin=0.8cm, labelsep=0.4cm}\n");
-    latex.push_str("\\setlist[1]{label=\\textbf{\\arabic*.}, leftmargin=*}\n");
+    latex.push_str("\\setlist{topsep=0.35cm, parsep=0.2cm, itemsep=0.5cm, leftmargin=0.8cm, labelsep=0.4cm}\n");
+    latex.push_str("\\setlist[enumerate,1]{label=\\textbf{\\arabic*.}, leftmargin=*}\n");
+    latex.push_str("\\setlist[itemize]{label=\\textbullet, leftmargin=1.4em, itemsep=0.25em, topsep=0.2em}\n");
 
     if !include_cover {
         latex.push_str("\\fancypagestyle{firstpage}{%\n");
         latex.push_str("  \\fancyhf{}%\n");
-        latex.push_str(&format!(
-            "  \\lhead{{\\footnotesize\\textcolor{{gray!80}}{{\\textbf{{{}}}}}}}%\n",
-            exam_title
-        ));
-        latex.push_str(&format!(
-            "  \\rhead{{\\footnotesize\\textcolor{{gray!80}}{{\\textbf{{Total Marks: {} marks}}}}}}%\n",
-            total_marks
-        ));
-        latex.push_str("  \\renewcommand{\\headrulewidth}{0.4pt}%\n");
-        latex.push_str("  \\renewcommand{\\headrule}{\\hbox to\\headwidth{\\color{gray!30}\\leaders\\hrule height \\headrulewidth\\hfill}}%\n");
-        latex.push_str("  \\cfoot{\\footnotesize\\textbf{Turn over}}%\n");
+        latex.push_str("  \\rhead{\\footnotesize\\textcolor{brandgray}{\\textbf{Page \\thepage\\ of \\pageref{LastPage}}}}%\n");
+        latex.push_str("  \\lfoot{\\scriptsize\\textcolor{gray!60}{\\textsf{MERGEMARK ASSESSMENTS}}}%\n");
+        latex.push_str("  \\rfoot{\\footnotesize\\textbf{Turn over}}%\n");
+        latex.push_str("  \\renewcommand{\\headrulewidth}{0pt}%\n");
+        latex.push_str("  \\renewcommand{\\footrulewidth}{0pt}%\n");
         latex.push_str("}%\n");
     }
 
     latex.push_str("\\begin{document}\n");
 
     if include_cover {
-        latex.push_str("\\begin{titlepage}\n\\thispagestyle{empty}\n\\begin{center}\n\\vspace*{0.5cm}\n");
+        latex.push_str("\\begin{titlepage}\n\\thispagestyle{empty}\n\n");
+        
+        // Top Header Bar
+        latex.push_str("\\noindent\n\\begin{minipage}[c]{0.65\\linewidth}\n\\raggedright\n");
         if !school_name.trim().is_empty() {
-            latex.push_str(&format!("{{\\Large\\textbf{{{}}}}}\\\\[0.6cm]\n", school_name));
+            latex.push_str(&format!("{{\\large\\textbf{{\\textcolor{{branddark}}{{{}}}}}}}\\\\[0.1cm]\n", school_name));
         }
-        latex.push_str(&format!("{{\\Huge\\textbf{{{}}}}}\\\\[0.4cm]\n", exam_title));
+        latex.push_str("{\\scriptsize\\textbf{\\textcolor{brandgray}{\\textsf{OFFICIAL EXAMINATION PAPER}}}}\n");
+        latex.push_str("\\end{minipage}%\n\\begin{minipage}[c]{0.35\\linewidth}\n\\raggedleft\n");
+        latex.push_str("\\includegraphics[height=1.2cm]{mergemark_logo.png}\n");
+        latex.push_str("\\end{minipage}\n\n");
+
+        latex.push_str("\\vspace{0.35cm}\n\\noindent{\\color{branddark}\\rule{\\linewidth}{1.5pt}}\n\\vspace{0.3cm}\n\n");
+
+        // Main Title & Subject
+        latex.push_str("\\begin{center}\n");
         if !subject.trim().is_empty() {
-            latex.push_str(&format!("{{\\Large\\textbf{{{}}}}}\\\\[0.8cm]\n", subject));
-        } else {
-            latex.push_str("\\vspace{0.4cm}\n");
+            latex.push_str(&format!("{{\\Large\\textbf{{\\textcolor{{brandgray}}{{{}}}}}}}\\\\[0.25cm]\n", subject));
         }
-        latex.push_str("\\begin{tabular}{|p{0.92\\linewidth}|}\n\\hline\n\\vspace{0.1cm}\n");
-        latex.push_str("\\textbf{Candidate Name:}\\hspace{0.5cm}\\makebox[3.2in]{\\hrulefill}\\\\[0.4cm]\n");
-        latex.push_str("\\textbf{Candidate Number:}\\hspace{0.3cm}\\makebox[1.4in]{\\hrulefill}\\hspace{0.4cm}\\textbf{Centre Number:}\\hspace{0.3cm}\\makebox[1.4in]{\\hrulefill}\\\\[0.4cm]\n");
-        latex.push_str("\\textbf{Date:}\\hspace{2.2cm}\\makebox[2.0in]{\\hrulefill}\\\\[0.1cm]\n");
-        latex.push_str("\\hline\n\\end{tabular}\\\\[0.8cm]\n");
+        latex.push_str(&format!("{{\\Huge\\textbf{{\\textcolor{{branddark}}{{{}}}}}}}\\\\[0.35cm]\n", exam_title));
+        latex.push_str("\\end{center}\n\n");
+
+        // Candidate Identification Box
+        latex.push_str("\\noindent\n\\begin{mdframed}[linewidth=0.8pt, linecolor=branddark, backgroundcolor=white, roundcorner=2pt, innertopmargin=10pt, innerbottommargin=10pt, innerleftmargin=12pt, innerrightmargin=12pt]\n");
+        latex.push_str("{\\large\\textbf{Candidate Details}}\\\\[0.35cm]\n");
+        latex.push_str("\\begin{tabularx}{\\linewidth}{@{}l X l X@{}}\n");
+        latex.push_str("\\textbf{Surname:} & \\makebox[\\linewidth]{\\hrulefill} & \\textbf{Other Names:} & \\makebox[\\linewidth]{\\hrulefill} \\\\[0.45cm]\n");
+        latex.push_str("\\end{tabularx}\n\\vspace{0.1cm}\n");
+        latex.push_str("\\begin{tabularx}{\\linewidth}{@{}l c @{\\hspace{1.5cm}} l c X@{}}\n");
+        latex.push_str("\\textbf{Centre Number:} & \\centreboxes & \\textbf{Candidate Number:} & \\candidateboxes & \\\\\n");
+        latex.push_str("\\end{tabularx}\n\\end{mdframed}\n\n\\vspace{0.35cm}\n\n");
+
+        // Paper Info Strip
+        latex.push_str("\\noindent\n\\begin{mdframed}[linewidth=0.6pt, linecolor=lightborder, backgroundcolor=cardbg, roundcorner=2pt, innertopmargin=6pt, innerbottommargin=6pt, innerleftmargin=10pt, innerrightmargin=10pt]\n");
         latex.push_str(&format!(
-            "\\textbf{{Time Allowed: {} minutes}}\\hspace{{1.5cm}}\\textbf{{Total Marks: {} marks}}\\\\[0.8cm]\n",
+            "\\begin{{tabularx}}{{\\linewidth}}{{@{{}}Xcr@{{}}}}\n\\textbf{{Time Allowed:}} {} minutes & \\textbf{{Total Marks:}} {} marks & \\textbf{{Calculators:}} Permitted\n\\end{{tabularx}}\n",
             time_allowed, total_marks
         ));
-        latex.push_str("\\begin{mdframed}[linewidth=0.8pt, roundcorner=4pt, innertopmargin=10pt, innerbottommargin=10pt]\n");
-        latex.push_str("\\textbf{\\large Instructions to Candidates}\n\\begin{itemize}[leftmargin=1.5em, itemsep=0.4em]\n");
+        latex.push_str("\\end{mdframed}\n\n\\vspace{0.35cm}\n\n");
+
+        // Instructions Card
+        latex.push_str("\\noindent\n\\begin{mdframed}[linewidth=0.6pt, linecolor=lightborder, backgroundcolor=white, roundcorner=2pt, innertopmargin=8pt, innerbottommargin=8pt, innerleftmargin=10pt, innerrightmargin=10pt]\n");
+        latex.push_str("\\textbf{\\normalsize Instructions to Candidates}\n\\begin{itemize}\n");
         for line in instructions.lines() {
             let trimmed = line.trim();
             if !trimmed.is_empty() {
@@ -743,39 +787,97 @@ pub async fn compile_worksheet(
                 latex.push_str(&format!("\\item {}\n", sanitized_line));
             }
         }
-        latex.push_str("\\end{itemize}\n\\end{mdframed}\n");
-        latex.push_str("\\end{center}\n\\end{titlepage}\n\\newpage\n");
+        latex.push_str("\\end{itemize}\n\\vspace{0.2cm}\n");
+        latex.push_str("\\textbf{\\normalsize Information for Candidates}\n\\begin{itemize}\n");
+        latex.push_str(&format!("\\item The total mark for this paper is \\textbf{{{}}}.\n", total_marks));
+        latex.push_str("\\item The marks for each question are shown in brackets --- use this as a guide as to how much time to spend on each question.\n");
+        latex.push_str("\\end{itemize}\n\\end{mdframed}\n\n\\vfill\n\n");
+
+        // Examiner's Score Table (Grid)
+        latex.push_str("\\noindent\n\\begin{center}\n\\footnotesize\n\\textbf{FOR EXAMINER'S USE ONLY}\\\\[0.15cm]\n");
+        let mut examiner_table = String::from("\\begin{tabular}{|p{2.2cm}|");
+        for _ in 0..fetched_questions.len() {
+            examiner_table.push_str(">{\\centering\\arraybackslash}p{0.85cm}|");
+        }
+        examiner_table.push_str(">{\\centering\\arraybackslash}p{1.3cm}|}\n\\hline\n\\textbf{Question} & ");
+        for (idx, _) in fetched_questions.iter().enumerate() {
+            examiner_table.push_str(&format!("\\textbf{{{}}} & ", idx + 1));
+        }
+        examiner_table.push_str("\\textbf{Total} \\\\\n\\hline\n\\textbf{Max Mark} & ");
+        for q in &fetched_questions {
+            examiner_table.push_str(&format!("{} & ", q.marks));
+        }
+        examiner_table.push_str(&format!("{} \\\\\n\\hline\n\\textbf{{Mark}} & ", total_marks));
+        for _ in &fetched_questions {
+            examiner_table.push_str(" & ");
+        }
+        examiner_table.push_str(" \\\\\n\\hline\n\\end{tabular}\n");
+        latex.push_str(&examiner_table);
+        latex.push_str("\\end{center}\n");
+
+        latex.push_str("\\end{titlepage}\n\\newpage\n");
     } else {
         latex.push_str("\\thispagestyle{firstpage}\n\n");
-        latex.push_str("\\noindent\n\\begin{tabularx}{\\linewidth}{|X|r|r|}\n\\hline\n");
-        latex.push_str("\\vspace{0.05cm}\\textbf{Candidate Name:}\\hspace{3.0in} & \\vspace{0.05cm}\\textbf{Centre No:} & \\vspace{0.05cm}\\textbf{Candidate No:} \\\\\n");
-        latex.push_str("\\vspace{0.45cm} & \\vspace{0.45cm} & \\vspace{0.45cm} \\\\\n\\hline\n\\end{tabularx}\n\\vspace{0.5cm}\n\n");
+        latex.push_str("\\noindent\n\\begin{minipage}[c]{0.12\\linewidth}\n");
+        latex.push_str("\\includegraphics[height=1.1cm]{mergemark_logo.png}\n");
+        latex.push_str("\\end{minipage}%\n\\begin{minipage}[c]{0.88\\linewidth}\n\\raggedright\n");
+        if !school_name.trim().is_empty() {
+            latex.push_str(&format!("{{\\scriptsize\\textbf{{\\textcolor{{brandgray}}{{\\textsf{{{}}}}}}}\\\\[0.05cm]}}\n", school_name));
+        }
+        latex.push_str(&format!("{{\\Large\\textbf{{\\textcolor{{branddark}}{{{}}}}}}}", exam_title));
+        if !subject.trim().is_empty() {
+            latex.push_str(&format!(" \\quad {{\\normalsize\\textbf{{\\textcolor{{brandgray}}{{| \\\\ {} }}}}}}", subject));
+        }
+        latex.push_str("\n\\end{minipage}\n\n\\vspace{0.25cm}\n\\noindent{\\color{lightborder}\\rule{\\linewidth}{0.6pt}}\n\\vspace{0.2cm}\n\n");
+
+        // Candidate strip with digit boxes
+        latex.push_str("\\noindent\n\\begin{mdframed}[linewidth=0.6pt, linecolor=branddark, backgroundcolor=white, roundcorner=2pt, innertopmargin=6pt, innerbottommargin=6pt, innerleftmargin=8pt, innerrightmargin=8pt]\n");
+        latex.push_str("\\begin{tabularx}{\\linewidth}{@{}p{0.42\\linewidth}@{\\hspace{0.02\\linewidth}}p{0.28\\linewidth}@{\\hspace{0.02\\linewidth}}p{0.26\\linewidth}@{}}\n");
+        latex.push_str("\\textbf{Candidate Name:} \\makebox[1.4in]{\\hrulefill} & \\textbf{Centre No:} \\ \\centreboxes & \\textbf{Candidate No:} \\ \\candidateboxes \\\\\n");
+        latex.push_str("\\end{tabularx}\n\\end{mdframed}\n\n\\vspace{0.15cm}\n\n");
+
+        // Stats pill
+        latex.push_str("\\noindent\n\\begin{mdframed}[linewidth=0.5pt, linecolor=lightborder, backgroundcolor=cardbg, roundcorner=2pt, innertopmargin=4pt, innerbottommargin=4pt, innerleftmargin=8pt, innerrightmargin=8pt]\n");
+        latex.push_str(&format!(
+            "\\textbf{{Total Marks:}} {} marks \\hfill \\textbf{{Time Allowed:}} {} mins \\hfill \\textbf{{Calculators:}} Permitted\n",
+            total_marks, time_allowed
+        ));
+        latex.push_str("\\end{mdframed}\n\n\\vspace{0.4cm}\n\n");
     }
 
     latex.push_str("\\begin{enumerate}\n");
 
     let mut answer_latex = String::new();
     answer_latex.push_str("\\documentclass[11pt,a4paper]{article}\n");
-    answer_latex.push_str("\\usepackage[top=2.2cm, bottom=2.5cm, left=2.2cm, right=2.2cm, headheight=20pt, headsep=0.8cm, footskip=1.2cm]{geometry}\n");
+    answer_latex.push_str("\\usepackage[top=2.0cm, bottom=2.2cm, left=2.0cm, right=2.0cm, headheight=24pt, headsep=0.7cm, footskip=1.1cm]{geometry}\n");
     answer_latex.push_str(
-        "\\usepackage{amsmath, amssymb, graphicx, xcolor, mdframed, parskip, enumitem, lastpage}\n",
+        "\\usepackage{amsmath, amssymb, graphicx, xcolor, mdframed, parskip, enumitem, lastpage, needspace}\n",
     );
     answer_latex.push_str("\\usepackage[scaled=0.92]{helvet}\n");
     answer_latex.push_str("\\renewcommand{\\familydefault}{\\sfdefault}\n");
     answer_latex.push_str("\\usepackage{fancyhdr}\n");
+
+    answer_latex.push_str("\\definecolor{branddark}{HTML}{0F172A}\n");
+    answer_latex.push_str("\\definecolor{brandgray}{HTML}{475569}\n");
+    answer_latex.push_str("\\definecolor{lightborder}{HTML}{CBD5E1}\n");
+    answer_latex.push_str("\\definecolor{cardbg}{HTML}{F8FAFC}\n");
+
     answer_latex.push_str("\\pagestyle{fancy}\n");
     answer_latex.push_str("\\fancyhf{}\n");
     answer_latex.push_str(&format!(
-        "\\lhead{{\\footnotesize\\textcolor{{gray!80}}{{\\textbf{{{} -- Mark Scheme & Solutions}}}}}}\n",
-        exam_title
+        "\\lhead{{\\footnotesize\\textcolor{{brandgray}}{{\\textbf{{{} -- Mark Scheme & Solutions}}}}}}\n",
+        header_title
     ));
-    answer_latex.push_str("\\rhead{\\footnotesize\\textcolor{gray!80}{\\textbf{Page \\thepage\\ of \\pageref{LastPage}}}}\n");
-    answer_latex.push_str("\\renewcommand{\\headrulewidth}{0.4pt}\n");
-    answer_latex.push_str("\\renewcommand{\\headrule}{\\hbox to\\headwidth{\\color{gray!30}\\leaders\\hrule height \\headrulewidth\\hfill}}\n");
+    answer_latex.push_str("\\rhead{\\footnotesize\\textcolor{brandgray}{\\textbf{Page \\thepage\\ of \\pageref{LastPage}}}}\n");
+    answer_latex.push_str("\\renewcommand{\\headrulewidth}{0.5pt}\n");
+    answer_latex.push_str("\\renewcommand{\\headrule}{\\hbox to\\headwidth{\\color{lightborder}\\leaders\\hrule height \\headrulewidth\\hfill}}\n");
+    answer_latex.push_str("\\lfoot{\\scriptsize\\textcolor{gray!60}{\\textsf{MERGEMARK ASSESSMENTS}}}\n");
+    answer_latex.push_str("\\rfoot{\\footnotesize\\textbf{Turn over}}\n");
     answer_latex.push_str("\\setlength{\\parskip}{0pt}\n");
     answer_latex.push_str("\\setlength{\\parindent}{0pt}\n");
-    answer_latex.push_str("\\setlist{topsep=0.4cm, parsep=0.2cm, itemsep=0.6cm, leftmargin=0.8cm, labelsep=0.4cm}\n");
-    answer_latex.push_str("\\setlist[1]{label=\\textbf{\\arabic*.}, leftmargin=*}\n");
+    answer_latex.push_str("\\setlist{topsep=0.35cm, parsep=0.2cm, itemsep=0.5cm, leftmargin=0.8cm, labelsep=0.4cm}\n");
+    answer_latex.push_str("\\setlist[enumerate,1]{label=\\textbf{\\arabic*.}, leftmargin=*}\n");
+    answer_latex.push_str("\\setlist[itemize]{label=\\textbullet, leftmargin=1.4em, itemsep=0.25em, topsep=0.2em}\n");
     answer_latex.push_str("\\begin{document}\n");
     answer_latex.push_str("\\begin{enumerate}\n");
 
@@ -784,14 +886,36 @@ pub async fn compile_worksheet(
         let mut content = crate::validate::sanitize_for_latex(&question.content);
         content = content.replace("\r\n", "\n");
 
+        // Format inline marks BEFORE bolding to catch **[X marks]**, [X m arks ], or trailing marks
+        content = RE_LATEX_INLINE_MARKS
+            .replace_all(&content, |caps: &regex::Captures| {
+                let count_str = caps.get(1).or_else(|| caps.get(2)).map(|m| m.as_str()).unwrap_or("0");
+                let count = count_str.parse::<u32>().unwrap_or(0);
+                if count == 1 {
+                    "\\null\\hfill\\textbf{[1 mark]}".to_string()
+                } else {
+                    format!("\\null\\hfill\\textbf{{[{} marks]}}", count)
+                }
+            })
+            .to_string();
+
         // Format markdown to LaTeX
         content = RE_LATEX_BOLD.replace_all(&content, r"\textbf{${1}}").to_string();
         content = RE_LATEX_ITALIC.replace_all(&content, r"\textit{${1}}").to_string();
         content = RE_LATEX_MULTIPLE_NL.replace_all(&content, "\n\n").to_string();
 
-        // Flush-right part marks
-        content = RE_LATEX_INLINE_MARKS
-            .replace_all(&content, r"\null\hfill\textbf{[${1} marks]}")
+        // Deduplicate repeated subpart tags
+        content = RE_LATEX_DUPLICATE_SUBPART
+            .replace_all(&content, |caps: &regex::Captures| {
+                let p1 = &caps[1];
+                let p2 = &caps[2];
+                let rest = &caps[3];
+                if p1 == p2 {
+                    format!("\\par\\vspace{{0.3cm}}\\noindent\\textbf{{({})}}\\hspace{{0.5em}}{}", p1, rest)
+                } else {
+                    format!("\\par\\vspace{{0.3cm}}\\noindent\\textbf{{({})}}\\hspace{{0.5em}}({}) {}", p1, p2, rest)
+                }
+            })
             .to_string();
 
         // Format subparts (i) with hanging indent
@@ -831,52 +955,83 @@ pub async fn compile_worksheet(
         // Fix bare Greek variables safely using a closure (no $23 expansion bugs!)
         content = RE_LATEX_GREEK
             .replace_all(&content, |caps: &regex::Captures| {
-                format!("{}$\\{}${}", &caps[1], &caps[2], &caps[3])
+                let sub = caps.get(3).map(|m| m.as_str()).unwrap_or("");
+                format!("{}$\\{}{}${}", &caps[1], &caps[2], sub, &caps[4])
             })
             .to_string();
 
         content = RE_LATEX_LIST.replace_all(&content, "\n\n").to_string();
 
-        while let Some(start_idx) = content.find("![Diagram](") {
-            if let Some(end_idx) = content[start_idx..].find(')') {
-                let path = &content[start_idx + 11..start_idx + end_idx];
-                let latex_img = format!(
-                    "\\begin{{center}}\\includegraphics[width=0.75\\linewidth]{{{}}}\\end{{center}}",
-                    path
-                );
-                content.replace_range(start_idx..start_idx + end_idx + 1, &latex_img);
-            } else {
-                break;
-            }
-        }
+        // Safe markdown image replacement (with path slashes normalized for LaTeX)
+        content = RE_MARKDOWN_IMG.replace_all(&content, |caps: &regex::Captures| {
+            let raw_path = &caps[1];
+            let safe_path = raw_path.replace('\\', "/");
+            format!("\\begin{{center}}\\includegraphics[width=0.75\\linewidth]{{{}}}\\end{{center}}", safe_path)
+        }).to_string();
 
-        latex.push_str("  \\needspace{4.5cm}\n");
-        latex.push_str(&format!("  \\item {}\n", content));
-        if !question.math_snippet.is_empty() {
-            if question.is_code {
-                latex.push_str(&format!(
-                    "  \\begin{{verbatim}}\n{}\n  \\end{{verbatim}}\n",
-                    question.math_snippet
-                ));
-            } else {
-                latex.push_str(&format!("  \\[ {} \\]\n", question.math_snippet));
-            }
-        }
-
-        latex.push_str(&format!(
-            "  \\par\\vspace{{0.25cm}}\\hfill\\textbf{{(Total for Question {} is {} marks)}}\\par\\vspace{{0.4cm}}\n",
-            question_num, question.marks
-        ));
+        let mark_word = if question.marks == 1 { "mark" } else { "marks" };
 
         if is_lined {
-            latex.push_str("  \\nointerlineskip\n");
-            let lines_to_draw = (question.marks * 3).max(6);
-            for _ in 0..lines_to_draw {
-                latex.push_str("  \\vspace{0.8cm}\\par\\noindent{\\color{gray!40}\\rule{\\linewidth}{0.3pt}}\\nointerlineskip\n");
+            if i > 0 {
+                latex.push_str("\\newpage\n");
             }
-            latex.push_str("  \\vspace{0.6cm}\\par\n\n");
+            latex.push_str(&format!("  \\item {}\n", content));
+            if !question.math_snippet.is_empty() {
+                if question.is_code {
+                    latex.push_str(&format!(
+                        "  \\begin{{verbatim}}\n{}\n  \\end{{verbatim}}\n",
+                        question.math_snippet
+                    ));
+                } else {
+                    latex.push_str(&format!("  \\[ {} \\]\n", question.math_snippet));
+                }
+            }
+
+            // Fill remainder of the question page with lines
+            latex.push_str("  \\par\\nopagebreak\\vspace{0.35cm}\n");
+            let initial_lines = 16;
+            for _ in 0..initial_lines {
+                latex.push_str("  \\examrule\n");
+            }
+
+            // High mark questions get continuation page(s) fully lined from top to bottom
+            let continuation_pages = if question.marks >= 11 {
+                2
+            } else if question.marks >= 5 {
+                1
+            } else {
+                0
+            };
+
+            for _ in 0..continuation_pages {
+                latex.push_str("\\newpage\n\\noindent\n");
+                latex.push_str(&format!("\\textbf{{Question {} continued}}\\\\[0.35cm]\n", question_num));
+                for _ in 0..26 {
+                    latex.push_str("\\examrule\n");
+                }
+            }
+
+            latex.push_str(&format!(
+                "  \\par\\vspace*{{\\fill}}\\hfill\\textbf{{(Total for Question {} is {} {})}}\\par\\vspace{{0.15cm}}\n\n",
+                question_num, question.marks, mark_word
+            ));
         } else {
-            latex.push_str("  \\vspace{0.5cm}\\par\n\n");
+            latex.push_str("  \\needspace{4.5cm}\n");
+            latex.push_str(&format!("  \\item {}\n", content));
+            if !question.math_snippet.is_empty() {
+                if question.is_code {
+                    latex.push_str(&format!(
+                        "  \\begin{{verbatim}}\n{}\n  \\end{{verbatim}}\n",
+                        question.math_snippet
+                    ));
+                } else {
+                    latex.push_str(&format!("  \\[ {} \\]\n", question.math_snippet));
+                }
+            }
+            latex.push_str(&format!(
+                "  \\par\\nopagebreak\\vspace{{0.3cm}}\\hfill\\textbf{{(Total for Question {} is {} {})}}\\par\\vspace{{0.45cm}}\n\n",
+                question_num, question.marks, mark_word
+            ));
         }
 
         answer_latex.push_str("  \\needspace{4.5cm}\n");
@@ -892,13 +1047,26 @@ pub async fn compile_worksheet(
             }
         }
         answer_latex.push_str(&format!(
-            "  \\par\\vspace{{0.25cm}}\\hfill\\textbf{{(Total for Question {} is {} marks)}}\\par\n",
-            question_num, question.marks
+            "  \\par\\nopagebreak\\vspace{{0.3cm}}\\hfill\\textbf{{(Total for Question {} is {} {})}}\\par\\vspace{{0.35cm}}\n",
+            question_num, question.marks, mark_word
         ));
 
         if let Some(raw_ans) = &question.answer_content {
             let mut ans_content = crate::validate::sanitize_for_latex(raw_ans);
             ans_content = ans_content.replace("\r\n", "\n");
+
+            ans_content = RE_LATEX_INLINE_MARKS
+                .replace_all(&ans_content, |caps: &regex::Captures| {
+                    let count_str = caps.get(1).or_else(|| caps.get(2)).map(|m| m.as_str()).unwrap_or("0");
+                    let count = count_str.parse::<u32>().unwrap_or(0);
+                    if count == 1 {
+                        "\\null\\hfill\\textbf{[1 mark]}".to_string()
+                    } else {
+                        format!("\\null\\hfill\\textbf{{[{} marks]}}", count)
+                    }
+                })
+                .to_string();
+
             ans_content = RE_LATEX_BOLD
                 .replace_all(&ans_content, r"\textbf{${1}}")
                 .to_string();
@@ -906,8 +1074,18 @@ pub async fn compile_worksheet(
                 .replace_all(&ans_content, r"\textit{${1}}")
                 .to_string();
             ans_content = RE_LATEX_MULTIPLE_NL.replace_all(&ans_content, "\n\n").to_string();
-            ans_content = RE_LATEX_INLINE_MARKS
-                .replace_all(&ans_content, r"\null\hfill\textbf{[${1} marks]}")
+
+            ans_content = RE_LATEX_DUPLICATE_SUBPART
+                .replace_all(&ans_content, |caps: &regex::Captures| {
+                    let p1 = &caps[1];
+                    let p2 = &caps[2];
+                    let rest = &caps[3];
+                    if p1 == p2 {
+                        format!("\\par\\vspace{{0.3cm}}\\noindent\\textbf{{({})}}\\hspace{{0.5em}}{}", p1, rest)
+                    } else {
+                        format!("\\par\\vspace{{0.3cm}}\\noindent\\textbf{{({})}}\\hspace{{0.5em}}({}) {}", p1, p2, rest)
+                    }
+                })
                 .to_string();
 
             ans_content = RE_LATEX_SUBPART
@@ -929,46 +1107,63 @@ pub async fn compile_worksheet(
                 )
                 .to_string();
 
-            ans_content = RE_LATEX_GREEK
-                .replace_all(&ans_content, |caps: &regex::Captures| {
-                    format!("{}$\\{}${}", &caps[1], &caps[2], &caps[3])
-                })
-                .to_string();
-            ans_content = RE_LATEX_LIST.replace_all(&ans_content, "\n\n").to_string();
+            ans_content = RE_LATEX_LEADING_NUM.replace(&ans_content, "").to_string();
 
-            while let Some(start_idx) = ans_content.find("![Diagram](") {
-                if let Some(end_idx) = ans_content[start_idx..].find(')') {
-                    let path = &ans_content[start_idx + 11..start_idx + end_idx];
-                    let latex_img = format!(
-                        "\\begin{{center}}\\includegraphics[width=0.75\\linewidth]{{{}}}\\end{{center}}",
-                        path
-                    );
-                    ans_content.replace_range(start_idx..start_idx + end_idx + 1, &latex_img);
-                } else {
-                    break;
+            let ans_snippet = question.math_snippet.trim();
+            if !ans_snippet.is_empty() {
+                let ans_content_trim = ans_content.trim_end();
+                if ans_content_trim.ends_with(ans_snippet) {
+                    ans_content = ans_content_trim[..ans_content_trim.len() - ans_snippet.len()]
+                        .trim_end()
+                        .to_string();
                 }
             }
 
-            answer_latex.push_str("  \\vspace{0.4em}\n  \\begin{mdframed}[backgroundcolor=gray!8, linewidth=0.5pt, roundcorner=4pt]\n");
-            answer_latex.push_str("  \\textbf{\\small Mark Scheme & Model Solution:}\\\\[0.4em]\n");
+            ans_content = RE_LATEX_GREEK
+                .replace_all(&ans_content, |caps: &regex::Captures| {
+                    let sub = caps.get(3).map(|m| m.as_str()).unwrap_or("");
+                    format!("{}$\\{}{}${}", &caps[1], &caps[2], sub, &caps[4])
+                })
+                .to_string();
+
+            ans_content = RE_LATEX_LIST.replace_all(&ans_content, "\n\n").to_string();
+
+            ans_content = RE_MARKDOWN_IMG.replace_all(&ans_content, |caps: &regex::Captures| {
+                let raw_path = &caps[1];
+                let safe_path = raw_path.replace('\\', "/");
+                format!("\\begin{{center}}\\includegraphics[width=0.75\\linewidth]{{{}}}\\end{{center}}", safe_path)
+            }).to_string();
+
+            answer_latex.push_str("  \\begin{mdframed}[linewidth=0.6pt, linecolor=lightborder, backgroundcolor=cardbg, roundcorner=3pt, innertopmargin=8pt, innerbottommargin=8pt, innerleftmargin=10pt, innerrightmargin=10pt]\n");
             answer_latex.push_str(&format!("  {}\n", ans_content));
+            answer_latex.push_str("  \\end{mdframed}\n\n");
+        } else {
+            answer_latex.push_str("  \\begin{mdframed}[linewidth=0.6pt, linecolor=lightborder, backgroundcolor=cardbg, roundcorner=3pt, innertopmargin=8pt, innerbottommargin=8pt, innerleftmargin=10pt, innerrightmargin=10pt]\n");
+            answer_latex.push_str("  \\textit{No mark scheme available for this question.}\n");
             answer_latex.push_str("  \\end{mdframed}\n\n");
         }
     }
 
     latex.push_str("\\end{enumerate}\n\n");
     latex.push_str("\\vspace{0.8cm}\n\\begin{center}\n");
-    latex.push_str(&format!("\\rule{{0.5\\linewidth}}{{0.4pt}}\\\\[0.3cm]\n\\textbf{{\\large TOTAL FOR PAPER: {} MARKS}}\\\\[0.2cm]\n\\textbf{{\\small --- END OF QUESTION PAPER ---}}\n", total_marks));
+    latex.push_str(&format!("\\rule{{0.5\\linewidth}}{{0.6pt}}\\\\[0.35cm]\n\\textbf{{\\large TOTAL FOR PAPER: {} MARKS}}\\\\[0.2cm]\n\\textbf{{\\small --- END OF QUESTION PAPER ---}}\n", total_marks));
     latex.push_str("\\end{center}\n");
+    latex.push_str("\\rfoot{}\n");
     latex.push_str("\\end{document}\n");
 
     answer_latex.push_str("\\end{enumerate}\n\n");
     answer_latex.push_str("\\vspace{0.8cm}\n\\begin{center}\n");
-    answer_latex.push_str(&format!("\\rule{{0.5\\linewidth}}{{0.4pt}}\\\\[0.3cm]\n\\textbf{{\\large TOTAL FOR PAPER: {} MARKS}}\\\\[0.2cm]\n\\textbf{{\\small --- END OF MARK SCHEME ---}}\n", total_marks));
+    answer_latex.push_str(&format!("\\rule{{0.5\\linewidth}}{{0.6pt}}\\\\[0.35cm]\n\\textbf{{\\large TOTAL FOR PAPER: {} MARKS}}\\\\[0.2cm]\n\\textbf{{\\small --- END OF MARK SCHEME ---}}\n", total_marks));
     answer_latex.push_str("\\end{center}\n");
+    answer_latex.push_str("\\rfoot{}\n");
     answer_latex.push_str("\\end{document}\n");
 
     let download_dir = app.path().download_dir().map_err(|e| e.to_string())?;
+
+    // Embed MergeMark logo for LaTeX compilation
+    let logo_bytes = include_bytes!("../icons/128x128@2x.png");
+    let logo_path = download_dir.join("mergemark_logo.png");
+    let _ = std::fs::write(&logo_path, logo_bytes);
 
     // Sanitize file name: keep alphanumeric, spaces, hyphens, underscores
     let effective_name = opts
@@ -1040,6 +1235,15 @@ pub async fn compile_worksheet(
         "pdflatex".to_string()
     };
 
+    // 2-Pass Compilation for Worksheet: Pass 1 generates .aux, Pass 2 resolves Page X of Y
+    let _ = std::process::Command::new(&pdflatex_cmd)
+        .current_dir(&download_dir)
+        .arg("-interaction=nonstopmode")
+        .arg("-output-directory")
+        .arg(&download_dir)
+        .arg(&worksheet_tex)
+        .output();
+
     let output_worksheet = std::process::Command::new(&pdflatex_cmd)
         .current_dir(&download_dir)
         .arg("-interaction=nonstopmode")
@@ -1058,6 +1262,15 @@ pub async fn compile_worksheet(
             stdout, stderr
         ));
     }
+
+    // 2-Pass Compilation for Answer Key
+    let _ = std::process::Command::new(&pdflatex_cmd)
+        .current_dir(&download_dir)
+        .arg("-interaction=nonstopmode")
+        .arg("-output-directory")
+        .arg(&download_dir)
+        .arg(&answer_key_tex)
+        .output();
 
     let output_answer_key = std::process::Command::new(&pdflatex_cmd)
         .current_dir(&download_dir)

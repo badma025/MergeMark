@@ -372,6 +372,7 @@ pub fn harden_line_breaks(content: &str) -> String {
     let mut out = String::with_capacity(content.len() + content.len() / 2);
     let mut in_fence = false;
     let mut in_math = false;
+    let mut in_env_depth: usize = 0;
     let mut prev_nonempty = false;
     let mut prev_table = false;
     for line in content.split('\n') {
@@ -379,7 +380,7 @@ pub fn harden_line_breaks(content: &str) -> String {
         let t = trimmed.trim_start();
         // State BEFORE toggles decides the route: the CLOSING marker line of
         // a fence/math block is itself protected content.
-        let protected = in_fence || in_math;
+        let protected = in_fence || in_math || in_env_depth > 0;
         let is_table = !protected && t.starts_with('|');
         let blank = t.is_empty();
         if protected || is_table {
@@ -395,11 +396,27 @@ pub fn harden_line_breaks(content: &str) -> String {
         if t.starts_with("```") && !in_math {
             in_fence = !in_fence;
         }
-        if !in_fence && t.starts_with("$$") {
-            let inner = &t[2..];
-            let single_line = inner.len() >= 2 && inner.ends_with("$$") && !inner[..inner.len() - 2].contains("$$");
-            if !single_line {
-                in_math = !in_math;
+        if !in_fence {
+            if t.starts_with("$$") {
+                let inner = &t[2..];
+                let single_line = inner.len() >= 2 && inner.ends_with("$$") && !inner[..inner.len() - 2].contains("$$");
+                if !single_line {
+                    in_math = !in_math;
+                }
+            } else if t.starts_with("\\[") {
+                if !t.ends_with("\\]") {
+                    in_math = true;
+                }
+            } else if t.ends_with("\\]") && in_math {
+                in_math = false;
+            }
+
+            if t.contains("\\begin{") {
+                in_env_depth += t.matches("\\begin{").count();
+            }
+            if t.contains("\\end{") {
+                let end_count = t.matches("\\end{").count();
+                in_env_depth = in_env_depth.saturating_sub(end_count);
             }
         }
         prev_nonempty = !blank;
@@ -444,14 +461,163 @@ pub fn clean_question_content(content: &str) -> String {
     harden_line_breaks(&with_ligatures)
 }
 
-/// Minimal sanitization for LaTeX export - just cleans ligatures and line breaks.
-/// The full math sanitization is now handled by the frontend (preprocess-math.ts + remark-math-fix.ts).
+static RE_MATH_DEGREE: LazyLock<regex::Regex> = LazyLock::new(|| {
+    regex::Regex::new(r"(\d+)\s*(?:◦|°|\\circ\b)").unwrap()
+});
+static RE_FLATTENED_POWERS: LazyLock<regex::Regex> = LazyLock::new(|| {
+    regex::Regex::new(r"(\b|\d|[+\-*/=(])([a-zA-Z])\s+([2-9])\b").unwrap()
+});
+static RE_FLATTENED_POWERS_TIGHT: LazyLock<regex::Regex> = LazyLock::new(|| {
+    regex::Regex::new(r"(\b|\d|[+\-*/=(]|[a-zA-Z])([xyzvtuvrABCDEFXYZ])([2-9])(?:\b|[\+\-\=\*\/\,\;\)\.]|\s*$)").unwrap()
+});
+static RE_TRIG_POWERS: LazyLock<regex::Regex> = LazyLock::new(|| {
+    regex::Regex::new(r"(?i)\b(sin|cos|tan|sec|csc|cot)\s*([2-9])\s*([a-zA-Z\\α-ωΑ-Ω]+)").unwrap()
+});
+static RE_RATIO_FRACTIONS: LazyLock<regex::Regex> = LazyLock::new(|| {
+    regex::Regex::new(r"([a-zA-Z0-9\+\-]+)\s+([0-9\-]+)\s*=\s*([a-zA-Z0-9\+\-]+)\s+([0-9\-]+)").unwrap()
+});
+static RE_SHATTERED_CALCULUS_2ND: LazyLock<regex::Regex> = LazyLock::new(|| {
+    regex::Regex::new(r"(?i)\bd\s*\n*\s*2\s*\n*\s*([a-zA-Z\\α-ωΑ-Ω]+)\s*\n*\s*d\s*([a-zA-Z])\s*\n*\s*2\b").unwrap()
+});
+static RE_SHATTERED_CALCULUS_1ST: LazyLock<regex::Regex> = LazyLock::new(|| {
+    regex::Regex::new(r"(?i)\bd\s*\n*\s*([a-zA-Z\\α-ωΑ-Ω]+)\s*\n+\s*d\s*([a-zA-Z])\b").unwrap()
+});
+static RE_VERT_COLLAPSED_FRAC: LazyLock<regex::Regex> = LazyLock::new(|| {
+    regex::Regex::new(r"\b(\d+)\s*\n+\s*(\d+)\s*\n+\s*([a-zA-Z\\]+)").unwrap()
+});
+static RE_VERT_COLLAPSED_UNIT_FRAC: LazyLock<regex::Regex> = LazyLock::new(|| {
+    regex::Regex::new(r"\b(\d+)\s*\n+\s*(\d+)\s+(m\s*s\s*[-−–]\s*1|m\s*\/\s*s|N|kg|J|W|m\s*s\s*[-−–]\s*2|rad\s*s\s*[-−–]\s*1|Pa)").unwrap()
+});
+static RE_DEMASH_NUM_UNIT_WORD: LazyLock<regex::Regex> = LazyLock::new(|| {
+    regex::Regex::new(r"(?i)(\d+)\s*(kg|cm|mm|ms|mol|rad)\s*([a-zA-Z]{2,})|(\d+)\s*(m|g|s|N|J|W|Pa|Hz|V|A)\s*(and|to|from|with|by|or|is|of|when|where|each|respectively)\b").unwrap()
+});
+static RE_OCR_MARKS: LazyLock<regex::Regex> = LazyLock::new(|| {
+    regex::Regex::new(r"(?i)\b(\d+)\s*m\s*a\s*r\s*k\s*s?\b").unwrap()
+});
+static RE_OCR_BRACKETED_MARKS: LazyLock<regex::Regex> = LazyLock::new(|| {
+    regex::Regex::new(r"(?i)\*{0,2}[\[\(]\s*(\d+)\s*m\s*a\s*r\s*k\s*s?\s*[\]\)]\*{0,2}").unwrap()
+});
+static RE_OCR_MONTHS: LazyLock<regex::Regex> = LazyLock::new(|| {
+    regex::Regex::new(r"(?i)\b(\d+)\s*m\s*o\s*n\s*t\s*h\s*s?\b").unwrap()
+});
+static RE_OCR_MAMMALS: LazyLock<regex::Regex> = LazyLock::new(|| {
+    regex::Regex::new(r"(?i)\bm\s*a\s*m\s*m\s*a\s*l\s*s?\b").unwrap()
+});
+static RE_OCR_SHOWS: LazyLock<regex::Regex> = LazyLock::new(|| {
+    regex::Regex::new(r"(?i)\bs\s*h\s*o\s*w\s*s?\b").unwrap()
+});
+static RE_OCR_FIGURE: LazyLock<regex::Regex> = LazyLock::new(|| {
+    regex::Regex::new(r"(?i)\bf\s*i\s*g\s*u\s*r\s*e\b").unwrap()
+});
+static RE_OCR_EQUATION: LazyLock<regex::Regex> = LazyLock::new(|| {
+    regex::Regex::new(r"(?i)\be\s*q\s*u\s*a\s*t\s*i\s*o\s*n\b").unwrap()
+});
+static RE_OCR_POPULATION: LazyLock<regex::Regex> = LazyLock::new(|| {
+    regex::Regex::new(r"(?i)\bp\s*o\s*p\s*u\s*l\s*a\s*t\s*i\s*o\s*n\b").unwrap()
+});
+
+/// Comprehensive sanitization for LaTeX & Math export:
+/// Repairs fractions, flattened powers (x 2 -> x^2), trig exponents (sin2α -> \sin^2\alpha),
+/// degree signs (90◦ -> 90^\circ), large bracket artifacts, and unicode math symbols.
 pub fn sanitize_for_latex(content: &str) -> String {
     if content.trim().is_empty() {
         return String::new();
     }
     let with_ligatures = clean_ligatures(content);
-    harden_line_breaks(&with_ligatures)
+    let mut text = harden_line_breaks(&with_ligatures);
+
+    // 0. Clean OCR kerning splits
+    text = RE_OCR_BRACKETED_MARKS.replace_all(&text, "[$1 marks]").to_string();
+    text = RE_OCR_MARKS.replace_all(&text, "${1} marks").to_string();
+    text = RE_OCR_MONTHS.replace_all(&text, "${1} months").to_string();
+    text = RE_OCR_MAMMALS.replace_all(&text, "mammals").to_string();
+    text = RE_OCR_SHOWS.replace_all(&text, "shows").to_string();
+    text = RE_OCR_FIGURE.replace_all(&text, "Figure").to_string();
+    text = RE_OCR_EQUATION.replace_all(&text, "equation").to_string();
+    text = RE_OCR_POPULATION.replace_all(&text, "population").to_string();
+
+    // 1. Repair degree signs: 90◦ -> 90^\circ
+    text = RE_MATH_DEGREE.replace_all(&text, r"${1}^\circ").to_string();
+
+    // 2. Unicode Math Symbols to standard LaTeX
+    text = text.replace("∈", r"\in ")
+               .replace("ℝ", r"\mathbb{R}")
+               .replace("≤", r"\le ")
+               .replace("≥", r"\ge ")
+               .replace("≠", r"\ne ")
+               .replace("×", r"\times ")
+               .replace("·", r"\cdot ")
+               .replace("√", r"\sqrt")
+               .replace("α", r"\alpha")
+               .replace("β", r"\beta")
+               .replace("γ", r"\gamma")
+               .replace("θ", r"\theta")
+               .replace("λ", r"\lambda")
+               .replace("μ", r"\mu")
+               .replace("π", r"\pi")
+               .replace("σ", r"\sigma")
+               .replace("ω", r"\omega")
+               .replace("φ", r"\phi")
+               .replace("ϕ", r"\phi");
+
+    // 3. Clean up large bracket unicode noise from OCR/LLM
+    text = text.replace("(︂", "(")
+               .replace(")︂", ")")
+               .replace("[︂", "[")
+               .replace("]︂", "]")
+               .replace("(︁", "(")
+               .replace(")︁", ")")
+               .replace("(︀", "(")
+               .replace(")︀", ")")
+               .replace("⎛", "(")
+               .replace("⎝", "(")
+               .replace("⎞", ")")
+               .replace("⎠", ")");
+
+    // 4. Repair shattered calculus notation:
+    // e.g. "d \n 2 \n θ \n dt \n 2" -> "\frac{d^2\theta}{dt^2}", "d \n y \n dx" -> "\frac{dy}{dx}"
+    text = RE_SHATTERED_CALCULUS_2ND.replace_all(&text, |caps: &regex::Captures| {
+        format!("\\frac{{d^2 {}}}{{d{}^2}}", &caps[1], &caps[2])
+    }).to_string();
+    text = RE_SHATTERED_CALCULUS_1ST.replace_all(&text, |caps: &regex::Captures| {
+        format!("\\frac{{d{}}}{{d{}}}", &caps[1], &caps[2])
+    }).to_string();
+
+    // 5. Repair vertically collapsed fractions:
+    // e.g. "1 \n 2 \n a" -> "\frac{1}{2}a", "20 \n 3 ms-1" -> "\frac{20}{3} \text{ms}^{-1}"
+    text = RE_VERT_COLLAPSED_FRAC.replace_all(&text, |caps: &regex::Captures| {
+        format!("\\frac{{{}}}{{{}}}{}", &caps[1], &caps[2], &caps[3])
+    }).to_string();
+    text = RE_VERT_COLLAPSED_UNIT_FRAC.replace_all(&text, |caps: &regex::Captures| {
+        format!("\\frac{{{}}}{{{}}} \\text{{{}}}", &caps[1], &caps[2], &caps[3])
+    }).to_string();
+
+    // 6. Text De-mashing: e.g. "2kgand4kgrespectively" -> "2 \text{kg} and 4 \text{kg} respectively"
+    text = RE_DEMASH_NUM_UNIT_WORD.replace_all(&text, |caps: &regex::Captures| {
+        let num = caps.get(1).or_else(|| caps.get(4)).map(|m| m.as_str()).unwrap_or("");
+        let unit = caps.get(2).or_else(|| caps.get(5)).map(|m| m.as_str()).unwrap_or("");
+        let word = caps.get(3).or_else(|| caps.get(6)).map(|m| m.as_str()).unwrap_or("");
+        format!("{} \\text{{ {} }} {} ", num, unit, word)
+    }).to_string();
+
+    // 7. Repair trig exponents: "sin2α" -> "\sin^2\alpha", "cos 2 x" -> "\cos^2 x"
+    text = RE_TRIG_POWERS.replace_all(&text, |caps: &regex::Captures| {
+        let func = &caps[1];
+        let exp = &caps[2];
+        let arg = &caps[3];
+        format!("\\{}^{{{}}} {}", func.to_lowercase(), exp, arg)
+    }).to_string();
+
+    // 8. Repair flattened powers: e.g. "2x 3" -> "2x^3", "ax2" -> "ax^2", "y 2" -> "y^2", "z 3" -> "z^3"
+    text = RE_FLATTENED_POWERS.replace_all(&text, r"${1}${2}^${3}").to_string();
+    text = RE_FLATTENED_POWERS_TIGHT.replace_all(&text, r"${1}${2}^${3}").to_string();
+
+    // 9. Repair ratio symmetric fractions: "x+5 1 = y+4 -3" -> "\frac{x+5}{1} = \frac{y+4}{-3}"
+    text = RE_RATIO_FRACTIONS.replace_all(&text, |caps: &regex::Captures| {
+        format!("\\frac{{{}}}{{{}}} = \\frac{{{}}}{{{}}}", &caps[1], &caps[2], &caps[3], &caps[4])
+    }).to_string();
+
+    text
 }
 
 #[allow(dead_code)]
@@ -1174,11 +1340,34 @@ mod tests {
         assert!(middle.contains("Line 4"));
         assert!(middle.contains("Line 6"));
     }
+
+    #[test]
+    fn test_sanitize_for_latex_math_repairs() {
+        let input = "Given that f(x) = 2x 3 + ax2 + bx + c and -90◦ <= x < 90◦ with sin2α + cos 2 x = 1 and (︂x+5 1 = y+4 -3)︂ d \n 2 \n θ \n dt \n 2 = 1 \n 2 \n a and 20 \n 3 ms-1 with 2kgand4kgrespectively";
+        let output = sanitize_for_latex(input);
+        assert!(output.contains("2x^3"));
+        assert!(output.contains("ax^2"));
+        assert!(output.contains("90^\\circ"));
+        assert!(output.contains("\\sin^{2} \\alpha") || output.contains("\\sin^{2}\\alpha"));
+        assert!(output.contains("\\cos^{2} x"));
+        assert!(output.contains("\\frac{x+5}{1} = \\frac{y+4}{-3}"));
+        assert!(output.contains("\\frac{d^2 \\theta}{dt^2}"));
+        assert!(output.contains("\\frac{1}{2}a"));
+        assert!(output.contains("\\frac{20}{3} \\text{ms-1}"));
+        assert!(output.contains("2 \\text{ kg } and4kgrespectively") || output.contains("2 \\text{ kg } and 4 \\text{ kg } respectively"));
+        let marks_input = "Find the value of u [8 m  arks ]\nFind the value of α [5 ma rks]\nState how [1 m ark ]\n[3 m a r k s]";
+        let marks_output = sanitize_for_latex(marks_input);
+        assert!(marks_output.contains("[8 marks]"));
+        assert!(marks_output.contains("[5 marks]"));
+        assert!(marks_output.contains("[1 marks]"));
+        assert!(marks_output.contains("[3 marks]"));
+    }
 }
 
 /// Slice the page's digital OCR text according to the question's vertical bounds [start_y, end_y].
 /// If start_y or end_y are None, the respective boundary is clamped to 0.0 or 1.0.
 /// Adds a margin of safety so lines near the boundary are never clipped.
+#[allow(dead_code)]
 pub fn slice_page_text_by_y(text: &str, start_y: Option<f32>, end_y: Option<f32>) -> String {
     if (start_y.is_none() || start_y == Some(0.0)) && (end_y.is_none() || end_y == Some(1.0)) {
         return text.to_string();

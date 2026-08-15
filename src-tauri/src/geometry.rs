@@ -63,10 +63,12 @@ static BOILERPLATE_REGEXES: LazyLock<Vec<regex::Regex>> = LazyLock::new(|| {
         .collect()
 });
 
+#[allow(dead_code)]
 static RE_MARKS: LazyLock<regex::Regex> = LazyLock::new(|| {
     regex::Regex::new(r"(?i)\[\s*\d+\s+marks?\s*\]").unwrap()
 });
 
+#[allow(dead_code)]
 static RE_CONT: LazyLock<regex::Regex> = LazyLock::new(|| {
     regex::Regex::new(r"(?i)question\s+\d+\s+continues\s+on\s+(?:the\s+)?next\s+page").unwrap()
 });
@@ -1026,7 +1028,8 @@ fn crop_diagram_reading(
     }
 
     let mut owned = img.clone();
-    let cropped = image::imageops::crop(&mut owned, safe_x, safe_y, safe_w, safe_h).to_image();
+    let raw_cropped = image::imageops::crop(&mut owned, safe_x, safe_y, safe_w, safe_h).to_image();
+    let cropped = trim_residual_text_edges(raw_cropped);
 
     if !ignore_grid {
         let gray = image::DynamicImage::ImageRgba8(cropped.clone()).to_luma8();
@@ -1035,6 +1038,100 @@ fn crop_diagram_reading(
         }
     }
     Ok(cropped)
+}
+
+/// Check horizontal row densities to detect and trim single-line question text/headers
+/// accidentally caught at the very top or bottom edge of a diagram crop.
+pub fn trim_residual_text_edges(img: image::RgbaImage) -> image::RgbaImage {
+    let (w, h) = (img.width(), img.height());
+    if w < 50 || h < 60 {
+        return img;
+    }
+
+    let gray = image::DynamicImage::ImageRgba8(img.clone()).to_luma8();
+    
+    // Row darkness profile: count of dark pixels (< 200) per row
+    let mut row_dark_counts: Vec<u32> = Vec::with_capacity(h as usize);
+    for y in 0..h {
+        let mut dark = 0u32;
+        for x in 0..w {
+            if gray.get_pixel(x, y)[0] < 200 {
+                dark += 1;
+            }
+        }
+        row_dark_counts.push(dark);
+    }
+
+    let mut top_trim = 0u32;
+    let max_search_h = (h as f32 * 0.18).round() as u32; // check up to top 18%
+
+    let mut text_band_found = false;
+    let mut gap_start = 0;
+    for y in 0..max_search_h {
+        let dark = row_dark_counts[y as usize];
+        let frac = dark as f32 / w as f32;
+        if frac > 0.03 && frac < 0.40 {
+            text_band_found = true;
+        } else if text_band_found && frac <= 0.005 {
+            gap_start = y;
+            break;
+        }
+    }
+
+    if gap_start > 0 {
+        let mut gap_len = 0;
+        for y in gap_start..max_search_h {
+            if row_dark_counts[y as usize] as f32 / w as f32 <= 0.005 {
+                gap_len += 1;
+            } else {
+                break;
+            }
+        }
+        if gap_len >= 6 {
+            top_trim = gap_start + gap_len;
+        }
+    }
+
+    let mut bottom_trim = 0u32;
+    let mut bottom_text_found = false;
+    let mut b_gap_start = 0;
+    let search_bottom_start = h.saturating_sub(max_search_h);
+
+    for y in (search_bottom_start..h).rev() {
+        let dark = row_dark_counts[y as usize];
+        let frac = dark as f32 / w as f32;
+        if frac > 0.03 && frac < 0.40 {
+            bottom_text_found = true;
+        } else if bottom_text_found && frac <= 0.005 {
+            b_gap_start = y;
+            break;
+        }
+    }
+
+    if b_gap_start > search_bottom_start {
+        let mut gap_len = 0;
+        for y in (search_bottom_start..=b_gap_start).rev() {
+            if row_dark_counts[y as usize] as f32 / w as f32 <= 0.005 {
+                gap_len += 1;
+            } else {
+                break;
+            }
+        }
+        if gap_len >= 6 {
+            bottom_trim = h.saturating_sub(b_gap_start.saturating_sub(gap_len));
+        }
+    }
+
+    if top_trim > 0 || bottom_trim > 0 {
+        let new_y = top_trim;
+        let new_h = h.saturating_sub(top_trim).saturating_sub(bottom_trim);
+        if new_h >= MIN_EDGE_PX {
+            let mut owned = image::DynamicImage::ImageRgba8(img);
+            return image::imageops::crop(&mut owned, 0, new_y, w, new_h).to_image();
+        }
+    }
+
+    img
 }
 
 /// Decode a base64 page image (with or without a data-URL prefix).
