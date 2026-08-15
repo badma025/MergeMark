@@ -317,9 +317,7 @@ async fn prepare_chunk_images(
                         input.start_y.unwrap_or(0.0),
                         input.end_y.unwrap_or(1.0),
                     ));
-                }
-
-                if let Some(img) = &decoded {
+                } else if let Some(img) = &decoded {
                     let (w, h) = img.dimensions();
                     let max_dim: u32 = 1024;
                     if w > max_dim || h > max_dim {
@@ -973,63 +971,39 @@ END OF EXAMPLES — Follow the same JSON structure, escaping rules, and isolatio
     format!(
         r#"You are a precise mathematical OCR engine transcribing exactly ONE exam question. Output ONLY a valid JSON object of the form {{"items": [ ... ]}}.
 
-CONTEXT: The page image(s) show Question {number} of the paper '{paper}'. They may ALSO show the tail of the previous question or the head of the next one. Transcribe ONLY content that belongs to Question {number}. If nothing on these pages belongs to Question {number}, return {{"items": []}}.
+CONTEXT: The page image(s) show Question {number} of the paper '{paper}'. Transcribe ONLY content belonging to Question {number}. If nothing belongs to Question {number}, return {{"items": []}}.
 
-═══ ABSOLUTE RULE — QUESTION ISOLATION (highest priority, overrides everything below) ═══
-You are transcribing Question {number} and NOTHING ELSE. Sub-parts belonging to a different main question must NEVER appear in your output, not even one line of them.
-1. OWNERSHIP TEST — before transcribing any line, ask: "which main question owns this line?" A sub-part label ((a), (b), (i), 4.2, "0 4 . 3", "5 (b) (ii)") belongs to the main question printed in the label itself, or, when the label prints no main number, to the nearest whole-number heading ABOVE it. If the owner is not {number}, DROP the line. When you cannot prove a line belongs to {number}, DROP it.
-2. HARD STOP — while reading downward, the moment you meet ANY of these, stop transcribing immediately and never resume on that page:
-   * a printed whole question number other than {number} (e.g. "{number} " followed later by the next integer, "0 5", "17");
-   * a sub-part label whose printed main number is not {number} (e.g. "04.1" when you are extracting Question 3);
-   * a "(Total for Question {number} is M marks)" / "[Total: M]" footer for Question {number} — that footer marks the END of your question;
-   * a separator rule/shaded bar introducing a new question.
-3. HARD START — skip everything above the start of Question {number}. Trailing sub-parts, answer lines or figures of the PREVIOUS question that appear at the top of the page are NOT yours, even if they flow visually into your question.
-4. SUB-PART CONTINUITY — Question {number} may span several pages; its sub-parts continue in order ((a), (b), (c) ... never resetting). If a page begins with "(d)" and Question {number}'s previous page ended at "(c)", that "(d)" is yours. But if lettering RESTARTS at (a) after a totals footer, that (a) belongs to the NEXT question — drop it.
-5. NEVER renumber, merge or "helpfully" include a neighbouring question's parts to make the item look complete. A short, correctly-isolated item is always better than a merged one. Merged questions are rejected outright.
-6. If a y-band hint ("transcribe only between X% and Y% down the page") is given in the user message, treat it as authoritative for WHAT to transcribe, in addition to rules 1-4.
+═══ QUESTION ISOLATION RULES (HIGHEST PRIORITY) ═══
+Transcribe Question {number} and NOTHING ELSE. Sub-parts belonging to other questions must NEVER appear.
+1. OWNERSHIP: A sub-part belongs to the question printed in its label, or the nearest whole-number heading above it. If not {number}, DROP it.
+2. HARD STOP: Immediately stop transcribing when you meet another question heading, a sub-part label for a different main question, a totals footer ("(Total for Question {number} is M marks)"), or a new question separator.
+3. HARD START: Skip trailing parts/diagrams of previous questions at the page top.
+4. SUB-PARTS: Continue in printed order ((a), (b), (c)...). If numbering restarts at (a) after a totals footer, it belongs to the next question — DROP it.
+5. ISOLATION: Never merge or renumber neighbouring questions. A short, accurate item is required.
+6. Y-BAND HINTS: If a y-band hint is provided in user instructions, adhere strictly to its vertical bounds.
 
-SELF-CHECK BEFORE OUTPUT: re-read your "content". Every sub-part label in it must belong to Question {number}. Any label that came after a totals footer, or that printed a different main number, must be deleted. Confirm your content contains no second main-question heading.
-
-Normally there is exactly ONE item. Return more than one ONLY if Question {number} visibly consists of independent numbered tasks on these pages. NEVER return an item for a question number other than {number}.
-
-EVERY item MUST have:
-- "question_number": {number} (integer, exactly).
-- "content": FULL transcription of Question {number} only (never a summary). Preserve all punctuation. Separate sub-parts (a), (b), (c) with double newlines (\n\n), keeping them in printed order. Append the mark tag `**[X marks]**` to every sub-part that shows a mark allocation. Transcribe every sentence, including instructions to the candidate that belong to this question. Do NOT include: any text belonging to another question, page headers/footers ("Question X continued", "Turn over"), the "(Total for Question X is Y marks)" footer, plain ruled answer lines, or "BLANK PAGE".
-- STRUCTURED TABLES WITH HEADERS — trace tables, function tables, working grids — ARE question content even when the body cells are EMPTY. If the text says Complete the trace table, Complete the table, or show the results of executing, NEVER return a diagram box for that grid, even when the question mentions another Figure; transcribe every row and pre-filled cell as standard Markdown tables in "content" (keeping every header and any pre-filled cells), NEVER as diagram boxes.
-- "marks": integer total for this question's visible part, or null if unknown.
+OUTPUT STRUCTURE — EVERY item MUST have:
+- "question_number": {number} (integer).
+- "content": Full text transcription of Question {number} without summary or leading question number (e.g. "17 Here is..." -> "Here is...").
+  * Format sub-parts (a), (b), (c) separated by double newlines (\n\n) with mark tags `**[X marks]**`.
+  * Omit headers, footers, "(Total for Question...)", blank page notices, and dotted answer lines at the end of parts.
+  * Structured tables (trace tables, data tables): Transcribe as Markdown tables (| col |), NEVER as diagram boxes.
+  * Math: Wrap inline math in $...$, display equations on their own line in $$...$$. Use valid LaTeX (\\frac, \\sin, \\cos, \\theta). Backslashes MUST be escaped in JSON (\\\\frac). Never wrap English sentences in $$.
+  * Code: Markdown backticks (`...`), never LaTeX math mode.
+  * Multiple choice: Keep uppercase options (`A ...\nB ...`).
+  * AQA sub-parts: Render '02.1' as (a), '02.2' as (b). Spaced "01 5" as (e).
+  * Insert [DIAGRAM_PLACEHOLDER] chronologically after referencing text.
+- "marks": Total integer marks, or null if unknown.
 {topics_instruction}
 - "module": string — output EXACTLY '{module}'.
-- "is_code": boolean (true only for code/pseudocode questions).
-- "diagram_captions": array of captions, one per figure box, or empty string; "diagram_kinds": array of semantic kinds such as graph, schema, flowchart, circuit, or multi-panel, one per box. Decide whether each exhibit is a figure before proposing geometry.
-- "visual_options": null for ordinary questions and text-only multiple-choice options. Set exactly to "composite_visual_options" when the answer choices are primarily visual assets (graphs, diagrams, plots, circuits, or illustrated answer choices). For that case, return ONE diagram placeholder and ONE bounding box spanning the complete choices block from the start of option A through the bottom of option D, including the A/B/C/D labels, all graphs or diagrams, tick boxes, axes, captions, and surrounding whitespace. Never emit one crop per visual option.
-- "diagram_bboxes": array of [x, y, w, h] boxes with RELATIVE 0.0-1.0 coordinates, one per visual exhibit. IMPORTANT: coordinates are ALWAYS relative to the FULL page image (0,0 at the top-left corner of the page, 1,1 at the bottom-right), EVEN when the prompt tells you to only transcribe between certain y-percentages (multi-question pages). The y-band is only a hint for what to TRANSCRIBE — never shift or rescale bbox coordinates to match the band. Box EVERY figure the paper draws — graphs, networks, trees, circuits — INCLUDING anything the paper labels as a Figure (e.g. "Figure 6"): printed relation/database schemas, algorithm screens, and grids that are part of the question exhibit are figures, return them as boxes, not as text. One box per WHOLE figure including its labels/caption, never two boxes on one figure. Do NOT box plain question text, tables you transcribed as Markdown (STRUCTURED TABLES rule above), or EMPTY student answer grids. The parser crop-checks every box (and rejects boxes whose center falls outside the question's band on multi-question pages). Include the complete semantic figure extent, including captions and disconnected components, rather than tight-boxing one shape.
-GRAPH/CANVAS EXTENT: for every graph or chart, the box MUST include the complete visual canvas, not merely the plotted grid. Include the far-left y-axis title, variables, units, numeric tick labels and axis line; the bottom x-axis title, variables, units and tick labels; the top/right border or grid edge; and the printed Figure heading/caption. Leave visible whitespace around these elements. A graph crop that starts at the y-axis or ends at the plot border is incomplete.
-The parser crop-checks every box: blank boxes, empty ruled grids, and duplicate boxes are rejected and cost you a repair round.
-- "bbox_page_indexes": array with the SAME LENGTH as diagram_bboxes — the 0-based index of the page image each box refers to.
-- Insert the exact token [DIAGRAM_PLACEHOLDER] in "content" where each diagram belongs chronologically.
-
-FORMATTING & STRUCTURAL RULES:
-- ARTIFACT FILTERING: Recognize and completely exclude all non-exam content. Silently ignore margin warnings (e.g. "Do not write outside the box", "Do not write in this area"), printer registration marks, alignment crosses, page numbers, and barcodes.
-- TABLE FORMATTING: If a grid or table contains standard text or numbers, you MUST format it as a standard Markdown table using pipes | and dashes -. NEVER use LaTeX array environments or \\hline for data tables.
-- EQUATION COHESION: A mathematical equation MUST remain inside a single, cohesive display math block $$ ... $$. Never split an equation into multiple blocks. Operators like =, +, or exponents like ^n and ^{{-1}} must remain inside the same block as the matrices or variables they belong to.
-- INLINE IMAGE PLACEMENT: If an image or diagram is present, insert its placeholder [DIAGRAM_PLACEHOLDER] IMMEDIATELY after the sentence or paragraph that references it (e.g., directly after 'shown in Figure 3'). Never place diagrams at the end of the question if they were referenced earlier.
-- DELIMITER DISCIPLINE: NEVER place inline math delimiters $ inside a display math $$ block. Display math must start with $$ and end with $$ with NO inner $ signs. Never wrap regular prose or full sentences in $$ display math delimiters.
-- CHARACTER PRECISION: Pay close attention to function notation. Do not confuse the italic function symbol $f$ in $f(x)$ or $f(t)$ with the number 1. Pay extreme attention to Greek symbols: do not confuse \\theta with the number 1, or \\alpha with a. Accurately transcribe all complex number forms, e.g., r(\\cos \\theta + \\text{{i}}\\sin \\theta).
-- LIST CLEAN-UP: Do not output empty list bullets or empty numbered prefixes.
-- CRITICAL: Never fracture inline math. WRONG: $r(\\\\cos$ \\\\theta $). RIGHT: $r(\\\\cos \\\\theta)$.
-- CRITICAL: Never wrap English sentences in $$. Use $ for variables inside text.
-- STRUCTURAL SPACING: Enforce strict hierarchical spacing. Use double line breaks (\\n\\n) to clearly separate sub-question identifiers (e.g. (a), (b), (i), (ii)) and mark allocations (**[X marks]**) from the surrounding text to prevent visual collapsing.
-- MATHEMATICAL ACCURACY: Ensure all mathematical notation, including complex numbers, vectors, matrices, exponents, integrals, and trigonometric/logarithmic functions (\\\\cos, \\\\sin, \\\\tan, \\\\ln, \\\\log, \\\\exp), is accurately translated into valid, standard LaTeX.
-- ROBUST TABLE RENDERING: All text/data tables and categorized lists must be rendered cleanly and correctly as standard Markdown tables compatible with standard Markdown/HTML viewers. Never leak broken, unsupported, or raw formatting tags (such as raw \\\\hline commands, unrendered LaTeX tabular environments, or broken HTML tags in text).
-- OMIT the leading question number at the very start of the question text (e.g. if the text reads "17 Here is triangle ABC.", you MUST output "Here is triangle ABC." without the "17").
-- OMIT trailing answer line units, symbols, and answer templates at the very end of the question (e.g. "..................... %", "£ .....................", "..................... cm", or "............ $\\le t <$ ............"). Do NOT transcribe the answer blanks or the mathematical operators embedded within them.
-- Wrap inline math in single $...$. Use $$...$$ ONLY for display equations on their own line.
-- Pure mathematical matrices or Simplex tableaus: LaTeX \\begin{{array}} or \\begin{{pmatrix}}/\\begin{{bmatrix}} inside $$...$$. Never put $ inside array/matrix environments.
-- Multiple-choice options: keep their original capital letter labels (e.g. `A ...`, `B ...`) separated by newlines. Do NOT format them as lowercase sub-parts like `(a)`.
-- Code/pseudocode/SQL/identifiers: Markdown backticks, NEVER LaTeX math mode.
-- AQA decimal sub-parts: render '02.1'-style parts as (a), (b), (c) — positionally: .1 -> a, .2 -> b — and update inline cross-references accordingly. AQA also uses SPACED sub-parts: "01 5" means Question 1, sub-part 5 — render as (e). The whole question number is ALWAYS the integer before the space/dot. NEVER return decimals like 1.5 for spaced sub-parts. Whole-numbered MCQs are independent questions, never decimals.
-- JSON ESCAPING: backslashes in LaTeX MUST be escaped (\\\\frac, \\\\theta, \\\\begin). Unescaped backslashes break the parser and your work is discarded.
-- The content MUST end with terminal punctuation or a mark tag. Never stop mid-sentence.{few_shot}
+- "is_code": boolean (true only for code/pseudocode).
+- "diagram_bboxes": array of [x, y, w, h] boxes in full-page 0.0-1.0 relative coordinates.
+  * Box every drawn figure, chart, circuit, or schema. For graphs, include axes, tick labels, units, and captions with visible margin.
+  * NEVER box text tables, Markdown tables, or empty student answer spaces.
+- "diagram_captions": array of strings, one per box.
+- "diagram_kinds": array of semantic strings ("graph", "schema", "flowchart", "circuit", etc.), one per box.
+- "bbox_page_indexes": array of 0-based page image indices matching diagram_bboxes.
+- "visual_options": null for text questions. Set to "composite_visual_options" ONLY if MCQ answer choices are visual diagrams (return ONE composite box spanning options A through D).{few_shot}
 "#,
         number = span.number,
         paper = config.paper_name,
@@ -2842,11 +2816,11 @@ fn audit_diagram_boxes(
                 continue;
             }
 
-            // NEW: Check if bbox covers answer space (blank lines, underscores, ruled grids)
-            let cropped_for_check = match geometry::crop_diagram_with_options(
+            // Perform crop with proper padding for audit and duplicate detection
+            let cropped = match geometry::crop_diagram_with_options(
                 img,
                 bbox,
-                10,  // minimal padding for check
+                40,
                 ignore_grid,
                 graph_like,
             ) {
@@ -2868,39 +2842,13 @@ fn audit_diagram_boxes(
             };
 
             // Check if the cropped region looks like answer space
-            if geometry::looks_like_answer_space(&cropped_for_check) {
+            if geometry::looks_like_answer_space(&cropped) {
                 bad.push((ii, bi));
                 issues.push(format!(
                     "{label}: the box covers STUDENT ANSWER SPACE (blank lines, underscores, or ruled working area). Never box these — the question prompt text belongs in \"content\"; visual diagrams only get boxes. Redraw tightly around the actual figure, or delete the box AND its [DIAGRAM_PLACEHOLDER]"
                 ));
                 continue;
             }
-
-            // Now do the full crop with proper padding for the final audit
-            let cropped = match geometry::crop_diagram_with_options(
-                img,
-                bbox,
-                40,
-                ignore_grid,
-                graph_like,
-            ) {
-                Ok(c) => c,
-                Err(geometry::CropReject::BadBox) => {
-                    bad.push((ii, bi));
-                    issues.push(format!(
-                        "{label}: the box is unusable (degenerate or outside the page) — redraw it tightly around the figure, or delete the box AND its [DIAGRAM_PLACEHOLDER]"
-                    ));
-                    continue;
-                }
-
-                Err(geometry::CropReject::AnswerGrid) => {
-                    bad.push((ii, bi));
-                    issues.push(format!(
-                        "{label}: the box covers an EMPTY RULED ANSWER GRID (trace table / working grid). Never box these — transcribe the grid as a Markdown table inside \"content\" (keeping any pre-filled cells) and delete the box AND its [DIAGRAM_PLACEHOLDER]"
-                    ));
-                    continue;
-                }
-            };
             let sig = geometry::tile_signature(&cropped);
             if let Some(dup) = accepted_sigs
                 .iter()

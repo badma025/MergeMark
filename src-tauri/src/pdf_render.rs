@@ -82,9 +82,9 @@ pub fn render_pdf_pages(path: &Path) -> Result<Vec<PageInput>, String> {
         .map_err(|e| format!("Failed to load PDF: {:?}", e))?;
 
     let render_dpi = std::env::var("MERGEMARK_RENDER_DPI")
-        .unwrap_or_else(|_| "200".to_string())
+        .unwrap_or_else(|_| "140".to_string())
         .parse::<u32>()
-        .unwrap_or(200);
+        .unwrap_or(140);
     let target_width = (8.27 * render_dpi as f32).round() as i32;
     let render_config = PdfRenderConfig::new().set_target_width(target_width.try_into().unwrap());
 

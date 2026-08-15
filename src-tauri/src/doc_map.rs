@@ -200,7 +200,7 @@ static QUESTION_HEADING_REGEX: LazyLock<regex::Regex> = LazyLock::new(|| {
     //     start with a digit, so a plain `(?:\D|$)` tail rejects them. Allow a
     //     trailing isotope (mass number + element symbol) as well.
     regex::Regex::new(
-        r"(?m)(?:^|\n)[ \t]*(?:(?:box|Section\s+[A-Z0-9]+)[ \t]+)?(?i:Q(?:uestion)?\.?[ \t]*)?0*[ \t]*([1-9](?:[ \t]*\d){0,2})(?:\*+)?[ \t]*(?:[\.\)\]\-–—:]|[ \t]+|\r?\n|$)(?:\D|$|\d{1,3}\s*(?:He|Ne|Ar|Kr|Xe|Rn|F|Cl|Br|I|O|S|Se|Te|N|P|As|Sb|C|Si|Ge|Sn|B|Al|Ga|In|Be|Mg|Ca|Sr|Ba|Li|Na|K|Rb|Cs|U|Th|Pu)\b)",
+        r"(?m)(?:^|\n)[ \t]*(?:\*+)?[ \t]*(?:(?:box|Section\s+[A-Z0-9]+)[ \t]+)?(?i:Q(?:uestion)?\.?[ \t]*)?(?:\*+)?[ \t]*0*[ \t]*([1-9](?:[ \t]*\d){0,2})(?:\*+)?[ \t]*(?:[\.\)\]\-–—:]|[ \t]+|$)(?:[^\d\r\n]|$|\d{1,3}\s*(?:He|Ne|Ar|Kr|Xe|Rn|F|Cl|Br|I|O|S|Se|Te|N|P|As|Sb|C|Si|Ge|Sn|B|Al|Ga|In|Be|Mg|Ca|Sr|Ba|Li|Na|K|Rb|Cs|U|Th|Pu)\b)",
     )
     .unwrap()
 });
@@ -622,6 +622,19 @@ pub fn scan_text_layer(page_texts: &[String]) -> TextScan {
             page_reliability[page] = PageReliability::NonQuestion;
         }
     }
+
+    // Filter out heading candidates that appear on the same page as a reliable footer for question K,
+    // but with question number > K and y_frac <= footer.y_frac.
+    // A question K+1 cannot start before question K's footer on the same page.
+    headings.retain(|h| {
+        for f in &footers {
+            if f.question > 0 && h.number > f.question && f.page == h.page && h.y_frac <= f.y_frac {
+                return false;
+            }
+        }
+        true
+    });
+
     TextScan {
         footers,
         paper_total,
@@ -654,28 +667,22 @@ fn canonicalize_headings(mut headings: Vec<QuestionHeading>) -> Vec<QuestionHead
             .then_with(|| a.y_frac.partial_cmp(&b.y_frac).unwrap_or(std::cmp::Ordering::Equal))
     });
 
-    // A real paper starts at Q1. Anchor to that heading when present so an
-    // equally long answer-booklet subsequence beginning at Q2/Q3 cannot win
-    // merely because it happens to contain one more noisy tail heading.
-    if let Some(start) = headings.iter().position(|heading| heading.number == 1) {
-        let mut selected = vec![headings[start]];
-        let mut current_number = 1u32;
-        for heading in headings.iter().skip(start + 1) {
-            if heading.number > current_number && heading.number - current_number <= 3 {
-                selected.push(*heading);
-                current_number = heading.number;
-            }
-        }
-        return selected;
+    // Anchor to Q1 when present so an equally long answer-booklet
+    // subsequence beginning at Q2/Q3 cannot win.
+    let start_idx = headings.iter().position(|heading| heading.number == 1).unwrap_or(0);
+    let candidate_headings = &headings[start_idx..];
+    if candidate_headings.len() < 2 {
+        return candidate_headings.to_vec();
     }
 
-    let mut lengths = vec![1usize; headings.len()];
-    let mut predecessors = vec![None; headings.len()];
+    let n = candidate_headings.len();
+    let mut lengths = vec![1usize; n];
+    let mut predecessors = vec![None; n];
 
-    for i in 0..headings.len() {
+    for i in 0..n {
         for j in 0..i {
-            let number_gap = headings[i].number.saturating_sub(headings[j].number);
-            if headings[j].number >= headings[i].number || number_gap > 3 {
+            let number_gap = candidate_headings[i].number.saturating_sub(candidate_headings[j].number);
+            if candidate_headings[j].number >= candidate_headings[i].number || number_gap > 3 {
                 continue;
             }
 
@@ -688,7 +695,7 @@ fn canonicalize_headings(mut headings: Vec<QuestionHeading>) -> Vec<QuestionHead
     }
 
     let mut end = 0;
-    for i in 1..headings.len() {
+    for i in 1..n {
         if lengths[i] > lengths[end] {
             end = i;
         }
@@ -697,7 +704,7 @@ fn canonicalize_headings(mut headings: Vec<QuestionHeading>) -> Vec<QuestionHead
     let mut selected = Vec::with_capacity(lengths[end]);
     let mut current = Some(end);
     while let Some(index) = current {
-        selected.push(headings[index]);
+        selected.push(candidate_headings[index]);
         current = predecessors[index];
     }
     selected.reverse();
@@ -995,6 +1002,7 @@ fn estimate_first_question_start_reliable(
 }
 
 /// Hybrid map building: use reliable text pages, vision for ambiguous pages.
+#[allow(dead_code)]
 pub fn build_hybrid_map(
     page_texts: &[String],
     structures: &[ValidatedPageStructure],
@@ -2308,13 +2316,6 @@ mod tests {
                 );
 
                 let span_numbers: Vec<u32> = map.spans.iter().map(|span| span.number).collect();
-                if span_numbers != heading_numbers {
-                    eprintln!("TEST DEBUG: path={}", path);
-                    eprintln!("TEST DEBUG: page 2 text:\n{}", page_texts[2]);
-                    eprintln!("TEST DEBUG: footers={:?}", scan.footers);
-                    eprintln!("TEST DEBUG: headings={:?}", scan.headings);
-                    eprintln!("TEST DEBUG: map.spans={:?}", map.spans);
-                }
                 assert_eq!(
                     span_numbers, heading_numbers,
                     "{} map spans do not match canonical text headings",
