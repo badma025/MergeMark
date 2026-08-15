@@ -444,6 +444,7 @@ pub fn sanitize_for_latex(content: &str) -> String {
     harden_line_breaks(&with_ligatures)
 }
 
+#[allow(dead_code)]
 fn append_array_block(out: &mut Vec<String>, lines: &mut Vec<String>) {
     if lines.is_empty() {
         return;
@@ -462,6 +463,7 @@ fn append_array_block(out: &mut Vec<String>, lines: &mut Vec<String>) {
     lines.clear();
 }
 
+#[allow(dead_code)]
 fn normalize_trace_table(text: &str) -> String {
     let lines: Vec<String> = text.lines().map(|line| line.trim().to_string()).collect();
     let start = match lines.iter().position(|line| line == "N") {
@@ -531,6 +533,7 @@ fn normalize_trace_table(text: &str) -> String {
     text.to_string()
 }
 
+#[allow(dead_code)]
 fn find_trace_header_end(lines: &[String], start: usize) -> Option<usize> {
     let window_end = (start + 7).min(lines.len());
     let window = &lines[start..window_end];
@@ -543,10 +546,12 @@ fn find_trace_header_end(lines: &[String], start: usize) -> Option<usize> {
     window.iter().rposition(|line| line.eq_ignore_ascii_case("**Mean**") || line.eq_ignore_ascii_case("Mean")).map(|offset| start + offset)
 }
 
+#[allow(dead_code)]
 fn is_plain_integer(value: &str) -> bool {
     !value.is_empty() && value.chars().all(|c| c.is_ascii_digit())
 }
 
+#[allow(dead_code)]
 fn clean_table_cell(value: &str) -> Option<String> {
     let value = value.trim().trim_matches('*').trim();
     if value.parse::<f64>().is_ok() {

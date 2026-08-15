@@ -160,6 +160,7 @@ pub fn looks_like_answer_space(crop: &image::RgbaImage) -> bool {
 }
 
 /// Heuristic: detect if a crop contains MCQ option letters (A, B, C, D) that would be clipped.
+#[allow(dead_code)]
 fn contains_mcq_options(_crop: &image::RgbaImage) -> bool {
     // This is a cheap check - we'd need OCR to be certain, but we can
     // use the caption text from the model to detect this case
@@ -1075,17 +1076,11 @@ pub fn crop_page_vertical_from_image(
     let cropped_rgba = image::imageops::crop_imm(img, 0, y0, w, band_h).to_image();
     let cropped = image::DynamicImage::ImageRgba8(cropped_rgba).to_rgb8();
 
-    // Re-encode as JPEG at high quality (matching what the frontend sends).
-    // We use JPEG rather than PNG here because the result goes straight
-    // to the vision API as an image_url payload and JPEG is ~4x smaller
-    // at equivalent visual fidelity for text+line-art pages.
+    // Re-encode as WebP format.
+    // WebP is ~30% smaller than JPEG at equivalent fidelity, reducing payload
+    // size and upload time to vision APIs.
     let mut buf = std::io::Cursor::new(Vec::with_capacity((w as usize * band_h as usize) / 8));
-    {
-        use image::codecs::jpeg::JpegEncoder;
-        use image::ImageEncoder;
-        let enc = JpegEncoder::new_with_quality(&mut buf, 92);
-        enc.write_image(&cropped, w, band_h, image::ExtendedColorType::Rgb8).ok()?;
-    }
+    cropped.write_to(&mut buf, image::ImageFormat::WebP).ok()?;
     let out_b64 = base64::engine::general_purpose::STANDARD.encode(buf.into_inner());
 
     Some(PageBand {
@@ -1095,6 +1090,44 @@ pub fn crop_page_vertical_from_image(
         y_offset_frac: y0 as f32 / h as f32,
         height_frac: band_h as f32 / h as f32,
     })
+}
+
+/// Fast heuristic to check if a page image is completely blank or near-blank (e.g., blank exam page).
+/// Samples pixels on a regular grid; returns true if almost all pixels are white / background.
+pub fn is_image_blank(img: &image::DynamicImage) -> bool {
+    use image::GenericImageView;
+    let (w, h) = img.dimensions();
+    if w == 0 || h == 0 {
+        return true;
+    }
+    let step_x = (w / 100).max(4);
+    let step_y = (h / 100).max(4);
+    let mut total_samples = 0usize;
+    let mut dark_pixels = 0usize;
+
+    for y in (0..h).step_by(step_y as usize) {
+        for x in (0..w).step_by(step_x as usize) {
+            total_samples += 1;
+            let pixel = img.get_pixel(x, y);
+            let r = pixel[0] as u32;
+            let g = pixel[1] as u32;
+            let b = pixel[2] as u32;
+            let a = pixel[3];
+            if a > 32 {
+                let lum = (299 * r + 587 * g + 114 * b) / 1000;
+                if lum < 235 {
+                    dark_pixels += 1;
+                }
+            }
+        }
+    }
+
+    if total_samples == 0 {
+        return true;
+    }
+
+    let dark_ratio = dark_pixels as f32 / total_samples as f32;
+    dark_ratio < 0.0015
 }
 
 /// Strip a data-URL prefix, if present.

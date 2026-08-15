@@ -339,22 +339,7 @@ async fn prepare_chunk_images(
                     let mut buf = std::io::Cursor::new(Vec::with_capacity(
                         (new_w as usize * new_h as usize) / 8,
                     ));
-                    use image::codecs::jpeg::JpegEncoder;
-                    use image::ImageEncoder;
-                    // Quality 80: visually identical for text/line-art OCR but
-                    // ~35% smaller than 92. Reduces upload + provider processing
-                    // time across all API calls. Diagram crops written to disk
-                    // are unaffected (those go through save_diagram at full res).
-                    let enc = JpegEncoder::new_with_quality(&mut buf, 80);
-                    if enc
-                        .write_image(
-                            &resized,
-                            new_w,
-                            new_h,
-                            image::ExtendedColorType::Rgba8,
-                        )
-                        .is_ok()
-                    {
+                    if resized.write_to(&mut buf, image::ImageFormat::WebP).is_ok() {
                         use base64::Engine;
                         final_b64 = base64::engine::general_purpose::STANDARD.encode(buf.into_inner());
                     }
@@ -752,6 +737,7 @@ fn looks_like_new_question(prev_content: &str, new_content: &str) -> bool {
 // Prompts
 // ══════════════════════════════════════════════════════════════════════════
 
+#[allow(dead_code)]
 fn structure_system_prompt() -> String {
     r#"You are an exam-document layout analyzer. Your single most important job is to draw the EXACT boundary between one top-level question and the next, so that no sub-part is ever assigned to the wrong parent question. Look at ONE page and report ONLY structural facts as a JSON object:
 
@@ -1160,6 +1146,15 @@ pub async fn run_question_pipeline<C: LlmClient, P: Progress>(
                     }
                     let mut images = Vec::new();
                     if let PageInputKind::Image { b64, .. } = &page.kind {
+                        // Fast-path: Check if the image itself is blank / solid white
+                        if let Some(decoded) = geometry::decode_page_image(b64) {
+                            if geometry::is_image_blank(&decoded) {
+                                return (
+                                    page_index,
+                                    Ok(r#"{"question_numbers_visible":[],"page_role":"BLANK"}"#.to_string()),
+                                );
+                            }
+                        }
                         images.push(b64.clone());
                     }
                     let (img_slice, text_opt): (&[String], Option<&str>) = if is_text_only {

@@ -91,9 +91,11 @@ static RE_TABULAR_MCQ_HEADER: OnceLock<Regex> = OnceLock::new();
 static RE_TABULAR_MCQ_ROW: OnceLock<Regex> = OnceLock::new();
 
 /// Question header prefix at start of text (e.g., "Question 5" or "Q5:")
+#[allow(dead_code)]
 static RE_QUESTION_HEADER_PREFIX: OnceLock<Regex> = OnceLock::new();
 
 /// Standalone "a)" or "(a)" style option markers that start lines
+#[allow(dead_code)]
 static RE_STANDALONE_OPTION_START: OnceLock<Regex> = OnceLock::new();
 
 // ══════════════════════════════════════════════════════════════════════════

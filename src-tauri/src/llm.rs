@@ -46,6 +46,7 @@ pub struct LlmConfig {
 /// parameter. Use `JsonSchema` to request strict schema-validated output.
 #[derive(Debug, Clone)]
 pub enum ResponseFormat {
+    #[allow(dead_code)]
     JsonObject,
     JsonSchema { schema: serde_json::Value },
 }
@@ -90,14 +91,12 @@ pub fn chat_body<S: AsRef<str>>(
         {
             continue;
         }
-        // Preserve the source MIME type when a data URL is supplied. PDF
-        // renders containing vector objects are PNGs; relabelling their bytes
-        // as JPEG produces an invalid payload for strict vision providers.
-        // Legacy raw-base64 callers still default to JPEG.
+        // Preserve the source MIME type when a data URL is supplied.
+        // Legacy raw-base64 callers default to WebP.
         let image_url = if t.starts_with("data:image/") && t.contains(',') {
             t.to_string()
         } else {
-            format!("data:image/jpeg;base64,{}", crate::geometry::strip_data_url(t))
+            format!("data:image/webp;base64,{}", crate::geometry::strip_data_url(t))
         };
         // Phase 0: OpenAI-style vision APIs honour a "detail" hint. "high"
         // forces 768-px tiles and lets the model see fine detail (small
@@ -408,9 +407,16 @@ mod tests {
     }
 
     #[test]
-    fn chat_body_defaults_raw_base64_to_jpeg() {
+    fn chat_body_preserves_webp_data_url() {
+        let images = ["data:image/webp;base64,WWWW"];
+        let body = chat_body("model", "system", &images, None, 100, None);
+        assert_eq!(image_url(&body), images[0]);
+    }
+
+    #[test]
+    fn chat_body_defaults_raw_base64_to_webp() {
         let images = ["CCCC"];
         let body = chat_body("model", "system", &images, None, 100, None);
-        assert_eq!(image_url(&body), "data:image/jpeg;base64,CCCC");
+        assert_eq!(image_url(&body), "data:image/webp;base64,CCCC");
     }
 }

@@ -111,11 +111,10 @@ pub fn render_pdf_pages(path: &Path) -> Result<Vec<PageInput>, String> {
             .map_err(|e| format!("Failed to convert bitmap to image on page {}: {:?}", i, e))?;
         
         let mut buf = Cursor::new(Vec::new());
-        let mut encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut buf, 88);
-        encoder.encode_image(&img)
-            .map_err(|e| format!("Failed to encode jpeg on page {}: {:?}", i, e))?;
+        img.write_to(&mut buf, image::ImageFormat::WebP)
+            .map_err(|e| format!("Failed to encode webp on page {}: {:?}", i, e))?;
         
-        let b64 = format!("data:image/jpeg;base64,{}", 
+        let b64 = format!("data:image/webp;base64,{}", 
             base64::engine::general_purpose::STANDARD.encode(buf.into_inner())
         );
 
@@ -149,12 +148,11 @@ pub fn load_and_optimize_image_file(path: &Path) -> Result<PageInput, String> {
     };
 
     let mut buf = Cursor::new(Vec::new());
-    let mut encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut buf, 88);
-    encoder.encode_image(&final_img)
-        .map_err(|e| format!("Failed to encode jpeg: {}", e))?;
+    final_img.write_to(&mut buf, image::ImageFormat::WebP)
+        .map_err(|e| format!("Failed to encode webp: {}", e))?;
 
     let b64 = format!(
-        "data:image/jpeg;base64,{}",
+        "data:image/webp;base64,{}",
         base64::engine::general_purpose::STANDARD.encode(buf.into_inner())
     );
 

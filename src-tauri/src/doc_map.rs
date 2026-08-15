@@ -295,7 +295,7 @@ pub fn scan_text_layer(page_texts: &[String]) -> TextScan {
     let formulae_sheet_re = regex::Regex::new(
         r"(?i)(?:^|\n)\s*(?:formulae?|data|constants|relationships?)\s*(?:sheet|booklet|table|page)?\s*$",
     ).unwrap();
-    let blank_re = regex::Regex::new(r"(?i)(blank page|this page is intentionally blank|there are no questions printed on this page|do not write on this page)").unwrap();
+    let blank_re = regex::Regex::new(r"(?i)\b(blank page|this page is intentionally blank|there are no questions printed on this page|do not write on this page)\b").unwrap();
     let ref_re = regex::Regex::new(r"(?i)^\s*(formulae|data|reference|constants)\s*(sheet|table|booklet)?\s*$").unwrap();
     let aqa_figure_re = regex::Regex::new(r"(?i)\bfig(?:ure)?\.?\s*\d+").unwrap();
     let aqa_table_re = regex::Regex::new(r"(?i)\btable\s+\d+").unwrap();
@@ -586,7 +586,7 @@ pub fn scan_text_layer(page_texts: &[String]) -> TextScan {
 
         if is_image_only {
             page_reliability[page] = PageReliability::Ambiguous;
-        } else if blank_re.is_match(text) || text.trim().is_empty() {
+        } else if (blank_re.is_match(text) && !has_question_signal) || text.trim().is_empty() {
             page_reliability[page] = PageReliability::NonQuestion;
         } else if has_footer {
             page_reliability[page] = PageReliability::Reliable;
