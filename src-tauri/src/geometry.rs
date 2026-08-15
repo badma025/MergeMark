@@ -90,55 +90,69 @@ fn contains_boilerplate(text: &str) -> bool {
     false
 }
 
-/// Check if a proposed bounding box (in relative coordinates 0..1) contains
-/// boilerplate text in the OCR text. We sample the text near the bbox center
-/// and in a small region around it to catch margin warnings, footers, etc.
+/// Conservatively clamp a proposed bounding box into the safe printable area,
+/// preventing accidental bleed into page headers, footers (Turn over, page numbers),
+/// and side margins without triggering expensive LLM repair loops.
+pub fn clamp_bbox_safe(bbox: &mut [f32]) {
+    if bbox.len() != 4 {
+        return;
+    }
+    const MIN_Y: f32 = 0.03;
+    const MAX_Y: f32 = 0.93;
+    const MIN_X: f32 = 0.03;
+    const MAX_X: f32 = 0.97;
+
+    let mut x = bbox[0].clamp(0.0, 1.0);
+    let mut y = bbox[1].clamp(0.0, 1.0);
+    let mut w = bbox[2].clamp(0.01, 1.0);
+    let mut h = bbox[3].clamp(0.01, 1.0);
+
+    // If y extends into header
+    if y < MIN_Y {
+        let diff = MIN_Y - y;
+        y = MIN_Y;
+        h = (h - diff).max(0.02);
+    }
+    // If y + h extends into footer
+    if y + h > MAX_Y {
+        h = (MAX_Y - y).max(0.02);
+    }
+
+    // If x extends into left margin
+    if x < MIN_X {
+        let diff = MIN_X - x;
+        x = MIN_X;
+        w = (w - diff).max(0.02);
+    }
+    // If x + w extends into right margin
+    if x + w > MAX_X {
+        w = (MAX_X - x).max(0.02);
+    }
+
+    bbox[0] = x;
+    bbox[1] = y;
+    bbox[2] = w;
+    bbox[3] = h;
+}
+
+/// Check if a proposed bounding box (in relative coordinates 0..1) lies entirely
+/// in a forbidden boilerplate zone (e.g. top header or bottom footer with page codes).
 pub fn bbox_contains_boilerplate(page_text: &str, bbox: &[f32]) -> bool {
     if bbox.len() != 4 || page_text.trim().is_empty() {
         return false;
     }
 
-    // Quick check: if the full page text contains boilerplate, it might bleed
-    // into the bbox. We do a more targeted check by looking at lines that
-    // would fall within or near the bbox's y-range.
     let bbox_y = bbox[1];
     let bbox_h = bbox[3];
 
-    // Split page text into lines and check lines that fall in the bbox y-range
-    // (with some margin above/below to catch adjacent boilerplate)
-    let margin = 0.03; // 3% margin
-    let _y_start = (bbox_y - margin).max(0.0);
-    let _y_end = (bbox_y + bbox_h + margin).min(1.0);
-
-    // For each line, we'd need its y-position. Since we don't have per-line
-    // coordinates, we check if any boilerplate patterns exist in the full
-    // text and if the bbox is in a region where boilerplate commonly appears
-    // (top/bottom margins, etc.)
-
-    // Check if bbox is in top margin (where "Do not write" warnings appear)
-    if bbox_y < 0.1 && contains_boilerplate(page_text) {
+    // Check if the entire bbox sits inside the top margin header zone (< 0.04)
+    if bbox_y + bbox_h <= 0.04 && contains_boilerplate(page_text) {
         return true;
     }
 
-    // Check if bbox is in bottom margin (where "Turn over", page numbers appear)
-    if bbox_y + bbox_h > 0.9 && contains_boilerplate(page_text) {
+    // Check if the entire bbox sits inside the bottom footer zone (>= 0.94)
+    if bbox_y >= 0.94 && contains_boilerplate(page_text) {
         return true;
-    }
-
-    // Check for mark allocations anywhere in the page text that might be
-    // included in the bbox
-    if contains_boilerplate(page_text) {
-        // Look for mark allocation patterns specifically
-        if RE_MARKS.is_match(page_text) {
-            // If marks brackets are found, check if bbox is near where they'd be
-            // (typically near question text or in margins)
-            return true;
-        }
-
-        // Check for continuation markers
-        if RE_CONT.is_match(page_text) {
-            return true;
-        }
     }
 
     false
@@ -1478,6 +1492,22 @@ mod tests {
         // Test the bypass
         let r_bypass = crop_diagram(&img, &[0.1, 0.1, 0.8, 0.8], 0, true);
         assert!(r_bypass.is_ok(), "bypass must allow grid through");
+    }
+
+    #[test]
+    fn conservative_clamping_protects_margins_and_footers() {
+        let mut box_overshooting_footer = vec![0.1, 0.5, 0.8, 0.48]; // reaches y=0.98 (footer)
+        clamp_bbox_safe(&mut box_overshooting_footer);
+        assert!(box_overshooting_footer[1] + box_overshooting_footer[3] <= 0.93 + 0.001);
+        assert!(box_overshooting_footer[3] > 0.02);
+
+        let mut box_overshooting_header = vec![0.1, 0.01, 0.8, 0.4]; // reaches y=0.01 (header)
+        clamp_bbox_safe(&mut box_overshooting_header);
+        assert!(box_overshooting_header[1] >= 0.03 - 0.001);
+
+        let mut box_overshooting_left_margin = vec![0.005, 0.2, 0.5, 0.4];
+        clamp_bbox_safe(&mut box_overshooting_left_margin);
+        assert!(box_overshooting_left_margin[0] >= 0.03 - 0.001);
     }
 
     #[test]

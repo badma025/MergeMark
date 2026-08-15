@@ -3298,6 +3298,9 @@ fn audit_diagram_boxes(
                 continue;
             }
 
+            // Conservatively clamp coordinates away from headers/footers/margins in-place
+            geometry::clamp_bbox_safe(bbox);
+
             let model_idx = indexes.get(bi).and_then(|v| value_to_usize(v)).unwrap_or(0);
             if model_idx >= local_to_chunk.len() {
                 bad.push((ii, bi));
