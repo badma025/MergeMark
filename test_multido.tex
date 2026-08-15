@@ -1,0 +1,47 @@
+\documentclass[11pt,a4paper]{article}
+\usepackage[top=2.0cm, bottom=2.2cm, left=2.0cm, right=2.0cm, headheight=24pt, headsep=0.7cm, footskip=1.1cm]{geometry}
+\usepackage{amsmath, amssymb, xcolor, lastpage, fancyhdr, multido}
+\usepackage[scaled=0.92]{helvet}
+\renewcommand{\familydefault}{\sfdefault}
+\definecolor{brandgray}{HTML}{475569}
+\definecolor{lightborder}{HTML}{CBD5E1}
+\definecolor{ruledline}{HTML}{D1D5DB}
+
+\pagestyle{fancy}
+\fancyhf{}
+\lhead{\footnotesize\textcolor{brandgray}{\textbf{Sutton Grammar School -- Mixed A-Level FM Paper}}}
+\rhead{\footnotesize\textcolor{brandgray}{\textbf{Page \thepage\ of \pageref{LastPage}}}}
+\renewcommand{\headrulewidth}{0.5pt}
+\renewcommand{\headrule}{\hbox to\headwidth{\color{lightborder}\leaders\hrule height \headrulewidth\hfill}}
+\lfoot{\scriptsize\textcolor{gray!60}{\textsf{MERGEMARK ASSESSMENTS}}}
+\rfoot{\footnotesize\textbf{Turn over}}
+
+\newcommand{\examrule}{\noindent\makebox[\linewidth]{\color{ruledline}\rule{\linewidth}{0.3pt}}\vspace{0.82cm}\par\nointerlineskip}
+
+% Exactly 22 lines for a full continuation page (never overflows to a 2nd page)
+\newcommand{\fullpagelines}{%
+  \multido{\i=1+1}{22}{\examrule}%
+}
+
+\begin{document}
+
+\noindent\textbf{1.} \ A curve $C$ has equation
+\[ y^2 = \frac{x^2}{x-1}, \quad x \in \mathbb{R}, \quad x > 1. \]
+Show that there exist exactly two tangents to $C$ which pass through the point $(1,2)$, and find their equations.
+
+\par\vspace{0.3cm}
+\multido{\i=1+1}{14}{\examrule}
+\par\vspace*{\fill}\hfill\textbf{(Total for Question 1 is 12 marks)}
+
+\newpage
+\noindent\textbf{Question 1 continued}\par\vspace{0.35cm}
+\fullpagelines
+\par\vspace*{\fill}\hfill\textbf{(Total for Question 1 is 12 marks)}
+
+\newpage
+\noindent\textbf{2.} \ Another question here.
+\par\vspace{0.3cm}
+\multido{\i=1+1}{18}{\examrule}
+\par\vspace*{\fill}\hfill\textbf{(Total for Question 2 is 8 marks)}
+
+\end{document}

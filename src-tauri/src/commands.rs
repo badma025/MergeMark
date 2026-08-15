@@ -987,13 +987,6 @@ pub async fn compile_worksheet(
                 }
             }
 
-            // Fill remainder of the question page with lines
-            latex.push_str("  \\par\\nopagebreak\\vspace{0.35cm}\n");
-            let initial_lines = 16;
-            for _ in 0..initial_lines {
-                latex.push_str("  \\examrule\n");
-            }
-
             // High mark questions get continuation page(s) fully lined from top to bottom
             let continuation_pages = if question.marks >= 11 {
                 2
@@ -1003,18 +996,44 @@ pub async fn compile_worksheet(
                 0
             };
 
-            for _ in 0..continuation_pages {
-                latex.push_str("\\newpage\n\\noindent\n");
-                latex.push_str(&format!("\\textbf{{Question {} continued}}\\\\[0.35cm]\n", question_num));
-                for _ in 0..26 {
-                    latex.push_str("\\examrule\n");
+            if continuation_pages == 0 {
+                // Single question page: question + 12 ruled lines + total mark line
+                latex.push_str("  \\par\\nopagebreak\\vspace{0.35cm}\n");
+                for _ in 0..12 {
+                    latex.push_str("  \\examrule\n");
+                }
+                latex.push_str(&format!(
+                    "  \\par\\vspace*{{\\fill}}\\hfill\\textbf{{(Total for Question {} is {} {})}}\\par\\vspace{{0.15cm}}\n\n",
+                    question_num, question.marks, mark_word
+                ));
+            } else {
+                // Initial question page: question + 12 ruled lines
+                latex.push_str("  \\par\\nopagebreak\\vspace{0.35cm}\n");
+                for _ in 0..12 {
+                    latex.push_str("  \\examrule\n");
+                }
+
+                // Continuation pages
+                for p in 1..=continuation_pages {
+                    latex.push_str("\\newpage\n\\noindent\n");
+                    latex.push_str(&format!("\\textbf{{Question {} continued}}\\\\[0.35cm]\n", question_num));
+                    if p == continuation_pages {
+                        // Final continuation page: 21 lines + total marks anchored at bottom
+                        for _ in 0..21 {
+                            latex.push_str("\\examrule\n");
+                        }
+                        latex.push_str(&format!(
+                            "  \\par\\vspace*{{\\fill}}\\hfill\\textbf{{(Total for Question {} is {} {})}}\\par\\vspace{{0.15cm}}\n\n",
+                            question_num, question.marks, mark_word
+                        ));
+                    } else {
+                        // Intermediate continuation page: 22 full lines
+                        for _ in 0..22 {
+                            latex.push_str("\\examrule\n");
+                        }
+                    }
                 }
             }
-
-            latex.push_str(&format!(
-                "  \\par\\vspace*{{\\fill}}\\hfill\\textbf{{(Total for Question {} is {} {})}}\\par\\vspace{{0.15cm}}\n\n",
-                question_num, question.marks, mark_word
-            ));
         } else {
             latex.push_str("  \\needspace{4.5cm}\n");
             latex.push_str(&format!("  \\item {}\n", content));
