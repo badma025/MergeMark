@@ -81,7 +81,6 @@ pub fn render_pdf_pages(path: &Path) -> Result<Vec<PageInput>, String> {
     let document = pdfium.load_pdf_from_file(path, None)
         .map_err(|e| format!("Failed to load PDF: {:?}", e))?;
 
-    let mut pages = Vec::new();
     let render_dpi = std::env::var("MERGEMARK_RENDER_DPI")
         .unwrap_or_else(|_| "200".to_string())
         .parse::<u32>()
@@ -89,6 +88,8 @@ pub fn render_pdf_pages(path: &Path) -> Result<Vec<PageInput>, String> {
     let target_width = (8.27 * render_dpi as f32).round() as i32;
     let render_config = PdfRenderConfig::new().set_target_width(target_width.try_into().unwrap());
 
+    // Phase 1: Fast sequential pass to extract text, object types, and rasterize page bitmaps
+    let mut raw_pages = Vec::with_capacity(document.pages().len() as usize);
     for (i, page) in document.pages().iter().enumerate() {
         let text = page.text().map_err(|e| e.to_string())?.all();
         
@@ -97,10 +98,7 @@ pub fn render_pdf_pages(path: &Path) -> Result<Vec<PageInput>, String> {
         let has_vectors = objects.iter().any(|obj| matches!(obj.object_type(), PdfPageObjectType::Path));
 
         if text.trim().is_empty() && !has_images && !has_vectors {
-            pages.push(PageInput {
-                kind: PageInputKind::TextOnly,
-                text,
-            });
+            raw_pages.push((i, text, None));
             continue;
         }
 
@@ -109,24 +107,39 @@ pub fn render_pdf_pages(path: &Path) -> Result<Vec<PageInput>, String> {
 
         let img: DynamicImage = bitmap.as_image()
             .map_err(|e| format!("Failed to convert bitmap to image on page {}: {:?}", i, e))?;
-        
-        let mut buf = Cursor::new(Vec::new());
-        img.write_to(&mut buf, image::ImageFormat::WebP)
-            .map_err(|e| format!("Failed to encode webp on page {}: {:?}", i, e))?;
-        
-        let b64 = format!("data:image/webp;base64,{}", 
-            base64::engine::general_purpose::STANDARD.encode(buf.into_inner())
-        );
 
-        pages.push(PageInput {
-            kind: PageInputKind::Image {
-                b64,
-            },
-            text,
-        });
+        raw_pages.push((i, text, Some(img)));
     }
 
-    Ok(pages)
+    // Phase 2: Parallel WebP compression & Base64 encoding across all CPU cores with Rayon
+    use rayon::prelude::*;
+    let pages: Result<Vec<PageInput>, String> = raw_pages
+        .into_par_iter()
+        .map(|(i, text, img_opt)| {
+            if let Some(img) = img_opt {
+                let mut buf = Cursor::new(Vec::new());
+                img.write_to(&mut buf, image::ImageFormat::WebP)
+                    .map_err(|e| format!("Failed to encode webp on page {}: {:?}", i, e))?;
+                
+                let b64 = format!(
+                    "data:image/webp;base64,{}", 
+                    base64::engine::general_purpose::STANDARD.encode(buf.into_inner())
+                );
+
+                Ok(PageInput {
+                    kind: PageInputKind::Image { b64 },
+                    text,
+                })
+            } else {
+                Ok(PageInput {
+                    kind: PageInputKind::TextOnly,
+                    text,
+                })
+            }
+        })
+        .collect();
+
+    pages
 }
 
 pub fn load_and_optimize_image_file(path: &Path) -> Result<PageInput, String> {

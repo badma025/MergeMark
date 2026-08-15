@@ -2752,6 +2752,7 @@ dependencies = [
  "image",
  "pdf-extract",
  "pdfium-render",
+ "rayon",
  "regex",
  "reqwest",
  "serde",
