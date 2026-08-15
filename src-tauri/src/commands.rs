@@ -1616,6 +1616,24 @@ pub async fn parse_mark_scheme_vision(
     };
 
     let progress = TauriProgress { app: app.clone() };
+
+    // ── Mark Scheme Extraction cache: skip vision pipeline if we've seen this file before ──
+    let file_bytes = std::fs::read(&file_path).unwrap_or_default();
+    let cache_key = crate::db::extraction_cache_key(
+        &file_bytes,
+        &model_name,
+        &format!("MS:{}", paper_name.trim()),
+    );
+    let pool_check = state.db.lock().await;
+    if let Ok(Some(cached_json)) = crate::db::get_cached_extraction(&pool_check, &cache_key).await {
+        if let Ok(cached_mappings) = serde_json::from_str::<Vec<ProposedMapping>>(&cached_json) {
+            progress.stage("Loaded mark scheme from cache — mapping answers.");
+            drop(pool_check);
+            return Ok(cached_mappings);
+        }
+    }
+    drop(pool_check);
+
     let (drafts, report): (Vec<AnswerDraft>, ImportReport) =
         pipeline::run_markscheme_pipeline(&client, &pages, &config, &progress, &state.cancel_flag)
             .await?;
@@ -1688,6 +1706,14 @@ pub async fn parse_mark_scheme_vision(
                     q_num, paper_name
                 );
             }
+        }
+    }
+
+    // ── Store mark scheme mappings in extraction cache ──────────────────────
+    if !proposed_mappings.is_empty() {
+        if let Ok(mappings_json) = serde_json::to_string(&proposed_mappings) {
+            let pool = state.db.lock().await;
+            let _ = crate::db::store_cached_extraction(&pool, &cache_key, &mappings_json).await;
         }
     }
 

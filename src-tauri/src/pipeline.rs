@@ -161,6 +161,7 @@ pub struct ImportReport {
     pub diagrams_deduped: usize,
     pub anomalies: Vec<String>,
     pub timings: Vec<TimingEntry>,
+    pub total_elapsed_ms: u64,
 }
 
 /// Concurrent vision calls in flight at once. Validation is per unit of work
@@ -1053,6 +1054,7 @@ pub async fn run_question_pipeline<C: LlmClient, P: Progress>(
     progress: &P,
     cancel: &AtomicBool,
 ) -> Result<(Vec<BuiltQuestion>, ImportReport), String> {
+    let overall_start = Instant::now();
     let mut report = ImportReport {
         paper_name: config.paper_name.clone(),
         kind: "questions".to_string(),
@@ -1518,6 +1520,10 @@ pub async fn run_question_pipeline<C: LlmClient, P: Progress>(
         progress.stage(&format!("Extracting {} questions…", total));
         let extract_start = Instant::now();
         let job_count = jobs.len();
+        let collateral_cache: CollateralCache =
+            Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
+        let all_spans = Arc::new(map.spans.clone());
+
         let mut results = futures_util::stream::iter(0..job_count).map(|position| {
             let job = &jobs[position];
             let client = client;
@@ -1525,6 +1531,8 @@ pub async fn run_question_pipeline<C: LlmClient, P: Progress>(
             let page_render_cache = Arc::clone(&page_render_cache);
             let page_image_cache = Arc::clone(&page_image_cache);
             let request_semaphore = Arc::clone(&request_semaphore);
+            let collateral_cache = Arc::clone(&collateral_cache);
+            let all_spans = Arc::clone(&all_spans);
             async move {
                 match job {
                     ExtractionJob::Single { span, pages } => {
@@ -1536,6 +1544,8 @@ pub async fn run_question_pipeline<C: LlmClient, P: Progress>(
                             &page_render_cache,
                             &page_image_cache,
                             &request_semaphore,
+                            &collateral_cache,
+                            &all_spans,
                         )
                         .await;
                         (position, vec![((*span).clone(), opt)], local_rep)
@@ -1550,6 +1560,8 @@ pub async fn run_question_pipeline<C: LlmClient, P: Progress>(
                             &page_render_cache,
                             &page_image_cache,
                             &request_semaphore,
+                            &collateral_cache,
+                            &all_spans,
                         )
                         .await;
                         (position, res_vec, local_rep)
@@ -1644,6 +1656,7 @@ pub async fn run_question_pipeline<C: LlmClient, P: Progress>(
     report.extracted_total_marks = built.iter().map(|q| q.marks.max(0) as u32).sum();
     // Removed printed paper total checksum warning as requested
     report.marks_checksum_ok = None;
+    report.total_elapsed_ms = overall_start.elapsed().as_millis() as u64;
 
     Ok((built, report))
 }
@@ -1661,6 +1674,9 @@ fn push_mark_check(span: &QuestionSpan, q: &BuiltQuestion, report: &mut ImportRe
     }
 }
 
+/// Thread-safe collateral question cache shared across concurrent extraction jobs in a paper run.
+type CollateralCache = Arc<tokio::sync::Mutex<std::collections::HashMap<u32, BuiltQuestion>>>;
+
 /// Repair-loop core: repeatedly ask → parse → validate; quote failures back.
 /// Returns (Some(question), report) on acceptance (possibly flagged),
 /// (None, report) on quarantine — the LOCAL report is absorbed by the caller
@@ -1673,10 +1689,25 @@ async fn extract_span<C: LlmClient>(
     page_render_cache: &Arc<crate::pdf_render::PageRenderCache>,
     page_image_cache: &Arc<PageImageCache>,
     request_semaphore: &Arc<Semaphore>,
+    collateral_cache: &CollateralCache,
+    all_spans: &Arc<Vec<QuestionSpan>>,
 ) -> (Option<BuiltQuestion>, ImportReport) {
     // Own, local report: spans now run in parallel batches, so each unit
     // accumulates its own bookkeeping and the caller absorbs it in order.
     let mut report = ImportReport::default();
+
+    // Check if this question was already fully extracted and validated as collateral
+    // during a previous question's call on a shared page. If so, return immediately with 0 API calls!
+    if let Some(cached_q) = collateral_cache.lock().await.remove(&span.number) {
+        eprintln!(
+            "[COLLATERAL_CACHE_HIT] Question {} retrieved from prior collateral extraction with 0 API calls",
+            span.number
+        );
+        report.pages_processed += (span.start_page..=span.end_page).count().max(1);
+        push_mark_check(span, &cached_q, &mut report);
+        return (Some(cached_q), report);
+    }
+
     let max_attempts = 1 + config.max_repairs;
 
     // Chunk long spans: at most 4 page images per call (your no-batching
@@ -2255,6 +2286,114 @@ async fn extract_span<C: LlmClient>(
                 .map(|n| n.to_string())
                 .collect();
             let original_items = page_items.items.clone();
+
+            // Collateral Question Ingestion: If the model returned downstream questions
+            // that reside on this chunk's last page and match expected marks/validation,
+            // cache them to avoid redundant LLM requests when their turns arrive.
+            for collateral_item in &original_items {
+                if let Some(num) = collateral_item
+                    .question_number
+                    .as_ref()
+                    .and_then(crate::validate::value_to_question_number)
+                {
+                    if num != span.number {
+                        if let Some(target_span) = all_spans.iter().find(|s| s.number == num) {
+                            let chunk_last_page = chunk.last().map(|(p, _)| *p).unwrap_or(0);
+                            if target_span.start_page == target_span.end_page && target_span.start_page == chunk_last_page {
+                                let mut item_content = collateral_item.content.clone().unwrap_or_default();
+                                let is_code = collateral_item.is_code.unwrap_or(false);
+                                let mut topics_acc = Vec::new();
+                                if let Some(t) = &collateral_item.topics {
+                                    for topic in value_to_topics(t) {
+                                        if config.allowed_topics.is_empty() || config.allowed_topics.contains(&topic) {
+                                            topics_acc.push(topic);
+                                        }
+                                    }
+                                }
+                                let ai_marks = collateral_item.marks.as_ref().and_then(crate::validate::value_to_marks);
+
+                                if let Some(bboxes) = &collateral_item.diagram_bboxes {
+                                    let indexes = collateral_item.bbox_page_indexes.clone().unwrap_or_default();
+                                    let mut requests = Vec::with_capacity(bboxes.len());
+                                    let mut page_b64 = std::collections::HashMap::new();
+                                    for (bi, bbox) in bboxes.iter().enumerate() {
+                                        let model_idx = indexes.get(bi).and_then(value_to_usize).filter(|&k| k < local_to_chunk.len()).unwrap_or(0);
+                                        let chunk_idx = local_to_chunk[model_idx];
+                                        if chunk_idx < chunk.len() {
+                                            let global_page_idx = chunk[chunk_idx].0;
+                                            let page = chunk[chunk_idx].1;
+                                            let ignore_grid = crate::validate::figure_references(&item_content) > 0 && !crate::validate::is_answer_grid_request(&item_content);
+                                            if config.pdf_path.is_none() {
+                                                if let Some(b64) = page.get_b64() {
+                                                    page_b64.entry(global_page_idx).or_insert_with(|| b64.clone());
+                                                }
+                                            }
+                                            requests.push(DiagramSaveRequest {
+                                                global_page_idx,
+                                                bbox: bbox.clone(),
+                                                ignore_grid,
+                                                graph_like: collateral_item
+                                                    .diagram_kinds
+                                                    .as_ref()
+                                                    .and_then(|kinds| kinds.get(bi))
+                                                    .map(|kind| {
+                                                        let kind = kind.to_ascii_lowercase();
+                                                        kind.contains("graph")
+                                                            || kind.contains("chart")
+                                                            || kind.contains("plot")
+                                                            || kind.contains("composite_visual_options")
+                                                    })
+                                                    .unwrap_or(false),
+                                            });
+                                        }
+                                    }
+                                    if let Ok(persisted) = persist_diagrams(
+                                        requests,
+                                        page_b64,
+                                        config.clone(),
+                                        Arc::clone(page_render_cache),
+                                        std::mem::take(&mut saved_diagrams),
+                                    ).await {
+                                        saved_diagrams = persisted.saved;
+                                        for link in persisted.links.into_iter().flatten() {
+                                            if item_content.contains("[DIAGRAM_PLACEHOLDER]") {
+                                                item_content = item_content.replacen("[DIAGRAM_PLACEHOLDER]", &link, 1);
+                                            } else {
+                                                item_content.push_str(&link);
+                                            }
+                                        }
+                                    }
+                                }
+                                item_content = item_content.replace("[DIAGRAM_PLACEHOLDER]", "");
+
+                                if let Some(built_q) = assemble_built_question(
+                                    target_span,
+                                    config,
+                                    vec![item_content],
+                                    topics_acc,
+                                    is_code,
+                                    false,
+                                    Vec::new(),
+                                    ai_marks,
+                                ) {
+                                    let marks_valid = match (target_span.expected_marks, built_q.marks) {
+                                        (Some(exp), actual) => actual > 0 && (actual as u32 == exp),
+                                        (None, actual) => actual > 0,
+                                    };
+                                    if !built_q.needs_review && marks_valid && !built_q.content.is_empty() {
+                                        eprintln!(
+                                            "[COLLATERAL_CACHED] Question {} cached during Question {} extraction on page {}",
+                                            num, span.number, target_span.start_page + 1
+                                        );
+                                        collateral_cache.lock().await.insert(num, built_q);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
             let initial_len = page_items.items.len();
             page_items.items.retain(|item| {
                 item.question_number.as_ref()
@@ -2759,6 +2898,8 @@ async fn extract_same_page_batch<C: LlmClient>(
     page_render_cache: &Arc<crate::pdf_render::PageRenderCache>,
     page_image_cache: &Arc<PageImageCache>,
     request_semaphore: &Arc<Semaphore>,
+    collateral_cache: &CollateralCache,
+    all_spans: &Arc<Vec<QuestionSpan>>,
 ) -> (Vec<(QuestionSpan, Option<BuiltQuestion>)>, ImportReport) {
     let mut report = ImportReport::default();
     let max_attempts = 1 + config.max_repairs;
@@ -2791,6 +2932,8 @@ async fn extract_same_page_batch<C: LlmClient>(
                     page_render_cache,
                     page_image_cache,
                     request_semaphore,
+                    collateral_cache,
+                    all_spans,
                 ).await;
                 report.absorb(r);
                 out.push(((*span).clone(), q));
@@ -3039,6 +3182,8 @@ async fn extract_same_page_batch<C: LlmClient>(
             page_render_cache,
             page_image_cache,
             request_semaphore,
+            collateral_cache,
+            all_spans,
         ).await;
         report.absorb(fallback_rep);
         out.push(((*span).clone(), fallback_q));
@@ -3927,6 +4072,7 @@ pub async fn run_markscheme_pipeline<C: LlmClient, P: Progress>(
     progress: &P,
     cancel: &AtomicBool,
 ) -> Result<(Vec<AnswerDraft>, ImportReport), String> {
+    let overall_start = Instant::now();
     let mut report = ImportReport {
         paper_name: config.paper_name.clone(),
         kind: "mark_scheme".to_string(),
@@ -4126,6 +4272,7 @@ pub async fn run_markscheme_pipeline<C: LlmClient, P: Progress>(
             }
         }
 
+    report.total_elapsed_ms = overall_start.elapsed().as_millis() as u64;
     Ok((drafts, report))
 } // Tests — the golden suite. Deterministic: MockLlm replays scripted model
   // behaviour (valid, hallucinating, truncating, junk) so every failure class
@@ -4521,8 +4668,10 @@ mod tests {
             PAGE_RENDER_CACHE_CAPACITY,
         ));
         let semaphore = Arc::new(Semaphore::new(1));
+        let collateral = Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
+        let all_spans = Arc::new(vec![span.clone()]);
         let (built_opt, report) =
-            extract_span(&mock, &config(), &span, &span_pages, &cache, &Arc::new(PageImageCache::new()), &semaphore).await;
+            extract_span(&mock, &config(), &span, &span_pages, &cache, &Arc::new(PageImageCache::new()), &semaphore, &collateral, &all_spans).await;
         let built = built_opt.expect("question must build after the repair round");
 
         assert_eq!(mock.remaining(), 0, "both attempts consumed");
@@ -4568,8 +4717,10 @@ mod tests {
             PAGE_RENDER_CACHE_CAPACITY,
         ));
         let semaphore = Arc::new(Semaphore::new(1));
+        let collateral = Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
+        let all_spans = Arc::new(vec![span.clone()]);
         let (built_opt, report) =
-            extract_span(&mock, &config(), &span, &span_pages, &cache, &Arc::new(PageImageCache::new()), &semaphore).await;
+            extract_span(&mock, &config(), &span, &span_pages, &cache, &Arc::new(PageImageCache::new()), &semaphore, &collateral, &all_spans).await;
         let built = built_opt.expect("split span must build");
 
         assert!(built.content.contains("First page content."));
@@ -4635,8 +4786,10 @@ mod tests {
             PAGE_RENDER_CACHE_CAPACITY,
         ));
         let semaphore = Arc::new(Semaphore::new(1));
+        let collateral = Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
+        let all_spans = Arc::new(vec![span.clone()]);
         let (built_opt, report) =
-            extract_span(&mock, &config(), &span, &span_pages, &cache, &Arc::new(PageImageCache::new()), &semaphore).await;
+            extract_span(&mock, &config(), &span, &span_pages, &cache, &Arc::new(PageImageCache::new()), &semaphore, &collateral, &all_spans).await;
         let built = built_opt.expect("transcription must survive even when boxes never pass");
 
         assert!(
@@ -4840,5 +4993,52 @@ mod tests {
         assert!(report.quarantined.is_empty());
         assert_eq!(mock.remaining(), 0);
     }
+
+    #[tokio::test]
+    async fn collateral_question_reused_from_shared_page() {
+        let mock = MockLlm::new(vec![
+            // structure pass: Q1 on pages 1-2 (multi-page), Q2 on page 2 (single-page)
+            structure_reply("QUESTION", "[1]", "[5]"),
+            structure_reply("QUESTION", "[1, 2]", "[5, 3]"),
+            // Q1 extraction call (spans pages 1 and 2): returns both Q1 and downstream Q2 as collateral
+            ok_chat(
+                r#"{"items":[
+                    {"question_number":1,"content":"Question 1 full content across pages. **[5 marks]**","marks":5,"topics":["Pure"],"module":"Pure"},
+                    {"question_number":2,"content":"Question 2 starts on the lower half of page 2. **[3 marks]**","marks":3,"topics":["Mechanics"],"module":"Pure"}
+                ]}"#,
+            ),
+            // Notice: NO LLM call queued for Question 2!
+        ]);
+        let pgs = vec![
+            PageInput {
+                kind: PageInputKind::TextOnly,
+                text: "Cover page\nAnswer ALL questions".into(),
+            },
+            PageInput {
+                kind: PageInputKind::TextOnly,
+                text: "1 Question 1 begins on page 1...".into(),
+            },
+            PageInput {
+                kind: PageInputKind::TextOnly,
+                text: "1 Question 1 ends here. (Total for Question 1 is 5 marks)\n2 Question 2 starts here. (Total for Question 2 is 3 marks)".into(),
+            },
+        ];
+        let mut cfg = config();
+        cfg.parallelism = 1;
+        let (built, report) =
+            run_question_pipeline(&mock, &pgs, &cfg, &NullProgress, &cancel_flag())
+                .await
+                .unwrap();
+
+        assert_eq!(built.len(), 2);
+        assert_eq!(built[0].question_number, 1);
+        assert_eq!(built[1].question_number, 2);
+        assert_eq!(built[1].marks, 3);
+        assert!(built[1].content.contains("Question 2 starts on the lower half of page 2."));
+        assert_eq!(report.questions_extracted, 2);
+        assert!(report.quarantined.is_empty());
+        assert_eq!(mock.remaining(), 0, "Question 2 was retrieved from collateral cache with 0 LLM calls");
+    }
 }
+
 

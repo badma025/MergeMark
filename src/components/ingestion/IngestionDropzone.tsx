@@ -35,6 +35,7 @@ export interface ImportReport {
   diagramsDeduped: number;
   anomalies: string[];
   timings: TimingEntry[];
+  totalElapsedMs?: number;
 }
 
 // ── IngestionDropzone ─────────────────────────────────────────────────────────
@@ -92,36 +93,27 @@ export function IngestionDropzone({ isActive = false, onSuccess }: IngestionDrop
 
   // Structured completion report from the ingestion pipeline.
   useEffect(() => {
-    // Helper to build human-readable timing summary
-    function buildTimingSummary(timings: TimingEntry[]): string[] {
-      const byStage = new Map<string, Map<string, number>>();
-      for (const t of timings) {
-        if (!byStage.has(t.stage)) byStage.set(t.stage, new Map());
-        const ops = byStage.get(t.stage)!;
-        ops.set(t.operation, (ops.get(t.operation) || 0) + t.milliseconds);
-      }
-      const summary: string[] = [];
-      for (const [stage, ops] of byStage) {
-        const parts: string[] = [];
-        for (const [op, ms] of ops) {
-          parts.push(`${op}: ${(ms / 1000).toFixed(1)}s`);
-        }
-        summary.push(`${stage} [${parts.join(", ")}]`);
-      }
-      return summary;
+    // Load paper names on mount or when mode changes.
+    if (importMode === "mark_scheme") {
+      invoke<string[]>("get_paper_names")
+        .then(names => setAvailablePaperNames(names))
+        .catch(err => console.error("Failed to load paper names:", err));
     }
+  }, [importMode]);
 
+  useEffect(() => {
     const unlisten = listen('import-report', (event: any) => {
       const r = event.payload as ImportReport;
       setReports(prev => [r, ...prev]);
       const warnings: number = r.quarantined.length;
       
-      // Build timing summary
-      const timingSummary = buildTimingSummary(r.timings);
-      const totalMs = r.timings.reduce((sum, t) => sum + t.milliseconds, 0);
-      const timingStr = timingSummary.length > 0 
-        ? `\n\nTiming: ${timingSummary.join(", ")} (total: ${(totalMs / 1000).toFixed(1)}s)`
-        : "";
+      const elapsedSec = r.totalElapsedMs 
+        ? (r.totalElapsedMs / 1000).toFixed(1)
+        : (r.timings.find(t => t.operation === 'span_stream')?.milliseconds 
+            ? (r.timings.find(t => t.operation === 'span_stream')!.milliseconds / 1000).toFixed(1)
+            : (r.timings.reduce((sum, t) => sum + t.milliseconds, 0) / 1000).toFixed(1));
+      
+      const timingStr = ` (took ${elapsedSec}s)`;
       
       if (warnings === 0) {
         if (r.repairs > 0 || r.salvageEvents > 0 || r.cropRejections > 0) {
