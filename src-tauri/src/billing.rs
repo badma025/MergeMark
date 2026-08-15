@@ -233,7 +233,8 @@ fn build_openrouter_body(payload_text: &str) -> serde_json::Value {
         ],
         "temperature": 0.1,
         "max_tokens": MAX_OUTPUT_TOKENS,
-        "response_format": { "type": "json_object" }
+        "response_format": { "type": "json_object" },
+        "reasoning": { "effort": "none" }
     })
 }
 

@@ -136,7 +136,8 @@ pub fn chat_body<S: AsRef<str>>(
         ],
         "temperature": 0.1,
         "max_tokens": max_tokens,
-        "response_format": rf
+        "response_format": rf,
+        "reasoning": { "effort": "none" }
     })
 }
 

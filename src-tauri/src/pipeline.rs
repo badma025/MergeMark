@@ -320,7 +320,7 @@ async fn prepare_chunk_images(
                     ));
                 } else if let Some(img) = &decoded {
                     let (w, h) = img.dimensions();
-                    let max_dim: u32 = 1024;
+                    let max_dim: u32 = 768;
                     if w > max_dim || h > max_dim {
                         let scale = max_dim as f32 / (w.max(h) as f32);
                         let new_w = (w as f32 * scale).round().max(1.0) as u32;

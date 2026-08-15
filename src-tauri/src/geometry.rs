@@ -1110,11 +1110,28 @@ pub fn crop_page_vertical_from_image(
     let cropped_rgba = image::imageops::crop_imm(img, 0, y0, w, band_h).to_image();
     let cropped = image::DynamicImage::ImageRgba8(cropped_rgba).to_rgb8();
 
+    // Scale to optimal vision tile dimension (max_dim: 768) to prevent tile explosions
+    let max_dim: u32 = 768;
+    let (cw, ch) = (cropped.width(), cropped.height());
+    let final_img = if cw > max_dim || ch > max_dim {
+        let scale = max_dim as f32 / (cw.max(ch) as f32);
+        let new_w = (cw as f32 * scale).round().max(1.0) as u32;
+        let new_h = (ch as f32 * scale).round().max(1.0) as u32;
+        image::DynamicImage::ImageRgb8(image::imageops::resize(
+            &cropped,
+            new_w,
+            new_h,
+            image::imageops::FilterType::Triangle,
+        ))
+    } else {
+        image::DynamicImage::ImageRgb8(cropped)
+    };
+
     // Re-encode as WebP format.
     // WebP is ~30% smaller than JPEG at equivalent fidelity, reducing payload
     // size and upload time to vision APIs.
-    let mut buf = std::io::Cursor::new(Vec::with_capacity((w as usize * band_h as usize) / 8));
-    cropped.write_to(&mut buf, image::ImageFormat::WebP).ok()?;
+    let mut buf = std::io::Cursor::new(Vec::with_capacity((final_img.width() as usize * final_img.height() as usize) / 8));
+    final_img.write_to(&mut buf, image::ImageFormat::WebP).ok()?;
     let out_b64 = base64::engine::general_purpose::STANDARD.encode(buf.into_inner());
 
     Some(PageBand {
