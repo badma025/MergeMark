@@ -13,6 +13,24 @@ static RE_ANS_LINES: LazyLock<regex::Regex> = LazyLock::new(|| regex::Regex::new
 static RE_AQA_NUM: LazyLock<regex::Regex> = LazyLock::new(|| regex::Regex::new(r"[0O]\s*(\d)\s*\.\s*(\d)").unwrap());
 static RE_COLLAPSE_NEWLINES: LazyLock<regex::Regex> = LazyLock::new(|| regex::Regex::new(r"\n{3,}").unwrap());
 
+// Static regexes for SubjectClassifier
+static RE_CLASSIFIER_MARKS: LazyLock<regex::Regex> = LazyLock::new(|| regex::Regex::new(r"(?i)\[\s*(\d+)\s*marks?\s*\]|\(\s*(\d+)\s*\)").unwrap());
+static RE_CLASSIFIER_QSPLIT: LazyLock<regex::Regex> = LazyLock::new(|| regex::Regex::new(r"(?m)(?:^|\n)(?:Question\s+\d+|Q\.?\s*\d+|\d{1,2}[.)]\s)").unwrap());
+static RE_CLASSIFIER_MATH: LazyLock<regex::Regex> = LazyLock::new(|| regex::Regex::new(r"(?s)\$\$?.+?\$\$?|\\\[.+?\\\]|\\\(.+?\\\)").unwrap());
+
+// Static regexes for compile_worksheet
+static RE_LATEX_BOLD: LazyLock<regex::Regex> = LazyLock::new(|| regex::Regex::new(r"\*\*(.+?)\*\*").unwrap());
+static RE_LATEX_ITALIC: LazyLock<regex::Regex> = LazyLock::new(|| regex::Regex::new(r"\*([^\*]+?)\*").unwrap());
+static RE_LATEX_MULTIPLE_NL: LazyLock<regex::Regex> = LazyLock::new(|| regex::Regex::new(r"\n+").unwrap());
+static RE_LATEX_INLINE_MARKS: LazyLock<regex::Regex> = LazyLock::new(|| regex::Regex::new(r"\[(\d+)\s*marks?\]").unwrap());
+static RE_LATEX_SUBPART: LazyLock<regex::Regex> = LazyLock::new(|| regex::Regex::new(r"(?m)^[ \t]*\((i|ii|iii|iv|v|vi|vii|viii|ix|x)\)[ \t]+(.*)").unwrap());
+static RE_LATEX_PART: LazyLock<regex::Regex> = LazyLock::new(|| regex::Regex::new(r"(?m)^[ \t]*\(([a-z])\)[ \t]+(.*)").unwrap());
+static RE_LATEX_LEADING_NUM: LazyLock<regex::Regex> = LazyLock::new(|| regex::Regex::new(r"^\s*\d+[\.\)\-\s]*").unwrap());
+static RE_LATEX_GREEK: LazyLock<regex::Regex> = LazyLock::new(|| {
+    regex::Regex::new(r"(?x)(^|[\s,.\-\(])\\(theta|alpha|beta|gamma|pi|mu|lambda|phi|omega|sigma|delta)([\s,.\-\)]|$)").unwrap()
+});
+static RE_LATEX_LIST: LazyLock<regex::Regex> = LazyLock::new(|| regex::Regex::new(r"(?m)^[\*\-]\s+").unwrap());
+
 // ── Shared data model ─────────────────────────────────────────────────────────
 
 #[derive(Debug, Serialize, Deserialize, sqlx::FromRow)]
@@ -112,22 +130,11 @@ impl Progress for TauriProgress {
 // ── Helper: shared question-classification + DB-insert logic (legacy path) ────
 
 /// Keyword tables used for TF-IDF-style subject scoring (legacy text imports).
-struct SubjectClassifier {
-    marks_re: regex::Regex,
-    q_split_re: regex::Regex,
-    math_re: regex::Regex,
-}
+struct SubjectClassifier;
 
 impl SubjectClassifier {
     fn new() -> Self {
-        Self {
-            marks_re: regex::Regex::new(r"(?i)\[\s*(\d+)\s*marks?\s*\]|\(\s*(\d+)\s*\)").unwrap(),
-            q_split_re: regex::Regex::new(
-                r"(?m)(?:^|\n)(?:Question\s+\d+|Q\.?\s*\d+|\d{1,2}[.)]\s)",
-            )
-            .unwrap(),
-            math_re: regex::Regex::new(r"(?s)\$\$?.+?\$\$?|\\\[.+?\\\]|\\\(.+?\\\)").unwrap(),
-        }
+        Self
     }
 
     fn classify(&self, text: &str) -> (&'static str, &'static str, bool) {
@@ -342,7 +349,7 @@ impl SubjectClassifier {
     }
 
     fn extract_marks(&self, text: &str) -> i32 {
-        if let Some(cap) = self.marks_re.captures_iter(text).last() {
+        if let Some(cap) = RE_CLASSIFIER_MARKS.captures_iter(text).last() {
             if let Some(m) = cap.get(1).or_else(|| cap.get(2)) {
                 if let Ok(v) = m.as_str().parse::<i32>() {
                     return v.clamp(1, 25);
@@ -353,15 +360,14 @@ impl SubjectClassifier {
     }
 
     fn extract_math(&self, text: &str) -> String {
-        self.math_re
+        RE_CLASSIFIER_MATH
             .find(text)
             .map(|m| m.as_str().to_string())
             .unwrap_or_default()
     }
 
     fn slice_questions<'a>(&self, text: &'a str) -> Vec<&'a str> {
-        let splits: Vec<_> = self
-            .q_split_re
+        let splits: Vec<_> = RE_CLASSIFIER_QSPLIT
             .split(text)
             .map(str::trim)
             .filter(|s| s.len() > 20)
@@ -672,35 +678,25 @@ pub async fn compile_worksheet(
             content = content.replace("\r\n", "\n");
 
             // Format markdown to LaTeX
-            let bold_re = regex::Regex::new(r"\*\*(.+?)\*\*").unwrap();
-            content = bold_re.replace_all(&content, r"\textbf{${1}}").to_string();
-            let italic_re = regex::Regex::new(r"\*([^\*]+?)\*").unwrap();
-            content = italic_re
-                .replace_all(&content, r"\textit{${1}}")
-                .to_string();
-            let multiple_nl_re = regex::Regex::new(r"\n+").unwrap();
-            content = multiple_nl_re.replace_all(&content, "\n\n").to_string();
+            content = RE_LATEX_BOLD.replace_all(&content, r"\textbf{${1}}").to_string();
+            content = RE_LATEX_ITALIC.replace_all(&content, r"\textit{${1}}").to_string();
+            content = RE_LATEX_MULTIPLE_NL.replace_all(&content, "\n\n").to_string();
 
             // Format inline marks
-            let inline_marks_re = regex::Regex::new(r"\[(\d+)\s*marks?\]").unwrap();
-            content = inline_marks_re
+            content = RE_LATEX_INLINE_MARKS
                 .replace_all(&content, r"\null\hfill \textbf{[${1} marks]}")
                 .to_string();
 
             // Format list indents for parts (a) and subparts (i).
             // Document-level \setlist already sets leftmargin / labelsep / topsep / parsep / itemsep
             // for all list depths, so we just emit plain itemize blocks and let the preamble handle it.
-            let subpart_re =
-                regex::Regex::new(r"(?m)^[ \t]*\((i|ii|iii|iv|v|vi|vii|viii|ix|x)\)[ \t]+(.*)")
-                    .unwrap();
-            content = subpart_re
+            content = RE_LATEX_SUBPART
                 .replace_all(
                     &content,
                     "\\begin{itemize}\n\\item[\\textbf{(${1})}] ${2}\n\\end{itemize}",
                 )
                 .to_string();
-            let part_re = regex::Regex::new(r"(?m)^[ \t]*\(([a-z])\)[ \t]+(.*)").unwrap();
-            content = part_re
+            content = RE_LATEX_PART
                 .replace_all(
                     &content,
                     "\\begin{itemize}\n\\item[\\textbf{(${1})}] ${2}\n\\end{itemize}",
@@ -708,8 +704,7 @@ pub async fn compile_worksheet(
                 .to_string();
 
             // 1. Strip leading numbers (e.g., "1. ", "1)", "- ")
-            let leading_num_re = regex::Regex::new(r"^\s*\d+[\.\)\-\s]*").unwrap();
-            content = leading_num_re.replace(&content, "").to_string();
+            content = RE_LATEX_LEADING_NUM.replace(&content, "").to_string();
 
             // 2. Strip trailing duplicate math snippet
             let snippet = question.math_snippet.trim();
@@ -723,21 +718,12 @@ pub async fn compile_worksheet(
             }
 
             // 3. Fix missing inline math wrapping on bare Greek variables
-            let greek_re = regex::Regex::new(
-                r"(?x)
-                (^|[\s,.\-\(])
-                \\(theta|alpha|beta|gamma|pi|mu|lambda|phi|omega|sigma|delta)
-                ([\s,.\-\)]|$)
-            ",
-            )
-            .unwrap();
-            content = greek_re
+            content = RE_LATEX_GREEK
                 .replace_all(&content, r"${1}$\$${2}$${3}")
                 .to_string();
 
             // 4. Clean up markdown lists
-            let list_re = regex::Regex::new(r"(?m)^[\*\-]\s+").unwrap();
-            content = list_re.replace_all(&content, "\n\n").to_string();
+            content = RE_LATEX_LIST.replace_all(&content, "\n\n").to_string();
 
             // Convert markdown diagram tags to LaTeX includegraphics
             while let Some(start_idx) = content.find("![Diagram](") {
@@ -811,33 +797,33 @@ pub async fn compile_worksheet(
             if let Some(raw_ans) = question.answer_content {
                 let mut ans_content = crate::validate::sanitize_for_latex(&raw_ans);
                 ans_content = ans_content.replace("\r\n", "\n");
-                ans_content = bold_re
+                ans_content = RE_LATEX_BOLD
                     .replace_all(&ans_content, r"\textbf{${1}}")
                     .to_string();
-                ans_content = italic_re
+                ans_content = RE_LATEX_ITALIC
                     .replace_all(&ans_content, r"\textit{${1}}")
                     .to_string();
-                ans_content = multiple_nl_re.replace_all(&ans_content, "\n\n").to_string();
-                ans_content = inline_marks_re
+                ans_content = RE_LATEX_MULTIPLE_NL.replace_all(&ans_content, "\n\n").to_string();
+                ans_content = RE_LATEX_INLINE_MARKS
                     .replace_all(&ans_content, r"\null\hfill \textbf{[${1} marks]}")
                     .to_string();
-                ans_content = subpart_re
+                ans_content = RE_LATEX_SUBPART
                     .replace_all(
                         &ans_content,
                         "\\begin{itemize}\n\\item[\\textbf{(${1})}] ${2}\n\\end{itemize}",
                     )
                     .to_string();
-                ans_content = part_re
+                ans_content = RE_LATEX_PART
                     .replace_all(
                         &ans_content,
                         "\\begin{itemize}\n\\item[\\textbf{(${1})}] ${2}\n\\end{itemize}",
                     )
                     .to_string();
 
-                ans_content = greek_re
+                ans_content = RE_LATEX_GREEK
                     .replace_all(&ans_content, r"${1}$\$${2}$${3}")
                     .to_string();
-                ans_content = list_re.replace_all(&ans_content, "\n\n").to_string();
+                ans_content = RE_LATEX_LIST.replace_all(&ans_content, "\n\n").to_string();
 
                 while let Some(start_idx) = ans_content.find("![Diagram](") {
                     if let Some(end_idx) = ans_content[start_idx..].find(')') {
@@ -1275,6 +1261,7 @@ pub async fn parse_pdf_vision(
 
     // ── Persist: idempotent upserts keyed by (paper_name, question_number) ──
     let mut final_questions = Vec::with_capacity(built.len());
+    let mut tx = pool.begin().await.map_err(|e| e.to_string())?;
 
     for q in built {
         let topics_json = if q.topics.is_empty() {
@@ -1294,7 +1281,7 @@ pub async fn parse_pdf_vision(
         )
         .bind(&config.paper_name)
         .bind(q.question_number as i64)
-        .fetch_optional(&*pool)
+        .fetch_optional(&mut *tx)
         .await
         .map_err(|e| e.to_string())?;
 
@@ -1329,7 +1316,7 @@ pub async fn parse_pdf_vision(
         .bind(q.question_number as i64)
         .bind(&q.module)
         .bind(q.needs_review)
-        .execute(&*pool)
+        .execute(&mut *tx)
         .await
         .map_err(|e| format!("DB upsert failed for question {}: {}", q.question_number, e))?;
         report.record_timing(
@@ -1357,6 +1344,8 @@ pub async fn parse_pdf_vision(
             answer_stale: false,
         });
     }
+
+    tx.commit().await.map_err(|e| e.to_string())?;
 
     // ── Store in extraction cache for instant re-ingestion ────────────────
     if !final_questions.is_empty() {

@@ -15,7 +15,10 @@ pub async fn init_db(app_data_dir: PathBuf) -> Result<SqlitePool, sqlx::Error> {
     let db_url = format!("sqlite://{}?mode=rwc", db_path.display());
 
     let options = SqliteConnectOptions::from_str(&db_url)?
-        .create_if_missing(true);
+        .create_if_missing(true)
+        .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal)
+        .synchronous(sqlx::sqlite::SqliteSynchronous::Normal)
+        .busy_timeout(std::time::Duration::from_secs(5));
 
     // 3. Connect to the SQLite database
     let pool = SqlitePool::connect_with(options).await?;
@@ -127,6 +130,16 @@ pub async fn init_db(app_data_dir: PathBuf) -> Result<SqlitePool, sqlx::Error> {
     )
     .execute(&pool)
     .await;
+
+    let _ = sqlx::query("CREATE INDEX IF NOT EXISTS idx_questions_subject ON questions(subject);")
+        .execute(&pool)
+        .await;
+    let _ = sqlx::query("CREATE INDEX IF NOT EXISTS idx_questions_module ON questions(module);")
+        .execute(&pool)
+        .await;
+    let _ = sqlx::query("CREATE INDEX IF NOT EXISTS idx_questions_paper_name ON questions(paper_name);")
+        .execute(&pool)
+        .await;
 
     // ── Billing / usage_config table ───────────────────────────────────────
     // A single-row table (id = 1) that tracks the beta-launch hybrid billing
