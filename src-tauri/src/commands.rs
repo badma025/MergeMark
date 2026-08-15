@@ -4,8 +4,14 @@ use crate::pipeline::{
 };
 use crate::AppState;
 use serde::{Deserialize, Serialize};
+use std::sync::LazyLock;
 use std::time::Instant;
 use tauri::{Emitter, Manager, State};
+
+static RE_LINES: LazyLock<regex::Regex> = LazyLock::new(|| regex::Regex::new(r"_+|-+").unwrap());
+static RE_ANS_LINES: LazyLock<regex::Regex> = LazyLock::new(|| regex::Regex::new(r"(?m)^\s*[1-6]\s*$").unwrap());
+static RE_AQA_NUM: LazyLock<regex::Regex> = LazyLock::new(|| regex::Regex::new(r"[0O]\s*(\d)\s*\.\s*(\d)").unwrap());
+static RE_COLLAPSE_NEWLINES: LazyLock<regex::Regex> = LazyLock::new(|| regex::Regex::new(r"\n{3,}").unwrap());
 
 // ── Shared data model ─────────────────────────────────────────────────────────
 
@@ -999,14 +1005,11 @@ fn extract_page_texts(file_path: &str, num_pages: usize) -> Vec<String> {
 
     // Old cleanup rules, preserved: strip blank answer-line artifacts and
     // fix AQA decimal numbering in the raw hint text.
-    let re_lines = regex::Regex::new(r"_+|-+").unwrap();
-    let re_ans_lines = regex::Regex::new(r"(?m)^\s*[1-6]\s*$").unwrap();
-    let re_aqa_num = regex::Regex::new(r"[0O]\s*(\d)\s*\.\s*(\d)").unwrap();
     for text in texts.iter_mut() {
         if !text.is_empty() {
-            *text = re_lines.replace_all(text, "").to_string();
-            *text = re_ans_lines.replace_all(text, "").to_string();
-            *text = re_aqa_num.replace_all(text, "${1}.${2}").to_string();
+            *text = RE_LINES.replace_all(text, "").to_string();
+            *text = RE_ANS_LINES.replace_all(text, "").to_string();
+            *text = RE_AQA_NUM.replace_all(text, "${1}.${2}").to_string();
         }
     }
     texts
@@ -1097,8 +1100,7 @@ pub async fn parse_pdf_vision(
             .map(|l| l.trim())
             .collect::<Vec<_>>()
             .join("\n");
-        let cleaned = regex::Regex::new(r"\n{3,}")
-            .unwrap()
+        let cleaned = RE_COLLAPSE_NEWLINES
             .replace_all(&cleaned, "\n\n")
             .to_string();
 
@@ -1528,10 +1530,9 @@ pub async fn parse_mark_scheme_vision(
             }
             match pdf_extract::extract_text_by_pages_encrypted(&path_clone, "") {
                 Ok(pages) => {
-                    let re_lines = regex::Regex::new(r"_+|-+").unwrap();
                     let mut out: Vec<String> = pages
                         .into_iter()
-                        .map(|s| re_lines.replace_all(&s, "").to_string())
+                        .map(|s| RE_LINES.replace_all(&s, "").to_string())
                         .map(|s| crate::validate::clean_ligatures(&s))
                         .collect();
                     out.resize(num_pages, String::new());

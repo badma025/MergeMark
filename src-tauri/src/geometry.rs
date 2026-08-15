@@ -31,6 +31,8 @@ pub struct CaptionHint {
     pub above: bool,
 }
 
+use std::sync::LazyLock;
+
 /// Minimum crop edge in pixels — anything smaller is a meaningless speck.
 const MIN_EDGE_PX: u32 = 12;
 /// Reject boxes covering more than this fraction of the page — that's a
@@ -54,11 +56,34 @@ const BOILERPLATE_PATTERNS: &[&str] = &[
     r"(?i)ib\s*/\s*[a-z]\s*/\s*[a-z]{3}\d{2}\s*/\s*\d+\s*/\s*\d+",  // Footer codes like IB/M/Jun21/7408/2
 ];
 
+static BOILERPLATE_REGEXES: LazyLock<Vec<regex::Regex>> = LazyLock::new(|| {
+    BOILERPLATE_PATTERNS
+        .iter()
+        .map(|p| regex::Regex::new(p).unwrap())
+        .collect()
+});
+
+static RE_MARKS: LazyLock<regex::Regex> = LazyLock::new(|| {
+    regex::Regex::new(r"(?i)\[\s*\d+\s+marks?\s*\]").unwrap()
+});
+
+static RE_CONT: LazyLock<regex::Regex> = LazyLock::new(|| {
+    regex::Regex::new(r"(?i)question\s+\d+\s+continues\s+on\s+(?:the\s+)?next\s+page").unwrap()
+});
+
+static RE_MULTI_FIG: LazyLock<regex::Regex> = LazyLock::new(|| {
+    regex::Regex::new(r"(?i)(?:fig(?:ure)?\.?\s*\d+[\s,]*(?:and|,|-)\s*)+fig(?:ure)?\.?\s*\d+").unwrap()
+});
+
+static RE_FIG_NUM: LazyLock<regex::Regex> = LazyLock::new(|| {
+    regex::Regex::new(r"(?i)fig(?:ure)?\.?\s*(\d+)").unwrap()
+});
+
 /// Detect if a text region contains boilerplate that should be excluded from image crops.
 fn contains_boilerplate(text: &str) -> bool {
     let lower = text.to_ascii_lowercase();
-    for pattern in BOILERPLATE_PATTERNS {
-        if regex::Regex::new(pattern).unwrap().is_match(&lower) {
+    for re in BOILERPLATE_REGEXES.iter() {
+        if re.is_match(&lower) {
             return true;
         }
     }
@@ -104,17 +129,14 @@ pub fn bbox_contains_boilerplate(page_text: &str, bbox: &[f32]) -> bool {
     // included in the bbox
     if contains_boilerplate(page_text) {
         // Look for mark allocation patterns specifically
-        let re_marks = regex::Regex::new(r"(?i)\[\s*\d+\s+marks?\s*\]").unwrap();
-        if re_marks.is_match(page_text) {
+        if RE_MARKS.is_match(page_text) {
             // If marks brackets are found, check if bbox is near where they'd be
             // (typically near question text or in margins)
-            // For now, if the page has them and bbox is suspicious, flag it
             return true;
         }
 
         // Check for continuation markers
-        let re_cont = regex::Regex::new(r"(?i)question\s+\d+\s+continues\s+on\s+(?:the\s+)?next\s+page").unwrap();
-        if re_cont.is_match(page_text) {
+        if RE_CONT.is_match(page_text) {
             return true;
         }
     }
@@ -224,14 +246,12 @@ pub fn split_compound_figure(
 /// Try to split a single bbox by detecting multiple figure references in the caption.
 fn try_split_by_caption(bbox: &[f32], caption: &str) -> Option<Vec<SplitFigure>> {
     // Pattern: "Figure 4 and Figure 5", "Figures 4-5", "Figure 4, Figure 5", etc.
-    let re_multi = regex::Regex::new(r"(?i)(?:fig(?:ure)?\.?\s*\d+[\s,]*(?:and|,|-)\s*)+fig(?:ure)?\.?\s*\d+").ok()?;
-    if !re_multi.is_match(caption) {
+    if !RE_MULTI_FIG.is_match(caption) {
         return None;
     }
 
     // Extract all figure numbers mentioned
-    let re_fig = regex::Regex::new(r"(?i)fig(?:ure)?\.?\s*(\d+)").ok()?;
-    let fig_nums: Vec<u32> = re_fig.captures_iter(caption)
+    let fig_nums: Vec<u32> = RE_FIG_NUM.captures_iter(caption)
         .filter_map(|c| c[1].parse::<u32>().ok())
         .collect();
 

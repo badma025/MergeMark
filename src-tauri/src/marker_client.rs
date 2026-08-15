@@ -1,5 +1,5 @@
 use regex::Regex;
-use std::sync::OnceLock;
+use std::sync::LazyLock;
 
 // ══════════════════════════════════════════════════════════════════════════
 // VLM System Prompts & Strict Formatting Rules
@@ -39,64 +39,145 @@ pub const VLM_FEW_SHOT_PROSE_WRAPPING: &str =
 // Compiled Regex Patterns for Post-Processing Fixes
 // ══════════════════════════════════════════════════════════════════════════
 
-/// Artifact boilerplate patterns to remove entirely
-static RE_ARTIFACT_BOILERPLATE: OnceLock<Regex> = OnceLock::new();
+static RE_ARTIFACT_BOILERPLATE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?im)^\s*(?:MARK\s+SCHEME|GCSE|A[-\s]?LEVEL|AS\s+LEVEL|BLANK\s+PAGE|DO\s+NOT\s+WRITE|TURN\s+OVER|TOTAL\s+FOR\s+(?:QUESTION|PAPER)\s+\d+|QUESTION\s+PAPER|EXAMINER|CENTRE\s+NUMBER|CANDIDATE\s+NUMBER|SPECIMEN|PRACTICE\s+PAPER|MOCK\s+EXAM|INSERT|FORMULAE?\s+SHEET|DATA\s+BOOKLET|COPYRIGHT|ACKNOWLEDGE|BLANK|PAGE\s+\d+\s+OF\s+\d+|\d+\s+OF\s+\d+)\b.*$").unwrap()
+});
 
-/// AQA decimal sub-part pattern: "02.1", "03.2" -> convert to (a), (b)
-static RE_AQA_DECIMAL_PART: OnceLock<Regex> = OnceLock::new();
+static RE_AQA_DECIMAL_PART: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?:^|\n)\s*(\d+)(?:[.\s])([1-9])\b").unwrap()
+});
 
-/// Sub-part labels: (a), (b), (i), (ii) - ensure double newline before
-static RE_SUBPART_LABEL: OnceLock<Regex> = OnceLock::new();
+static RE_SUBPART_LABEL: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?m)(^|\n)(\s*)(\([a-z]\)|\([ivx]+\))(\s)").unwrap()
+});
 
-/// Visual MCQ lead-in patterns
-static RE_VISUAL_MCQ_LEADIN: OnceLock<Regex> = OnceLock::new();
+static RE_VISUAL_MCQ_LEADIN: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)(Which\s+(?:graph|diagram|figure|image|chart|plot|sketch|drawing)\s+(?:is|shows|represents|matches|corresponds\s+to)\s+(?:correct|the\s+correct|best|accurate)\s*\w*\??|Which\s+of\s+the\s+following\s+(?:graphs?|diagrams?|figures?|images?|charts?|plots?|sketches?)\s+(?:is|shows|represents)\??)\s*").unwrap()
+});
 
-/// Mark allocation tags: **[X marks]**, **[X mark]**
-static RE_MARK_TAG: OnceLock<Regex> = OnceLock::new();
+static RE_MARK_TAG: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"\*\*\[\s*(\d+)\s+marks?\s*\]\*\*").unwrap()
+});
 
-/// Table row with MCQ options (pipes or tabs)
-static RE_TABLE_MCQ_ROW: OnceLock<Regex> = OnceLock::new();
+static RE_TABLE_MCQ_ROW: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?m)^\|?\s*([A-D]|\([A-D]\)|\d+)[\.)]?\s*\|([^|]*)\|").unwrap()
+});
 
-/// LaTeX command spacing fix
-static RE_LATEX_SPACED_CMD: OnceLock<Regex> = OnceLock::new();
+static RE_LATEX_SPACED_CMD: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"\\ +(begin|end|frac|dfrac|cfrac|sqrt|text|textbf|textit|mathbf|mathit|mathrm|mathbb|mathcal|operatorname|pmatrix|bmatrix|vmatrix|matrix|array|cases|aligned|theta|lambda|alpha|beta|gamma|delta|Delta|pi|mu|sigma|omega|Omega|phi|Phi|psi|Psi|times|div|pm|mp|leq|geq|neq|approx|sim|equiv|subset|supset|subseteq|supseteq|in|notin|forall|exists|infty|partial|nabla|cos|sin|tan|sec|csc|cot|cosh|sinh|tanh|ln|log|exp|int|iint|iiint|oint|sum|prod|lim|vec|hat|bar|dot|ddot|tilde|binom|quad|qquad|hline|hlinex|cline|multicolumn|multirow)\b").unwrap()
+});
 
-/// Multiple consecutive newlines normalization
-static RE_EXCESSIVE_NEWLINES: OnceLock<Regex> = OnceLock::new();
+static RE_EXCESSIVE_NEWLINES: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"\n{3,}").unwrap()
+});
 
-/// Page number / barcode / registration mark patterns
-static RE_PAGE_ARTIFACTS: OnceLock<Regex> = OnceLock::new();
+static RE_PAGE_ARTIFACTS: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?im)^\s*(?:Page\s+\d+|Pg\.\s*\d+|\d+\s*/\s*\d+|\[\s*Barcode\s*\]|\[\s*Registration\s*\]|Printer\s*Mark).*$").unwrap()
+});
 
-/// Leading question number / OCR artifacts at start of question text
-static RE_LEADING_NUMBER_ARTIFACTS: OnceLock<Regex> = OnceLock::new();
+static RE_LEADING_NUMBER_ARTIFACTS: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?m)(^|\n\n)\s*(?:Q\d+\s*[.:]?|\d{1,3}(?:\s+[A-Za-z\d]){1,3}\s+)").unwrap()
+});
 
-/// Visual MCQ gibberish patterns (A B C D repeated etc.)
-static RE_VISUAL_MCQ_GIBBERISH: OnceLock<Regex> = OnceLock::new();
+static RE_VISUAL_MCQ_GIBBERISH: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?m)^\s*(?:[A-D]\s*){4,}$").unwrap()
+});
 
-/// Standalone page numbers (footer codes like "IB/M/Jun21/7408/2")
-static RE_FOOTER_CODES: OnceLock<Regex> = OnceLock::new();
+static RE_FOOTER_CODES: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?im)^\s*[A-Z]{2}/[A-Z]/[A-Za-z]{3}\d{2}/\d+/\d+\s*$").unwrap()
+});
 
-/// Margin artifact warnings ("Do not write outside the box", "Do not write in this area")
-static RE_MARGIN_ARTIFACTS: OnceLock<Regex> = OnceLock::new();
+static RE_MARGIN_ARTIFACTS: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?im)^\s*Do\s+not\s+write\s+(?:outside\s+the\s+box|in\s+this\s+area)\b.*$").unwrap()
+});
 
-/// Alpha-numeric paper/serial codes (exam board codes, session identifiers)
-static RE_SERIAL_CODES: OnceLock<Regex> = OnceLock::new();
+static RE_SERIAL_CODES: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?im)^\s*(?:[A-Z]{2,4}\d{2,5}[A-Z]?(?:/\d+)?|\d{4,6}/\d+|[A-Z]\d{2,4}[A-Z]?(?:/\d+)?|\d{5,6})\s*$").unwrap()
+});
 
-/// Navigation markers ("Turn over ►", "Turn over for the next question", "END OF QUESTIONS")
-static RE_NAVIGATION_MARKERS: OnceLock<Regex> = OnceLock::new();
+static RE_NAVIGATION_MARKERS: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?im)^\s*(?:TURN\s+OVER\s*[\p{So}]*|TURN\s+OVER\s+FOR\s+THE\s+NEXT\s+QUESTION|END\s+OF\s+QUESTIONS?|CONTINUE\s+ON\s+NEXT\s+PAGE|GO\s+TO\s+NEXT\s+PAGE)\b.*$").unwrap()
+});
 
-/// Tabular MCQ column headers with units
-static RE_TABULAR_MCQ_HEADER: OnceLock<Regex> = OnceLock::new();
+static RE_TABULAR_MCQ_HEADER: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?m)^\s*[A-Za-z][A-Za-z/\s().]*(?:/\s*[A-Za-z])\b.*$").unwrap()
+});
 
-/// MCQ option rows without pipes (A 200 0.50, B 150 0.40, etc.)
-static RE_TABULAR_MCQ_ROW: OnceLock<Regex> = OnceLock::new();
+static RE_TABULAR_MCQ_ROW: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?m)^\s*[A-D][\).]?\s+\d").unwrap()
+});
 
-/// Question header prefix at start of text (e.g., "Question 5" or "Q5:")
-#[allow(dead_code)]
-static RE_QUESTION_HEADER_PREFIX: OnceLock<Regex> = OnceLock::new();
+static RE_INLINE_MCQ: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?m)([A-D]\)[^A-D\n]*(?:\s+[A-D]\)[^A-D\n]*)+)").unwrap()
+});
 
-/// Standalone "a)" or "(a)" style option markers that start lines
-#[allow(dead_code)]
-static RE_STANDALONE_OPTION_START: OnceLock<Regex> = OnceLock::new();
+static RE_SPLIT_MCQ: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"([A-D]\)[^A-D\n]*)").unwrap()
+});
+
+static RE_PAREN_MCQ: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?m)(\([A-D]\)[^(\n]*(?:\s+\([A-D]\)[^(\n]*)+)").unwrap()
+});
+
+static RE_SPLIT_PAREN_MCQ: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(\([A-D]\)[^(\n]*)").unwrap()
+});
+
+static RE_TABLE_ROW: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?m)^(\|.*?\|)\s*$").unwrap()
+});
+
+static RE_OPTION_ROW: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"^\|\s*([A-D]|\([A-D]\))").unwrap()
+});
+
+static RE_HEADER_COLS: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"\s{2,}|\t+").unwrap()
+});
+
+static RE_OPT_ROW: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"^([A-D])[\).]?\s+(.+)$").unwrap()
+});
+
+static RE_VISUAL_OPTS: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?m)([A-D]\))\s*(\[DIAGRAM_PLACEHOLDER\])").unwrap()
+});
+
+static RE_DIAGRAM_OPT: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(\[DIAGRAM_PLACEHOLDER\])").unwrap()
+});
+
+static RE_OPT_LINE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?m)^\s*([A-D]\))\s+(.+)$").unwrap()
+});
+
+static RE_PAREN_OPT: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?m)^\s*(\([A-D]\))\s+(.+)$").unwrap()
+});
+
+static RE_SUBPART: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?m)((?:^|\n\n)\s*)(\([a-z]\)|\([ivx]+\))\s+").unwrap()
+});
+
+static RE_MCQ_BOUNDARY: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?m)([A-D]\)|\([A-D]\))").unwrap()
+});
+
+static RE_MARK_TAG_MATCH: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"\*\*\[\s*\d+\s+marks?\s*\]\*\*").unwrap()
+});
+
+static RE_MCQ_START: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?m)((?:^|\n\n?))([A-D]\)|\([A-D]\))").unwrap()
+});
+
+static RE_REMOVE_MARKS: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r" \*\*\[\s*\d+\s+marks?\s*\]\*\*").unwrap()
+});
+
+static RE_NAV_TEXT: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?im)^\s*(?:TURN\s+OVER|END\s+OF\s+QUESTIONS?|CONTINUE\s+ON\s+NEXT\s+PAGE|GO\s+TO\s+NEXT\s+PAGE)[\s\p{So}]*$").unwrap()
+});
 
 // ══════════════════════════════════════════════════════════════════════════
 // Minimal Post-Processing — Only basic typo fixes that are safe as string ops
@@ -116,62 +197,35 @@ pub fn clean_ligatures(s: &str) -> String {
 /// Fix space after backslash for known LaTeX commands: "\ begin" -> "\begin", "\ sqrt" -> "\sqrt"
 /// Uses a single compiled regex for all known commands. Safe, fast, no look-arounds.
 pub fn fix_basic_latex_typos(text: &str) -> String {
-    let re = RE_LATEX_SPACED_CMD.get_or_init(|| {
-        Regex::new(r"\\ +(begin|end|frac|dfrac|cfrac|sqrt|text|textbf|textit|mathbf|mathit|mathrm|mathbb|mathcal|operatorname|pmatrix|bmatrix|vmatrix|matrix|array|cases|aligned|theta|lambda|alpha|beta|gamma|delta|Delta|pi|mu|sigma|omega|Omega|phi|Phi|psi|Psi|times|div|pm|mp|leq|geq|neq|approx|sim|equiv|subset|supset|subseteq|supseteq|in|notin|forall|exists|infty|partial|nabla|cos|sin|tan|sec|csc|cot|cosh|sinh|tanh|ln|log|exp|int|iint|iiint|oint|sum|prod|lim|vec|hat|bar|dot|ddot|tilde|binom|quad|qquad|hline|hlinex|cline|multicolumn|multirow)\b").unwrap()
-    });
-
-    re.replace_all(text, |caps: &regex::Captures| {
+    RE_LATEX_SPACED_CMD.replace_all(text, |caps: &regex::Captures| {
         format!("\\{}", &caps[1])
     }).to_string()
 }
 
 /// Remove exam-board boilerplate: MARK SCHEME, GCSE, A-LEVEL, BLANK PAGE, DO NOT WRITE, Turn over, etc.
 fn remove_artifact_boilerplate(text: &str) -> String {
-    let re = RE_ARTIFACT_BOILERPLATE.get_or_init(|| {
-        // Match common exam board boilerplate lines (case-insensitive, whole lines)
-        Regex::new(r"(?im)^\s*(?:MARK\s+SCHEME|GCSE|A[-\s]?LEVEL|AS\s+LEVEL|BLANK\s+PAGE|DO\s+NOT\s+WRITE|TURN\s+OVER|TOTAL\s+FOR\s+(?:QUESTION|PAPER)\s+\d+|QUESTION\s+PAPER|EXAMINER|CENTRE\s+NUMBER|CANDIDATE\s+NUMBER|SPECIMEN|PRACTICE\s+PAPER|MOCK\s+EXAM|INSERT|FORMULAE?\s+SHEET|DATA\s+BOOKLET|COPYRIGHT|ACKNOWLEDGE|BLANK|PAGE\s+\d+\s+OF\s+\d+|\d+\s+OF\s+\d+)\b.*$").unwrap()
-    });
-    re.replace_all(text, "").to_string()
+    RE_ARTIFACT_BOILERPLATE.replace_all(text, "").to_string()
 }
 
 /// Remove margin artifact warnings ("Do not write outside the box", "Do not write in this area")
 fn remove_margin_artifacts(text: &str) -> String {
-    let re = RE_MARGIN_ARTIFACTS.get_or_init(|| {
-        Regex::new(r"(?im)^\s*Do\s+not\s+write\s+(?:outside\s+the\s+box|in\s+this\s+area)\b.*$").unwrap()
-    });
-    re.replace_all(text, "").to_string()
+    RE_MARGIN_ARTIFACTS.replace_all(text, "").to_string()
 }
 
 /// Remove alphanumeric paper/serial codes (exam board codes, session identifiers)
 fn remove_serial_codes(text: &str) -> String {
-    let re = RE_SERIAL_CODES.get_or_init(|| {
-        // Match patterns like: "7408/2", "PHYA1", "8463/1H", "74052", "J248/01", "8462/1F"
-        // These are typically: digits + optional slash + digits, or alphanumeric codes
-        Regex::new(r"(?im)^\s*(?:[A-Z]{2,4}\d{2,5}[A-Z]?(?:/\d+)?|\d{4,6}/\d+|[A-Z]\d{2,4}[A-Z]?(?:/\d+)?|\d{5,6})\s*$").unwrap()
-    });
-    re.replace_all(text, "").to_string()
+    RE_SERIAL_CODES.replace_all(text, "").to_string()
 }
 
 /// Remove navigation markers ("Turn over ►", "Turn over for the next question", "END OF QUESTIONS")
 fn remove_navigation_markers(text: &str) -> String {
-    let re = RE_NAVIGATION_MARKERS.get_or_init(|| {
-        Regex::new(r"(?im)^\s*(?:TURN\s+OVER\s*[\p{So}]*|TURN\s+OVER\s+FOR\s+THE\s+NEXT\s+QUESTION|END\s+OF\s+QUESTIONS?|CONTINUE\s+ON\s+NEXT\s+PAGE|GO\s+TO\s+NEXT\s+PAGE)\b.*$").unwrap()
-    });
-    re.replace_all(text, "").to_string()
+    RE_NAVIGATION_MARKERS.replace_all(text, "").to_string()
 }
 
 /// Remove page artifacts: page numbers, barcodes, registration marks, footer codes
 fn remove_page_artifacts(text: &str) -> String {
-    let re = RE_PAGE_ARTIFACTS.get_or_init(|| {
-        Regex::new(r"(?im)^\s*(?:Page\s+\d+|Pg\.\s*\d+|\d+\s*/\s*\d+|\[\s*Barcode\s*\]|\[\s*Registration\s*\]|Printer\s*Mark).*$").unwrap()
-    });
-    let cleaned = re.replace_all(text, "").to_string();
-
-    // Also remove footer codes like "IB/M/Jun21/7408/2"
-    let re_footer = RE_FOOTER_CODES.get_or_init(|| {
-        Regex::new(r"(?im)^\s*[A-Z]{2}/[A-Z]/[A-Za-z]{3}\d{2}/\d+/\d+\s*$").unwrap()
-    });
-    re_footer.replace_all(&cleaned, "").to_string()
+    let cleaned = RE_PAGE_ARTIFACTS.replace_all(text, "").to_string();
+    RE_FOOTER_CODES.replace_all(&cleaned, "").to_string()
 }
 
 /// Remove leading question numbers and OCR artifacts from start of question text
@@ -181,17 +235,7 @@ fn remove_page_artifacts(text: &str) -> String {
 /// Does NOT remove "Question N:" headers or AQA decimal parts like "02.1"
 /// Does NOT remove sub-part identifiers like "(a)", "(i)", "1.1"
 fn remove_leading_number_artifacts(text: &str) -> String {
-    let re = RE_LEADING_NUMBER_ARTIFACTS.get_or_init(|| {
-        // Match patterns at start of text (^) or after double newline (\n\n):
-        // - "Q5" or "Q5:" or "Q5." or "Q5 " prefixes
-        // - Leading digits with OCR noise: "1 9 O", "3 1 27Mg 12" (digits + spaces + letters/digits, 1-3 groups)
-        // - Does NOT match "Question N:" which is a valid header
-        // - Does not match AQA decimal parts like "02.1" or "03 5" (handled separately)
-        // - Does NOT match sub-part identifiers like "(a)", "(i)", "1.1"
-        Regex::new(r"(?m)(^|\n\n)\s*(?:Q\d+\s*[.:]?|\d{1,3}(?:\s+[A-Za-z\d]){1,3}\s+)").unwrap()
-    });
-
-    re.replace_all(text, |caps: &regex::Captures| {
+    RE_LEADING_NUMBER_ARTIFACTS.replace_all(text, |caps: &regex::Captures| {
         let prefix = &caps[1];
         if prefix == "\n\n" {
             "\n\n".to_string()
@@ -204,13 +248,7 @@ fn remove_leading_number_artifacts(text: &str) -> String {
 /// Convert AQA decimal sub-parts: "02.1" -> "(a)", "02.2" -> "(b)", "02 5" -> "(e)"
 /// Only applies when the pattern appears as a sub-part label (start of line or after whitespace)
 fn convert_aqa_decimal_parts(text: &str) -> String {
-    let re = RE_AQA_DECIMAL_PART.get_or_init(|| {
-        // Match AQA decimal: whole number + dot + single digit, OR spaced "02 5"
-        // Only at start of line or after newline/whitespace as a sub-part marker
-        Regex::new(r"(?:^|\n)\s*(\d+)(?:[.\s])([1-9])\b").unwrap()
-    });
-
-    re.replace_all(text, |caps: &regex::Captures| {
+    RE_AQA_DECIMAL_PART.replace_all(text, |caps: &regex::Captures| {
         let _whole: u32 = caps[1].parse().unwrap_or(0);
         let part: u32 = caps[2].parse().unwrap_or(0);
         if part >= 1 && part <= 26 {
@@ -224,50 +262,30 @@ fn convert_aqa_decimal_parts(text: &str) -> String {
 
 /// Ensure sub-part labels (a), (b), (i), (ii) have double newline before them
 fn ensure_subpart_spacing(text: &str) -> String {
-    let re = RE_SUBPART_LABEL.get_or_init(|| {
-        // Match sub-part labels at start of line or after single newline
-        // Roman numerals (i), (ii), (iii), (iv), (v) or letters (a), (b), (c)...
-        // Capture the prefix (^ or \n) and the label, then require whitespace after
-        Regex::new(r"(?m)(^|\n)(\s*)(\([a-z]\)|\([ivx]+\))(\s)").unwrap()
-    });
-
-    re.replace_all(text, |caps: &regex::Captures| {
-        let prefix = &caps[1];
+    RE_SUBPART_LABEL.replace_all(text, |caps: &regex::Captures| {
+        let _prefix = &caps[1];
         let whitespace = &caps[2];
         let label = &caps[3];
         let following_space = &caps[4];
-        if prefix == "\n" {
-            format!("\n\n{}{}{}", label, whitespace, following_space)
-        } else {
-            format!("\n\n{}{}{}", label, whitespace, following_space)
-        }
+        format!("\n\n{}{}{}", label, whitespace, following_space)
     }).to_string()
 }
 
 /// Fix MCQ option flattening: ensure each option A) B) C) D) or (A) (B) (C) (D) is on its own line
 fn fix_mcq_option_flattening(text: &str) -> String {
-    // Without lookahead support, we match inline MCQ sequences and split them
-    // Approach: find patterns like "A) text B) text C) text" and replace with "A) text\n\nB) text\n\nC) text"
-
     // First pass: handle uppercase A) B) C) D) format
-    let re_inline = Regex::new(r"(?m)([A-D]\)[^A-D\n]*(?:\s+[A-D]\)[^A-D\n]*)+)").unwrap();
-    let result = re_inline.replace_all(text, |caps: &regex::Captures| {
-        // Split by option markers
+    let result = RE_INLINE_MCQ.replace_all(text, |caps: &regex::Captures| {
         let matched = &caps[1];
-        let re_split = Regex::new(r"([A-D]\)[^A-D\n]*)").unwrap();
-        let parts: Vec<String> = re_split.find_iter(matched)
+        let parts: Vec<String> = RE_SPLIT_MCQ.find_iter(matched)
             .map(|m| m.as_str().trim().to_string())
             .collect();
-        // Ensure first option starts on new line (add double newline prefix)
         format!("\n\n{}", parts.join("\n\n"))
     }).to_string();
 
     // Second pass: handle (A) (B) (C) (D) format
-    let re_paren = Regex::new(r"(?m)(\([A-D]\)[^(\n]*(?:\s+\([A-D]\)[^(\n]*)+)").unwrap();
-    re_paren.replace_all(&result, |caps: &regex::Captures| {
+    RE_PAREN_MCQ.replace_all(&result, |caps: &regex::Captures| {
         let matched = &caps[1];
-        let re_split = Regex::new(r"(\([A-D]\)[^(\n]*)").unwrap();
-        let parts: Vec<String> = re_split.find_iter(matched)
+        let parts: Vec<String> = RE_SPLIT_PAREN_MCQ.find_iter(matched)
             .map(|m| m.as_str().trim().to_string())
             .collect();
         format!("\n\n{}", parts.join("\n\n"))
@@ -276,46 +294,25 @@ fn fix_mcq_option_flattening(text: &str) -> String {
 
 /// Fix tabular MCQ options: if options appear in a table, convert to clean list or proper markdown table
 fn fix_tabular_mcq_options(text: &str) -> String {
-    // First check for existing markdown tables with MCQ options (already handled)
-    let re_table_mcq = RE_TABLE_MCQ_ROW.get_or_init(|| {
-        Regex::new(r"(?m)^\|?\s*([A-D]|\([A-D]\)|\d+)[\.)]?\s*\|([^|]*)\|").unwrap()
-    });
-
-    if re_table_mcq.is_match(&text) {
+    if RE_TABLE_MCQ_ROW.is_match(text) {
         // Ensure existing markdown tables are well-formatted
-        let re_table_row = Regex::new(r"(?m)^(\|.*?\|)\s*$").unwrap();
-        let cleaned = re_table_row.replace_all(&text, "$1\n").to_string();
-        // Also try to add header if missing (detect by looking for first row with A/B/C/D)
+        let cleaned = RE_TABLE_ROW.replace_all(text, "$1\n").to_string();
         return add_table_header_if_missing(&cleaned);
     }
 
-    // Check for columnar data without pipes (e.g., "Secondary voltage / V  Secondary current / A\nA 200 0.50")
-    // Pattern: header line with "Secondary voltage / V  Secondary current / A" followed by data rows
-    let re_tabular_header = RE_TABULAR_MCQ_HEADER.get_or_init(|| {
-        Regex::new(r"(?m)^\s*[A-Za-z][A-Za-z/\s().]*(?:/\s*[A-Za-z])\b.*$").unwrap()
-    });
-    let re_tabular_row = RE_TABULAR_MCQ_ROW.get_or_init(|| {
-        Regex::new(r"(?m)^\s*[A-D][\).]?\s+\d").unwrap()
-    });
-
-    // Try to detect columnar MCQ: multiple lines where first line has headers, subsequent lines have option letters + numbers
     let lines: Vec<&str> = text.lines().collect();
     if lines.len() >= 2 {
-        // Check if first non-empty line looks like headers and others look like option rows
         let mut has_header = false;
         let mut has_option_rows = false;
 
-        // Collect non-empty lines
         let non_empty: Vec<&str> = lines.iter().map(|l| l.trim()).filter(|l| !l.is_empty()).collect();
 
         if non_empty.len() >= 2 {
-            // Check header line (first non-empty line)
-            if re_tabular_header.is_match(non_empty[0]) {
+            if RE_TABULAR_MCQ_HEADER.is_match(non_empty[0]) {
                 has_header = true;
             }
-            // Check if subsequent lines look like option rows
             for line in &non_empty[1..] {
-                if re_tabular_row.is_match(line) {
+                if RE_TABULAR_MCQ_ROW.is_match(line) {
                     has_option_rows = true;
                     break;
                 }
@@ -335,19 +332,14 @@ fn add_table_header_if_missing(text: &str) -> String {
     let lines: Vec<&str> = text.lines().collect();
     if lines.is_empty() { return text.to_string(); }
 
-    // Check if first line is already a markdown table header (has |---|)
     let first_line = lines[0].trim();
     if first_line.starts_with('|') && first_line.contains("---") {
         return text.to_string(); // Already has header
     }
 
-    // Check if first non-empty line has option letters (A, B, C, D)
-    let re_option_row = Regex::new(r"^\|\s*([A-D]|\([A-D]\))").unwrap();
-    if re_option_row.is_match(first_line) {
-        // Count columns
+    if RE_OPTION_ROW.is_match(first_line) {
         let col_count = first_line.matches('|').count().saturating_sub(1);
         if col_count >= 2 {
-            // Build header: Option | Col2 | Col3 ...
             let mut header = String::from("| Option");
             for i in 1..col_count {
                 header.push_str(&format!(" | Column {}", i));
@@ -376,12 +368,10 @@ fn convert_columnar_to_markdown_table(text: &str) -> String {
     let lines: Vec<&str> = text.lines().map(|l| l.trim()).filter(|l| !l.is_empty()).collect();
     if lines.len() < 2 { return text.to_string(); }
 
-    // Assume first line is header, rest are option rows
     let header_text = lines[0];
     let option_lines = &lines[1..];
 
-    // Try to parse header into columns (split by 2+ spaces or tabs)
-    let header_cols: Vec<&str> = Regex::new(r"\s{2,}|\t+").unwrap()
+    let header_cols: Vec<&str> = RE_HEADER_COLS
         .split(header_text)
         .map(|s| s.trim())
         .filter(|s| !s.is_empty())
@@ -389,12 +379,9 @@ fn convert_columnar_to_markdown_table(text: &str) -> String {
 
     if header_cols.len() < 2 { return text.to_string(); }
 
-    // Parse option rows
     let mut rows = Vec::new();
     for line in option_lines {
-        // Match: A 200 0.50  or  A) 200 0.50  or  (A) 200 0.50
-        let re = Regex::new(r"^([A-D])[\).]?\s+(.+)$").unwrap();
-        if let Some(caps) = re.captures(line) {
+        if let Some(caps) = RE_OPT_ROW.captures(line) {
             let opt = caps[1].to_string();
             let rest = caps[2].trim();
             let vals: Vec<&str> = rest.split_whitespace().collect();
@@ -406,10 +393,8 @@ fn convert_columnar_to_markdown_table(text: &str) -> String {
 
     if rows.is_empty() { return text.to_string(); }
 
-    // Build markdown table
     let mut result = String::new();
 
-    // Header row
     let mut header = String::from("| Option");
     for col in &header_cols {
         header.push_str(&format!(" | {}", col));
@@ -418,7 +403,6 @@ fn convert_columnar_to_markdown_table(text: &str) -> String {
     result.push_str(&header);
     result.push('\n');
 
-    // Separator
     let mut sep = String::from("|");
     for _ in 0..header_cols.len() {
         sep.push_str("---|");
@@ -426,7 +410,6 @@ fn convert_columnar_to_markdown_table(text: &str) -> String {
     result.push_str(&sep);
     result.push('\n');
 
-    // Data rows
     for row in rows {
         let mut row_str = String::from("|");
         for cell in row {
@@ -441,65 +424,29 @@ fn convert_columnar_to_markdown_table(text: &str) -> String {
 
 /// Fix visual MCQ gibberish: "Which graph is correct?" followed by [DIAGRAM_PLACEHOLDER] options
 fn fix_visual_mcq_gibberish(text: &str) -> String {
-    let re = RE_VISUAL_MCQ_LEADIN.get_or_init(|| {
-        // Match visual MCQ lead-ins more flexibly - allow any word after "correct" until punctuation
-        Regex::new(r"(?i)(Which\s+(?:graph|diagram|figure|image|chart|plot|sketch|drawing)\s+(?:is|shows|represents|matches|corresponds\s+to)\s+(?:correct|the\s+correct|best|accurate)\s*\w*\??|Which\s+of\s+the\s+following\s+(?:graphs?|diagrams?|figures?|images?|charts?|plots?|sketches?)\s+(?:is|shows|represents)\??)\s*").unwrap()
-    });
-
-    // Ensure the lead-in ends with double newline and options are formatted as labeled items
-    let result = re.replace_all(text, |caps: &regex::Captures| {
+    let result = RE_VISUAL_MCQ_LEADIN.replace_all(text, |caps: &regex::Captures| {
         format!("{}\n\n", caps[1].trim())
     }).to_string();
 
-    // Then ensure each [DIAGRAM_PLACEHOLDER] for visual MCQ options gets a label
-    // Pattern: "A)[\\s\\S]*?[DIAGRAM_PLACEHOLDER]" - match option marker + optional whitespace + placeholder
-    // Using lookahead to match across lines: A) followed by any whitespace then [DIAGRAM_PLACEHOLDER]
-    let re_visual_opts = Regex::new(r"(?m)([A-D]\))\s*(\[DIAGRAM_PLACEHOLDER\])").unwrap();
-    let result = re_visual_opts.replace_all(&result, "$1 $2\n\n").to_string();
+    let result = RE_VISUAL_OPTS.replace_all(&result, "$1 $2\n\n").to_string();
+    let result = RE_DIAGRAM_OPT.replace_all(&result, "[VISUAL_MCQ_PLACEHOLDER]").to_string();
+    let result = RE_VISUAL_MCQ_GIBBERISH.replace_all(&result, "").to_string();
 
-    // Replace bare graph/diagram option placeholders with VISUAL_MCQ_PLACEHOLDER for chunker
-    // Pattern: A) [DIAGRAM_PLACEHOLDER] -> A) [VISUAL_MCQ_PLACEHOLDER]
-    let re_diagram_opt = Regex::new(r"(\[DIAGRAM_PLACEHOLDER\])").unwrap();
-    let result = re_diagram_opt.replace_all(&result, "[VISUAL_MCQ_PLACEHOLDER]").to_string();
-
-    // Remove gibberish patterns like "A B C D A B C D" that appear when OCR reads visual options
-    // Match lines that consist entirely of A-D letters separated by whitespace (4+ letters)
-    let re_gibberish = RE_VISUAL_MCQ_GIBBERISH.get_or_init(|| {
-        Regex::new(r"(?m)^\s*(?:[A-D]\s*){4,}$").unwrap()
-    });
-    let result = re_gibberish.replace_all(&result, "").to_string();
-
-    // Strip margin artifacts using the new dedicated function
     let result = remove_margin_artifacts(&result);
-
-    // Remove serial codes using the new dedicated function
     let result = remove_serial_codes(&result);
-
-    // Remove navigation markers using the new dedicated function
     remove_navigation_markers(&result)
 }
 
 /// Format MCQ options as markdown list items with bold keys: "A) 4N" -> "- **A** 4N"
 fn format_mcq_options_bold(text: &str) -> String {
-    // Handle already separated lines: "A) Option text" -> "- **A** Option text"
-    // Allow leading whitespace before the option marker
-    let re_opt_line = Regex::new(r"(?m)^\s*([A-D]\))\s+(.+)$").unwrap();
-    let result = re_opt_line.replace_all(text, "- **$1** $2").to_string();
-
-    // Handle parenthesized: "(A) Option text" -> "- **(A)** Option text"
-    let re_paren_opt = Regex::new(r"(?m)^\s*(\([A-D]\))\s+(.+)$").unwrap();
-    re_paren_opt.replace_all(&result, "- **$1** $2").to_string()
+    let result = RE_OPT_LINE.replace_all(text, "- **$1** $2").to_string();
+    RE_PAREN_OPT.replace_all(&result, "- **$1** $2").to_string()
 }
 
 /// Fix mark allocation misplacement: ensure **[X marks]** appears at end of sub-part, before MCQ options
 fn fix_mark_allocation(text: &str) -> String {
-    let re = RE_MARK_TAG.get_or_init(|| {
-        Regex::new(r"\*\*\[\s*(\d+)\s+marks?\s*\]\*\*").unwrap()
-    });
-
-    // First, collect all mark tags (just the string portion)
     let mut marks: Vec<String> = Vec::new();
-    for cap in re.find_iter(text) {
+    for cap in RE_MARK_TAG.find_iter(text) {
         marks.push(cap.as_str().to_string());
     }
 
@@ -507,36 +454,25 @@ fn fix_mark_allocation(text: &str) -> String {
         return text.to_string();
     }
 
-    // Remove all mark tags from the text first
-    let result = re.replace_all(text, "").to_string();
+    let result = RE_MARK_TAG.replace_all(text, "").to_string();
 
-    // Find sub-part boundaries and place marks at the end of each sub-part
-    // Match sub-part labels at start of text or after newlines: (a), (b), (i), (ii), etc.
-    // We match: optional prefix (^ or \n\n), then optional whitespace, then label, then optional whitespace
-    // The trailing \s+ ensures we capture at least one whitespace after label
-    let re_subpart = Regex::new(r"(?m)((?:^|\n\n)\s*)(\([a-z]\)|\([ivx]+\))\s+").unwrap();
+    let parts: Vec<String> = RE_SUBPART.split(&result).map(|s| s.to_string()).collect();
 
-    // Split by sub-parts while keeping the labels
-    let parts: Vec<String> = re_subpart.split(&result).map(|s| s.to_string()).collect();
-
-    // Extract the prefix (group 1) and label (group 2) from each match
-    let label_data: Vec<(String, String)> = re_subpart.captures_iter(&result).map(|caps| {
-        let prefix = caps[1].to_string();  // includes ^ or \n\n + whitespace
-        let label = caps[2].to_string();   // just the (a) or (i)
+    let label_data: Vec<(String, String)> = RE_SUBPART.captures_iter(&result).map(|caps| {
+        let prefix = caps[1].to_string();
+        let label = caps[2].to_string();
         (prefix, label)
     }).collect();
 
     if !parts.is_empty() && !marks.is_empty() && parts.len() == label_data.len() + 1 {
         let mut rebuilt = String::new();
-        // First part (before first sub-part)
         if !parts[0].trim().is_empty() {
             rebuilt.push_str(parts[0].trim());
         }
 
         for (i, (prefix, label)) in label_data.iter().enumerate() {
-            rebuilt.push_str(prefix);  // This includes \n\n before the label
+            rebuilt.push_str(prefix);
             rebuilt.push_str(label);
-            // The regex consumed trailing whitespace (\s+), add a space to separate from content
             rebuilt.push_str(" ");
             rebuilt.push_str(parts[i + 1].trim());
             if i < marks.len() {
@@ -547,18 +483,11 @@ fn fix_mark_allocation(text: &str) -> String {
         }
         let result = rebuilt.trim().to_string();
 
-        // Check if result has MCQ options after the mark - if so, we may need to adjust
-        // for the case where marks need to be BEFORE MCQ options, not after sub-part
-        let re_mcq = Regex::new(r"(?m)([A-D]\)|\([A-D]\))").unwrap();
         let mut mark_after_mcq = false;
-        if re_mcq.is_match(&result) {
-            // Find first MCQ option position
-            if let Some(mcq_pos) = re_mcq.find(&result).map(|m| m.start()) {
-                // Find first mark position
-                let mark_re = Regex::new(r"\*\*\[\s*\d+\s+marks?\s*\]\*\*").unwrap();
-                if let Some(mark_pos) = mark_re.find(&result).map(|m| m.start()) {
+        if RE_MCQ_BOUNDARY.is_match(&result) {
+            if let Some(mcq_pos) = RE_MCQ_BOUNDARY.find(&result).map(|m| m.start()) {
+                if let Some(mark_pos) = RE_MARK_TAG_MATCH.find(&result).map(|m| m.start()) {
                     if mark_pos > mcq_pos {
-                        // Mark is after MCQ option - need to move mark before MCQ options
                         mark_after_mcq = true;
                     }
                 }
@@ -568,50 +497,35 @@ fn fix_mark_allocation(text: &str) -> String {
         if !mark_after_mcq {
             return result;
         }
-
-        // Fall through to fallback when mark_after_mcq is true
     }
 
-    // Fallback: handle case where marks need to be before MCQ options
-    // Look for MCQ option start and insert marks before it
-    // Match MCQ options at start of string, after \n, or after \n\n
-    let re_mcq_start = Regex::new(r"(?m)((?:^|\n\n?))([A-D]\)|\([A-D]\))").unwrap();
-    if re_mcq_start.is_match(&result) && !marks.is_empty() {
-        // Insert first mark before first MCQ option
+    if RE_MCQ_START.is_match(&result) && !marks.is_empty() {
         let first_mark = marks[0].clone();
-        let mut modified = re_mcq_start.replace(&result, |caps: &regex::Captures| {
+        let mut modified = RE_MCQ_START.replace(&result, |caps: &regex::Captures| {
             format!("{}{} {}", &caps[1], first_mark, &caps[2])
         }).to_string();
-        // Add remaining marks at end if any
         if marks.len() > 1 {
             for mark in &marks[1..] {
                 modified.push_str(" ");
                 modified.push_str(mark);
             }
         }
-        // Also need to remove any marks we already placed after sub-parts
-        let re_remove_marks = Regex::new(r" \*\*\[\s*\d+\s+marks?\s*\]\*\*").unwrap();
-        modified = re_remove_marks.replace_all(&modified, "").to_string();
+        modified = RE_REMOVE_MARKS.replace_all(&modified, "").to_string();
         return modified;
     }
 
-    // Final fallback: just ensure marks have proper spacing at end
-    let re_fix_spacing = re.replace_all(&result, " **[${1} marks]**");
+    let re_fix_spacing = RE_MARK_TAG.replace_all(&result, " **[${1} marks]**");
     re_fix_spacing.to_string()
 }
 
 /// Normalize excessive newlines (more than 2 consecutive) to exactly 2
 fn normalize_newlines(text: &str) -> String {
-    let re = RE_EXCESSIVE_NEWLINES.get_or_init(|| {
-        Regex::new(r"\n{3,}").unwrap()
-    });
-    re.replace_all(text, "\n\n").to_string()
+    RE_EXCESSIVE_NEWLINES.replace_all(text, "\n\n").to_string()
 }
 
 /// Remove navigational text like "Turn over ►", "END OF QUESTIONS"
 fn remove_navigational_text(text: &str) -> String {
-    let re = Regex::new(r"(?im)^\s*(?:TURN\s+OVER|END\s+OF\s+QUESTIONS?|CONTINUE\s+ON\s+NEXT\s+PAGE|GO\s+TO\s+NEXT\s+PAGE)[\s\p{So}]*$").unwrap();
-    re.replace_all(text, "").to_string()
+    RE_NAV_TEXT.replace_all(text, "").to_string()
 }
 
 /// Main post-processing entry point - comprehensive fixes for 6 error categories

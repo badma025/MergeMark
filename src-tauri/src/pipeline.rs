@@ -219,6 +219,7 @@ impl PageImageCache {
 
 struct ChunkImageInput {
     chunk_idx: usize,
+    global_page_idx: usize,
     b64: String,
     start_y: Option<f32>,
     end_y: Option<f32>,
@@ -297,7 +298,7 @@ async fn prepare_chunk_images(
         )> = inputs
             .into_par_iter()
             .map(|input| {
-                let decoded = page_cache.get_or_decode(input.chunk_idx, &input.b64);
+                let decoded = page_cache.get_or_decode(input.global_page_idx, &input.b64);
                 let mut final_b64 = input.b64;
                 let mut crop_offset = (0.0_f32, 1.0_f32);
                 let mut page_band = None;
@@ -1205,8 +1206,7 @@ pub async fn run_question_pipeline<C: LlmClient, P: Progress>(
         // Build the text-layer-only map concurrently. This is fast (ms)
         // but starts the setup work while API calls are in flight.
         let map_setup_future = async {
-            let page_texts_setup: Vec<String> = pages.iter().map(|p| p.text.clone()).collect();
-            doc_map::build_hybrid_map(&page_texts_setup, &[], pages.len())
+            doc_map::build_hybrid_map_with_scan(&page_texts, &[], pages.len(), &scan)
         };
 
         // Both futures run concurrently on the same task. The structure
@@ -1279,11 +1279,10 @@ pub async fn run_question_pipeline<C: LlmClient, P: Progress>(
     }
 
     // ── 2. Document map ─────────────────────────────────────────────────────
-    let page_texts: Vec<String> = pages.iter().map(|p| p.text.clone()).collect();
     let doc_map_start = Instant::now();
 
     // Use hybrid map building: reliable text pages + vision for ambiguous pages
-    let mut map = doc_map::build_hybrid_map(&page_texts, &structures, pages.len());
+    let mut map = doc_map::build_hybrid_map_with_scan(&page_texts, &structures, pages.len(), &scan);
 
     // Record which pages used vision fallback
     report.timings.push(TimingEntry {
@@ -1686,6 +1685,7 @@ async fn extract_span<C: LlmClient>(
             if let Some(b64) = _p.get_b64() {
                 preparation_inputs.push(ChunkImageInput {
                     chunk_idx: local_idx,
+                    global_page_idx: *global_pi,
                     b64: b64.clone(),
                     start_y: s,
                     end_y: e,
@@ -3145,6 +3145,7 @@ RULES:
     let preparation_inputs = match &page.kind {
         PageInputKind::Image { b64, .. } => vec![ChunkImageInput {
             chunk_idx: 0,
+            global_page_idx: page_idx,
             b64: b64.clone(),
             start_y: None,
             end_y: None,

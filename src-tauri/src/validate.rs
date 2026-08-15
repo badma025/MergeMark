@@ -5,7 +5,19 @@
 // *gate* (structure proposals). The pipeline uses their verdicts to build
 // repair prompts and quarantine reports.
 
-use std::sync::OnceLock;
+use std::sync::{LazyLock, OnceLock};
+
+static INEQ_RE: LazyLock<regex::Regex> = LazyLock::new(|| {
+    regex::Regex::new(r"(?im)^[\s\.\$]*(?:\\\\?leq?|\\\\?geq?|<|>)\s*[a-zA-Z]\s*(?:\\\\?leq?|\\\\?geq?|<|>)\s*(.*?)\s*\$?\s*$").unwrap()
+});
+
+static EQ_RE: LazyLock<regex::Regex> = LazyLock::new(|| {
+    regex::Regex::new(r"(?im)^[\s\.\$]*[a-zA-Z]\s*=\s*(.*?)\s*\$?\s*$").unwrap()
+});
+
+static RE_EXAMINER_CODES: LazyLock<regex::Regex> = LazyLock::new(|| {
+    regex::Regex::new(r"(?i)[\s,;]*(?:[\[(]?\b(?:d?(?:[mab]1?|ft|oe|cao|aef|awrt|dep|indep|allow|condone|ignore|accept|or\s+equivalent|award))[\](,)]*)+\s*$").unwrap()
+});
 
 fn re(pattern: &'static str) -> &'static regex::Regex {
     // One Regex per distinct literal pattern, compiled once per process.
@@ -418,12 +430,10 @@ pub fn clean_question_content(content: &str) -> String {
     }
 
     // Strip trailing inequality answer templates (e.g., "$... \le t < ...$ [2 marks]") while preserving the marks
-    let ineq_re = regex::Regex::new(r"(?im)^[\s\.\$]*(?:\\\\?leq?|\\\\?geq?|<|>)\s*[a-zA-Z]\s*(?:\\\\?leq?|\\\\?geq?|<|>)\s*(.*?)\s*\$?\s*$").unwrap();
-    cleaned = ineq_re.replace_all(&cleaned, "$1").into_owned();
+    cleaned = INEQ_RE.replace_all(&cleaned, "$1").into_owned();
 
     // Strip trailing equality answer templates (e.g., "$... x = ...$ [2 marks]")
-    let eq_re = regex::Regex::new(r"(?im)^[\s\.\$]*[a-zA-Z]\s*=\s*(.*?)\s*\$?\s*$").unwrap();
-    cleaned = eq_re.replace_all(&cleaned, "$1").into_owned();
+    cleaned = EQ_RE.replace_all(&cleaned, "$1").into_owned();
 
     // Collapse runs of 3+ newlines left by removals.
     let collapse = re(r"\n{3,}");
@@ -894,9 +904,8 @@ pub fn is_duplicate_answer(existing: &str, new: &str) -> bool {
 // ── Mark Scheme Normalization (Task 2) ──────────────────────────────────────
 
 pub fn normalize_mark_scheme_chunk(chunk: &str) -> String {
-    let re_examiner_codes = regex::Regex::new(r"(?i)[\s,;]*(?:[\[(]?\b(?:d?(?:[mab]1?|ft|oe|cao|aef|awrt|dep|indep|allow|condone|ignore|accept|or\s+equivalent|award))[\](,)]*)+\s*$").unwrap();
     let mut lines: Vec<String> = chunk.lines().map(|line| {
-        let cleaned = re_examiner_codes.replace_all(line, "");
+        let cleaned = RE_EXAMINER_CODES.replace_all(line, "");
         cleaned.trim().to_string()
     }).collect();
     
