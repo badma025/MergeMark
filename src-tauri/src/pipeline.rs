@@ -933,7 +933,7 @@ fn page_band_note(span: &QuestionSpan, page_index_in_span: usize, total_pages_in
     Some(note)
 }
 
-fn extraction_system_prompt(config: &PipelineConfig, span: &QuestionSpan) -> String {
+fn extraction_system_prompt(config: &PipelineConfig) -> String {
     let topics_instruction = if config.allowed_topics.is_empty() {
         "- \"topics\": array. MUST be empty []. Do NOT invent topics.".to_string()
     } else {
@@ -969,22 +969,22 @@ END OF EXAMPLES — Follow the same JSON structure, escaping rules, and isolatio
 "#;
 
     format!(
-        r#"You are a precise mathematical OCR engine transcribing exactly ONE exam question. Output ONLY a valid JSON object of the form {{"items": [ ... ]}}.
+        r#"You are a precise mathematical OCR engine transcribing exactly ONE requested exam question. Output ONLY a valid JSON object of the form {{"items": [ ... ]}}.
 
-CONTEXT: The page image(s) show Question {number} of the paper '{paper}'. Transcribe ONLY content belonging to Question {number}. If nothing belongs to Question {number}, return {{"items": []}}.
+CONTEXT: The user will specify the target question number, paper name, and module name in the user prompt. Transcribe ONLY content belonging to the requested target question. If nothing on the page(s) belongs to the target question, return {{"items": []}}.
 
 ═══ QUESTION ISOLATION RULES (HIGHEST PRIORITY) ═══
-Transcribe Question {number} and NOTHING ELSE. Sub-parts belonging to other questions must NEVER appear.
-1. OWNERSHIP: A sub-part belongs to the question printed in its label, or the nearest whole-number heading above it. If not {number}, DROP it.
-2. HARD STOP: Immediately stop transcribing when you meet another question heading, a sub-part label for a different main question, a totals footer ("(Total for Question {number} is M marks)"), or a new question separator.
+Transcribe the target question and NOTHING ELSE. Sub-parts belonging to other questions must NEVER appear.
+1. OWNERSHIP: A sub-part belongs to the question printed in its label, or the nearest whole-number heading above it. If not the target question, DROP it.
+2. HARD STOP: Immediately stop transcribing when you meet another question heading, a sub-part label for a different main question, a totals footer for the target question ("(Total for Question N is M marks)"), or a new question separator.
 3. HARD START: Skip trailing parts/diagrams of previous questions at the page top.
 4. SUB-PARTS: Continue in printed order ((a), (b), (c)...). If numbering restarts at (a) after a totals footer, it belongs to the next question — DROP it.
 5. ISOLATION: Never merge or renumber neighbouring questions. A short, accurate item is required.
 6. Y-BAND HINTS: If a y-band hint is provided in user instructions, adhere strictly to its vertical bounds.
 
 OUTPUT STRUCTURE — EVERY item MUST have:
-- "question_number": {number} (integer).
-- "content": Full text transcription of Question {number} without summary or leading question number (e.g. "17 Here is..." -> "Here is...").
+- "question_number": integer matching the requested target question number.
+- "content": Full text transcription of the target question without summary or leading question number (e.g. "17 Here is..." -> "Here is...").
   * Format sub-parts (a), (b), (c) separated by double newlines (\n\n) with mark tags `**[X marks]**`.
   * Omit headers, footers, "(Total for Question...)", blank page notices, and dotted answer lines at the end of parts.
   * Structured tables (trace tables, data tables): Transcribe as Markdown tables (| col |), NEVER as diagram boxes.
@@ -1005,10 +1005,8 @@ OUTPUT STRUCTURE — EVERY item MUST have:
 - "bbox_page_indexes": array of 0-based page image indices matching diagram_bboxes.
 - "visual_options": null for text questions. Set to "composite_visual_options" ONLY if MCQ answer choices are visual diagrams (return ONE composite box spanning options A through D).{few_shot}
 "#,
-        number = span.number,
-        paper = config.paper_name,
-        module = config.module_name,
         topics_instruction = topics_instruction,
+        module = config.module_name,
         few_shot = FEW_SHOT,
     )
 }
@@ -1746,7 +1744,7 @@ async fn extract_span<C: LlmClient>(
             }
         }
 
-        let system = extraction_system_prompt(config, span);
+        let system = extraction_system_prompt(config);
         // JSON Schema for structured extraction output
         let extraction_schema = extraction_json_schema();
         let mut last_error = String::new();
@@ -1762,7 +1760,10 @@ async fn extract_span<C: LlmClient>(
                 )
             };
             let user_text = format!(
-                "Transcribe Question {} from the attached page image(s).{}{}{}{}",
+                "TARGET: Question {}\nPAPER: '{}'\nMODULE: '{}'\n\nTranscribe Question {} from the attached page image(s).{}{}{}{}",
+                span.number,
+                config.paper_name,
+                config.module_name,
                 span.number,
                 band_notes,
                 if raw_text.is_empty() {
@@ -3761,6 +3762,7 @@ mod tests {
         );
         c.allowed_topics = vec!["Proof".into(), "Integration".into()];
         c.max_repairs = 2;
+        c.parallelism = 1;
         c
     }
 
@@ -3846,9 +3848,9 @@ mod tests {
         assert!(report.quarantined.is_empty());
         // The repair response mentions the failure:
         let bodies = mock.bodies();
-        let repair_body = &bodies[4];
-        let sys = repair_body["messages"][0]["content"].as_str().unwrap();
-        assert!(sys.contains("Question 1"));
+        let repair_body = &bodies[3];
+        let user_msg = repair_body["messages"][1]["content"].as_str().unwrap();
+        assert!(user_msg.contains("Question 1") && user_msg.contains("PREVIOUS ATTEMPT FAILED VALIDATION"));
     }
 
     #[tokio::test]
