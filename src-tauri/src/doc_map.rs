@@ -146,13 +146,18 @@ const FOOTER_PATTERNS: &[FooterPattern] = &[
         has_question_num: true,
     },
     FooterPattern {
+        // OCR / Edexcel equals sign variant: "(Total for Question 1 = 8 marks)"
+        re: r"(?i)\(?\s*Total\s+for\s+Question\s+(\d{1,2})\s*(?:is\s*|=)\s*(\d{1,2})\s*marks?\s*\)?",
+        has_question_num: true,
+    },
+    FooterPattern {
         // OCR / AQA variants
         re: r"(?i)\(?\s*Total\s+(?:for\s+Question\s+(\d{1,2})\s+)?(?:is\s+)?(\d{1,2})\s+marks?\s*\)?",
         has_question_num: true,
     },
     FooterPattern {
-        // WJEC / Eduqas / IB short forms
-        re: r"(?i)\[\s*Total\s*:?\s*(\d{1,2})\s*marks?\s*\]",
+        // Cambridge CIE / WJEC / Eduqas / IB short forms: "[Total: 8]", "(Total 8 marks)", "[Total marks: 10]"
+        re: r"(?i)[\[\(]\s*Total\s*(?:marks\s*)?:?\s*(\d{1,2})\s*(?:marks?)?\s*[\]\)]",
         has_question_num: false,
     },
 ];
@@ -165,13 +170,13 @@ fn compile_footer_regexes() -> Vec<(regex::Regex, bool)> {
 }
 
 fn paper_total_regex() -> regex::Regex {
-    regex::Regex::new(r"(?i)TOTAL\s+FOR\s+PAPER\s+IS\s+(\d{1,3})\s+MARKS").unwrap()
+    regex::Regex::new(r"(?i)(?:TOTAL\s+(?:FOR|MARKS\s+FOR)?\s+(?:THIS\s+)?PAPER\s*(?:IS|:|=)?\s*|MAXIMUM\s+MARK\s*:\s*)(\d{1,3})\s*(?:MARKS)?").unwrap()
 }
 
 /// Regex for question HEADINGS (whole questions, not parts) at the start of
 /// a line / block. Accepts:
 ///   "1." "1)" "1]" "1–" "1-" "1 " with optional bold "**1.**",
-///   "Q1" "Q.1" "Q 1", "Question 1" / "Question 1(a)"
+///   "Q1" "Q.1" "Q 1", "Question 1" / "Question 1(a)", "QUESTION 1"
 /// but NOT:
 ///   * AQA decimal part numbers "03.1" (handled separately via a leading 0
 ///     guard; sub-part digits are filtered).
@@ -194,7 +199,7 @@ fn question_heading_regex() -> regex::Regex {
     //     start with a digit, so a plain `(?:\D|$)` tail rejects them. Allow a
     //     trailing isotope (mass number + element symbol) as well.
     regex::Regex::new(
-        r"(?m)(?:^|\n)[ \t]*(?:box[ \t]+)?(?:\*\*)?(?:Q(?:uestion)?\.?[ \t]*)?0*[ \t]*([1-9](?:[ \t]*\d){0,2})(?:\*\*)?[ \t]*(?:[\.\)\]\-–—]|[ \t]+)(?:\D|$|\d{1,3}\s*(?:He|Ne|Ar|Kr|Xe|Rn|F|Cl|Br|I|O|S|Se|Te|N|P|As|Sb|C|Si|Ge|Sn|B|Al|Ga|In|Be|Mg|Ca|Sr|Ba|Li|Na|K|Rb|Cs|U|Th|Pu)\b)",
+        r"(?mi)(?:^|\n)[ \t]*(?:box[ \t]+)?(?:Section\s+[A-Z0-9]+[ \t]+)?(?:\*+|#+)?[ \t]*(?:Q(?:uestion)?\.?[ \t]*)?0*[ \t]*([1-9](?:[ \t]*\d){0,2})(?:\*+)?[ \t]*(?:[\.\)\]\-–—:]|[ \t]+)(?:\D|$|\d{1,3}\s*(?:He|Ne|Ar|Kr|Xe|Rn|F|Cl|Br|I|O|S|Se|Te|N|P|As|Sb|C|Si|Ge|Sn|B|Al|Ga|In|Be|Mg|Ca|Sr|Ba|Li|Na|K|Rb|Cs|U|Th|Pu)\b)",
     )
     .unwrap()
 }
@@ -225,25 +230,22 @@ pub fn text_layer_map_sufficient(scan: &TextScan, num_pages: usize) -> bool {
     nums.sort();
     nums.dedup();
     // Need a real paper's worth of questions, starting at Q1.
-    if nums.len() < 6 || nums.first().copied() != Some(1) {
+    // Modular papers (Further Maths, Mechanics, Option modules) often have 4 or 5 questions.
+    if nums.len() < 4 || nums.first().copied() != Some(1) {
         return false;
     }
-    // At most 2 missing numbers inside 1..=max (tolerates a heading lost to
-    // a diagram-only page or extraction quirk; more means the text layer is
-    // too sparse to trust alone). Headings have already been canonicalized
-    // into the longest plausible ordered sequence by scan_text_layer, so a
-    // stray heading cannot inflate this range or the spans built later.
+    // At most 2 missing numbers inside 1..=max (or 1 gap for 4-5 question papers).
     let max_q = *nums.last().unwrap();
     let gaps = (max_q as usize).saturating_sub(nums.len());
-    if gaps > 2 {
+    let allowed_gaps = if nums.len() <= 5 { 1 } else { 2 };
+    if gaps > allowed_gaps {
         return false;
     }
-    // Headings must be spread across the document, not clumped on a couple
-    // of pages (which would indicate a heading-like list, not questions).
+    // Headings must be spread across the document, not clumped on a single page
     let pages_with_headings: std::collections::BTreeSet<usize> =
         scan.headings.iter().map(|h| h.page).collect();
     let coverage = pages_with_headings.len() as f32 / num_pages as f32;
-    pages_with_headings.len() >= 4 || coverage >= 0.35
+    pages_with_headings.len() >= 3 || coverage >= 0.30
 }
 
 /// Scan every page's raw text layer for structural footers AND question
@@ -454,6 +456,8 @@ pub fn scan_text_layer(page_texts: &[String]) -> TextScan {
                         let has_zero = full.as_str()[..group_off].contains('0');
                         let has_q = full.as_str().to_lowercase().contains('q');
                         let has_period = full.as_str().contains('.');
+                        let has_colon = full.as_str().contains(':');
+                        let has_subpart = full.as_str().contains('(') || full.as_str().contains('[');
                         // Margin-marker form: spaced digits ("1 0") or leading
                         // zero ("0 1"). These are strong question signals that
                         // survive the quantity check below — physics MCQ pages
@@ -479,7 +483,7 @@ pub fn scan_text_layer(page_texts: &[String]) -> TextScan {
                         // AQA prints page numbers at the very bottom (y_frac > 0.85). On blank pages, y_frac is 0.0 but text.len() is small.
                         // We avoid dropping real questions by checking AQA's padding conventions (leading zeros, spaces between digits).
                         let is_likely_page_number = (n as usize) == page + 1 || (n as usize) == page || (n as usize) == page + 2;
-                        let looks_like_real_question = has_margin_form || has_q || has_period;
+                        let looks_like_real_question = has_margin_form || has_q || has_period || has_colon || has_subpart;
 
                         let at_bottom = y_frac > 0.85 && chars_remaining < 150;
                         let at_top = y_frac < 0.15 && safe_end < 150;
@@ -2116,6 +2120,41 @@ mod tests {
         ]);
         let scan = scan_text_layer(&dense);
         assert!(text_layer_map_sufficient(&scan, 9));
+
+        // 4-question modular paper run 1..=4 -> sufficient.
+        let modular = texts(&[
+            "Instructions",
+            "1 (a) alpha text padding padding padding padding padding padding padding padding",
+            "2 (a) beta text padding padding padding padding padding padding padding padding",
+            "3 (a) gamma text padding padding padding padding padding padding padding padding",
+            "4 (a) delta text padding padding padding padding padding padding padding padding",
+        ]);
+        let scan_mod = scan_text_layer(&modular);
+        assert!(text_layer_map_sufficient(&scan_mod, 5));
+
+        // Cambridge CIE style headings & footers
+        let cie = texts(&[
+            "Instructions",
+            "1 (a) Find the derivative of f(x) padding padding padding padding padding padding [Total: 8]",
+            "2 (a) Solve the differential equation padding padding padding padding padding [Total: 10]",
+            "3 (a) Calculate the vector product padding padding padding padding padding [Total: 6]",
+            "4 (a) Evaluate the definite integral padding padding padding padding padding [Total: 12]",
+        ]);
+        let scan_cie = scan_text_layer(&cie);
+        assert!(text_layer_map_sufficient(&scan_cie, 5));
+        assert_eq!(scan_cie.footers.len(), 4);
+
+        // OCR style uppercase headings & footers
+        let ocr = texts(&[
+            "Instructions",
+            "QUESTION 1\nCalculate the kinetic energy padding padding padding padding padding\n(Total for Question 1 = 6 marks)",
+            "QUESTION 2\nDetermine the wavelength padding padding padding padding padding\n(Total for Question 2 = 8 marks)",
+            "QUESTION 3\nFind the resistance padding padding padding padding padding\n(Total for Question 3 = 7 marks)",
+            "QUESTION 4\nExplain the observed spectrum padding padding padding padding padding\n(Total for Question 4 = 9 marks)",
+        ]);
+        let scan_ocr = scan_text_layer(&ocr);
+        assert!(text_layer_map_sufficient(&scan_ocr, 5));
+        assert_eq!(scan_ocr.footers.len(), 4);
     }
 
     #[test]
