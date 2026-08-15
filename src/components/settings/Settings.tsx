@@ -1,11 +1,12 @@
 import { useState, useEffect } from "react";
-import { Settings as SettingsIcon, Key, RefreshCw, AlertCircle, Trash2, AlertTriangle, Archive, Download, Upload } from "lucide-react";
+import { Settings as SettingsIcon, Key, RefreshCw, AlertCircle, Trash2, AlertTriangle, Archive, Download, Upload, Sparkles } from "lucide-react";
 import { Input } from "@/components/ui/input";
 import { Button } from "@/components/ui/button";
 import { invoke } from "@tauri-apps/api/core";
 import { open, save } from "@tauri-apps/plugin-dialog";
 import { toast } from "sonner";
 import { TaxonomyManager } from "./TaxonomyManager";
+import { SplashScreen } from "@/components/common/SplashScreen";
 
 // Mirrors the serde camelCase report structs in src-tauri/src/backup.rs
 interface ExportReport {
@@ -50,6 +51,7 @@ export function Settings() {
   const [pendingImport, setPendingImport] = useState<PendingImport | null>(null);
   const [importMode, setImportMode] = useState<"merge" | "replace">("merge");
   const [replaceInput, setReplaceInput] = useState("");
+  const [showSplashPreview, setShowSplashPreview] = useState(false);
 
   useEffect(() => {
     const savedKey = localStorage.getItem("mergemark_openai_key");
@@ -94,9 +96,6 @@ export function Settings() {
     try {
       const models = await invoke<string[]>("fetch_models", { baseUrl, apiKey });
       setAvailableModels(models);
-      if (models.length > 0 && !models.includes(modelName)) {
-        // optionally don't auto-set, just let the user pick
-      }
     } catch (err: any) {
       setModelFetchError(err.toString());
     } finally {
@@ -416,16 +415,46 @@ export function Settings() {
       <div className="w-full max-w-md flex flex-col gap-4 rounded-2xl border border-destructive/30 bg-destructive/5 p-6 shadow-sm mb-12">
         <h2 className="text-sm font-bold text-destructive flex items-center gap-2">
           <AlertTriangle className="size-4" />
-          Danger Zone
+          Settings
         </h2>
-        <div className="flex flex-col gap-2">
-          <p className="text-sm text-muted-foreground">
-            Irreversibly delete all imported questions, mark schemes, and generated content from your local database.
-          </p>
+
+        {/* Appearance & Branding */}
+        <div className="flex flex-col gap-2 pt-4 border-t border-border/40">
+          <div className="flex items-center justify-between">
+            <div>
+              <p className="text-xs font-semibold text-foreground">Launch Splash Screen</p>
+              <p className="text-xs text-muted-foreground">
+                Preview the native MergeMark startup screen and logo animation.
+              </p>
+            </div>
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={() => setShowSplashPreview(true)}
+              className="gap-1.5 text-xs"
+            >
+              <Sparkles className="size-3.5 text-primary" />
+              Preview Splash
+            </Button>
+          </div>
+        </div>
+
+        {/* Delete All Data */}
+        <div className="flex flex-col gap-2 pt-4 border-t border-border/40">
+          <div className="flex items-center justify-between">
+            <div>
+              <p className="text-xs font-semibold text-destructive">Danger Zone</p>
+              <p className="text-xs text-muted-foreground">
+                Permanently delete all questions and diagrams from the local SQLite database.
+              </p>
+            </div>
+          </div>
+          
           {!confirmingClear ? (
             <Button 
-              variant="destructive" 
-              className="mt-2 w-fit gap-2"
+              variant="outline" 
+              size="sm" 
+              className="w-fit text-destructive hover:bg-destructive/10 hover:text-destructive border-destructive/30 gap-2 text-xs"
               onClick={() => setConfirmingClear(true)}
             >
               <Trash2 className="size-4" />
@@ -470,6 +499,13 @@ export function Settings() {
           )}
         </div>
       </div>
+
+      {showSplashPreview && (
+        <SplashScreen
+          duration={5000}
+          onFinish={() => setShowSplashPreview(false)}
+        />
+      )}
     </section>
   );
 }

@@ -1,4 +1,4 @@
-import { Search, Plus } from "lucide-react";
+import { Search, Plus, X, FileText } from "lucide-react";
 import { useState, useEffect } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { toast } from "sonner";
@@ -23,15 +23,24 @@ import { useTaxonomy } from "@/lib/TaxonomyContext";
 export interface RepositoryFeedProps {
   isActive?: boolean;
   onAddToWorksheet: (question: Omit<QuestionCardProps, "onAddToWorksheet" | "onDelete">) => void;
+  onAddMultipleToWorksheet?: (questions: Omit<QuestionCardProps, "onAddToWorksheet" | "onDelete">[]) => void;
+  selectedQuestionIds?: string[];
 }
 
-export function RepositoryFeed({ isActive = true, onAddToWorksheet }: RepositoryFeedProps) {
+export function RepositoryFeed({
+  isActive = true,
+  onAddToWorksheet,
+  onAddMultipleToWorksheet,
+  selectedQuestionIds = [],
+}: RepositoryFeedProps) {
   const [search, setSearch] = useState("");
   const [showAddModal, setShowAddModal] = useState(false);
   const [showManagePapers, setShowManagePapers] = useState(false);
   const [selectedSubject, setSelectedSubject] = useState<string>("All");
   const [selectedModule, setSelectedModule] = useState<string>("All");
   const [selectedTopics, setSelectedTopics] = useState<string[]>([]);
+  const [selectedPaper, setSelectedPaper] = useState<string>("All");
+  const [selectedMarksRange, setSelectedMarksRange] = useState<"All" | "1-2" | "3-5" | "6+">("All");
   const [reviewFilter, setReviewFilter] = useState<"All" | "Clean" | "Needs review">("All");
   const [questions, setQuestions] = useState<Omit<QuestionCardProps, "onAddToWorksheet" | "onDelete">[]>([]);
   const [loading, setLoading] = useState(true);
@@ -41,6 +50,14 @@ export function RepositoryFeed({ isActive = true, onAddToWorksheet }: Repository
     Object.values(topicsBySubject)
       .flatMap(subjectMods => Object.values(subjectMods).flat())
   ));
+
+  const availablePapers = Array.from(
+    new Set(
+      questions
+        .map((q) => (q as any).paperName)
+        .filter((name): name is string => typeof name === "string" && name.trim().length > 0)
+    )
+  ).sort();
 
   useEffect(() => {
     if (isActive) {
@@ -92,6 +109,25 @@ export function RepositoryFeed({ isActive = true, onAddToWorksheet }: Repository
     }
   }
 
+  const handleClearFilters = () => {
+    setSearch("");
+    setSelectedSubject("All");
+    setSelectedModule("All");
+    setSelectedTopics([]);
+    setSelectedPaper("All");
+    setSelectedMarksRange("All");
+    setReviewFilter("All");
+  };
+
+  const hasActiveFilters =
+    search !== "" ||
+    selectedSubject !== "All" ||
+    selectedModule !== "All" ||
+    selectedTopics.length > 0 ||
+    selectedPaper !== "All" ||
+    selectedMarksRange !== "All" ||
+    reviewFilter !== "All";
+
   const filtered = questions.filter((q) => {
     const term = search.toLowerCase().trim();
     const matchesSearch = term === "" ||
@@ -103,6 +139,18 @@ export function RepositoryFeed({ isActive = true, onAddToWorksheet }: Repository
 
     const resolvedSubject = subjects.find(s => s.id === q.subject || s.name.toLowerCase() === (q.subject || "").toLowerCase())?.name || q.subject || "";
     const matchesSubject = selectedSubject === "All" || resolvedSubject.toLowerCase() === selectedSubject.toLowerCase();
+
+    const qPaper = ((q as any).paperName || "").trim();
+    const matchesPaper = selectedPaper === "All" || qPaper.toLowerCase() === selectedPaper.toLowerCase();
+
+    let matchesMarks = true;
+    if (selectedMarksRange === "1-2") {
+      matchesMarks = q.marks >= 1 && q.marks <= 2;
+    } else if (selectedMarksRange === "3-5") {
+      matchesMarks = q.marks >= 3 && q.marks <= 5;
+    } else if (selectedMarksRange === "6+") {
+      matchesMarks = q.marks >= 6;
+    }
 
     let matchesTopicFilter = true;
     if (selectedTopics.length > 0) {
@@ -150,8 +198,10 @@ export function RepositoryFeed({ isActive = true, onAddToWorksheet }: Repository
       matchesReviewFilter = !!q.needsReview || !!q.answerStale;
     }
 
-    return matchesSearch && matchesTopicFilter && matchesSubject && matchesModuleFilter && matchesReviewFilter;
+    return matchesSearch && matchesTopicFilter && matchesSubject && matchesModuleFilter && matchesReviewFilter && matchesPaper && matchesMarks;
   });
+
+  const totalMarksFiltered = filtered.reduce((sum, q) => sum + (q.marks || 0), 0);
 
   function handleAdd(id: string) {
     const question = questions.find((q) => q.id === id);
@@ -184,10 +234,31 @@ export function RepositoryFeed({ isActive = true, onAddToWorksheet }: Repository
           
           {/* Action buttons & filters */}
           <div className="flex flex-wrap items-center gap-2 sm:gap-3 order-1 md:order-none ml-auto md:ml-0">
-            <span className="text-sm text-muted-foreground whitespace-nowrap hidden xl:inline-block">
-              Total Questions: <span className="font-semibold text-foreground">{filtered.length}</span>
-            </span>
-            <div className="w-[130px] sm:w-[140px]">
+            {/* Paper Filter */}
+            {availablePapers.length > 0 && (
+              <div className="w-[140px] sm:w-[160px]">
+                <Select
+                  value={selectedPaper}
+                  onValueChange={(v) => {
+                    if (v) setSelectedPaper(v);
+                  }}
+                >
+                  <SelectTrigger className="h-8 text-xs font-semibold bg-muted/40">
+                    <FileText className="size-3.5 mr-1.5 text-muted-foreground shrink-0" />
+                    <SelectValue placeholder="All Papers" />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="All">All Papers ({availablePapers.length})</SelectItem>
+                    {availablePapers.map((p) => (
+                      <SelectItem key={p} value={p}>{p}</SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+              </div>
+            )}
+
+            {/* Review status Filter */}
+            <div className="w-[125px] sm:w-[135px]">
               <Select
                 value={reviewFilter}
                 onValueChange={(v) => {
@@ -204,6 +275,7 @@ export function RepositoryFeed({ isActive = true, onAddToWorksheet }: Repository
                 </SelectContent>
               </Select>
             </div>
+
             <Button
               onClick={() => setShowAddModal(true)}
               size="sm"
@@ -278,6 +350,65 @@ export function RepositoryFeed({ isActive = true, onAddToWorksheet }: Repository
           </div>
         )}
 
+        {/* Marks Range Pills & Active Filter Bar */}
+        <div className="mt-3 flex flex-wrap items-center justify-between gap-2 border-b border-border/50 pb-3">
+          <div className="flex flex-wrap items-center gap-1.5">
+            <span className="text-xs font-medium text-muted-foreground mr-1">Marks:</span>
+            {[
+              { id: "All", label: "All Marks" },
+              { id: "1-2", label: "1–2 (MCQ / Short)" },
+              { id: "3-5", label: "3–5 (Standard)" },
+              { id: "6+", label: "6+ (Extended)" },
+            ].map(({ id, label }) => {
+              const isSelected = selectedMarksRange === id;
+              return (
+                <Badge
+                  key={id}
+                  variant={isSelected ? "default" : "outline"}
+                  className={cn(
+                    "cursor-pointer text-xs font-medium py-0.5 px-2.5 rounded-md transition-all",
+                    isSelected
+                      ? "bg-emerald-600 text-white hover:bg-emerald-700 border-emerald-600"
+                      : "hover:bg-accent border-border/60 text-muted-foreground hover:text-foreground"
+                  )}
+                  onClick={() => setSelectedMarksRange(id as any)}
+                >
+                  {label}
+                </Badge>
+              );
+            })}
+          </div>
+
+          <div className="flex items-center gap-2.5 ml-auto flex-wrap">
+            <span className="text-xs text-muted-foreground whitespace-nowrap">
+              Showing <span className="font-semibold text-foreground">{filtered.length}</span> of {questions.length} questions ({totalMarksFiltered} marks)
+            </span>
+            {filtered.length > 0 && onAddMultipleToWorksheet && (
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={() => onAddMultipleToWorksheet(filtered)}
+                className="h-6 text-xs font-semibold gap-1 px-2 text-primary hover:bg-primary/10 border-primary/30"
+                title="Add all currently filtered questions to worksheet"
+              >
+                <Plus className="size-3" />
+                <span>Add All ({filtered.length})</span>
+              </Button>
+            )}
+            {hasActiveFilters && (
+              <Button
+                variant="ghost"
+                size="sm"
+                onClick={handleClearFilters}
+                className="h-6 text-xs text-muted-foreground hover:text-foreground gap-1 px-2 hover:bg-destructive/10 hover:text-destructive"
+              >
+                <X className="size-3" />
+                <span>Reset</span>
+              </Button>
+            )}
+          </div>
+        </div>
+
         {/* Topics Filter */}
         <div className="mt-3 flex flex-wrap items-center gap-2 max-h-36 overflow-y-auto pr-1">
           {(() => {
@@ -330,13 +461,7 @@ export function RepositoryFeed({ isActive = true, onAddToWorksheet }: Repository
               <Button
                 variant="outline"
                 size="sm"
-                onClick={() => {
-                  setSearch("");
-                  setSelectedSubject("All");
-                  setSelectedModule("All");
-                  setSelectedTopics([]);
-                  setReviewFilter("All");
-                }}
+                onClick={handleClearFilters}
               >
                 Clear All Filters
               </Button>
@@ -351,6 +476,7 @@ export function RepositoryFeed({ isActive = true, onAddToWorksheet }: Repository
               <li key={q.id} className="min-w-0" style={{ contentVisibility: "auto", containIntrinsicSize: "0 350px" }}>
                 <QuestionCard
                   {...q}
+                  isAdded={selectedQuestionIds.includes(q.id)}
                   onAddToWorksheet={handleAdd}
                   onDelete={handleDelete}
                   onUpdate={handleUpdate}

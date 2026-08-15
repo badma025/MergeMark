@@ -4,7 +4,7 @@ import { RichTextEditor } from "./RichTextEditor";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/ui/dialog";
-import { Plus, Trash2, Pencil, AlertTriangle, ShieldCheck } from "lucide-react";
+import { Plus, Trash2, Pencil, AlertTriangle, ShieldCheck, Maximize2, ZoomIn, ZoomOut, Download, Copy, Check, X, CheckCircle2, ChevronDown } from "lucide-react";
 import ReactMarkdown from "react-markdown";
 import remarkMath from "remark-math";
 import rehypeKatex from "rehype-katex";
@@ -14,15 +14,102 @@ import { remarkMathFix } from "@/lib/remark-math-fix";
 import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 import { useTaxonomy } from "@/lib/TaxonomyContext";
 import { toast } from "sonner";
-import Zoom from "react-medium-image-zoom";
-import "react-medium-image-zoom/dist/styles.css";
 
 /**
- * Phase 0: Diagram renderer with click-to-enlarge.
- * Diagrams are now rendered at ~200 DPI from the PDF pipeline, but the
- * card CSS caps them at the content width (`max-w-full`). Clicking opens
- * the image at native resolution in a modal so users can inspect axis
- * labels, circuit symbols, or fine geometry that gets squeezed in a card.
+ * Interactive Diagram Lightbox Modal with zoom, copy, and download controls.
+ */
+function DiagramLightboxModal({
+  isOpen,
+  onClose,
+  src,
+  alt,
+}: {
+  isOpen: boolean;
+  onClose: () => void;
+  src: string;
+  alt: string;
+}) {
+  const [scale, setScale] = useState(1);
+  const isLocal = /^[a-zA-Z]:[\\/]/.test(src) || src.startsWith("/");
+  const resolved = isLocal ? convertFileSrc(src) : src;
+
+  const handleZoomIn = () => setScale((s) => Math.min(s + 0.25, 3.5));
+  const handleZoomOut = () => setScale((s) => Math.max(s - 0.25, 0.5));
+  const handleReset = () => setScale(1);
+
+  const handleDownload = async () => {
+    try {
+      const a = document.createElement("a");
+      a.href = resolved;
+      a.download = alt ? `${alt.replace(/\s+/g, "_")}.png` : "diagram.png";
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      toast.success("Diagram downloaded");
+    } catch {
+      toast.error("Failed to download diagram");
+    }
+  };
+
+  const handleCopy = async () => {
+    try {
+      const res = await fetch(resolved);
+      const blob = await res.blob();
+      await navigator.clipboard.write([
+        new ClipboardItem({ [blob.type || "image/png"]: blob }),
+      ]);
+      toast.success("Diagram copied to clipboard");
+    } catch {
+      toast.error("Failed to copy image to clipboard");
+    }
+  };
+
+  if (!isOpen) return null;
+
+  return (
+    <Dialog open={isOpen} onOpenChange={(open) => !open && onClose()}>
+      <DialogContent className="max-w-5xl w-[95vw] max-h-[90vh] p-0 overflow-hidden bg-background/95 backdrop-blur-md border-border/80 shadow-2xl flex flex-col">
+        <DialogHeader className="px-6 py-4 border-b border-border/60 flex flex-row items-center justify-between space-y-0">
+          <div>
+            <DialogTitle className="text-base font-semibold">{alt || "Diagram Inspection"}</DialogTitle>
+            <p className="text-xs text-muted-foreground mt-0.5">High-Resolution Vector/Pixel Crop · 200 DPI</p>
+          </div>
+          <div className="flex items-center gap-1.5 mr-6">
+            <Button variant="outline" size="icon" className="size-8" onClick={handleZoomOut} title="Zoom Out (-)">
+              <ZoomOut className="size-4" />
+            </Button>
+            <Button variant="outline" size="sm" className="h-8 px-2.5 text-xs font-mono" onClick={handleReset} title="Reset Zoom">
+              {Math.round(scale * 100)}%
+            </Button>
+            <Button variant="outline" size="icon" className="size-8" onClick={handleZoomIn} title="Zoom In (+)">
+              <ZoomIn className="size-4" />
+            </Button>
+            <div className="w-px h-4 bg-border mx-1" />
+            <Button variant="outline" size="sm" className="h-8 gap-1.5 text-xs" onClick={handleCopy} title="Copy Image">
+              <Copy className="size-3.5" />
+              <span>Copy</span>
+            </Button>
+            <Button variant="outline" size="sm" className="h-8 gap-1.5 text-xs" onClick={handleDownload} title="Download PNG">
+              <Download className="size-3.5" />
+              <span>Download</span>
+            </Button>
+          </div>
+        </DialogHeader>
+        <div className="flex-1 min-h-0 overflow-auto p-6 flex items-center justify-center bg-black/40">
+          <img
+            src={resolved}
+            alt={alt}
+            style={{ transform: `scale(${scale})`, transition: "transform 0.15s ease-out" }}
+            className="max-w-full max-h-[70vh] object-contain rounded-md shadow-lg ring-1 ring-border/40"
+          />
+        </div>
+      </DialogContent>
+    </Dialog>
+  );
+}
+
+/**
+ * Diagram renderer with click-to-enlarge lightbox modal.
  */
 function DiagramImg({
   src,
@@ -31,17 +118,22 @@ function DiagramImg({
   src: string;
   alt: string;
 }) {
+  const [isLightboxOpen, setIsLightboxOpen] = useState(false);
   const isLocal = /^[a-zA-Z]:[\\/]/.test(src) || src.startsWith("/");
   const resolved = isLocal ? convertFileSrc(src) : src;
+
   return (
-    <div className="relative group/diag my-4">
-      <Zoom classDialog="custom-zoom-dark" zoomMargin={40}>
+    <div className="relative group/diag my-4 inline-block max-w-full">
+      <div 
+        onClick={() => setIsLightboxOpen(true)}
+        className="relative cursor-zoom-in group/img overflow-hidden rounded-lg border border-border/70 hover:border-primary/50 transition-all shadow-sm hover:shadow-md bg-card/50"
+      >
         <img
           src={resolved}
           alt={alt}
           loading="lazy"
           decoding="async"
-          className="max-w-full rounded-md cursor-zoom-in ring-1 ring-border/60 hover:ring-primary/40 transition-shadow"
+          className="max-w-full rounded-lg transition-transform duration-200 group-hover/img:scale-[1.01]"
           onError={(e) => {
             console.error("Failed to load diagram:", src, resolved);
             const target = e.target as HTMLImageElement;
@@ -49,7 +141,20 @@ function DiagramImg({
             target.title = `Failed to load: ${src}`;
           }}
         />
-      </Zoom>
+        <div className="absolute inset-0 bg-black/0 group-hover/img:bg-black/25 transition-colors flex items-end justify-end p-2 opacity-0 group-hover/img:opacity-100 pointer-events-none">
+          <span className="bg-background/90 backdrop-blur-sm text-foreground text-[11px] font-medium px-2 py-1 rounded-md shadow-sm border border-border/60 flex items-center gap-1">
+            <Maximize2 className="size-3 text-primary" />
+            Click to Enlarge
+          </span>
+        </div>
+      </div>
+
+      <DiagramLightboxModal
+        isOpen={isLightboxOpen}
+        onClose={() => setIsLightboxOpen(false)}
+        src={src}
+        alt={alt}
+      />
     </div>
   );
 }
@@ -91,6 +196,8 @@ export interface QuestionCardProps {
   needsReview?: boolean;
   /** Set when a mark scheme is re-imported over an existing answer — shows STALE ANSWER banner */
   answerStale?: boolean;
+  /** Whether this question is already selected in the active worksheet */
+  isAdded?: boolean;
   onAddToWorksheet?: (id: string) => void;
   onDelete?: (id: string) => void;
   onUpdate?: (id: string, newContent: string, newMarks: number, newAnswerContent?: string, newTopics?: string[], newModule?: string) => void;
@@ -108,6 +215,7 @@ export function QuestionCard(props: QuestionCardProps) {
     className,
     needsReview: initialNeedsReview,
     answerStale: initialAnswerStale,
+    isAdded = false,
     onAddToWorksheet,
     onUpdate,
     onDelete,
@@ -118,6 +226,7 @@ export function QuestionCard(props: QuestionCardProps) {
   const [isShowingAnswer, setIsShowingAnswer] = useState(false);
   const [needsReview, setNeedsReview] = useState(!!initialNeedsReview);
   const [answerStale, setAnswerStale] = useState(!!initialAnswerStale);
+  const [isAddedBtnHovered, setIsAddedBtnHovered] = useState(false);
   let parsedTopics: string[] = [];
   try {
     if (topics) {
@@ -211,7 +320,27 @@ export function QuestionCard(props: QuestionCardProps) {
         </div>
 
         {/* Right: Action buttons (never squished, distinct hover styling) */}
-        <div className="flex items-center gap-1 shrink-0 opacity-0 group-hover:opacity-100 focus-within:opacity-100 transition-opacity duration-150 -mr-1 -mt-1">
+        <div className="flex items-center gap-1 shrink-0 opacity-70 group-hover:opacity-100 focus-within:opacity-100 transition-opacity duration-150 -mr-1 -mt-1">
+          {!isEditing && (
+            <button
+              type="button"
+              onClick={(e) => {
+                e.stopPropagation();
+                navigator.clipboard.writeText(displayContent);
+                toast.success("Question copied to clipboard");
+              }}
+              title="Copy Question Markdown"
+              aria-label={`Copy question ${id}`}
+              className={cn(
+                "flex items-center justify-center rounded-md p-1.5",
+                "text-muted-foreground transition-all duration-150",
+                "hover:bg-primary/10 hover:text-primary",
+                "focus-visible:opacity-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/60"
+              )}
+            >
+              <Copy className="size-4" />
+            </button>
+          )}
           {!isEditing && (
             <button
               type="button"
@@ -292,16 +421,9 @@ export function QuestionCard(props: QuestionCardProps) {
         </div>
       )}
 
-      {/* ── Question / Answer Content (Crossfade) ── */}
+      {/* ── Question Content ── */}
       <div className="relative text-sm leading-relaxed text-foreground prose prose-sm dark:prose-invert max-w-none prose-p:my-1 prose-pre:my-1 break-words [overflow-wrap:anywhere] min-w-0">
-        
-        {/* Question Content */}
-        <div 
-          className={cn(
-            "transition-opacity duration-200 ease-in-out overflow-x-auto min-w-0 max-w-full",
-            isShowingAnswer ? "opacity-0 absolute inset-0 pointer-events-none" : "opacity-100 relative"
-          )}
-        >
+        <div className="overflow-x-auto min-w-0 max-w-full">
           <ReactMarkdown 
             remarkPlugins={[remarkMath, remarkGfm, remarkMathFix]} 
             rehypePlugins={[[rehypeKatex, { throwOnError: false, strict: false }]]}
@@ -322,33 +444,48 @@ export function QuestionCard(props: QuestionCardProps) {
           </ReactMarkdown>
         </div>
 
-        {/* Answer Content */}
-        <div 
-          className={cn(
-            "transition-opacity duration-200 ease-in-out overflow-x-auto min-w-0 max-w-full",
-            isShowingAnswer ? "opacity-100 relative" : "opacity-0 absolute inset-0 pointer-events-none"
-          )}
-        >
-          <div className="font-semibold text-xs text-muted-foreground mb-2 uppercase tracking-wider">Mark Scheme Answer</div>
-          <ReactMarkdown 
-            remarkPlugins={[remarkMath, remarkGfm, remarkMathFix]} 
-            rehypePlugins={[[rehypeKatex, { throwOnError: false, strict: false }]]}
-            urlTransform={(value) => value}
-            components={{
-              img: ({ node, ...props }) => {
-                if (!props.src) return null;
-                return (
-                  <DiagramImg
-                    src={props.src}
-                    alt={props.alt || "Diagram"}
-                  />
-                );
-              },
-            }}
-          >
-            {preprocessMathString(answerContent ?? "")}
-          </ReactMarkdown>
-        </div>
+        {/* ── Mark Scheme Accordion Drawer ── */}
+        {strippedAnswerContent && strippedAnswerContent.trim() !== "" && (
+          <div className="mt-3 pt-2 border-t border-border/50 not-prose">
+            <button
+              type="button"
+              onClick={(e) => {
+                e.stopPropagation();
+                setIsShowingAnswer(!isShowingAnswer);
+              }}
+              className="flex w-full items-center justify-between py-1.5 px-3 rounded-lg bg-muted/40 hover:bg-muted/70 border border-border/60 cursor-pointer transition-colors text-xs font-semibold text-muted-foreground hover:text-foreground select-none"
+            >
+              <div className="flex items-center gap-1.5">
+                <CheckCircle2 className="size-3.5 text-emerald-500 shrink-0" />
+                <span>Mark Scheme Solution</span>
+              </div>
+              <ChevronDown className={cn("size-3.5 transition-transform duration-200", isShowingAnswer && "rotate-180")} />
+            </button>
+
+            {isShowingAnswer && (
+              <div className="mt-2 p-3 rounded-lg bg-muted/20 border border-border/60 prose prose-sm dark:prose-invert max-w-none text-sm animate-in fade-in-50 slide-in-from-top-1 duration-150">
+                <ReactMarkdown 
+                  remarkPlugins={[remarkMath, remarkGfm, remarkMathFix]} 
+                  rehypePlugins={[[rehypeKatex, { throwOnError: false, strict: false }]]}
+                  urlTransform={(value) => value}
+                  components={{
+                    img: ({ node, ...props }) => {
+                      if (!props.src) return null;
+                      return (
+                        <DiagramImg
+                          src={props.src}
+                          alt={props.alt || "Diagram"}
+                        />
+                      );
+                    },
+                  }}
+                >
+                  {preprocessMathString(strippedAnswerContent)}
+                </ReactMarkdown>
+              </div>
+            )}
+          </div>
+        )}
       </div>
 
       {/* ── Edit Modal ── */}
@@ -442,41 +579,64 @@ export function QuestionCard(props: QuestionCardProps) {
         </DialogContent>
       </Dialog>
 
-      {/* ── Footer: Add to Worksheet & Show Answer ── */}
-      <div className="flex items-center justify-between pt-1">
-        <div>
-          {answerContent && answerContent.trim() !== "" && (
-            <Button
-              variant="secondary"
-              size="sm"
-              className="text-xs h-7 px-3 transition-colors"
-              onClick={(e) => {
-                e.stopPropagation();
-                setIsShowingAnswer(!isShowingAnswer);
-              }}
-            >
-              {isShowingAnswer ? "Show Question" : "Show Answer"}
-            </Button>
-          )}
-        </div>
-        <Button
-          id={`add-to-worksheet-${id}`}
-          size="sm"
-          className={cn(
-            "gap-1.5 text-xs font-semibold",
-            "bg-primary text-primary-foreground",
-            "opacity-0 translate-y-1 transition-all duration-200",
-            "group-hover:opacity-100 group-hover:translate-y-0"
-          )}
-          onClick={(e) => {
-            e.stopPropagation();
-            onAddToWorksheet?.(id);
-          }}
-          aria-label={`Add question ${id} to worksheet`}
-        >
-          <Plus className="size-3.5" />
-          Add to Worksheet
-        </Button>
+      {/* ── Footer: Add to Worksheet Button ── */}
+      <div className="flex items-center justify-end pt-1">
+        {isAdded ? (
+          <Button
+            id={`add-to-worksheet-${id}`}
+            size="sm"
+            variant="secondary"
+            onMouseEnter={() => setIsAddedBtnHovered(true)}
+            onMouseLeave={() => setIsAddedBtnHovered(false)}
+            className={cn(
+              "group/addedbtn gap-1.5 text-xs font-semibold select-none cursor-pointer",
+              "transition-all duration-150 shadow-xs",
+              "hover:scale-[1.03] active:scale-[0.97]",
+              isAddedBtnHovered
+                ? "bg-destructive/15 text-destructive border border-destructive/40 shadow-destructive/15 hover:bg-destructive/25 hover:border-destructive/60 hover:ring-2 hover:ring-destructive/30"
+                : "bg-emerald-500/15 text-emerald-600 dark:text-emerald-400 border border-emerald-500/30 hover:bg-emerald-500/25 hover:border-emerald-500/50 hover:ring-2 hover:ring-emerald-500/20"
+            )}
+            onClick={(e) => {
+              e.stopPropagation();
+              setIsAddedBtnHovered(false);
+              onAddToWorksheet?.(id);
+            }}
+            aria-label={`Remove question ${id} from worksheet`}
+          >
+            {isAddedBtnHovered ? (
+              <>
+                <X className="size-3.5 transition-transform duration-150 group-hover/addedbtn:rotate-90" />
+                <span>Remove</span>
+              </>
+            ) : (
+              <>
+                <Check className="size-3.5 transition-transform duration-150 group-hover/addedbtn:scale-110" />
+                <span>Added</span>
+              </>
+            )}
+          </Button>
+        ) : (
+          <Button
+            id={`add-to-worksheet-${id}`}
+            size="sm"
+            className={cn(
+              "group/addbtn gap-1.5 text-xs font-semibold cursor-pointer select-none",
+              "bg-primary text-primary-foreground shadow-xs",
+              "hover:bg-primary/85 dark:hover:bg-primary/90 hover:brightness-110",
+              "hover:ring-2 hover:ring-primary/40 hover:shadow-md hover:shadow-primary/20",
+              "hover:scale-[1.04] active:scale-[0.96]",
+              "transition-all duration-150"
+            )}
+            onClick={(e) => {
+              e.stopPropagation();
+              onAddToWorksheet?.(id);
+            }}
+            aria-label={`Add question ${id} to worksheet`}
+          >
+            <Plus className="size-3.5 transition-transform duration-150 group-hover/addbtn:rotate-90 group-hover/addbtn:scale-110" />
+            <span>Add to Worksheet</span>
+          </Button>
+        )}
       </div>
     </article>
   );

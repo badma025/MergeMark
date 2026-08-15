@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { Toaster } from "sonner";
+import { Toaster, toast } from "sonner";
 import { LayoutGrid, UploadCloud, Settings as SettingsIcon, BookOpen, FileText } from "lucide-react";
 import { RepositoryFeed } from "@/components/repository/RepositoryFeed";
 import { WorksheetBuilder } from "@/components/worksheet/WorksheetBuilder";
@@ -12,6 +12,7 @@ import { TaxonomyProvider } from "@/lib/TaxonomyContext";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
 import { FlashcardsTab } from "@/components/flashcards/FlashcardsTab";
+import { SplashScreen } from "@/components/common/SplashScreen";
 
 export type SelectedQuestion = Omit<QuestionCardProps, "onAddToWorksheet">;
 
@@ -34,7 +35,9 @@ function App() {
 
   function handleAddQuestion(question: SelectedQuestion) {
     setSelectedQuestions((prev) => {
-      if (prev.some((q) => q.id === question.id)) return prev;
+      if (prev.some((q) => q.id === question.id)) {
+        return prev.filter((q) => q.id !== question.id);
+      }
 
       const newWorksheetItem: WorksheetItemData = {
         id: question.id,
@@ -49,6 +52,27 @@ function App() {
 
   function handleRemoveQuestion(id: string) {
     setSelectedQuestions((prev) => prev.filter((q) => q.id !== id));
+  }
+
+  function handleClearAllQuestions() {
+    setSelectedQuestions([]);
+    toast.success("Worksheet cleared");
+  }
+
+  function handleAddMultipleQuestions(questions: SelectedQuestion[]) {
+    setSelectedQuestions((prev) => {
+      const existingIds = new Set(prev.map((q) => q.id));
+      const toAdd = questions
+        .filter((q) => !existingIds.has(q.id))
+        .map((q) => ({
+          id: q.id,
+          subject: q.subject,
+          subtopic: q.subtopic,
+          marks: q.marks,
+        }));
+      return [...prev, ...toAdd];
+    });
+    toast.success(`Added ${questions.length} questions to worksheet`);
   }
 
   function handleReorderQuestions(newQuestions: WorksheetItemData[]) {
@@ -132,7 +156,12 @@ function App() {
           {/* Tab panels container */}
           <main className="flex-1 min-h-0 min-w-0 overflow-hidden relative">
             <div className={cn("absolute inset-0 flex flex-col min-h-0 min-w-0 overflow-hidden bg-background", activeTab === "repository" ? "z-10 opacity-100 pointer-events-auto" : "z-0 opacity-0 pointer-events-none")}>
-              <RepositoryFeed isActive={activeTab === "repository"} onAddToWorksheet={handleAddQuestion} />
+              <RepositoryFeed
+                isActive={activeTab === "repository"}
+                onAddToWorksheet={handleAddQuestion}
+                onAddMultipleToWorksheet={handleAddMultipleQuestions}
+                selectedQuestionIds={selectedQuestions.map((q) => q.id)}
+              />
             </div>
             <div className={cn("absolute inset-0 flex flex-col min-h-0 min-w-0 overflow-hidden bg-background", activeTab === "ingestion" ? "z-10 opacity-100 pointer-events-auto" : "z-0 opacity-0 pointer-events-none")}>
               <IngestionDropzone
@@ -158,6 +187,7 @@ function App() {
             selectedQuestions={selectedQuestions}
             onRemove={handleRemoveQuestion}
             onReorder={handleReorderQuestions}
+            onClear={handleClearAllQuestions}
           />
         </div>
 
@@ -176,6 +206,7 @@ function App() {
                 selectedQuestions={selectedQuestions}
                 onRemove={handleRemoveQuestion}
                 onReorder={handleReorderQuestions}
+                onClear={handleClearAllQuestions}
                 onClose={() => setIsWorksheetDrawerOpen(false)}
               />
             </div>
@@ -184,6 +215,9 @@ function App() {
 
         {/* Global toast notifications */}
         <Toaster theme="dark" richColors position="bottom-right" />
+
+        {/* Initial Brand Splash Screen */}
+        <SplashScreen duration={5000} />
       </div>
     </TaxonomyProvider>
   );

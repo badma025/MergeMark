@@ -1,14 +1,141 @@
 <!doctype html>
-<html lang="en">
+<html lang="en" class="dark" style="background-color: #09090b; color-scheme: dark;">
   <head>
     <meta charset="UTF-8" />
     <link rel="icon" type="image/svg+xml" href="/mergemark.svg" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>MergeMark</title>
+    <style>
+      * {
+        box-sizing: border-box;
+      }
+      html, body {
+        margin: 0;
+        padding: 0;
+        width: 100%;
+        height: 100%;
+        background-color: #09090b;
+        color: #f4f4f5;
+        overflow: hidden;
+        font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
+      }
+      #root {
+        width: 100%;
+        height: 100%;
+      }
+      .splash-container {
+        position: fixed;
+        inset: 0;
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
+        background-color: #09090b;
+        user-select: none;
+        z-index: 9999;
+      }
+      .splash-glow {
+        position: absolute;
+        width: 280px;
+        height: 280px;
+        border-radius: 9999px;
+        background: rgba(16, 185, 129, 0.1);
+        filter: blur(80px);
+        pointer-events: none;
+      }
+      .splash-logo-wrap {
+        position: relative;
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        gap: 28px;
+      }
+      .splash-svg {
+        height: 64px;
+        width: auto;
+        filter: drop-shadow(0 0 32px rgba(16, 185, 129, 0.25));
+      }
+      .mm-path-m {
+        stroke-dasharray: 100;
+        stroke-dashoffset: 100;
+        animation: mmDrawM 0.7s cubic-bezier(0.4, 0, 0.2, 1) forwards;
+      }
+      .mm-path-check {
+        stroke-dasharray: 100;
+        stroke-dashoffset: 100;
+        animation: mmDrawCheck 0.6s cubic-bezier(0.16, 1, 0.3, 1) 0.4s forwards;
+      }
+      .mm-text {
+        opacity: 0;
+        animation: mmFadeText 0.6s ease-out 0.3s forwards;
+      }
+      .splash-bar-track {
+        width: 144px;
+        height: 2.5px;
+        background: rgba(255, 255, 255, 0.08);
+        border-radius: 9999px;
+        overflow: hidden;
+        position: relative;
+      }
+      .splash-bar-fill {
+        position: absolute;
+        height: 100%;
+        background: linear-gradient(90deg, #10b981, #3b82f6);
+        border-radius: 9999px;
+        animation: splash-slide 1.2s cubic-bezier(0.4, 0, 0.2, 1) infinite alternate;
+      }
+      @keyframes mmDrawM {
+        0% { stroke-dashoffset: 100; opacity: 0.2; }
+        100% { stroke-dashoffset: 0; opacity: 1; }
+      }
+      @keyframes mmDrawCheck {
+        0% { stroke-dashoffset: 100; filter: drop-shadow(0 0 0px #10B981); }
+        50% { filter: drop-shadow(0 0 20px #10B981); }
+        100% { stroke-dashoffset: 0; filter: drop-shadow(0 0 10px #10B981); }
+      }
+      @keyframes mmFadeText {
+        0% { opacity: 0; transform: translateX(-8px); }
+        100% { opacity: 1; transform: translateX(0); }
+      }
+      @keyframes splash-slide {
+        0% { left: 0%; width: 25%; }
+        100% { left: 75%; width: 25%; }
+      }
+    </style>
   </head>
 
   <body>
-    <div id="root"></div>
+    <div id="root">
+      <div class="splash-container">
+        <div class="splash-glow"></div>
+        <div class="splash-logo-wrap">
+          <svg xmlns="http://www.w3.org/2000/svg" viewBox="150 280 1650 450" class="splash-svg">
+            <g transform="translate(18.4, 102.4) scale(0.8)">
+              <path d="M 232 742 L 232 382 L 382 532 L 512 402" 
+                    stroke="#F4F4F5" 
+                    stroke-width="72" 
+                    stroke-linecap="round" 
+                    stroke-linejoin="round" 
+                    fill="none"
+                    pathLength="100"
+                    class="mm-path-m"/>
+              <path d="M 512 402 L 612 502 L 792 282" 
+                    stroke="#10B981" 
+                    stroke-width="72" 
+                    stroke-linecap="round" 
+                    stroke-linejoin="round" 
+                    fill="none"
+                    pathLength="100"
+                    class="mm-path-check"/>
+            </g>
+            <text x="716" y="512" dominant-baseline="central" font-family="system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-size="160" font-weight="bold" fill="#FFFFFF" class="mm-text">MergeMark</text>
+          </svg>
+          <div class="splash-bar-track">
+            <div class="splash-bar-fill"></div>
+          </div>
+        </div>
+      </div>
+    </div>
     <script type="module" src="/src/main.tsx"></script>
   </body>
 </html>

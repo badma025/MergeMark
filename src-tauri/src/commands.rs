@@ -21,10 +21,11 @@ static RE_CLASSIFIER_MATH: LazyLock<regex::Regex> = LazyLock::new(|| regex::Rege
 // Static regexes for compile_worksheet
 static RE_LATEX_BOLD: LazyLock<regex::Regex> = LazyLock::new(|| regex::Regex::new(r"\*\*(.+?)\*\*").unwrap());
 static RE_LATEX_ITALIC: LazyLock<regex::Regex> = LazyLock::new(|| regex::Regex::new(r"\*([^\*]+?)\*").unwrap());
-static RE_LATEX_MULTIPLE_NL: LazyLock<regex::Regex> = LazyLock::new(|| regex::Regex::new(r"\n+").unwrap());
+static RE_LATEX_MULTIPLE_NL: LazyLock<regex::Regex> = LazyLock::new(|| regex::Regex::new(r"\n{3,}").unwrap());
 static RE_LATEX_INLINE_MARKS: LazyLock<regex::Regex> = LazyLock::new(|| regex::Regex::new(r"\[(\d+)\s*marks?\]").unwrap());
 static RE_LATEX_SUBPART: LazyLock<regex::Regex> = LazyLock::new(|| regex::Regex::new(r"(?m)^[ \t]*\((i|ii|iii|iv|v|vi|vii|viii|ix|x)\)[ \t]+(.*)").unwrap());
-static RE_LATEX_PART: LazyLock<regex::Regex> = LazyLock::new(|| regex::Regex::new(r"(?m)^[ \t]*\(([a-z])\)[ \t]+(.*)").unwrap());
+static RE_LATEX_PAREN_PART: LazyLock<regex::Regex> = LazyLock::new(|| regex::Regex::new(r"(?m)^[ \t]*\(([a-z])\)[ \t]+(.*)").unwrap());
+static RE_LATEX_UNPAREN_PART: LazyLock<regex::Regex> = LazyLock::new(|| regex::Regex::new(r"(?m)^[ \t]*([a-z])\)[ \t]+(.*)").unwrap());
 static RE_LATEX_LEADING_NUM: LazyLock<regex::Regex> = LazyLock::new(|| regex::Regex::new(r"^\s*\d+[\.\)\-\s]*").unwrap());
 static RE_LATEX_GREEK: LazyLock<regex::Regex> = LazyLock::new(|| {
     regex::Regex::new(r"(?x)(^|[\s,.\-\(])\\(theta|alpha|beta|gamma|pi|mu|lambda|phi|omega|sigma|delta)([\s,.\-\)]|$)").unwrap()
@@ -563,10 +564,23 @@ pub async fn parse_pdf(app: tauri::AppHandle, file_path: String) -> Result<usize
     insert_questions_from_text(&*pool, &cleaned, &classifier).await
 }
 
+#[derive(Debug, Clone, serde::Deserialize, Default)]
+pub struct WorksheetCompileOptions {
+    pub file_name: Option<String>,
+    pub exam_title: Option<String>,
+    pub subject: Option<String>,
+    pub school_name: Option<String>,
+    pub time_allowed_mins: Option<u32>,
+    pub instructions: Option<String>,
+    pub include_cover_page: Option<bool>,
+    pub answer_layout: Option<String>, // "compact" | "lined"
+}
+
 #[tauri::command]
 pub async fn export_worksheet_markdown(
     app: tauri::AppHandle,
     question_ids: Vec<String>,
+    options: Option<WorksheetCompileOptions>,
 ) -> Result<String, String> {
     let state: State<'_, AppState> = app.state();
     let pool = state.db.lock().await;
@@ -589,7 +603,25 @@ pub async fn export_worksheet_markdown(
         }
     }
 
-    let mut header = format!("# Worksheet\n\n**Total Marks:** {}\n\n---\n\n", total_marks);
+    let opts = options.unwrap_or_default();
+    let title = opts
+        .exam_title
+        .as_deref()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or("Worksheet");
+    let subject = opts.subject.as_deref().unwrap_or("");
+    let time_mins = opts
+        .time_allowed_mins
+        .unwrap_or_else(|| (total_marks as f32 * 1.2).round() as u32);
+
+    let mut header = format!("# {}\n\n", title);
+    if !subject.trim().is_empty() {
+        header.push_str(&format!("**Subject:** {} | ", subject));
+    }
+    header.push_str(&format!(
+        "**Total Marks:** {} | **Time Allowed:** {} mins\n\n---\n\n",
+        total_marks, time_mins
+    ));
     header.push_str(&markdown);
 
     Ok(header)
@@ -600,259 +632,351 @@ pub async fn compile_worksheet(
     app: tauri::AppHandle,
     question_ids: Vec<String>,
     file_name: String,
+    options: Option<WorksheetCompileOptions>,
 ) -> Result<Vec<String>, String> {
     let state: State<'_, AppState> = app.state();
     let pool = state.db.lock().await;
 
-    let mut latex = String::new();
-    latex.push_str("\\documentclass[11pt]{article}\n");
-    latex.push_str("\\usepackage[margin=1in]{geometry}\n");
-    latex.push_str(
-        "\\usepackage{amsmath, amssymb, graphicx, xcolor, mdframed, parskip, enumitem}\n",
-    );
-    latex.push_str("\\usepackage{fancyhdr}\n");
-    latex.push_str("\\renewcommand{\\familydefault}{\\sfdefault}\n");
-    latex.push_str(
-        "% Pin all vertical rhythm at the document level so it cannot vary per question.\n",
-    );
-    latex.push_str(
-        "\\setlist{topsep=0.4cm, parsep=0.2cm, itemsep=0.2cm, leftmargin=1.2cm, labelsep=0.4cm}\n",
-    );
-    latex.push_str("\\setlist[1]{label=\\textbf{\\arabic*.}, leftmargin=*}\n");
-    latex.push_str("\\setlist[2]{label=\\textbf{(\\alph*)}, leftmargin=0.8cm}\n");
-    latex.push_str("\\setlist[3]{label=\\textbf{(\\roman*)}, leftmargin=1.8cm}\n");
-    latex.push_str("\\setlength{\\parskip}{0pt}\n");
-    latex.push_str("\\setlength{\\parindent}{0pt}\n");
-    latex.push_str("\\fancypagestyle{firstpage}{%\n");
-    latex.push_str("  \\fancyhf{}%\n");
-    latex.push_str("  \\lhead{\\textbf{Name:}\\hspace{0.4cm}\\makebox[2.5in]{\\hrulefill}}%\n");
-    latex.push_str("  \\chead{\\textbf{Date:}\\hspace{0.4cm}\\makebox[1.5in]{\\hrulefill}}%\n");
-    latex.push_str(
-        "  \\rhead{\\textbf{Score:}\\hspace{0.4cm}\\makebox[1in]{\\hrulefill} / Total}%\n",
-    );
-    latex.push_str("}%\n");
-    latex.push_str("\\pagestyle{empty}\n");
-    latex.push_str("\\setlength{\\headheight}{28pt}\n");
-    latex.push_str("\\setlength{\\headsep}{0.5cm}\n");
-    latex.push_str("\\begin{document}\n");
-    latex.push_str("\\thispagestyle{firstpage}\n\n");
-    latex.push_str("\\begin{enumerate}\n");
-
-    let mut answer_latex = String::new();
-    answer_latex.push_str("\\documentclass[11pt]{article}\n");
-    answer_latex.push_str("\\usepackage[margin=1in]{geometry}\n");
-    answer_latex.push_str(
-        "\\usepackage{amsmath, amssymb, graphicx, xcolor, mdframed, parskip, enumitem}\n",
-    );
-    answer_latex.push_str("\\usepackage{fancyhdr}\n");
-    answer_latex.push_str("\\renewcommand{\\familydefault}{\\sfdefault}\n");
-    answer_latex.push_str(
-        "\\setlist{topsep=0.4cm, parsep=0.2cm, itemsep=0.2cm, leftmargin=1.2cm, labelsep=0.4cm}\n",
-    );
-    answer_latex.push_str("\\setlist[1]{label=\\textbf{\\arabic*.}, leftmargin=*}\n");
-    answer_latex.push_str("\\setlist[2]{label=\\textbf{(\\alph*)}, leftmargin=0.8cm}\n");
-    answer_latex.push_str("\\setlist[3]{label=\\textbf{(\\roman*)}, leftmargin=1.8cm}\n");
-    answer_latex.push_str("\\setlength{\\parskip}{0pt}\n");
-    answer_latex.push_str("\\setlength{\\parindent}{0pt}\n");
-    answer_latex.push_str("\\fancypagestyle{firstpage}{%\n");
-    answer_latex.push_str("  \\fancyhf{}%\n");
-    answer_latex.push_str("  \\chead{\\Large\\textbf{Mergemark Practice Paper -- Answer Key}}%\n");
-    answer_latex.push_str("}%\n");
-    answer_latex.push_str("\\pagestyle{empty}\n");
-    answer_latex.push_str("\\setlength{\\headheight}{28pt}\n");
-    answer_latex.push_str("\\begin{document}\n");
-    answer_latex.push_str("\\thispagestyle{firstpage}\n\n");
-    answer_latex.push_str("\\begin{enumerate}\n");
-
-    let mut question_num: usize = 0;
-    for id in question_ids {
+    let mut fetched_questions = Vec::new();
+    let mut total_marks = 0;
+    for id in &question_ids {
         let q: Option<Question> = sqlx::query_as("SELECT * FROM questions WHERE id = ?")
-            .bind(&id)
+            .bind(id)
             .fetch_optional(&*pool)
             .await
             .map_err(|e| e.to_string())?;
-
         if let Some(question) = q {
-            question_num += 1;
-            let mut content = crate::validate::sanitize_for_latex(&question.content);
-            content = content.replace("\r\n", "\n");
+            total_marks += question.marks;
+            fetched_questions.push(question);
+        }
+    }
 
-            // Format markdown to LaTeX
-            content = RE_LATEX_BOLD.replace_all(&content, r"\textbf{${1}}").to_string();
-            content = RE_LATEX_ITALIC.replace_all(&content, r"\textit{${1}}").to_string();
-            content = RE_LATEX_MULTIPLE_NL.replace_all(&content, "\n\n").to_string();
+    let opts = options.unwrap_or_default();
+    let raw_title = opts
+        .exam_title
+        .as_deref()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or("MergeMark Practice Paper");
+    let exam_title = crate::validate::sanitize_for_latex(raw_title);
+    let subject = crate::validate::sanitize_for_latex(opts.subject.as_deref().unwrap_or(""));
+    let school_name = crate::validate::sanitize_for_latex(opts.school_name.as_deref().unwrap_or(""));
+    let time_allowed = opts
+        .time_allowed_mins
+        .unwrap_or_else(|| (total_marks as f32 * 1.2).round() as u32);
+    let include_cover = opts.include_cover_page.unwrap_or(false);
+    let is_lined = opts.answer_layout.as_deref() == Some("lined");
+    let default_instructions = "Answer all questions in the spaces provided.\nShow all necessary working out clearly.\nCalculators may be used where appropriate.";
+    let instructions = opts
+        .instructions
+        .as_deref()
+        .unwrap_or(default_instructions);
 
-            // Format inline marks
-            content = RE_LATEX_INLINE_MARKS
-                .replace_all(&content, r"\null\hfill \textbf{[${1} marks]}")
-                .to_string();
+    let mut latex = String::new();
+    latex.push_str("\\documentclass[11pt,a4paper]{article}\n");
+    latex.push_str("\\usepackage[top=2.2cm, bottom=2.5cm, left=2.2cm, right=2.2cm, headheight=20pt, headsep=0.8cm, footskip=1.2cm]{geometry}\n");
+    latex.push_str(
+        "\\usepackage{amsmath, amssymb, graphicx, xcolor, mdframed, parskip, enumitem, tabularx, lastpage, needspace}\n",
+    );
+    latex.push_str("\\usepackage[scaled=0.92]{helvet}\n");
+    latex.push_str("\\renewcommand{\\familydefault}{\\sfdefault}\n");
+    latex.push_str("\\usepackage{fancyhdr}\n");
+    latex.push_str("\\pagestyle{fancy}\n");
+    latex.push_str("\\fancyhf{}\n");
+    latex.push_str(&format!(
+        "\\lhead{{\\footnotesize\\textcolor{{gray!80}}{{\\textbf{{{}}}}}}}\n",
+        exam_title
+    ));
+    latex.push_str("\\rhead{\\footnotesize\\textcolor{gray!80}{\\textbf{Page \\thepage\\ of \\pageref{LastPage}}}}\n");
+    latex.push_str("\\renewcommand{\\headrulewidth}{0.4pt}\n");
+    latex.push_str("\\renewcommand{\\headrule}{\\hbox to\\headwidth{\\color{gray!30}\\leaders\\hrule height \\headrulewidth\\hfill}}\n");
+    latex.push_str("\\cfoot{\\footnotesize\\textbf{Turn over}}\n");
+    latex.push_str("\\setlength{\\parskip}{0pt}\n");
+    latex.push_str("\\setlength{\\parindent}{0pt}\n");
+    latex.push_str("\\setlist{topsep=0.4cm, parsep=0.2cm, itemsep=0.6cm, leftmargin=0.8cm, labelsep=0.4cm}\n");
+    latex.push_str("\\setlist[1]{label=\\textbf{\\arabic*.}, leftmargin=*}\n");
 
-            // Format list indents for parts (a) and subparts (i).
-            // Document-level \setlist already sets leftmargin / labelsep / topsep / parsep / itemsep
-            // for all list depths, so we just emit plain itemize blocks and let the preamble handle it.
-            content = RE_LATEX_SUBPART
-                .replace_all(
-                    &content,
-                    "\\begin{itemize}\n\\item[\\textbf{(${1})}] ${2}\n\\end{itemize}",
-                )
-                .to_string();
-            content = RE_LATEX_PART
-                .replace_all(
-                    &content,
-                    "\\begin{itemize}\n\\item[\\textbf{(${1})}] ${2}\n\\end{itemize}",
-                )
-                .to_string();
+    if !include_cover {
+        latex.push_str("\\fancypagestyle{firstpage}{%\n");
+        latex.push_str("  \\fancyhf{}%\n");
+        latex.push_str(&format!(
+            "  \\lhead{{\\footnotesize\\textcolor{{gray!80}}{{\\textbf{{{}}}}}}}%\n",
+            exam_title
+        ));
+        latex.push_str(&format!(
+            "  \\rhead{{\\footnotesize\\textcolor{{gray!80}}{{\\textbf{{Total Marks: {} marks}}}}}}%\n",
+            total_marks
+        ));
+        latex.push_str("  \\renewcommand{\\headrulewidth}{0.4pt}%\n");
+        latex.push_str("  \\renewcommand{\\headrule}{\\hbox to\\headwidth{\\color{gray!30}\\leaders\\hrule height \\headrulewidth\\hfill}}%\n");
+        latex.push_str("  \\cfoot{\\footnotesize\\textbf{Turn over}}%\n");
+        latex.push_str("}%\n");
+    }
 
-            // 1. Strip leading numbers (e.g., "1. ", "1)", "- ")
-            content = RE_LATEX_LEADING_NUM.replace(&content, "").to_string();
+    latex.push_str("\\begin{document}\n");
 
-            // 2. Strip trailing duplicate math snippet
-            let snippet = question.math_snippet.trim();
-            if !snippet.is_empty() {
-                let content_trim = content.trim_end();
-                if content_trim.ends_with(snippet) {
-                    content = content_trim[..content_trim.len() - snippet.len()]
-                        .trim_end()
-                        .to_string();
-                }
+    if include_cover {
+        latex.push_str("\\begin{titlepage}\n\\thispagestyle{empty}\n\\begin{center}\n\\vspace*{0.5cm}\n");
+        if !school_name.trim().is_empty() {
+            latex.push_str(&format!("{{\\Large\\textbf{{{}}}}}\\\\[0.6cm]\n", school_name));
+        }
+        latex.push_str(&format!("{{\\Huge\\textbf{{{}}}}}\\\\[0.4cm]\n", exam_title));
+        if !subject.trim().is_empty() {
+            latex.push_str(&format!("{{\\Large\\textbf{{{}}}}}\\\\[0.8cm]\n", subject));
+        } else {
+            latex.push_str("\\vspace{0.4cm}\n");
+        }
+        latex.push_str("\\begin{tabular}{|p{0.92\\linewidth}|}\n\\hline\n\\vspace{0.1cm}\n");
+        latex.push_str("\\textbf{Candidate Name:}\\hspace{0.5cm}\\makebox[3.2in]{\\hrulefill}\\\\[0.4cm]\n");
+        latex.push_str("\\textbf{Candidate Number:}\\hspace{0.3cm}\\makebox[1.4in]{\\hrulefill}\\hspace{0.4cm}\\textbf{Centre Number:}\\hspace{0.3cm}\\makebox[1.4in]{\\hrulefill}\\\\[0.4cm]\n");
+        latex.push_str("\\textbf{Date:}\\hspace{2.2cm}\\makebox[2.0in]{\\hrulefill}\\\\[0.1cm]\n");
+        latex.push_str("\\hline\n\\end{tabular}\\\\[0.8cm]\n");
+        latex.push_str(&format!(
+            "\\textbf{{Time Allowed: {} minutes}}\\hspace{{1.5cm}}\\textbf{{Total Marks: {} marks}}\\\\[0.8cm]\n",
+            time_allowed, total_marks
+        ));
+        latex.push_str("\\begin{mdframed}[linewidth=0.8pt, roundcorner=4pt, innertopmargin=10pt, innerbottommargin=10pt]\n");
+        latex.push_str("\\textbf{\\large Instructions to Candidates}\n\\begin{itemize}[leftmargin=1.5em, itemsep=0.4em]\n");
+        for line in instructions.lines() {
+            let trimmed = line.trim();
+            if !trimmed.is_empty() {
+                let sanitized_line = crate::validate::sanitize_for_latex(trimmed);
+                latex.push_str(&format!("\\item {}\n", sanitized_line));
             }
+        }
+        latex.push_str("\\end{itemize}\n\\end{mdframed}\n");
+        latex.push_str("\\end{center}\n\\end{titlepage}\n\\newpage\n");
+    } else {
+        latex.push_str("\\thispagestyle{firstpage}\n\n");
+        latex.push_str("\\noindent\n\\begin{tabularx}{\\linewidth}{|X|r|r|}\n\\hline\n");
+        latex.push_str("\\vspace{0.05cm}\\textbf{Candidate Name:}\\hspace{3.0in} & \\vspace{0.05cm}\\textbf{Centre No:} & \\vspace{0.05cm}\\textbf{Candidate No:} \\\\\n");
+        latex.push_str("\\vspace{0.45cm} & \\vspace{0.45cm} & \\vspace{0.45cm} \\\\\n\\hline\n\\end{tabularx}\n\\vspace{0.5cm}\n\n");
+    }
 
-            // 3. Fix missing inline math wrapping on bare Greek variables
-            content = RE_LATEX_GREEK
-                .replace_all(&content, r"${1}$\$${2}$${3}")
+    latex.push_str("\\begin{enumerate}\n");
+
+    let mut answer_latex = String::new();
+    answer_latex.push_str("\\documentclass[11pt,a4paper]{article}\n");
+    answer_latex.push_str("\\usepackage[top=2.2cm, bottom=2.5cm, left=2.2cm, right=2.2cm, headheight=20pt, headsep=0.8cm, footskip=1.2cm]{geometry}\n");
+    answer_latex.push_str(
+        "\\usepackage{amsmath, amssymb, graphicx, xcolor, mdframed, parskip, enumitem, lastpage}\n",
+    );
+    answer_latex.push_str("\\usepackage[scaled=0.92]{helvet}\n");
+    answer_latex.push_str("\\renewcommand{\\familydefault}{\\sfdefault}\n");
+    answer_latex.push_str("\\usepackage{fancyhdr}\n");
+    answer_latex.push_str("\\pagestyle{fancy}\n");
+    answer_latex.push_str("\\fancyhf{}\n");
+    answer_latex.push_str(&format!(
+        "\\lhead{{\\footnotesize\\textcolor{{gray!80}}{{\\textbf{{{} -- Mark Scheme & Solutions}}}}}}\n",
+        exam_title
+    ));
+    answer_latex.push_str("\\rhead{\\footnotesize\\textcolor{gray!80}{\\textbf{Page \\thepage\\ of \\pageref{LastPage}}}}\n");
+    answer_latex.push_str("\\renewcommand{\\headrulewidth}{0.4pt}\n");
+    answer_latex.push_str("\\renewcommand{\\headrule}{\\hbox to\\headwidth{\\color{gray!30}\\leaders\\hrule height \\headrulewidth\\hfill}}\n");
+    answer_latex.push_str("\\setlength{\\parskip}{0pt}\n");
+    answer_latex.push_str("\\setlength{\\parindent}{0pt}\n");
+    answer_latex.push_str("\\setlist{topsep=0.4cm, parsep=0.2cm, itemsep=0.6cm, leftmargin=0.8cm, labelsep=0.4cm}\n");
+    answer_latex.push_str("\\setlist[1]{label=\\textbf{\\arabic*.}, leftmargin=*}\n");
+    answer_latex.push_str("\\begin{document}\n");
+    answer_latex.push_str("\\begin{enumerate}\n");
+
+    for (i, question) in fetched_questions.iter().enumerate() {
+        let question_num = i + 1;
+        let mut content = crate::validate::sanitize_for_latex(&question.content);
+        content = content.replace("\r\n", "\n");
+
+        // Format markdown to LaTeX
+        content = RE_LATEX_BOLD.replace_all(&content, r"\textbf{${1}}").to_string();
+        content = RE_LATEX_ITALIC.replace_all(&content, r"\textit{${1}}").to_string();
+        content = RE_LATEX_MULTIPLE_NL.replace_all(&content, "\n\n").to_string();
+
+        // Flush-right part marks
+        content = RE_LATEX_INLINE_MARKS
+            .replace_all(&content, r"\null\hfill\textbf{[${1} marks]}")
+            .to_string();
+
+        // Format subparts (i) with hanging indent
+        content = RE_LATEX_SUBPART
+            .replace_all(
+                &content,
+                r"\par\vspace{0.2cm}\noindent\hspace*{1.8em}\textbf{(${1})}\hspace{0.5em}${2}",
+            )
+            .to_string();
+
+        // Format parts (a) and a) with bold hanging label
+        content = RE_LATEX_PAREN_PART
+            .replace_all(
+                &content,
+                r"\par\vspace{0.3cm}\noindent\textbf{(${1})}\hspace{0.5em}${2}",
+            )
+            .to_string();
+        content = RE_LATEX_UNPAREN_PART
+            .replace_all(
+                &content,
+                r"\par\vspace{0.3cm}\noindent\textbf{(${1})}\hspace{0.5em}${2}",
+            )
+            .to_string();
+
+        content = RE_LATEX_LEADING_NUM.replace(&content, "").to_string();
+
+        let snippet = question.math_snippet.trim();
+        if !snippet.is_empty() {
+            let content_trim = content.trim_end();
+            if content_trim.ends_with(snippet) {
+                content = content_trim[..content_trim.len() - snippet.len()]
+                    .trim_end()
+                    .to_string();
+            }
+        }
+
+        // Fix bare Greek variables safely using a closure (no $23 expansion bugs!)
+        content = RE_LATEX_GREEK
+            .replace_all(&content, |caps: &regex::Captures| {
+                format!("{}$\\{}${}", &caps[1], &caps[2], &caps[3])
+            })
+            .to_string();
+
+        content = RE_LATEX_LIST.replace_all(&content, "\n\n").to_string();
+
+        while let Some(start_idx) = content.find("![Diagram](") {
+            if let Some(end_idx) = content[start_idx..].find(')') {
+                let path = &content[start_idx + 11..start_idx + end_idx];
+                let latex_img = format!(
+                    "\\begin{{center}}\\includegraphics[width=0.75\\linewidth]{{{}}}\\end{{center}}",
+                    path
+                );
+                content.replace_range(start_idx..start_idx + end_idx + 1, &latex_img);
+            } else {
+                break;
+            }
+        }
+
+        latex.push_str("  \\needspace{4.5cm}\n");
+        latex.push_str(&format!("  \\item {}\n", content));
+        if !question.math_snippet.is_empty() {
+            if question.is_code {
+                latex.push_str(&format!(
+                    "  \\begin{{verbatim}}\n{}\n  \\end{{verbatim}}\n",
+                    question.math_snippet
+                ));
+            } else {
+                latex.push_str(&format!("  \\[ {} \\]\n", question.math_snippet));
+            }
+        }
+
+        latex.push_str(&format!(
+            "  \\par\\vspace{{0.25cm}}\\hfill\\textbf{{(Total for Question {} is {} marks)}}\\par\\vspace{{0.4cm}}\n",
+            question_num, question.marks
+        ));
+
+        if is_lined {
+            latex.push_str("  \\nointerlineskip\n");
+            let lines_to_draw = (question.marks * 3).max(6);
+            for _ in 0..lines_to_draw {
+                latex.push_str("  \\vspace{0.8cm}\\par\\noindent{\\color{gray!40}\\rule{\\linewidth}{0.3pt}}\\nointerlineskip\n");
+            }
+            latex.push_str("  \\vspace{0.6cm}\\par\n\n");
+        } else {
+            latex.push_str("  \\vspace{0.5cm}\\par\n\n");
+        }
+
+        answer_latex.push_str("  \\needspace{4.5cm}\n");
+        answer_latex.push_str(&format!("  \\item {}\n", content));
+        if !question.math_snippet.is_empty() {
+            if question.is_code {
+                answer_latex.push_str(&format!(
+                    "  \\begin{{verbatim}}\n{}\n  \\end{{verbatim}}\n",
+                    question.math_snippet
+                ));
+            } else {
+                answer_latex.push_str(&format!("  \\[ {} \\]\n", question.math_snippet));
+            }
+        }
+        answer_latex.push_str(&format!(
+            "  \\par\\vspace{{0.25cm}}\\hfill\\textbf{{(Total for Question {} is {} marks)}}\\par\n",
+            question_num, question.marks
+        ));
+
+        if let Some(raw_ans) = &question.answer_content {
+            let mut ans_content = crate::validate::sanitize_for_latex(raw_ans);
+            ans_content = ans_content.replace("\r\n", "\n");
+            ans_content = RE_LATEX_BOLD
+                .replace_all(&ans_content, r"\textbf{${1}}")
+                .to_string();
+            ans_content = RE_LATEX_ITALIC
+                .replace_all(&ans_content, r"\textit{${1}}")
+                .to_string();
+            ans_content = RE_LATEX_MULTIPLE_NL.replace_all(&ans_content, "\n\n").to_string();
+            ans_content = RE_LATEX_INLINE_MARKS
+                .replace_all(&ans_content, r"\null\hfill\textbf{[${1} marks]}")
                 .to_string();
 
-            // 4. Clean up markdown lists
-            content = RE_LATEX_LIST.replace_all(&content, "\n\n").to_string();
+            ans_content = RE_LATEX_SUBPART
+                .replace_all(
+                    &ans_content,
+                    r"\par\vspace{0.2cm}\noindent\hspace*{1.8em}\textbf{(${1})}\hspace{0.5em}${2}",
+                )
+                .to_string();
+            ans_content = RE_LATEX_PAREN_PART
+                .replace_all(
+                    &ans_content,
+                    r"\par\vspace{0.3cm}\noindent\textbf{(${1})}\hspace{0.5em}${2}",
+                )
+                .to_string();
+            ans_content = RE_LATEX_UNPAREN_PART
+                .replace_all(
+                    &ans_content,
+                    r"\par\vspace{0.3cm}\noindent\textbf{(${1})}\hspace{0.5em}${2}",
+                )
+                .to_string();
 
-            // Convert markdown diagram tags to LaTeX includegraphics
-            while let Some(start_idx) = content.find("![Diagram](") {
-                if let Some(end_idx) = content[start_idx..].find(')') {
-                    let path = &content[start_idx + 11..start_idx + end_idx];
-                    let latex_img = format!("\\begin{{center}}\\includegraphics[width=0.8\\linewidth]{{{}}}\\end{{center}}", path);
-                    content.replace_range(start_idx..start_idx + end_idx + 1, &latex_img);
+            ans_content = RE_LATEX_GREEK
+                .replace_all(&ans_content, |caps: &regex::Captures| {
+                    format!("{}$\\{}${}", &caps[1], &caps[2], &caps[3])
+                })
+                .to_string();
+            ans_content = RE_LATEX_LIST.replace_all(&ans_content, "\n\n").to_string();
+
+            while let Some(start_idx) = ans_content.find("![Diagram](") {
+                if let Some(end_idx) = ans_content[start_idx..].find(')') {
+                    let path = &ans_content[start_idx + 11..start_idx + end_idx];
+                    let latex_img = format!(
+                        "\\begin{{center}}\\includegraphics[width=0.75\\linewidth]{{{}}}\\end{{center}}",
+                        path
+                    );
+                    ans_content.replace_range(start_idx..start_idx + end_idx + 1, &latex_img);
                 } else {
                     break;
                 }
             }
 
-            latex.push_str(&format!("  \\item {}\n", content));
-            if !question.math_snippet.is_empty() {
-                if question.is_code {
-                    latex.push_str(&format!(
-                        "  \\begin{{verbatim}}\n{}\n  \\end{{verbatim}}\n",
-                        question.math_snippet
-                    ));
-                } else {
-                    latex.push_str(&format!("  \\[ {} \\]\n", question.math_snippet));
-                }
-            }
-            // Inline "Total for question" footer — does not introduce a \par or \hfill that would
-            // disturb the ruled-line rhythm below it.
-            latex.push_str(&format!(
-                "  \\hfill\\textbf{{[Total for Question {} is {} marks]}}\\par\\vspace{{0.4cm}}\n",
-                question_num, question.marks
-            ));
-
-            // Ruled lines: exact 0.9cm pitch, full A4 page coverage.
-            //
-            // A4 at 1in margins has ~24.13cm of usable vertical height. We compute the number of
-            // 0.9cm lines needed to fill the page from the current cursor down to the bottom margin.
-            // \pagetotal + \textheight - \baselineskip gives the remaining space, but the
-            // simplest robust approach is to draw (marks * 3) lines or enough to cover one full
-            // page (27 lines at 0.9cm = 24.3cm, which exactly fills the area) — whichever is
-            // larger. We use a tabbing-free \rule + \vspace pattern that gives a guaranteed
-            // 0.9cm pitch independent of \baselineskip.
-            //
-            // 0.3pt line + 0.9cm - 0.3pt = 0.89cm-ish of gap. We use \vspace* to prevent the gap
-            // collapsing at page breaks, and \nointerlineskip so the ruled lines don't
-            // inherit a \baselineskip between them.
-            latex.push_str("  \\nointerlineskip\n");
-            let lines_to_draw = (question.marks * 3).max(27);
-            for _ in 0..lines_to_draw {
-                // \rule with width=\linewidth draws a 0.3pt line across the full text width.
-                // The \vspace{0.9cm} is the gap ABOVE the next line, which combined with the
-                // 0.3pt line below gives an exact 0.9cm pitch.
-                latex.push_str("  \\vspace{0.9cm}\\par\\noindent{\\color{gray!60}\\rule{\\linewidth}{0.3pt}}\\nointerlineskip\n");
-            }
-            latex.push_str("  \\newpage\n\n");
-
-            answer_latex.push_str(&format!("  \\item {}\n", content));
-            if !question.math_snippet.is_empty() {
-                if question.is_code {
-                    answer_latex.push_str(&format!(
-                        "  \\begin{{verbatim}}\n{}\n  \\end{{verbatim}}\n",
-                        question.math_snippet
-                    ));
-                } else {
-                    answer_latex.push_str(&format!("  \\[ {} \\]\n", question.math_snippet));
-                }
-            }
-            // Same inline "Total" footer treatment as the worksheet (no \par + \hfill disruption).
-            answer_latex.push_str(&format!(
-                "  \\hfill\\textbf{{[Total for Question {} is {} marks]}}\\par\n",
-                question_num, question.marks
-            ));
-
-            if let Some(raw_ans) = question.answer_content {
-                let mut ans_content = crate::validate::sanitize_for_latex(&raw_ans);
-                ans_content = ans_content.replace("\r\n", "\n");
-                ans_content = RE_LATEX_BOLD
-                    .replace_all(&ans_content, r"\textbf{${1}}")
-                    .to_string();
-                ans_content = RE_LATEX_ITALIC
-                    .replace_all(&ans_content, r"\textit{${1}}")
-                    .to_string();
-                ans_content = RE_LATEX_MULTIPLE_NL.replace_all(&ans_content, "\n\n").to_string();
-                ans_content = RE_LATEX_INLINE_MARKS
-                    .replace_all(&ans_content, r"\null\hfill \textbf{[${1} marks]}")
-                    .to_string();
-                ans_content = RE_LATEX_SUBPART
-                    .replace_all(
-                        &ans_content,
-                        "\\begin{itemize}\n\\item[\\textbf{(${1})}] ${2}\n\\end{itemize}",
-                    )
-                    .to_string();
-                ans_content = RE_LATEX_PART
-                    .replace_all(
-                        &ans_content,
-                        "\\begin{itemize}\n\\item[\\textbf{(${1})}] ${2}\n\\end{itemize}",
-                    )
-                    .to_string();
-
-                ans_content = RE_LATEX_GREEK
-                    .replace_all(&ans_content, r"${1}$\$${2}$${3}")
-                    .to_string();
-                ans_content = RE_LATEX_LIST.replace_all(&ans_content, "\n\n").to_string();
-
-                while let Some(start_idx) = ans_content.find("![Diagram](") {
-                    if let Some(end_idx) = ans_content[start_idx..].find(')') {
-                        let path = &ans_content[start_idx + 11..start_idx + end_idx];
-                        let latex_img = format!("\\begin{{center}}\\includegraphics[width=0.8\\linewidth]{{{}}}\\end{{center}}", path);
-                        ans_content.replace_range(start_idx..start_idx + end_idx + 1, &latex_img);
-                    } else {
-                        break;
-                    }
-                }
-
-                answer_latex.push_str("  \\vspace{0.5em}\n  \\begin{mdframed}[backgroundcolor=gray!10, linewidth=0.5pt, roundcorner=4pt]\n");
-                answer_latex.push_str("  \\textbf{Mark Scheme:}\\\\[0.5em]\n");
-                answer_latex.push_str(&format!("  {}\n", ans_content));
-                answer_latex.push_str("  \\end{mdframed}\n\n");
-            }
+            answer_latex.push_str("  \\vspace{0.4em}\n  \\begin{mdframed}[backgroundcolor=gray!8, linewidth=0.5pt, roundcorner=4pt]\n");
+            answer_latex.push_str("  \\textbf{\\small Mark Scheme & Model Solution:}\\\\[0.4em]\n");
+            answer_latex.push_str(&format!("  {}\n", ans_content));
+            answer_latex.push_str("  \\end{mdframed}\n\n");
         }
     }
 
-    latex.push_str("\\end{enumerate}\n");
+    latex.push_str("\\end{enumerate}\n\n");
+    latex.push_str("\\vspace{0.8cm}\n\\begin{center}\n");
+    latex.push_str(&format!("\\rule{{0.5\\linewidth}}{{0.4pt}}\\\\[0.3cm]\n\\textbf{{\\large TOTAL FOR PAPER: {} MARKS}}\\\\[0.2cm]\n\\textbf{{\\small --- END OF QUESTION PAPER ---}}\n", total_marks));
+    latex.push_str("\\end{center}\n");
     latex.push_str("\\end{document}\n");
 
-    answer_latex.push_str("\\end{enumerate}\n");
+    answer_latex.push_str("\\end{enumerate}\n\n");
+    answer_latex.push_str("\\vspace{0.8cm}\n\\begin{center}\n");
+    answer_latex.push_str(&format!("\\rule{{0.5\\linewidth}}{{0.4pt}}\\\\[0.3cm]\n\\textbf{{\\large TOTAL FOR PAPER: {} MARKS}}\\\\[0.2cm]\n\\textbf{{\\small --- END OF MARK SCHEME ---}}\n", total_marks));
+    answer_latex.push_str("\\end{center}\n");
     answer_latex.push_str("\\end{document}\n");
 
     let download_dir = app.path().download_dir().map_err(|e| e.to_string())?;
 
     // Sanitize file name: keep alphanumeric, spaces, hyphens, underscores
-    let sanitized: String = file_name
+    let effective_name = opts
+        .file_name
+        .as_deref()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or(&file_name);
+    let sanitized: String = effective_name
         .chars()
         .map(|c| {
             if c.is_alphanumeric() || c == ' ' || c == '-' || c == '_' {
