@@ -437,7 +437,15 @@ static RE_SINGLE_BLOCK_LINE: LazyLock<regex::Regex> = LazyLock::new(|| {
 });
 
 static RE_HAS_POLAR_PREAMBLE: LazyLock<regex::Regex> = LazyLock::new(|| {
-    regex::Regex::new(r"(?i)polar\s+equations?|cardioid|spiral\s+curve|curve(?:\s+\$?[A-Z]\$?)?\s+with\s+polar").unwrap()
+    regex::Regex::new(r"(?i)polar\s+equations?|cardioid|spiral\s+curve|curve(?:\s+\$?[A-Za-z0-9_]+\$?)?\s+with\s+polar").unwrap()
+});
+
+static RE_HAS_EQUATION_PREAMBLE: LazyLock<regex::Regex> = LazyLock::new(|| {
+    regex::Regex::new(r"(?i)polar\s+equations?|cardioid|spiral\s+curve|curve(?:\s+\$?[A-Za-z0-9_]+\$?)?\s+with|line(?:\s+\$?[A-Za-z0-9_]+\$?)?\s+with|with\s+(?:Cartesian\s+)?equation").unwrap()
+});
+
+static RE_TRIPLE_DOLLARS: LazyLock<regex::Regex> = LazyLock::new(|| {
+    regex::Regex::new(r"\${3,}").unwrap()
 });
 
 static RE_MULTI_CURVE_COMMA: LazyLock<regex::Regex> = LazyLock::new(|| {
@@ -449,6 +457,7 @@ static RE_MULTI_CURVE_CONST: LazyLock<regex::Regex> = LazyLock::new(|| {
 });
 
 pub fn heal_polar_equations(content: &str) -> String {
+    let content = RE_TRIPLE_DOLLARS.replace_all(content, "$$");
     let lines: Vec<&str> = content.lines().collect();
     let mut result: Vec<String> = Vec::with_capacity(lines.len());
 
@@ -457,6 +466,7 @@ pub fn heal_polar_equations(content: &str) -> String {
         let prev_line = if i > 0 { lines[i - 1].trim() } else { "" };
         let prev2_line = if i > 1 { lines[i - 2].trim() } else { "" };
         let has_polar_preamble = RE_HAS_POLAR_PREAMBLE.is_match(prev_line) || RE_HAS_POLAR_PREAMBLE.is_match(prev2_line);
+        let has_equation_preamble = has_polar_preamble || RE_HAS_EQUATION_PREAMBLE.is_match(prev_line) || RE_HAS_EQUATION_PREAMBLE.is_match(prev2_line);
 
         if !trimmed.starts_with('$') && !trimmed.starts_with("$$") && !trimmed.is_empty() {
             if let Some(caps) = RE_TWO_BLOCK_LINE.captures(trimmed) {
@@ -482,8 +492,11 @@ pub fn heal_polar_equations(content: &str) -> String {
                     expr = expr.trim().to_string();
                 }
                 let has_theta = expr.contains("\\theta") || has_polar_preamble;
+                let is_cartesian = !has_theta && (expr.contains('x') || expr.contains('k') || expr.contains('t'));
                 let prefix = if has_theta && !expr.starts_with("r =") && !expr.starts_with("r=") {
                     "r = "
+                } else if is_cartesian && has_equation_preamble && !expr.starts_with("y =") && !expr.starts_with("y=") {
+                    "y = "
                 } else {
                     ""
                 };
@@ -491,8 +504,14 @@ pub fn heal_polar_equations(content: &str) -> String {
                 continue;
             }
 
-            if has_polar_preamble && (trimmed.contains("\\cos") || trimmed.contains("\\sin") || trimmed.contains("\\theta") || trimmed.contains("\\frac")) && !trimmed.contains('$') {
-                let prefix = if !trimmed.starts_with("r =") && !trimmed.starts_with("r=") { "r = " } else { "" };
+            if has_equation_preamble && (trimmed.contains("\\cos") || trimmed.contains("\\sin") || trimmed.contains("\\theta") || trimmed.contains("\\frac")) && !trimmed.contains('$') {
+                let prefix = if has_polar_preamble && !trimmed.starts_with("r =") && !trimmed.starts_with("r=") {
+                    "r = "
+                } else if !trimmed.starts_with("y =") && !trimmed.starts_with("y=") {
+                    "y = "
+                } else {
+                    ""
+                };
                 result.push(format!("$${}{}$$", prefix, trimmed));
                 continue;
             }

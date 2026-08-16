@@ -120,17 +120,20 @@ export function normalizeMarkdownTables(text: string): string {
 export function stripOrphanedDollars(text: string): string {
   let s = text;
 
-  // 1. Strip trailing $ immediately following mark allocations: [4 marks]$ or (3 marks)$
+  // 1. Triple or more dollars -> $$
+  s = s.replace(/\${3,}/g, '$$$$');
+
+  // 2. Strip trailing $ immediately following mark allocations: [4 marks]$ or (3 marks)$
   s = s.replace(/((?:\[|\()\s*(?:Total:?\s*)?\d+\s*marks?\s*(?:\]|\)))\$/gi, '$1');
 
-  // 2. Strip trailing $ right after punctuation at end of line: "value of $x$.$" -> "value of $x$."
+  // 3. Strip trailing $ right after punctuation at end of line: "value of $x$.$" -> "value of $x$."
   s = s.replace(/([.?!,;:])\$(?=\s|$)/g, '$1');
 
-  // 3. Strip stray double-dollar with an extra single dollar: "$$ $" or "$ $$"
+  // 4. Strip stray double-dollar with an extra single dollar: "$$ $" or "$ $$"
   s = s.replace(/\$\$\s*\$(?!\$)/g, '$$$$');
   s = s.replace(/(?<!\$)\$\s*\$\$/g, '$$$$');
 
-  // 4. Strip solitary dollar signs on their own line
+  // 5. Strip solitary dollar signs on their own line
   s = s.replace(/^[ \t]*\$[ \t]*$/gm, '');
 
   return s;
@@ -156,10 +159,6 @@ export function balanceMathEnvironments(text: string): string {
  * Heal mismatched single vs double dollar blocks ($...$$ or $$...$)
  * and lines starting with raw LaTeX commands ending with $ (missing opening delimiter).
  */
-/**
- * Heal mismatched single vs double dollar blocks ($...$$ or $$...$)
- * and lines starting with raw LaTeX commands ending with $ (missing opening delimiter).
- */
 export function healMismatchedAndMissingDelimiters(text: string): string {
   let s = text;
 
@@ -179,37 +178,91 @@ export function healMismatchedAndMissingDelimiters(text: string): string {
 }
 
 /**
- * Balance inline ($) and block ($$) math delimiters
+ * Heals bare matrix environments and matrix blocks concatenated with display math:
+ * e.g. "\begin{pmatrix} 7 & 6 \\ 6 & 2 \end{pmatrix}$$\lambda = -2...$$"
+ * -> "$$\begin{pmatrix} 7 & 6 \\ 6 & 2 \end{pmatrix}$$\n\n$$\lambda = -2...$$"
+ * e.g. "$\begin{pmatrix} 1 & 2 \\ 2 & -4 \end{pmatrix} \quad \text{and} \quad B = \begin{pmatrix}...$"
+ * -> "$$\begin{pmatrix} 1 & 2 \\ 2 & -4 \end{pmatrix} \quad \text{and} \quad B = \begin{pmatrix}...$$"
  */
-export function balanceDelimiters(text: string): string {
-  let s = healMismatchedAndMissingDelimiters(text);
+export function healMatrixEnvironments(text: string): string {
+  if (!text || !text.includes('\\begin{')) return text;
 
-  // Count unescaped block math delimiters ($$)
+  let s = text;
+
+  // 1. Bare \begin{matrix} ... \end{matrix}$$equation$$ -> $$\begin{matrix} ... \end{matrix}$$\n\n$$equation$$
+  s = s.replace(
+    /(?:^|\n)([ \t]*\\begin\{(?:pmatrix|bmatrix|vmatrix|Vmatrix|matrix|cases|aligned)\}[\s\S]*?\\end\{(?:pmatrix|bmatrix|vmatrix|Vmatrix|matrix|cases|aligned)\})\$\$([\s\S]*?\$\$)(?=\n|$)/g,
+    (_match, matrixBlock, eqBlock) => {
+      return `\n\n$$${matrixBlock.trim()}$$\n\n$$${eqBlock.trim()}\n\n`;
+    }
+  );
+
+  // 2. Single $ containing matrix environments -> elevate to $$ ... $$
+  s = s.replace(
+    /(?:^|[\n \t])\$(?!\$)([^\n\$]*?\\begin\{(?:pmatrix|bmatrix|vmatrix|Vmatrix|matrix|cases|aligned)\}[\s\S]*?\\end\{(?:pmatrix|bmatrix|vmatrix|Vmatrix|matrix|cases|aligned)\}[^\n\$]*?)\$(?!\$)/g,
+    (_match, content) => {
+      return `\n\n$$${content.trim()}$$\n\n`;
+    }
+  );
+
+  // 3. Isolated bare \begin{matrix} ... \end{matrix} without any $ on its own lines
+  s = s.replace(
+    /(?:^|\n)([ \t]*\\begin\{(?:pmatrix|bmatrix|vmatrix|Vmatrix|matrix|cases|dcases)\}[\s\S]*?\\end\{(?:pmatrix|bmatrix|vmatrix|Vmatrix|matrix|cases|dcases)\}[ \t]*)(?=\n|$)/g,
+    (match, block) => {
+      const trimmed = block.trim();
+      if (!trimmed.startsWith('$') && !trimmed.endsWith('$')) {
+        return `\n\n$$${trimmed}$$\n\n`;
+      }
+      return match;
+    }
+  );
+
+  return s;
+}
+
+/**
+ * Strict final delimiter validator and repair pass
+ */
+export function validateAndEnforceDelimiters(text: string): string {
+  if (!text) return '';
+
+  let s = text;
+
+  // 1. Triple or more dollars -> $$
+  s = s.replace(/\${3,}/g, '$$$$');
+
+  // 2. Mismatched single vs double
+  s = healMismatchedAndMissingDelimiters(s);
+
+  // 3. Count unescaped block math delimiters ($$)
   const doubleMatches = s.match(/(?<!\\)\$\$/g) || [];
   if (doubleMatches.length % 2 !== 0) {
     s += '\n$$';
   }
 
-  // Count unescaped single inline dollars ($) outside of $$ blocks
+  // 4. Split by display math $$ blocks
   const parts = s.split('$$');
   const healedParts = parts.map((part, index) => {
-    // Even indices are outside display math ($$)
+    // Even indices are OUTSIDE display math ($$)
     if (index % 2 === 0) {
       const singleDollars = (part.match(/(?<!\\)\$/g) || []).length;
       if (singleDollars % 2 !== 0) {
         return part + '$';
       }
+      return part;
+    } else {
+      // Odd indices are INSIDE display math ($$)
+      // Strip nested single $ inside display math to prevent KaTeX parse errors
+      return part.replace(/(?<!\\)\$/g, '');
     }
-    return part;
   });
 
   return healedParts.join('$$');
 }
 
 /**
- * Heals dropped variable prefixes (e.g. 'r = ') and missing opening '$' delimiters
- * in polar equations, cardioids, and Cartesian curves without ever consuming
- * preceding paragraphs or headings.
+ * Heals dropped variable prefixes (e.g. 'r = ', 'y = ') and missing opening '$' delimiters
+ * in polar equations, cardioids, Cartesian lines, and curves without ever consuming preambles.
  */
 export function healPolarAndDroppedEquations(text: string): string {
   if (!text) return '';
@@ -220,18 +273,19 @@ export function healPolarAndDroppedEquations(text: string): string {
     const line = lines[i];
     const trimmed = line.trim();
 
-    // Check if previous lines contained a polar curve preamble
     const prevLine = i > 0 ? lines[i - 1].trim() : '';
     const prev2Line = i > 1 ? lines[i - 2].trim() : '';
     const hasPolarPreamble =
-      /polar\s+equations?|cardioid|spiral\s+curve|curve(?:\s+\$?[A-Z]\$?)?\s+with\s+polar/i.test(prevLine) ||
-      /polar\s+equations?|cardioid|spiral\s+curve|curve(?:\s+\$?[A-Z]\$?)?\s+with\s+polar/i.test(prev2Line);
+      /polar\s+equations?|cardioid|spiral\s+curve|curve(?:\s+\$?[A-Za-z0-9_]+\$?)?\s+with\s+polar/i.test(prevLine) ||
+      /polar\s+equations?|cardioid|spiral\s+curve|curve(?:\s+\$?[A-Za-z0-9_]+\$?)?\s+with\s+polar/i.test(prev2Line);
+
+    const hasEquationPreamble =
+      hasPolarPreamble ||
+      /(?:straight\s+)?line(?:\s+\$?[A-Za-z0-9_]+\$?)?\s+with(?:\s+(?:polar|Cartesian)?\s+equation)?|curve(?:\s+\$?[A-Za-z0-9_]+\$?)?\s+with(?:\s+(?:polar|Cartesian)?\s+equation)?|(?:Cartesian\s+)?equation\s+of\s+the\s+(?:line|curve)|with\s+(?:Cartesian\s+)?equation/i.test(prevLine) ||
+      /(?:straight\s+)?line(?:\s+\$?[A-Za-z0-9_]+\$?)?\s+with(?:\s+(?:polar|Cartesian)?\s+equation)?|curve(?:\s+\$?[A-Za-z0-9_]+\$?)?\s+with(?:\s+(?:polar|Cartesian)?\s+equation)?|(?:Cartesian\s+)?equation\s+of\s+the\s+(?:line|curve)|with\s+(?:Cartesian\s+)?equation/i.test(prev2Line);
 
     if (!trimmed.startsWith('$') && !trimmed.startsWith('$$') && trimmed.length > 0) {
       // Case 1: Two dollar blocks on this line: `expr$, $domain$` or `expr$, \quad $domain$`
-      // e.g. "1 - \cos\theta$, $0 \le \theta < \frac{\pi}{2}$."
-      // e.g. "\sqrt{6} \cos 2\theta$, $0 \le \theta \le \frac{\pi}{4}$."
-      // e.g. "2 + 2\sin\theta$, $0 \le \theta \le 2\pi$,"
       const twoBlockMatch = trimmed.match(
         /^([a-zA-Z0-9\\+\-*/()_^{} \t]*?\\(?:cos|sin|tan|sec|csc|cot|theta|frac|sqrt|pi|lambda|alpha|beta)\b[a-zA-Z0-9\\+\-*/()_^{} \t]*?)\$,\s*(?:\\quad\s*)?\$([^\n\$]+?)\$([.,]?)$/
       );
@@ -248,11 +302,12 @@ export function healPolarAndDroppedEquations(text: string): string {
       // Case 2: Single un-opened block ending with a single `$`:
       // e.g. "a\theta, \quad 0 \leq \theta \leq 2\pi$,"
       // e.g. "4(\cos\theta + \sin\theta) \quad 0 \le \theta < 2\pi$."
-      // e.g. "\frac{\cos\theta + \sin\theta}{\cos^2\theta + \sin 2\theta + 1}, \quad 0 \le \theta < 2\pi$"
+      // e.g. "x + k$"
+      // e.g. "2x^2 + 3x - 1$."
       const singleBlockMatch = trimmed.match(
-        /^([a-zA-Z0-9\\+\-*/()_^{} \t]*?\\(?:cos|sin|tan|sec|csc|cot|theta|frac|sqrt|pi|lambda|alpha|beta|leq|le|geq|ge|quad)\b[^\n\$]+?)\$([.,]?)$/
+        /^([a-zA-Z0-9\\+\-*/()_^{} \t]+?)\$([.,]?)$/
       );
-      if (singleBlockMatch) {
+      if (singleBlockMatch && hasEquationPreamble) {
         let expr = singleBlockMatch[1].trim();
         let punct = singleBlockMatch[2] || '';
         const trailingPunctMatch = expr.match(/([.,])$/);
@@ -261,15 +316,23 @@ export function healPolarAndDroppedEquations(text: string): string {
           expr = expr.slice(0, -1).trim();
         }
         const hasTheta = expr.includes('\\theta') || hasPolarPreamble;
-        const prefix = hasTheta && !/^[a-zA-Z]\s*=/.test(expr) ? 'r = ' : '';
+        const isCartesianLineOrCurve = !hasTheta && /[xkt]/i.test(expr);
+        let prefix = '';
+        if (!/^[a-zA-Z]\s*=/.test(expr)) {
+          if (hasTheta) {
+            prefix = 'r = ';
+          } else if (isCartesianLineOrCurve) {
+            prefix = 'y = ';
+          }
+        }
         result.push(`$$${prefix}${expr}$$${punct}`);
         continue;
       }
 
-      // Case 3: Completely unbracketed formula line directly following polar preamble
-      if (hasPolarPreamble && /\\(?:cos|sin|tan|sec|csc|cot|theta|frac|sqrt|pi)\b/.test(trimmed) && !trimmed.includes('$')) {
+      // Case 3: Completely unbracketed formula line directly following polar or curve preamble
+      if (hasEquationPreamble && /\\(?:cos|sin|tan|sec|csc|cot|theta|frac|sqrt|pi)\b/.test(trimmed) && !trimmed.includes('$')) {
         let expr = trimmed;
-        const prefix = !/^[a-zA-Z]\s*=/.test(expr) ? 'r = ' : '';
+        const prefix = !/^[a-zA-Z]\s*=/.test(expr) ? (hasPolarPreamble ? 'r = ' : 'y = ') : '';
         result.push(`$$${prefix}${expr}$$`);
         continue;
       }
@@ -329,10 +392,11 @@ export function healLatexDelimiters(raw: string): string {
   s = deduplicateRepeatedParagraphs(s);
   s = normalizeMarkdownTables(s);
   s = fixSpacedCommands(s);
+  s = healMatrixEnvironments(s);
   s = healPolarAndDroppedEquations(s);
   s = stripOrphanedDollars(s);
   s = balanceMathEnvironments(s);
-  s = balanceDelimiters(s);
+  s = validateAndEnforceDelimiters(s);
 
   return s;
 }
