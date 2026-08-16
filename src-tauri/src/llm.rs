@@ -128,6 +128,16 @@ pub fn chat_body<S: AsRef<str>>(
         _ => serde_json::json!({ "type": "json_object" }),
     };
 
+    let m_lower = model.to_lowercase();
+    let reasoning_effort = if m_lower.contains("3.7-flash")
+        || m_lower.contains("3.7_flash")
+        || (m_lower.contains("3.7") && m_lower.contains("flash"))
+    {
+        "low"
+    } else {
+        "none"
+    };
+
     serde_json::json!({
         "model": model,
         "messages": [
@@ -137,7 +147,7 @@ pub fn chat_body<S: AsRef<str>>(
         "temperature": 0.1,
         "max_tokens": max_tokens,
         "response_format": rf,
-        "reasoning": { "effort": "none" }
+        "reasoning": { "effort": reasoning_effort }
     })
 }
 
@@ -155,6 +165,34 @@ pub fn message_content(resp: &serde_json::Value) -> Result<String, LlmError> {
             );
             LlmError::BadShape("missing choices[0].message.content".to_string())
         })
+}
+
+/// Real token usage extracted from the API response `usage` block.
+#[derive(Debug, Clone, Default)]
+#[allow(dead_code)]
+pub struct TokenUsage {
+    pub prompt_tokens: u64,
+    pub completion_tokens: u64,
+    pub total_tokens: u64,
+}
+
+/// Extract token usage from an OpenAI-compatible chat completion response.
+/// Returns `TokenUsage::default()` if the usage block is missing.
+#[allow(dead_code)]
+pub fn usage_from_response(resp: &serde_json::Value) -> TokenUsage {
+    let usage = &resp["usage"];
+    if usage.is_null() {
+        return TokenUsage::default();
+    }
+    TokenUsage {
+        prompt_tokens: usage["prompt_tokens"].as_u64().unwrap_or(0),
+        completion_tokens: usage["completion_tokens"].as_u64().unwrap_or(0),
+        total_tokens: usage["total_tokens"].as_u64()
+            .unwrap_or_else(|| {
+                usage["prompt_tokens"].as_u64().unwrap_or(0)
+                    + usage["completion_tokens"].as_u64().unwrap_or(0)
+            }),
+    }
 }
 
 // ── Real client ─────────────────────────────────────────────────────────────
@@ -419,5 +457,15 @@ mod tests {
         let images = ["CCCC"];
         let body = chat_body("model", "system", &images, None, 100, None);
         assert_eq!(image_url(&body), "data:image/webp;base64,CCCC");
+    }
+
+    #[test]
+    fn chat_body_sets_low_reasoning_for_3_7_flash() {
+        let images = ["CCCC"];
+        let body = chat_body("google/gemini-3.7-flash", "system", &images, None, 100, None);
+        assert_eq!(body["reasoning"]["effort"], "low");
+
+        let body2 = chat_body("google/gemini-2.5-flash", "system", &images, None, 100, None);
+        assert_eq!(body2["reasoning"]["effort"], "none");
     }
 }

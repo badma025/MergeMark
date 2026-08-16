@@ -189,6 +189,15 @@
   --sidebar-ring: oklch(0.556 0 0);
 }
 
+/* ─── Question Container Overflow & Word Breaking ────────────────────────── */
+article,
+.question-card,
+.question-container {
+  min-width: 0;
+  overflow-wrap: anywhere;
+  word-break: normal;
+}
+
 /* ─── KaTeX display (block) math ──────────────────────────────────────────── */
 /* !important is required to override Tailwind prose rules */
 
@@ -196,10 +205,12 @@
   display: block !important;
   text-align: center !important;
   /* Comfortable vertical breathing room above and below each equation */
-  margin: 1em 0 !important;
-  padding: 0.5em 0 !important;
-  overflow-x: auto;
-  overflow-y: hidden;
+  margin: 0.85em 0 !important;
+  padding: 0.35em 0 !important;
+  overflow-x: auto !important;
+  overflow-y: hidden !important;
+  max-width: 100% !important;
+  -webkit-overflow-scrolling: touch;
 }
 
 /* The actual rendered math sits inside an inline-block inside .katex-display.
@@ -215,14 +226,54 @@
 .prose-sm .katex-display {
   display: block !important;
   text-align: center !important;
-  margin: 1em 0 !important;
-  padding: 0.5em 0 !important;
+  margin: 0.85em 0 !important;
+  padding: 0.35em 0 !important;
   overflow-x: auto !important;
   overflow-y: hidden !important;
+  max-width: 100% !important;
 }
 
 /* ─── KaTeX inline math ────────────────────────────────────────────────────── */
-/* Don't override font-size for inline — let it match surrounding text */
 .katex {
   max-width: 100%;
 }
+
+/* ─── Print & PDF Dynamic Pagination Rules ───────────────────────────────── */
+@media print {
+  /* Prevent question cards and MCQ options from splitting across pages */
+  article,
+  .question-card,
+  .question-container,
+  .mcq-item,
+  .katex-display,
+  figure,
+  table {
+    break-inside: avoid !important;
+    page-break-inside: avoid !important;
+  }
+
+  /* Prevent question titles and headers from separating from content */
+  h1, h2, h3, h4, .question-header {
+    break-after: avoid !important;
+    page-break-after: avoid !important;
+  }
+
+  /* Prevent orphan single lines at page boundaries */
+  p {
+    orphans: 3;
+    widows: 3;
+  }
+
+  /* Hide interactive controls in print */
+  button,
+  .no-print,
+  ::-webkit-scrollbar {
+    display: none !important;
+  }
+
+  /* Ensure crisp high-contrast text on white paper */
+  body, article, p, span, td, th {
+    color: #000000 !important;
+    background-color: transparent !important;
+  }
+}

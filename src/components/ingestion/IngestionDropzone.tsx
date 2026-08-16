@@ -107,11 +107,9 @@ export function IngestionDropzone({ isActive = false, onSuccess }: IngestionDrop
       setReports(prev => [r, ...prev]);
       const warnings: number = r.quarantined.length;
       
-      const elapsedSec = r.totalElapsedMs 
+      const elapsedSec = r?.totalElapsedMs 
         ? (r.totalElapsedMs / 1000).toFixed(1)
-        : (r.timings.find(t => t.operation === 'span_stream')?.milliseconds 
-            ? (r.timings.find(t => t.operation === 'span_stream')!.milliseconds / 1000).toFixed(1)
-            : (r.timings.reduce((sum, t) => sum + t.milliseconds, 0) / 1000).toFixed(1));
+        : (((r?.timings || []).reduce((sum, t) => sum + (t?.milliseconds || 0), 0)) / 1000).toFixed(1);
       
       const timingStr = ` (took ${elapsedSec}s)`;
       

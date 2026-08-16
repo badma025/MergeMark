@@ -1,5 +1,5 @@
 import { Search, Plus, X, FileText } from "lucide-react";
-import { useState, useEffect } from "react";
+import { useState, useEffect, useRef, useMemo, useDeferredValue, useCallback } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { toast } from "sonner";
 import { Input } from "@/components/ui/input";
@@ -34,6 +34,7 @@ export function RepositoryFeed({
   selectedQuestionIds = [],
 }: RepositoryFeedProps) {
   const [search, setSearch] = useState("");
+  const deferredSearch = useDeferredValue(search);
   const [showAddModal, setShowAddModal] = useState(false);
   const [showManagePapers, setShowManagePapers] = useState(false);
   const [selectedSubject, setSelectedSubject] = useState<string>("All");
@@ -44,20 +45,65 @@ export function RepositoryFeed({
   const [reviewFilter, setReviewFilter] = useState<"All" | "Clean" | "Needs review">("All");
   const [questions, setQuestions] = useState<Omit<QuestionCardProps, "onAddToWorksheet" | "onDelete">[]>([]);
   const [loading, setLoading] = useState(true);
-  const { subjects, topicsBySubject } = useTaxonomy();
-  const subjectNames = subjects.map(s => s.name);
-  const ALL_TOPICS = Array.from(new Set(
-    Object.values(topicsBySubject)
-      .flatMap(subjectMods => Object.values(subjectMods).flat())
-  ));
+  const splashDismissedRef = useRef(false);
+  const { subjects, topicsBySubject, loading: taxonomyLoading } = useTaxonomy();
 
-  const availablePapers = Array.from(
-    new Set(
-      questions
-        .map((q) => (q as any).paperName)
-        .filter((name): name is string => typeof name === "string" && name.trim().length > 0)
-    )
-  ).sort();
+  const subjectNames = useMemo(() => (subjects || []).map(s => s?.name).filter(Boolean), [subjects]);
+
+  const ALL_TOPICS = useMemo(() => {
+    if (!topicsBySubject) return [];
+    return Array.from(new Set(
+      Object.values(topicsBySubject)
+        .filter(Boolean)
+        .flatMap(subjectMods => Object.values(subjectMods || {}).flat().filter(Boolean))
+    ));
+  }, [topicsBySubject]);
+
+  const availablePapers = useMemo(() => {
+    return Array.from(
+      new Set(
+        questions
+          .map((q) => (q as any).paperName)
+          .filter((name): name is string => typeof name === "string" && name.trim().length > 0)
+      )
+    ).sort();
+  }, [questions]);
+
+  // Pre-index questions to make search and multi-filtering virtually instantaneous
+  const indexedQuestions = useMemo(() => {
+    return questions.map((q) => {
+      let parsedTopics: string[] = [];
+      try {
+        if (q.topics) {
+          const parsed = JSON.parse(q.topics);
+          if (Array.isArray(parsed)) parsedTopics = parsed;
+        }
+      } catch {}
+
+      const resolvedSubject =
+        subjects.find(
+          (s) =>
+            s.id === q.subject ||
+            s.name.toLowerCase() === (q.subject || "").toLowerCase()
+        )?.name ||
+        q.subject ||
+        "";
+
+      const paper = ((q as any).paperName || "").trim();
+      const mathSnippet = ((q as any).mathSnippet || "").trim();
+
+      // Lowercase search corpus created once per question update
+      const searchCorpus = `${q.subject || ""} ${q.subtopic || ""} ${q.content || ""} ${paper} ${mathSnippet} ${parsedTopics.join(" ")}`.toLowerCase();
+
+      return {
+        raw: q,
+        searchCorpus,
+        parsedTopics,
+        resolvedSubject,
+        paper,
+      };
+    });
+  }, [questions, subjects]);
 
   useEffect(() => {
     if (isActive) {
@@ -69,6 +115,20 @@ export function RepositoryFeed({
     window.addEventListener("refresh-questions", handleRefresh);
     return () => window.removeEventListener("refresh-questions", handleRefresh);
   }, [isActive]);
+
+  // Coordinate splash dismissal: only fade out when both questions and taxonomy are fully ready and painted in the DOM
+  useEffect(() => {
+    if (!loading && !taxonomyLoading && !splashDismissedRef.current) {
+      splashDismissedRef.current = true;
+      requestAnimationFrame(() => {
+        requestAnimationFrame(() => {
+          setTimeout(() => {
+            (window as unknown as { __dismissSplash?: () => void }).__dismissSplash?.();
+          }, 60);
+        });
+      });
+    }
+  }, [loading, taxonomyLoading]);
 
   async function fetchQuestions() {
     setLoading(true);
@@ -83,7 +143,7 @@ export function RepositoryFeed({
     }
   }
 
-  async function handleDelete(id: string) {
+  const handleDelete = useCallback(async (id: string) => {
     // Optimistically remove from local state immediately so the UI feels instant
     setQuestions((prev) => prev.filter((q) => q.id !== id));
     try {
@@ -94,22 +154,22 @@ export function RepositoryFeed({
       toast.error("Failed to delete question", { description: String(err) });
       fetchQuestions(); // re-sync with DB
     }
-  }
+  }, []);
 
-  async function handleUpdate(id: string, newContent: string, newMarks: number, newAnswerContent?: string, newTopics?: string[]) {
+  const handleUpdate = useCallback(async (id: string, newContent: string, newMarks: number, newAnswerContent?: string, newTopics?: string[], newModule?: string) => {
     try {
       const newTopicsStr = newTopics ? JSON.stringify(newTopics) : undefined;
-      await invoke("update_question", { id, newContent, newMarks, newAnswerContent, newTopics: newTopicsStr });
+      await invoke("update_question", { id, newContent, newMarks, newAnswerContent, newTopics: newTopicsStr, newModule });
       setQuestions((prev) => 
-        prev.map(q => q.id === id ? { ...q, content: newContent, marks: newMarks, answerContent: newAnswerContent, topics: newTopicsStr ?? q.topics } : q)
+        prev.map(q => q.id === id ? { ...q, content: newContent, marks: newMarks, answerContent: newAnswerContent, topics: newTopicsStr ?? q.topics, module: newModule ?? (q as any).module } : q)
       );
       toast.success("Question updated successfully");
     } catch (err) {
       toast.error("Failed to update question", { description: String(err) });
     }
-  }
+  }, []);
 
-  const handleClearFilters = () => {
+  const handleClearFilters = useCallback(() => {
     setSearch("");
     setSelectedSubject("All");
     setSelectedModule("All");
@@ -117,7 +177,7 @@ export function RepositoryFeed({
     setSelectedPaper("All");
     setSelectedMarksRange("All");
     setReviewFilter("All");
-  };
+  }, []);
 
   const hasActiveFilters =
     search !== "" ||
@@ -128,87 +188,78 @@ export function RepositoryFeed({
     selectedMarksRange !== "All" ||
     reviewFilter !== "All";
 
-  const filtered = questions.filter((q) => {
-    const term = search.toLowerCase().trim();
-    const matchesSearch = term === "" ||
-      (q.subject || "").toLowerCase().includes(term) ||
-      (q.subtopic || "").toLowerCase().includes(term) ||
-      (q.content || "").toLowerCase().includes(term) ||
-      ((q as any).paperName || "").toLowerCase().includes(term) ||
-      ((q as any).mathSnippet || "").toLowerCase().includes(term);
+  const filtered = useMemo(() => {
+    const term = deferredSearch.toLowerCase().trim();
 
-    const resolvedSubject = subjects.find(s => s.id === q.subject || s.name.toLowerCase() === (q.subject || "").toLowerCase())?.name || q.subject || "";
-    const matchesSubject = selectedSubject === "All" || resolvedSubject.toLowerCase() === selectedSubject.toLowerCase();
-
-    const qPaper = ((q as any).paperName || "").trim();
-    const matchesPaper = selectedPaper === "All" || qPaper.toLowerCase() === selectedPaper.toLowerCase();
-
-    let matchesMarks = true;
-    if (selectedMarksRange === "1-2") {
-      matchesMarks = q.marks >= 1 && q.marks <= 2;
-    } else if (selectedMarksRange === "3-5") {
-      matchesMarks = q.marks >= 3 && q.marks <= 5;
-    } else if (selectedMarksRange === "6+") {
-      matchesMarks = q.marks >= 6;
-    }
-
-    let matchesTopicFilter = true;
-    if (selectedTopics.length > 0) {
-      let qTopics: string[] = [];
-      try {
-        if (q.topics) {
-          qTopics = JSON.parse(q.topics);
-          if (!Array.isArray(qTopics)) qTopics = [];
+    return indexedQuestions
+      .filter(({ raw: q, searchCorpus, parsedTopics, resolvedSubject, paper }) => {
+        // Instant search check against pre-indexed corpus
+        if (term.length > 0 && !searchCorpus.includes(term)) {
+          return false;
         }
-      } catch (e) {
-        // ignore
-      }
-      matchesTopicFilter = qTopics.some((t) => selectedTopics.includes(t));
-    }
 
-    let matchesModuleFilter = true;
-    if (selectedModule !== "All") {
-      const qMod = (q as any).module;
-      if (qMod && qMod !== "Unknown" && qMod !== "General") {
-        matchesModuleFilter = qMod === selectedModule;
-      } else {
-        // Fallback to topics if no explicit module is provided
-        const resolvedSubject = subjects.find(s => s.id === q.subject)?.name || q.subject;
-        const moduleTopics = (topicsBySubject[resolvedSubject] || {})[selectedModule] || [];
-        if (selectedTopics.length === 0) {
-          let qTopics: string[] = [];
-          try {
-            if (q.topics) {
-              qTopics = JSON.parse(q.topics);
-              if (!Array.isArray(qTopics)) qTopics = [];
+        if (
+          selectedSubject !== "All" &&
+          resolvedSubject.toLowerCase() !== selectedSubject.toLowerCase()
+        ) {
+          return false;
+        }
+
+        if (
+          selectedPaper !== "All" &&
+          paper.toLowerCase() !== selectedPaper.toLowerCase()
+        ) {
+          return false;
+        }
+
+        if (selectedMarksRange === "1-2" && (q.marks < 1 || q.marks > 2)) return false;
+        if (selectedMarksRange === "3-5" && (q.marks < 3 || q.marks > 5)) return false;
+        if (selectedMarksRange === "6+" && q.marks < 6) return false;
+
+        if (selectedTopics.length > 0 && !parsedTopics.some((t) => selectedTopics.includes(t))) {
+          return false;
+        }
+
+        if (selectedModule !== "All") {
+          const qMod = (q as any).module;
+          if (qMod && qMod !== "Unknown" && qMod !== "General") {
+            if (qMod !== selectedModule) return false;
+          } else {
+            const moduleTopics = (topicsBySubject[resolvedSubject] || {})[selectedModule] || [];
+            if (selectedTopics.length === 0 && parsedTopics.length > 0) {
+              if (!parsedTopics.some((t) => moduleTopics.includes(t))) return false;
             }
-          } catch (e) {}
-          
-          if (qTopics.length > 0) {
-            matchesModuleFilter = qTopics.some((t) => moduleTopics.includes(t));
           }
         }
-      }
-    }
 
-    let matchesReviewFilter = true;
-    if (reviewFilter === "Clean") {
-      matchesReviewFilter = !q.needsReview && !q.answerStale;
-    } else if (reviewFilter === "Needs review") {
-      matchesReviewFilter = !!q.needsReview || !!q.answerStale;
-    }
+        if (reviewFilter === "Clean" && (q.needsReview || q.answerStale)) return false;
+        if (reviewFilter === "Needs review" && !q.needsReview && !q.answerStale) return false;
 
-    return matchesSearch && matchesTopicFilter && matchesSubject && matchesModuleFilter && matchesReviewFilter && matchesPaper && matchesMarks;
-  });
+        return true;
+      })
+      .map((item) => item.raw);
+  }, [
+    indexedQuestions,
+    deferredSearch,
+    selectedSubject,
+    selectedPaper,
+    selectedMarksRange,
+    selectedTopics,
+    selectedModule,
+    reviewFilter,
+    topicsBySubject,
+  ]);
 
-  const totalMarksFiltered = filtered.reduce((sum, q) => sum + (q.marks || 0), 0);
+  const totalMarksFiltered = useMemo(() => {
+    return filtered.reduce((sum, q) => sum + (q.marks || 0), 0);
+  }, [filtered]);
 
-  function handleAdd(id: string) {
+  const handleAdd = useCallback((id: string) => {
     const question = questions.find((q) => q.id === id);
     if (question) {
       onAddToWorksheet(question);
     }
-  }
+  }, [questions, onAddToWorksheet]);
 
   return (
     <section
@@ -236,21 +287,23 @@ export function RepositoryFeed({
           <div className="flex flex-wrap items-center gap-2 sm:gap-3 order-1 md:order-none ml-auto md:ml-0">
             {/* Paper Filter */}
             {availablePapers.length > 0 && (
-              <div className="w-[140px] sm:w-[160px]">
+              <div className="w-[180px] sm:w-[220px] md:w-[260px]">
                 <Select
                   value={selectedPaper}
                   onValueChange={(v) => {
                     if (v) setSelectedPaper(v);
                   }}
                 >
-                  <SelectTrigger className="h-8 text-xs font-semibold bg-muted/40">
+                  <SelectTrigger className="h-8 text-xs font-semibold bg-muted/40 w-full">
                     <FileText className="size-3.5 mr-1.5 text-muted-foreground shrink-0" />
                     <SelectValue placeholder="All Papers" />
                   </SelectTrigger>
-                  <SelectContent>
+                  <SelectContent className="min-w-[max(100%,320px)] max-w-[500px]">
                     <SelectItem value="All">All Papers ({availablePapers.length})</SelectItem>
                     {availablePapers.map((p) => (
-                      <SelectItem key={p} value={p}>{p}</SelectItem>
+                      <SelectItem key={p} value={p} title={p}>
+                        {p}
+                      </SelectItem>
                     ))}
                   </SelectContent>
                 </Select>

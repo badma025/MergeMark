@@ -7,7 +7,7 @@ interface SplashScreenProps {
   forceShow?: boolean;
 }
 
-export function SplashScreen({ onFinish, duration = 5000, forceShow = false }: SplashScreenProps) {
+export function SplashScreen({ onFinish, duration = 3000, forceShow = false }: SplashScreenProps) {
   const [visible, setVisible] = useState(true);
   const [fading, setFading] = useState(false);
 
@@ -19,7 +19,7 @@ export function SplashScreen({ onFinish, duration = 5000, forceShow = false }: S
     const finishTimer = setTimeout(() => {
       setVisible(false);
       onFinish?.();
-    }, duration + 400);
+    }, duration + 450);
 
     return () => {
       clearTimeout(fadeTimer);
@@ -32,12 +32,12 @@ export function SplashScreen({ onFinish, duration = 5000, forceShow = false }: S
   return (
     <div
       className={cn(
-        "fixed inset-0 z-[9999] flex flex-col items-center justify-center bg-[#09090b] text-[#f4f4f5] select-none transition-opacity duration-400 ease-out",
+        "fixed inset-0 z-[99999] flex flex-col items-center justify-center bg-[#09090b] text-[#f4f4f5] select-none transition-opacity duration-450 ease-out",
         fading && !forceShow ? "opacity-0 pointer-events-none" : "opacity-100"
       )}
     >
       {/* Background Ambient Glow */}
-      <div className="absolute w-72 h-72 rounded-full bg-emerald-500/10 blur-[90px] pointer-events-none animate-pulse duration-1000" />
+      <div className="absolute w-72 h-72 rounded-full bg-emerald-500/12 blur-[90px] pointer-events-none animate-pulse duration-1000" />
 
       <div className="relative flex flex-col items-center gap-7">
         {/* Animated SVG Logo */}
@@ -90,11 +90,11 @@ export function SplashScreen({ onFinish, duration = 5000, forceShow = false }: S
         </div>
 
         {/* Minimalist Glowing Progress Track */}
-        <div className="w-36 h-[2.5px] bg-white/10 rounded-full overflow-hidden relative">
+        <div className="w-36 h-[2.5px] bg-white/10 rounded-full overflow-hidden relative transform translate-z-0">
           <div
-            className="absolute h-full rounded-full bg-gradient-to-r from-emerald-400 to-blue-500"
+            className="absolute top-0 left-0 h-full w-[35%] rounded-full bg-gradient-to-r from-emerald-400 to-blue-500 will-change-transform"
             style={{
-              animation: "splash-slide 1.2s cubic-bezier(0.4, 0, 0.2, 1) infinite alternate",
+              animation: "splash-slide 1.3s cubic-bezier(0.4, 0, 0.2, 1) infinite alternate",
             }}
           />
         </div>
@@ -109,12 +109,11 @@ export function SplashScreen({ onFinish, duration = 5000, forceShow = false }: S
         .mm-path-check {
           stroke-dasharray: 100;
           stroke-dashoffset: 100;
-          animation: mmDrawCheck 0.6s cubic-bezier(0.16, 1, 0.3, 1) 0.4s forwards;
+          animation: mmDrawCheck 0.6s cubic-bezier(0.16, 1, 0.3, 1) 0.35s forwards;
         }
         .mm-text {
           opacity: 0;
-          transform: translateX(-8px);
-          animation: mmFadeText 0.6s ease-out 0.3s forwards;
+          animation: mmFadeText 0.6s ease-out 0.25s forwards;
         }
         @keyframes mmDrawM {
           0% { stroke-dashoffset: 100; opacity: 0.2; }
@@ -130,8 +129,8 @@ export function SplashScreen({ onFinish, duration = 5000, forceShow = false }: S
           100% { opacity: 1; transform: translateX(0); }
         }
         @keyframes splash-slide {
-          0% { left: 0%; width: 25%; }
-          100% { left: 75%; width: 25%; }
+          0% { transform: translateX(-10%); }
+          100% { transform: translateX(200%); }
         }
       `}</style>
     </div>

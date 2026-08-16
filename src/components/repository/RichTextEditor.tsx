@@ -1,11 +1,7 @@
 import { useState, useRef, useEffect, useCallback } from 'react';
-import ReactMarkdown from 'react-markdown';
-import remarkMath from 'remark-math';
-import rehypeKatex from 'rehype-katex';
-import remarkGfm from 'remark-gfm';
 import 'katex/dist/katex.min.css';
-import { cn, preprocessMathString } from '@/lib/utils';
-import { remarkMathFix } from '@/lib/remark-math-fix';
+import { cn } from '@/lib/utils';
+import { ExamMarkdownRenderer } from '@/components/common/ExamMarkdownRenderer';
 import {
   Bold,
   Italic,
@@ -435,14 +431,8 @@ export function RichTextEditor({ markdown, onChange, placeholder, className }: R
         {(mode === 'preview' || mode === 'split') && (
           <div className="flex-1 flex flex-col min-h-0 bg-card/40 p-4 overflow-y-auto">
             {markdown?.trim() ? (
-              <div className="text-sm leading-relaxed text-foreground prose prose-sm dark:prose-invert max-w-none prose-p:my-1 prose-pre:my-1 break-words">
-                <ReactMarkdown
-                  remarkPlugins={[remarkMath, remarkGfm, remarkMathFix]}
-                  rehypePlugins={[[rehypeKatex, { throwOnError: false, strict: false }]]}
-                  urlTransform={(value) => value}
-                >
-                  {preprocessMathString(markdown)}
-                </ReactMarkdown>
+              <div className="text-sm leading-relaxed text-foreground min-w-0">
+                <ExamMarkdownRenderer content={markdown} />
               </div>
             ) : (
               <div className="flex items-center justify-center h-full text-xs text-muted-foreground italic">

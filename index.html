@@ -14,14 +14,16 @@
         padding: 0;
         width: 100%;
         height: 100%;
-        background-color: #09090b;
+        background-color: #09090b !important;
         color: #f4f4f5;
         overflow: hidden;
         font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
+        color-scheme: dark;
       }
       #root {
         width: 100%;
         height: 100%;
+        background-color: #09090b;
       }
       .splash-container {
         position: fixed;
@@ -32,16 +34,25 @@
         justify-content: center;
         background-color: #09090b;
         user-select: none;
-        z-index: 9999;
+        z-index: 99999;
+        transition: opacity 0.45s cubic-bezier(0.16, 1, 0.3, 1), visibility 0.45s ease-out;
+        will-change: opacity;
+      }
+      .splash-container.splash-fade-out {
+        opacity: 0;
+        visibility: hidden;
+        pointer-events: none;
       }
       .splash-glow {
         position: absolute;
         width: 280px;
         height: 280px;
         border-radius: 9999px;
-        background: rgba(16, 185, 129, 0.1);
+        background: rgba(16, 185, 129, 0.12);
         filter: blur(80px);
         pointer-events: none;
+        animation: mmPulse 2.5s ease-in-out infinite alternate;
+        will-change: opacity, transform;
       }
       .splash-logo-wrap {
         position: relative;
@@ -63,11 +74,11 @@
       .mm-path-check {
         stroke-dasharray: 100;
         stroke-dashoffset: 100;
-        animation: mmDrawCheck 0.6s cubic-bezier(0.16, 1, 0.3, 1) 0.4s forwards;
+        animation: mmDrawCheck 0.6s cubic-bezier(0.16, 1, 0.3, 1) 0.35s forwards;
       }
       .mm-text {
         opacity: 0;
-        animation: mmFadeText 0.6s ease-out 0.3s forwards;
+        animation: mmFadeText 0.6s ease-out 0.25s forwards;
       }
       .splash-bar-track {
         width: 144px;
@@ -76,13 +87,18 @@
         border-radius: 9999px;
         overflow: hidden;
         position: relative;
+        transform: translateZ(0);
       }
       .splash-bar-fill {
         position: absolute;
+        top: 0;
+        left: 0;
+        width: 35%;
         height: 100%;
         background: linear-gradient(90deg, #10b981, #3b82f6);
         border-radius: 9999px;
-        animation: splash-slide 1.2s cubic-bezier(0.4, 0, 0.2, 1) infinite alternate;
+        animation: splash-slide 1.3s cubic-bezier(0.4, 0, 0.2, 1) infinite alternate;
+        will-change: transform;
       }
       @keyframes mmDrawM {
         0% { stroke-dashoffset: 100; opacity: 0.2; }
@@ -97,45 +113,67 @@
         0% { opacity: 0; transform: translateX(-8px); }
         100% { opacity: 1; transform: translateX(0); }
       }
+      @keyframes mmPulse {
+        0% { opacity: 0.6; transform: scale(0.95); }
+        100% { opacity: 1; transform: scale(1.05); }
+      }
       @keyframes splash-slide {
-        0% { left: 0%; width: 25%; }
-        100% { left: 75%; width: 25%; }
+        0% { transform: translateX(-10%); }
+        100% { transform: translateX(200%); }
       }
     </style>
   </head>
 
   <body>
-    <div id="root">
-      <div class="splash-container">
-        <div class="splash-glow"></div>
-        <div class="splash-logo-wrap">
-          <svg xmlns="http://www.w3.org/2000/svg" viewBox="150 280 1650 450" class="splash-svg">
-            <g transform="translate(18.4, 102.4) scale(0.8)">
-              <path d="M 232 742 L 232 382 L 382 532 L 512 402" 
-                    stroke="#F4F4F5" 
-                    stroke-width="72" 
-                    stroke-linecap="round" 
-                    stroke-linejoin="round" 
-                    fill="none"
-                    pathLength="100"
-                    class="mm-path-m"/>
-              <path d="M 512 402 L 612 502 L 792 282" 
-                    stroke="#10B981" 
-                    stroke-width="72" 
-                    stroke-linecap="round" 
-                    stroke-linejoin="round" 
-                    fill="none"
-                    pathLength="100"
-                    class="mm-path-check"/>
-            </g>
-            <text x="716" y="512" dominant-baseline="central" font-family="system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-size="160" font-weight="bold" fill="#FFFFFF" class="mm-text">MergeMark</text>
-          </svg>
-          <div class="splash-bar-track">
-            <div class="splash-bar-fill"></div>
-          </div>
+    <div id="root"></div>
+    <div id="splash-overlay" class="splash-container">
+      <div class="splash-glow"></div>
+      <div class="splash-logo-wrap">
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="150 280 1650 450" class="splash-svg">
+          <g transform="translate(18.4, 102.4) scale(0.8)">
+            <path d="M 232 742 L 232 382 L 382 532 L 512 402" 
+                  stroke="#F4F4F5" 
+                  stroke-width="72" 
+                  stroke-linecap="round" 
+                  stroke-linejoin="round" 
+                  fill="none"
+                  pathLength="100"
+                  class="mm-path-m"/>
+            <path d="M 512 402 L 612 502 L 792 282" 
+                  stroke="#10B981" 
+                  stroke-width="72" 
+                  stroke-linecap="round" 
+                  stroke-linejoin="round" 
+                  fill="none"
+                  pathLength="100"
+                  class="mm-path-check"/>
+          </g>
+          <text x="716" y="512" dominant-baseline="central" font-family="system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-size="160" font-weight="bold" fill="#FFFFFF" class="mm-text">MergeMark</text>
+        </svg>
+        <div class="splash-bar-track">
+          <div class="splash-bar-fill"></div>
         </div>
       </div>
     </div>
+    <script>
+      window.__dismissSplash = function() {
+        var overlay = document.getElementById('splash-overlay');
+        if (!overlay || overlay.classList.contains('splash-fade-out')) return;
+        overlay.classList.add('splash-fade-out');
+        setTimeout(function() {
+          if (overlay && overlay.parentNode) {
+            overlay.parentNode.removeChild(overlay);
+          }
+        }, 500);
+      };
+
+      // Safety fallback timer (15s) in case of an unexpected crash
+      setTimeout(function() {
+        if (typeof window.__dismissSplash === 'function') {
+          window.__dismissSplash();
+        }
+      }, 15000);
+    </script>
     <script type="module" src="/src/main.tsx"></script>
   </body>
 </html>

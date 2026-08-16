@@ -1,5 +1,21 @@
 import { useState, useEffect } from "react";
-import { Settings as SettingsIcon, Key, RefreshCw, AlertCircle, Trash2, AlertTriangle, Archive, Download, Upload, Sparkles } from "lucide-react";
+import { 
+  Settings as SettingsIcon, 
+  Key, 
+  RefreshCw, 
+  AlertCircle, 
+  Trash2, 
+  Archive, 
+  Download, 
+  Upload, 
+  Sparkles, 
+  DollarSign, 
+  FolderTree, 
+  ShieldAlert,
+  Server,
+  Eye,
+  EyeOff
+} from "lucide-react";
 import { Input } from "@/components/ui/input";
 import { Button } from "@/components/ui/button";
 import { invoke } from "@tauri-apps/api/core";
@@ -7,8 +23,9 @@ import { open, save } from "@tauri-apps/plugin-dialog";
 import { toast } from "sonner";
 import { TaxonomyManager } from "./TaxonomyManager";
 import { SplashScreen } from "@/components/common/SplashScreen";
+import { UsageDashboard } from "./UsageDashboard";
+import { cn } from "@/lib/utils";
 
-// Mirrors the serde camelCase report structs in src-tauri/src/backup.rs
 interface ExportReport {
   questions: number;
   images: number;
@@ -34,8 +51,11 @@ interface PendingImport {
 }
 
 export function Settings() {
+  const [activeTab, setActiveTab] = useState<"api_usage" | "taxonomy" | "backup_danger">("api_usage");
+
   const [apiKey, setApiKey] = useState("");
-  const [baseUrl, setBaseUrl] = useState("https://openrouter.ai/api/v1/");
+  const [showApiKey, setShowApiKey] = useState(false);
+  const [baseUrl, setBaseUrl] = useState("https://openrouter.ai/api/v1");
   const [modelName, setModelName] = useState("google/gemini-2.5-flash");
   const [availableModels, setAvailableModels] = useState<string[]>([]);
   const [fetchingModels, setFetchingModels] = useState(false);
@@ -110,7 +130,7 @@ export function Settings() {
         defaultPath: `mergemark-backup-${new Date().toISOString().slice(0, 10)}.zip`,
         filters: [{ name: "MergeMark Backup", extensions: ["zip"] }],
       });
-      if (!path) return; // user cancelled the picker
+      if (!path) return;
       const report = await invoke<ExportReport>("export_backup", { destPath: path });
       if (report.missingImages > 0) {
         toast.warning(`Backup saved — ${report.questions} questions, ${report.images} images`, {
@@ -133,7 +153,7 @@ export function Settings() {
         multiple: false,
         filters: [{ name: "MergeMark Backup", extensions: ["zip"] }],
       });
-      if (!path || typeof path !== "string") return; // user cancelled the picker
+      if (!path || typeof path !== "string") return;
       const preview = await invoke<BackupPreview>("preview_backup", { srcPath: path });
       setPendingImport({ path, preview });
       setImportMode("merge");
@@ -154,14 +174,14 @@ export function Settings() {
         srcPath: pendingImport.path,
         mode: importMode,
       });
-      toast.success(
-        summary.replaced
-          ? `Library restored — ${summary.added} questions, ${summary.imagesCopied} images`
-          : `Import complete — ${summary.added} new, ${summary.updated} updated, ${summary.imagesCopied} images restored`
-      );
+      const modeText = summary.replaced ? "Library replaced" : "Library updated";
+      toast.success(`${modeText} from backup`, {
+        description: `Added ${summary.added} new questions, updated ${summary.updated}, copied ${summary.imagesCopied} images.`,
+      });
       setPendingImport(null);
+      setReplaceInput("");
     } catch (err) {
-      toast.error("Import failed", { description: String(err) });
+      toast.error("Restore failed", { description: String(err) });
     } finally {
       setBackupBusy(null);
     }
@@ -169,11 +189,10 @@ export function Settings() {
 
   async function handleClearRepository() {
     if (clearInput !== REQUIRED_CLEAR_PHRASE) return;
-    
     setClearing(true);
     try {
       await invoke("delete_all_questions");
-      toast.success("Repository cleared successfully");
+      toast.success("Question repository cleared");
       setConfirmingClear(false);
       setClearInput("");
     } catch (err) {
@@ -185,319 +204,396 @@ export function Settings() {
 
   return (
     <section
-      className="flex flex-1 flex-col items-center justify-start h-full min-h-0 px-4 sm:px-8 py-6 sm:py-12 bg-background overflow-y-auto"
+      className="flex flex-1 flex-col items-center justify-start h-full min-h-0 px-4 sm:px-8 py-6 sm:py-8 bg-background overflow-y-auto"
       aria-label="Settings"
     >
-      <div className="w-full max-w-md flex flex-col items-center mt-4 mb-8 text-center space-y-1 select-none">
-        <h1 className="text-2xl font-bold tracking-tight text-foreground flex items-center justify-center gap-2">
-          <SettingsIcon className="size-6 text-primary" />
-          Settings
-        </h1>
-        <p className="text-sm text-muted-foreground max-w-md">
-          Configure MergeMark preferences and API integrations.
-        </p>
-      </div>
-
-      <div className="w-full max-w-md flex flex-col gap-6 rounded-2xl border border-border/60 bg-card p-6 shadow-sm mb-12">
-        
-        {/* Base URL */}
-        <div className="flex flex-col gap-3">
-          <label htmlFor="base-url" className="text-sm font-semibold flex items-center gap-2">
-            Base URL
-          </label>
-          <Input
-            id="base-url"
-            type="text"
-            placeholder="https://api.openai.com/v1"
-            value={baseUrl}
-            onChange={handleBaseUrlChange}
-            className="font-mono"
-            aria-describedby="base-url-description"
-          />
-          <p id="base-url-description" className="text-xs text-muted-foreground">
-            The API endpoint. For Ollama, use <code className="bg-muted px-1 py-0.5 rounded">http://localhost:11434/v1</code>.
-          </p>
+      {/* ── Settings Header ── */}
+      <div className="w-full max-w-4xl flex flex-col items-center mb-6 text-center space-y-2 select-none">
+        <div className="flex items-center gap-2.5">
+          <div className="size-8 rounded-xl bg-primary/10 border border-primary/20 flex items-center justify-center text-primary shadow-xs">
+            <SettingsIcon className="size-4.5" />
+          </div>
+          <h1 className="text-xl font-bold tracking-tight text-foreground">
+            Settings &amp; Configuration
+          </h1>
         </div>
+        <p className="text-xs text-muted-foreground max-w-md">
+          Configure API endpoints, monitor real-time OpenRouter spending, manage curriculum taxonomies, and manage database backups.
+        </p>
 
-        {/* Model Name */}
-        <div className="flex flex-col gap-3">
-          <label htmlFor="model-name" className="text-sm font-semibold flex items-center justify-between">
-            <span className="flex items-center gap-2">Model Name</span>
-            <Button 
-              variant="outline" 
-              size="sm" 
-              className="h-7 text-xs" 
-              onClick={handleFetchModels}
-              disabled={fetchingModels}
-            >
-              {fetchingModels ? <RefreshCw className="size-3 mr-1 animate-spin" /> : <RefreshCw className="size-3 mr-1" />}
-              Fetch
-            </Button>
-          </label>
-          <div className="relative">
-            <Input
-              id="model-name"
-              type="text"
-              list="models-list"
-              placeholder="gpt-4o-mini"
-              value={modelName}
-              onChange={handleModelChange}
-              className="font-mono w-full"
-              aria-describedby="model-name-description"
-            />
-            {availableModels.length > 0 && (
-              <datalist id="models-list">
-                {availableModels.map(m => <option key={m} value={m} />)}
-              </datalist>
+        {/* ── Segmented Tab Switcher ── */}
+        <div className="inline-flex items-center p-1 bg-muted/60 dark:bg-muted/40 border border-border/80 rounded-xl shadow-xs mt-3">
+          <button
+            type="button"
+            onClick={() => setActiveTab("api_usage")}
+            className={cn(
+              "flex items-center gap-2 px-4 py-1.5 rounded-lg text-xs font-semibold transition-all select-none",
+              activeTab === "api_usage" 
+                ? "bg-card text-foreground shadow-xs border border-border/80" 
+                : "text-muted-foreground hover:text-foreground"
             )}
-          </div>
-          {modelFetchError && (
-            <p className="text-xs text-destructive flex items-center gap-1">
-              <AlertCircle className="size-3" /> {modelFetchError}
-            </p>
-          )}
-          <p id="model-name-description" className="text-xs text-muted-foreground">
-            The model to use. You can click Fetch to load available models.
-          </p>
-        </div>
+          >
+            <DollarSign className="size-3.5 text-primary" />
+            <span>API &amp; Spend</span>
+          </button>
 
-        {/* API Key */}
-        <div className="flex flex-col gap-3">
-          <label htmlFor="openai-api-key" className="text-sm font-semibold flex items-center gap-2">
-            <Key className="size-4 text-primary" />
-            API Key
-          </label>
-          <Input
-            id="openai-api-key"
-            type="password"
-            placeholder="sk-..."
-            value={apiKey}
-            onChange={handleKeyChange}
-            className="font-mono"
-            aria-describedby="openai-api-key-description"
-          />
-          <p id="openai-api-key-description" className="text-xs text-muted-foreground">
-            Required for OpenAI/cloud providers. Leave blank or enter a dummy value for local providers like Ollama.
-          </p>
+          <button
+            type="button"
+            onClick={() => setActiveTab("taxonomy")}
+            className={cn(
+              "flex items-center gap-2 px-4 py-1.5 rounded-lg text-xs font-semibold transition-all select-none",
+              activeTab === "taxonomy" 
+                ? "bg-card text-foreground shadow-xs border border-border/80" 
+                : "text-muted-foreground hover:text-foreground"
+            )}
+          >
+            <FolderTree className="size-3.5 text-blue-500" />
+            <span>Curriculum Taxonomy</span>
+          </button>
+
+          <button
+            type="button"
+            onClick={() => setActiveTab("backup_danger")}
+            className={cn(
+              "flex items-center gap-2 px-4 py-1.5 rounded-lg text-xs font-semibold transition-all select-none",
+              activeTab === "backup_danger" 
+                ? "bg-card text-foreground shadow-xs border border-border/80" 
+                : "text-muted-foreground hover:text-foreground"
+            )}
+          >
+            <Archive className="size-3.5 text-amber-500" />
+            <span>Backup &amp; Maintenance</span>
+          </button>
         </div>
       </div>
 
-      {/* ── Backup & Restore ── */}
-      <div className="w-full max-w-md flex flex-col gap-4 rounded-2xl border border-border/60 bg-card p-6 shadow-sm mb-12">
-        <h2 className="text-sm font-bold flex items-center gap-2 text-foreground">
-          <Archive className="size-4 text-primary" />
-          Backup &amp; Restore
-        </h2>
-        <p className="text-sm text-muted-foreground">
-          Save your entire question library — including diagrams — to a single file you can
-          keep as a backup, move to another computer, or share. Your API key is never included.
-        </p>
-
-        {!pendingImport ? (
-          <div className="flex gap-2">
-            <Button
-              variant="outline"
-              className="gap-2"
-              onClick={handleExportBackup}
-              disabled={backupBusy !== null}
-            >
-              <Download className="size-4" />
-              {backupBusy === "export" ? "Exporting..." : "Export backup"}
-            </Button>
-            <Button
-              variant="outline"
-              className="gap-2"
-              onClick={handlePickBackup}
-              disabled={backupBusy !== null}
-            >
-              <Upload className="size-4" />
-              {backupBusy === "import" ? "Reading..." : "Import backup"}
-            </Button>
-          </div>
-        ) : (
-          <div className="flex flex-col gap-3 bg-background p-4 rounded-xl border border-border/60">
-            <p className="text-sm font-medium text-foreground">
-              Ready to import
-            </p>
-            <p className="text-xs text-muted-foreground">
-              Backup from{" "}
-              <span className="font-medium text-foreground">
-                {new Date(pendingImport.preview.exportedAt * 1000).toLocaleString()}
-              </span>{" "}
-              · {pendingImport.preview.questionCount} questions ·{" "}
-              {pendingImport.preview.imageCount} images · made with app v
-              {pendingImport.preview.appVersion}
-            </p>
-
-            <label className="flex items-start gap-2 text-sm cursor-pointer mt-1">
-              <input
-                type="radio"
-                name="import-mode"
-                className="mt-1 accent-primary"
-                checked={importMode === "merge"}
-                onChange={() => setImportMode("merge")}
-              />
-              <span>
-                <span className="font-medium">Merge</span>
-                <span className="block text-xs text-muted-foreground">
-                  Add new questions and update ones that already exist in this backup. Nothing is deleted. Recommended.
-                </span>
-              </span>
-            </label>
-            <label className="flex items-start gap-2 text-sm cursor-pointer">
-              <input
-                type="radio"
-                name="import-mode"
-                className="mt-1 accent-destructive"
-                checked={importMode === "replace"}
-                onChange={() => setImportMode("replace")}
-              />
-              <span>
-                <span className="font-medium text-destructive">Replace everything</span>
-                <span className="block text-xs text-muted-foreground">
-                  Delete the entire current library first, then restore from this backup.
-                </span>
-              </span>
-            </label>
-
-            {importMode === "replace" && (
-              <div className="flex flex-col gap-2 mt-1">
-                <p className="text-xs font-medium text-foreground">
-                  Type{" "}
-                  <code className="bg-muted px-1.5 py-0.5 rounded text-destructive select-all">
-                    {REQUIRED_REPLACE_PHRASE}
-                  </code>{" "}
-                  below to confirm.
+      {/* ── Tab Content Container ── */}
+      <div className="w-full max-w-4xl flex flex-col gap-6 mb-12">
+        {/* ════════════════ TAB 1: API & USAGE SPEND ════════════════ */}
+        {activeTab === "api_usage" && (
+          <div className="flex flex-col gap-6 animate-in fade-in-50 duration-150">
+            {/* API Configuration Card */}
+            <div className="flex flex-col gap-5 rounded-xl border border-border/70 bg-card p-6 shadow-xs">
+              <div className="border-b border-border/60 pb-3">
+                <h2 className="text-sm font-bold flex items-center gap-2 text-foreground">
+                  <Key className="size-4 text-primary" />
+                  API &amp; Model Credentials
+                </h2>
+                <p className="text-xs text-muted-foreground mt-0.5">
+                  MergeMark connects directly to OpenRouter or your custom OpenAI-compatible endpoint using your key.
                 </p>
-                <Input
-                  type="text"
-                  placeholder="Type the phrase above"
-                  value={replaceInput}
-                  onChange={(e) => setReplaceInput(e.target.value)}
-                  onPaste={(e) => e.preventDefault()}
-                  onDrop={(e) => e.preventDefault()}
-                  className="text-xs"
-                />
               </div>
-            )}
 
-            <div className="flex gap-2 justify-end mt-1">
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                {/* Base URL */}
+                <div className="flex flex-col gap-1.5">
+                  <label htmlFor="base-url" className="text-xs font-semibold flex items-center gap-1.5 text-foreground">
+                    <Server className="size-3.5 text-muted-foreground" />
+                    <span>Base URL</span>
+                  </label>
+                  <Input
+                    id="base-url"
+                    type="text"
+                    placeholder="https://openrouter.ai/api/v1"
+                    value={baseUrl}
+                    onChange={handleBaseUrlChange}
+                    className="font-mono text-xs bg-muted/20"
+                  />
+                  <p className="text-[11px] text-muted-foreground">
+                    Default: <code className="bg-muted px-1 py-0.5 rounded text-[10px]">https://openrouter.ai/api/v1</code>
+                  </p>
+                </div>
+
+                {/* Model Identifier */}
+                <div className="flex flex-col gap-1.5">
+                  <div className="flex items-center justify-between">
+                    <label htmlFor="model-name" className="text-xs font-semibold text-foreground">
+                      <span>Model Identifier</span>
+                    </label>
+                    <Button 
+                      variant="outline" 
+                      size="sm" 
+                      className="h-6 text-[11px] px-2 gap-1" 
+                      onClick={handleFetchModels}
+                      disabled={fetchingModels}
+                    >
+                      <RefreshCw className={cn("size-3", fetchingModels && "animate-spin text-primary")} />
+                      <span>Fetch</span>
+                    </Button>
+                  </div>
+                  <div className="relative">
+                    <Input
+                      id="model-name"
+                      type="text"
+                      list="models-list"
+                      placeholder="google/gemini-2.5-flash"
+                      value={modelName}
+                      onChange={handleModelChange}
+                      className="font-mono text-xs w-full bg-muted/20"
+                    />
+                    {availableModels.length > 0 && (
+                      <datalist id="models-list">
+                        {availableModels.map(m => <option key={m} value={m} />)}
+                      </datalist>
+                    )}
+                  </div>
+                  {modelFetchError ? (
+                    <p className="text-[11px] text-destructive flex items-center gap-1">
+                      <AlertCircle className="size-3" /> {modelFetchError}
+                    </p>
+                  ) : (
+                    <p className="text-[11px] text-muted-foreground">
+                      Recommended: <code className="bg-muted px-1 py-0.5 rounded text-[10px]">google/gemini-2.5-flash</code>
+                    </p>
+                  )}
+                </div>
+              </div>
+
+              {/* API Key */}
+              <div className="flex flex-col gap-1.5 pt-3 border-t border-border/40">
+                <label htmlFor="openai-api-key" className="text-xs font-semibold flex items-center gap-1.5 text-foreground">
+                  <Key className="size-3.5 text-primary" />
+                  <span>OpenRouter / OpenAI API Key</span>
+                </label>
+                <div className="relative">
+                  <Input
+                    id="openai-api-key"
+                    type={showApiKey ? "text" : "password"}
+                    placeholder="sk-or-v1-..."
+                    value={apiKey}
+                    onChange={handleKeyChange}
+                    className="font-mono text-xs pr-9 bg-muted/20"
+                  />
+                  <button
+                    type="button"
+                    onClick={() => setShowApiKey(!showApiKey)}
+                    className="absolute right-2.5 top-1/2 -translate-y-1/2 text-muted-foreground hover:text-foreground"
+                    title={showApiKey ? "Hide key" : "Show key"}
+                  >
+                    {showApiKey ? <EyeOff className="size-3.5" /> : <Eye className="size-3.5" />}
+                  </button>
+                </div>
+                <p className="text-[11px] text-muted-foreground">
+                  Stored securely on this local device only. Providing an OpenRouter key enables live account spend metrics.
+                </p>
+              </div>
+            </div>
+
+            {/* Live OpenRouter Usage & Historical Spend Dashboard */}
+            <UsageDashboard apiKey={apiKey} />
+          </div>
+        )}
+
+        {/* ════════════════ TAB 2: CURRICULUM TAXONOMY ════════════════ */}
+        {activeTab === "taxonomy" && (
+          <div className="rounded-xl border border-border/70 bg-card p-6 shadow-xs animate-in fade-in-50 duration-150">
+            <TaxonomyManager />
+          </div>
+        )}
+
+        {/* ════════════════ TAB 3: BACKUP & MAINTENANCE ════════════════ */}
+        {activeTab === "backup_danger" && (
+          <div className="flex flex-col gap-6 animate-in fade-in-50 duration-150">
+            {/* Backup & Restore */}
+            <div className="flex flex-col gap-4 rounded-xl border border-border/70 bg-card p-6 shadow-xs">
+              <div className="border-b border-border/60 pb-3">
+                <h2 className="text-sm font-bold flex items-center gap-2 text-foreground">
+                  <Archive className="size-4 text-primary" />
+                  Repository Backup &amp; Migration
+                </h2>
+                <p className="text-xs text-muted-foreground mt-0.5">
+                  Export all extracted questions, mark schemes, and cropped diagrams to a compressed zip bundle.
+                </p>
+              </div>
+
+              {!pendingImport ? (
+                <div className="flex flex-wrap gap-2.5 pt-1">
+                  <Button
+                    variant="outline"
+                    className="gap-2 text-xs font-medium"
+                    onClick={handleExportBackup}
+                    disabled={backupBusy !== null}
+                  >
+                    <Download className="size-3.5 text-primary" />
+                    <span>{backupBusy === "export" ? "Exporting..." : "Export Full Backup"}</span>
+                  </Button>
+                  <Button
+                    variant="outline"
+                    className="gap-2 text-xs font-medium"
+                    onClick={handlePickBackup}
+                    disabled={backupBusy !== null}
+                  >
+                    <Upload className="size-3.5 text-blue-500" />
+                    <span>{backupBusy === "import" ? "Reading..." : "Import Backup File"}</span>
+                  </Button>
+                </div>
+              ) : (
+                <div className="flex flex-col gap-3 bg-muted/20 p-4 rounded-xl border border-border/60">
+                  <p className="text-xs font-semibold text-foreground">Ready to import backup</p>
+                  <p className="text-xs text-muted-foreground">
+                    Created on{" "}
+                    <span className="font-medium text-foreground">
+                      {new Date(pendingImport.preview.exportedAt * 1000).toLocaleString()}
+                    </span>{" "}
+                    · {pendingImport.preview.questionCount} questions · {pendingImport.preview.imageCount} diagrams
+                  </p>
+
+                  <label className="flex items-start gap-2 text-xs cursor-pointer mt-1">
+                    <input
+                      type="radio"
+                      name="import-mode"
+                      className="mt-0.5 accent-primary"
+                      checked={importMode === "merge"}
+                      onChange={() => setImportMode("merge")}
+                    />
+                    <span>
+                      <span className="font-semibold">Merge</span>
+                      <span className="block text-[11px] text-muted-foreground">
+                        Add new questions and update existing ones. Safe (recommended).
+                      </span>
+                    </span>
+                  </label>
+
+                  <label className="flex items-start gap-2 text-xs cursor-pointer">
+                    <input
+                      type="radio"
+                      name="import-mode"
+                      className="mt-0.5 accent-destructive"
+                      checked={importMode === "replace"}
+                      onChange={() => setImportMode("replace")}
+                    />
+                    <span>
+                      <span className="font-semibold text-destructive">Replace entire library</span>
+                      <span className="block text-[11px] text-muted-foreground">
+                        Permanently wipe your current repository and replace it with this backup.
+                      </span>
+                    </span>
+                  </label>
+
+                  {importMode === "replace" && (
+                    <div className="flex flex-col gap-2 mt-2 p-3 bg-destructive/10 rounded-lg border border-destructive/20 text-xs">
+                      <p className="text-destructive font-medium">
+                        Type <code className="bg-destructive/20 px-1 py-0.5 rounded text-destructive select-all">{REQUIRED_REPLACE_PHRASE}</code> to confirm:
+                      </p>
+                      <Input
+                        type="text"
+                        placeholder="Type the confirmation phrase"
+                        value={replaceInput}
+                        onChange={(e) => setReplaceInput(e.target.value)}
+                        className="text-xs"
+                      />
+                    </div>
+                  )}
+
+                  <div className="flex gap-2 justify-end mt-2 pt-2 border-t border-border/40">
+                    <Button
+                      variant="ghost"
+                      size="sm"
+                      onClick={() => {
+                        setPendingImport(null);
+                        setReplaceInput("");
+                      }}
+                      disabled={backupBusy !== null}
+                      className="text-xs"
+                    >
+                      Cancel
+                    </Button>
+                    <Button
+                      variant={importMode === "replace" ? "destructive" : "default"}
+                      size="sm"
+                      onClick={handleImportBackup}
+                      disabled={backupBusy !== null || (importMode === "replace" && replaceInput !== REQUIRED_REPLACE_PHRASE)}
+                      className="text-xs font-semibold"
+                    >
+                      {backupBusy === "import" ? "Restoring..." : importMode === "replace" ? "Replace Library" : "Merge Library"}
+                    </Button>
+                  </div>
+                </div>
+              )}
+            </div>
+
+            {/* Particle Splash Screen Preview */}
+            <div className="flex flex-col gap-3 rounded-xl border border-border/70 bg-card p-6 shadow-xs">
+              <div className="border-b border-border/60 pb-3">
+                <h2 className="text-sm font-bold flex items-center gap-2 text-foreground">
+                  <Sparkles className="size-4 text-amber-500" />
+                  Intro Screen Preview
+                </h2>
+                <p className="text-xs text-muted-foreground mt-0.5">
+                  Launch the animated startup particle screen.
+                </p>
+              </div>
               <Button
-                variant="ghost"
+                variant="outline"
                 size="sm"
-                onClick={() => setPendingImport(null)}
-                disabled={backupBusy !== null}
+                className="w-fit text-xs gap-2"
+                onClick={() => setShowSplashPreview(true)}
               >
-                Cancel
+                <Sparkles className="size-3.5 text-amber-500" />
+                <span>Launch Splash Screen</span>
               </Button>
-              <Button
-                variant={importMode === "replace" ? "destructive" : "default"}
-                size="sm"
-                disabled={
-                  backupBusy !== null ||
-                  (importMode === "replace" && replaceInput !== REQUIRED_REPLACE_PHRASE)
-                }
-                onClick={handleImportBackup}
-              >
-                {backupBusy === "import"
-                  ? "Importing..."
-                  : importMode === "replace"
-                    ? "Replace library with backup"
-                    : "Merge into library"}
-              </Button>
+            </div>
+
+            {/* Danger Zone: Clear Repository */}
+            <div className="flex flex-col gap-4 rounded-xl border border-destructive/40 bg-destructive/5 p-6 shadow-xs">
+              <div className="flex items-center gap-2 text-destructive border-b border-destructive/20 pb-3">
+                <ShieldAlert className="size-4" />
+                <h2 className="text-sm font-bold">Danger Zone</h2>
+              </div>
+              <p className="text-xs text-muted-foreground">
+                Permanently purge all questions, answers, and cached extractions in the SQLite repository. This action cannot be undone.
+              </p>
+
+              {!confirmingClear ? (
+                <Button 
+                  variant="outline" 
+                  size="sm" 
+                  className="w-fit text-destructive hover:bg-destructive/10 hover:text-destructive border-destructive/30 gap-2 text-xs font-semibold"
+                  onClick={() => setConfirmingClear(true)}
+                >
+                  <Trash2 className="size-3.5" />
+                  <span>Clear All Questions</span>
+                </Button>
+              ) : (
+                <div className="flex flex-col gap-3 bg-background p-4 rounded-xl border border-destructive/30 text-xs">
+                  <p className="text-xs font-medium text-foreground">
+                    Type <code className="bg-muted px-1.5 py-0.5 rounded text-destructive select-all">{REQUIRED_CLEAR_PHRASE}</code> below to confirm:
+                  </p>
+                  <Input
+                    type="text"
+                    placeholder="Type the phrase above"
+                    value={clearInput}
+                    onChange={(e) => setClearInput(e.target.value)}
+                    className="text-xs"
+                  />
+                  <div className="flex gap-2 justify-end mt-1">
+                    <Button 
+                      variant="ghost" 
+                      size="sm"
+                      onClick={() => {
+                        setConfirmingClear(false);
+                        setClearInput("");
+                      }}
+                      disabled={clearing}
+                      className="text-xs"
+                    >
+                      Cancel
+                    </Button>
+                    <Button 
+                      variant="destructive" 
+                      size="sm" 
+                      disabled={clearInput !== REQUIRED_CLEAR_PHRASE || clearing}
+                      onClick={handleClearRepository}
+                      className="text-xs font-semibold"
+                    >
+                      {clearing ? "Deleting..." : "Permanently Delete All"}
+                    </Button>
+                  </div>
+                </div>
+              )}
             </div>
           </div>
         )}
-      </div>
-
-      <TaxonomyManager />
-
-      <div className="w-full max-w-md flex flex-col gap-4 rounded-2xl border border-destructive/30 bg-destructive/5 p-6 shadow-sm mb-12">
-        <h2 className="text-sm font-bold text-destructive flex items-center gap-2">
-          <AlertTriangle className="size-4" />
-          Settings
-        </h2>
-
-        {/* Appearance & Branding */}
-        <div className="flex flex-col gap-2 pt-4 border-t border-border/40">
-          <div className="flex items-center justify-between">
-            <div>
-              <p className="text-xs font-semibold text-foreground">Launch Splash Screen</p>
-              <p className="text-xs text-muted-foreground">
-                Preview the native MergeMark startup screen and logo animation.
-              </p>
-            </div>
-            <Button
-              variant="outline"
-              size="sm"
-              onClick={() => setShowSplashPreview(true)}
-              className="gap-1.5 text-xs"
-            >
-              <Sparkles className="size-3.5 text-primary" />
-              Preview Splash
-            </Button>
-          </div>
-        </div>
-
-        {/* Delete All Data */}
-        <div className="flex flex-col gap-2 pt-4 border-t border-border/40">
-          <div className="flex items-center justify-between">
-            <div>
-              <p className="text-xs font-semibold text-destructive">Danger Zone</p>
-              <p className="text-xs text-muted-foreground">
-                Permanently delete all questions and diagrams from the local SQLite database.
-              </p>
-            </div>
-          </div>
-          
-          {!confirmingClear ? (
-            <Button 
-              variant="outline" 
-              size="sm" 
-              className="w-fit text-destructive hover:bg-destructive/10 hover:text-destructive border-destructive/30 gap-2 text-xs"
-              onClick={() => setConfirmingClear(true)}
-            >
-              <Trash2 className="size-4" />
-              Clear Repository
-            </Button>
-          ) : (
-            <div className="flex flex-col gap-3 mt-2 bg-background p-4 rounded-xl border border-destructive/20">
-              <p className="text-xs font-medium text-foreground">
-                Type <code className="bg-muted px-1.5 py-0.5 rounded text-destructive select-all">{REQUIRED_CLEAR_PHRASE}</code> below to confirm.
-              </p>
-              <Input
-                type="text"
-                placeholder="Type the phrase above"
-                value={clearInput}
-                onChange={(e) => setClearInput(e.target.value)}
-                onPaste={(e) => e.preventDefault()}
-                onDrop={(e) => e.preventDefault()}
-                className="text-xs"
-              />
-              <div className="flex gap-2 justify-end mt-1">
-                <Button 
-                  variant="ghost" 
-                  size="sm"
-                  onClick={() => {
-                    setConfirmingClear(false);
-                    setClearInput("");
-                  }}
-                  disabled={clearing}
-                >
-                  Cancel
-                </Button>
-                <Button 
-                  variant="destructive" 
-                  size="sm"
-                  disabled={clearInput !== REQUIRED_CLEAR_PHRASE || clearing}
-                  onClick={handleClearRepository}
-                >
-                  {clearing ? "Deleting..." : "Permanently Delete All"}
-                </Button>
-              </div>
-            </div>
-          )}
-        </div>
       </div>
 
       {showSplashPreview && (

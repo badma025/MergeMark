@@ -428,6 +428,92 @@ pub fn harden_line_breaks(content: &str) -> String {
     re(r"\n{3,}").replace_all(&out, "\n\n").to_string()
 }
 
+static RE_TWO_BLOCK_LINE: LazyLock<regex::Regex> = LazyLock::new(|| {
+    regex::Regex::new(r"^([a-zA-Z0-9\\+\-*/()_^{} \t]*?\\(?:cos|sin|tan|sec|csc|cot|theta|frac|sqrt|pi|lambda|alpha|beta)\b[a-zA-Z0-9\\+\-*/()_^{} \t]*?)\$,\s*(?:\\quad\s*)?\$([^\n\$]+?)\$([.,]?)$").unwrap()
+});
+
+static RE_SINGLE_BLOCK_LINE: LazyLock<regex::Regex> = LazyLock::new(|| {
+    regex::Regex::new(r"^([a-zA-Z0-9\\+\-*/()_^{} \t]*?\\(?:cos|sin|tan|sec|csc|cot|theta|frac|sqrt|pi|lambda|alpha|beta|leq|le|geq|ge|quad)\b[^\n\$]+?)\$([.,]?)$").unwrap()
+});
+
+static RE_HAS_POLAR_PREAMBLE: LazyLock<regex::Regex> = LazyLock::new(|| {
+    regex::Regex::new(r"(?i)polar\s+equations?|cardioid|spiral\s+curve|curve(?:\s+\$?[A-Z]\$?)?\s+with\s+polar").unwrap()
+});
+
+static RE_MULTI_CURVE_COMMA: LazyLock<regex::Regex> = LazyLock::new(|| {
+    regex::Regex::new(r"\$,\s*([0-9a-zA-Z\\+\-*/()_^{} \t]+?\\(?:cos|sin|tan|sec|csc|cot|theta|frac|sqrt|pi)\b[0-9a-zA-Z\\+\-*/()_^{} \t]*?)\$,\s*(?:\\quad\s*)?\$([^\n\$]+?)\$").unwrap()
+});
+
+static RE_MULTI_CURVE_CONST: LazyLock<regex::Regex> = LazyLock::new(|| {
+    regex::Regex::new(r"\$,\s*([0-9.]+)\$,\s*(?:\\quad\s*)?\$([^\n\$]+?)\$").unwrap()
+});
+
+pub fn heal_polar_equations(content: &str) -> String {
+    let lines: Vec<&str> = content.lines().collect();
+    let mut result: Vec<String> = Vec::with_capacity(lines.len());
+
+    for (i, line) in lines.iter().enumerate() {
+        let trimmed = line.trim();
+        let prev_line = if i > 0 { lines[i - 1].trim() } else { "" };
+        let prev2_line = if i > 1 { lines[i - 2].trim() } else { "" };
+        let has_polar_preamble = RE_HAS_POLAR_PREAMBLE.is_match(prev_line) || RE_HAS_POLAR_PREAMBLE.is_match(prev2_line);
+
+        if !trimmed.starts_with('$') && !trimmed.starts_with("$$") && !trimmed.is_empty() {
+            if let Some(caps) = RE_TWO_BLOCK_LINE.captures(trimmed) {
+                let expr = caps[1].trim();
+                let domain = caps[2].trim();
+                let punct = caps.get(3).map(|m| m.as_str()).unwrap_or("");
+                let has_theta = expr.contains("\\theta") || domain.contains("\\theta") || has_polar_preamble;
+                let prefix = if has_theta && !expr.starts_with("r =") && !expr.starts_with("r=") {
+                    "r = "
+                } else {
+                    ""
+                };
+                result.push(format!("$${}{}, \\quad {}$${}", prefix, expr, domain, punct));
+                continue;
+            }
+
+            if let Some(caps) = RE_SINGLE_BLOCK_LINE.captures(trimmed) {
+                let mut expr = caps[1].trim().to_string();
+                let mut punct = caps.get(2).map(|m| m.as_str()).unwrap_or("").to_string();
+                if expr.ends_with('.') || expr.ends_with(',') {
+                    let trailing = expr.pop().unwrap();
+                    punct.insert(0, trailing);
+                    expr = expr.trim().to_string();
+                }
+                let has_theta = expr.contains("\\theta") || has_polar_preamble;
+                let prefix = if has_theta && !expr.starts_with("r =") && !expr.starts_with("r=") {
+                    "r = "
+                } else {
+                    ""
+                };
+                result.push(format!("$${}{}$${}", prefix, expr, punct));
+                continue;
+            }
+
+            if has_polar_preamble && (trimmed.contains("\\cos") || trimmed.contains("\\sin") || trimmed.contains("\\theta") || trimmed.contains("\\frac")) && !trimmed.contains('$') {
+                let prefix = if !trimmed.starts_with("r =") && !trimmed.starts_with("r=") { "r = " } else { "" };
+                result.push(format!("$${}{}$$", prefix, trimmed));
+                continue;
+            }
+        }
+
+        let mut fixed_line = RE_MULTI_CURVE_COMMA.replace_all(line, |caps: &regex::Captures| {
+            let expr = caps[1].trim();
+            let domain = caps[2].trim();
+            if expr.starts_with("r =") || expr.starts_with("r=") || expr.starts_with('$') {
+                format!("$, {}, ${}$", expr, domain)
+            } else {
+                format!("$$ and $$r = {}, \\quad {}$$", expr, domain)
+            }
+        }).to_string();
+        fixed_line = RE_MULTI_CURVE_CONST.replace_all(&fixed_line, "$$ and $$r = $1, \\quad $2$$").to_string();
+        result.push(fixed_line);
+    }
+
+    result.join("\n")
+}
+
 pub fn clean_question_content(content: &str) -> String {
     let patterns: &[&str] = &[
         r"(?i)Question\s+\d+\s+continued",
@@ -452,6 +538,9 @@ pub fn clean_question_content(content: &str) -> String {
     // Strip trailing equality answer templates (e.g., "$... x = ...$ [2 marks]")
     cleaned = EQ_RE.replace_all(&cleaned, "$1").into_owned();
 
+    // Heal dropped 'r = ' in polar equations and unbalanced delimiters
+    cleaned = heal_polar_equations(&cleaned);
+
     // Collapse runs of 3+ newlines left by removals.
     let collapse = re(r"\n{3,}");
     let collapsed = collapse.replace_all(&cleaned, "\n\n").trim().to_string();
@@ -465,13 +554,10 @@ static RE_MATH_DEGREE: LazyLock<regex::Regex> = LazyLock::new(|| {
     regex::Regex::new(r"(\d+)\s*(?:◦|°|\\circ\b)").unwrap()
 });
 static RE_FLATTENED_POWERS: LazyLock<regex::Regex> = LazyLock::new(|| {
-    regex::Regex::new(r"(\b|\d|[+\-*/=(])([a-zA-Z])\s+([2-9])\b").unwrap()
+    regex::Regex::new(r"(\b|\d|[+\-*/=(])([xyzvtuvrXYZVTUR])\s+([2-9])\b").unwrap()
 });
 static RE_FLATTENED_POWERS_TIGHT: LazyLock<regex::Regex> = LazyLock::new(|| {
     regex::Regex::new(r"(\b|\d|[+\-*/=(]|[a-zA-Z])([xyzvtuvrABCDEFXYZ])([2-9])(?:\b|[\+\-\=\*\/\,\;\)\.]|\s*$)").unwrap()
-});
-static RE_TRIG_POWERS: LazyLock<regex::Regex> = LazyLock::new(|| {
-    regex::Regex::new(r"(?i)\b(sin|cos|tan|sec|csc|cot)\s*([2-9])\s*([a-zA-Z\\α-ωΑ-Ω]+)").unwrap()
 });
 static RE_RATIO_FRACTIONS: LazyLock<regex::Regex> = LazyLock::new(|| {
     regex::Regex::new(r"([a-zA-Z0-9\+\-]+)\s+([0-9\-]+)\s*=\s*([a-zA-Z0-9\+\-]+)\s+([0-9\-]+)").unwrap()
@@ -501,24 +587,80 @@ static RE_OCR_MONTHS: LazyLock<regex::Regex> = LazyLock::new(|| {
     regex::Regex::new(r"(?i)\b(\d+)\s*m\s*o\s*n\s*t\s*h\s*s?\b").unwrap()
 });
 static RE_OCR_MAMMALS: LazyLock<regex::Regex> = LazyLock::new(|| {
-    regex::Regex::new(r"(?i)\bm\s*a\s*m\s*m\s*a\s*l\s*s?\b").unwrap()
+    regex::Regex::new(r"(?i)\bm\s+a\s+m\s+m\s+a\s+l\s*s?\b").unwrap()
 });
 static RE_OCR_SHOWS: LazyLock<regex::Regex> = LazyLock::new(|| {
-    regex::Regex::new(r"(?i)\bs\s*h\s*o\s*w\s*s?\b").unwrap()
+    regex::Regex::new(r"(?i)\bs\s+h\s+o\s+w\s*s?\b").unwrap()
 });
 static RE_OCR_FIGURE: LazyLock<regex::Regex> = LazyLock::new(|| {
-    regex::Regex::new(r"(?i)\bf\s*i\s*g\s*u\s*r\s*e\b").unwrap()
+    regex::Regex::new(r"(?i)\bf\s+i\s+g\s+u\s+r\s+e\b").unwrap()
 });
 static RE_OCR_EQUATION: LazyLock<regex::Regex> = LazyLock::new(|| {
-    regex::Regex::new(r"(?i)\be\s*q\s*u\s*a\s*t\s*i\s*o\s*n\b").unwrap()
+    regex::Regex::new(r"(?i)\be\s+q\s+u\s+a\s+t\s+i\s+o\s+n\b").unwrap()
 });
 static RE_OCR_POPULATION: LazyLock<regex::Regex> = LazyLock::new(|| {
-    regex::Regex::new(r"(?i)\bp\s*o\s*p\s*u\s*l\s*a\s*t\s*i\s*o\s*n\b").unwrap()
+    regex::Regex::new(r"(?i)\bp\s+o\s+p\s+u\s+l\s+a\s+t\s+i\s+o\s+n\b").unwrap()
+});
+static RE_MATRIX_TRAILING_DOLLAR: LazyLock<regex::Regex> = LazyLock::new(|| {
+    regex::Regex::new(r"(\\end\{(?:pmatrix|bmatrix|matrix|vmatrix|array)\})\$([^\$]|\z)").unwrap()
+});
+
+// Markdown -> LaTeX formatting regexes
+static RE_MATH_BLOCK: LazyLock<regex::Regex> = LazyLock::new(|| {
+    regex::Regex::new(r"(?s)(\$\$.*?\$\$|\\\[.*?\\\]|\$[^\$\n]+?\$)").unwrap()
+});
+static RE_BARE_MATRIX: LazyLock<regex::Regex> = LazyLock::new(|| {
+    regex::Regex::new(r"(?s)\\begin\{(?:pmatrix|bmatrix|matrix|vmatrix|array)\}.*?\\end\{(?:pmatrix|bmatrix|matrix|vmatrix|array)\}(?:\s*\\text\{[^\n\$]*\}[^\n\$]*\$|\s*\$)?").unwrap()
+});
+static RE_BARE_EQ_LINE: LazyLock<regex::Regex> = LazyLock::new(|| {
+    regex::Regex::new(r"(?m)^[ \t]*(\\(?:tan|sin|cos|frac)\b[^\n]+)$").unwrap()
+});
+static RE_LATEX_LIST_ITEM: LazyLock<regex::Regex> = LazyLock::new(|| {
+    regex::Regex::new(r"(?m)^[ \t]*[\*\-]\s+(.*)").unwrap()
+});
+static RE_SAFE_BOLD: LazyLock<regex::Regex> = LazyLock::new(|| {
+    regex::Regex::new(r"\*\*([^*\n]+?)\*\*").unwrap()
+});
+static RE_SAFE_ITALIC: LazyLock<regex::Regex> = LazyLock::new(|| {
+    regex::Regex::new(r"(^|[\s(])\*([^*\n]+?)\*([\s\),.:;!?]|\z)").unwrap()
+});
+static RE_SUBPART_DOUBLE: LazyLock<regex::Regex> = LazyLock::new(|| {
+    regex::Regex::new(r"(?m)^[ \t]*\(([a-h])\)\s*\(([a-h])\)[ \t]+(.*)").unwrap()
+});
+static RE_SUBPART_ROMAN: LazyLock<regex::Regex> = LazyLock::new(|| {
+    regex::Regex::new(r"(?m)^[ \t]*\((i|ii|iii|iv|v|vi|vii|viii|ix|x)\)[ \t]+(.*)").unwrap()
+});
+static RE_SUBPART_ALPHA_PAREN: LazyLock<regex::Regex> = LazyLock::new(|| {
+    regex::Regex::new(r"(?m)^[ \t]*\(([a-h])\)[ \t]+(.*)").unwrap()
+});
+static RE_SUBPART_ALPHA_UNPAREN: LazyLock<regex::Regex> = LazyLock::new(|| {
+    regex::Regex::new(r"(?m)^[ \t]*([a-h])\)[ \t]+(.*)").unwrap()
+});
+static RE_MARKDOWN_IMG_SAFE: LazyLock<regex::Regex> = LazyLock::new(|| {
+    regex::Regex::new(r"!\[.*?\]\((.*?)\)").unwrap()
+});
+static RE_LATEX_MULTIPLE_NL_SAFE: LazyLock<regex::Regex> = LazyLock::new(|| {
+    regex::Regex::new(r"\n{3,}").unwrap()
+});
+static RE_LATEX_LEADING_NUM_SAFE: LazyLock<regex::Regex> = LazyLock::new(|| {
+    regex::Regex::new(r"^\s*\d+[\.\)\-\s]*").unwrap()
+});
+static RE_LATEX_INLINE_MARKS_SAFE: LazyLock<regex::Regex> = LazyLock::new(|| {
+    regex::Regex::new(r"(?i)(?:\*{0,2}[\[\(]\s*(\d+)\s*m\s*a\s*r\s*k\s*s?\s*[\]\)]\*{0,2}|\b(\d+)\s*m\s*a\s*r\s*k\s*s?\s*(?:\]|\)|$))").unwrap()
+});
+static RE_MARK_TAG_GENERAL: LazyLock<regex::Regex> = LazyLock::new(|| {
+    regex::Regex::new(r"(?i)(?:\*{0,2}[\[\(]\s*(\d+)\s*m\s*a\s*r\s*k\s*s?\s*[\]\)]\*{0,2})").unwrap()
+});
+static RE_SUBPART_SPLIT: LazyLock<regex::Regex> = LazyLock::new(|| {
+    regex::Regex::new(r"(?m)^[ \t]*(\((?:[a-hA-H]|\d+|i|ii|iii|iv|v|vi|vii|viii|ix|x)\)|(?:[a-hA-H]|\d+|i|ii|iii|iv|v|vi|vii|viii|ix|x)\))[ \t]+").unwrap()
+});
+static RE_COLLAPSE_SPACES: LazyLock<regex::Regex> = LazyLock::new(|| {
+    regex::Regex::new(r"[ \t]{2,}").unwrap()
 });
 
 /// Comprehensive sanitization for LaTeX & Math export:
-/// Repairs fractions, flattened powers (x 2 -> x^2), trig exponents (sin2α -> \sin^2\alpha),
-/// degree signs (90◦ -> 90^\circ), large bracket artifacts, and unicode math symbols.
+/// Repairs fractions, flattened powers (x 2 -> x^2), degree signs (90◦ -> 90^\circ),
+/// large bracket artifacts, and unicode math symbols using \ensuremath.
 pub fn sanitize_for_latex(content: &str) -> String {
     if content.trim().is_empty() {
         return String::new();
@@ -536,31 +678,13 @@ pub fn sanitize_for_latex(content: &str) -> String {
     text = RE_OCR_EQUATION.replace_all(&text, "equation").to_string();
     text = RE_OCR_POPULATION.replace_all(&text, "population").to_string();
 
+    // Strip rogue single closing $ right after \end{...matrix}$
+    text = RE_MATRIX_TRAILING_DOLLAR.replace_all(&text, "${1}${2}").to_string();
+
     // 1. Repair degree signs: 90◦ -> 90^\circ
     text = RE_MATH_DEGREE.replace_all(&text, r"${1}^\circ").to_string();
 
-    // 2. Unicode Math Symbols to standard LaTeX
-    text = text.replace("∈", r"\in ")
-               .replace("ℝ", r"\mathbb{R}")
-               .replace("≤", r"\le ")
-               .replace("≥", r"\ge ")
-               .replace("≠", r"\ne ")
-               .replace("×", r"\times ")
-               .replace("·", r"\cdot ")
-               .replace("√", r"\sqrt")
-               .replace("α", r"\alpha")
-               .replace("β", r"\beta")
-               .replace("γ", r"\gamma")
-               .replace("θ", r"\theta")
-               .replace("λ", r"\lambda")
-               .replace("μ", r"\mu")
-               .replace("π", r"\pi")
-               .replace("σ", r"\sigma")
-               .replace("ω", r"\omega")
-               .replace("φ", r"\phi")
-               .replace("ϕ", r"\phi");
-
-    // 3. Clean up large bracket unicode noise from OCR/LLM
+    // 2. Clean up large bracket unicode noise from OCR/LLM
     text = text.replace("(︂", "(")
                .replace(")︂", ")")
                .replace("[︂", "[")
@@ -574,16 +698,16 @@ pub fn sanitize_for_latex(content: &str) -> String {
                .replace("⎞", ")")
                .replace("⎠", ")");
 
-    // 4. Repair shattered calculus notation:
+    // 3. Repair shattered calculus notation:
     // e.g. "d \n 2 \n θ \n dt \n 2" -> "\frac{d^2\theta}{dt^2}", "d \n y \n dx" -> "\frac{dy}{dx}"
     text = RE_SHATTERED_CALCULUS_2ND.replace_all(&text, |caps: &regex::Captures| {
-        format!("\\frac{{d^2 {}}}{{d{}^2}}", &caps[1], &caps[2])
+        format!("\\frac{{d^2 {}}}{{d{}^2}}", caps[1].trim(), caps[2].trim())
     }).to_string();
     text = RE_SHATTERED_CALCULUS_1ST.replace_all(&text, |caps: &regex::Captures| {
-        format!("\\frac{{d{}}}{{d{}}}", &caps[1], &caps[2])
+        format!("\\frac{{d{}}}{{d{}}}", caps[1].trim(), caps[2].trim())
     }).to_string();
 
-    // 5. Repair vertically collapsed fractions:
+    // 4. Repair vertically collapsed fractions:
     // e.g. "1 \n 2 \n a" -> "\frac{1}{2}a", "20 \n 3 ms-1" -> "\frac{20}{3} \text{ms}^{-1}"
     text = RE_VERT_COLLAPSED_FRAC.replace_all(&text, |caps: &regex::Captures| {
         format!("\\frac{{{}}}{{{}}}{}", &caps[1], &caps[2], &caps[3])
@@ -592,7 +716,7 @@ pub fn sanitize_for_latex(content: &str) -> String {
         format!("\\frac{{{}}}{{{}}} \\text{{{}}}", &caps[1], &caps[2], &caps[3])
     }).to_string();
 
-    // 6. Text De-mashing: e.g. "2kgand4kgrespectively" -> "2 \text{kg} and 4 \text{kg} respectively"
+    // 5. Text De-mashing: e.g. "2kgand4kgrespectively" -> "2 \text{kg} and 4 \text{kg} respectively"
     text = RE_DEMASH_NUM_UNIT_WORD.replace_all(&text, |caps: &regex::Captures| {
         let num = caps.get(1).or_else(|| caps.get(4)).map(|m| m.as_str()).unwrap_or("");
         let unit = caps.get(2).or_else(|| caps.get(5)).map(|m| m.as_str()).unwrap_or("");
@@ -600,24 +724,232 @@ pub fn sanitize_for_latex(content: &str) -> String {
         format!("{} \\text{{ {} }} {} ", num, unit, word)
     }).to_string();
 
-    // 7. Repair trig exponents: "sin2α" -> "\sin^2\alpha", "cos 2 x" -> "\cos^2 x"
-    text = RE_TRIG_POWERS.replace_all(&text, |caps: &regex::Captures| {
-        let func = &caps[1];
-        let exp = &caps[2];
-        let arg = &caps[3];
-        format!("\\{}^{{{}}} {}", func.to_lowercase(), exp, arg)
-    }).to_string();
-
-    // 8. Repair flattened powers: e.g. "2x 3" -> "2x^3", "ax2" -> "ax^2", "y 2" -> "y^2", "z 3" -> "z^3"
+    // 6. Repair flattened powers for math variables: e.g. "2x 3" -> "2x^3", "ax2" -> "ax^2", "y 2" -> "y^2", "z 3" -> "z^3"
     text = RE_FLATTENED_POWERS.replace_all(&text, r"${1}${2}^${3}").to_string();
     text = RE_FLATTENED_POWERS_TIGHT.replace_all(&text, r"${1}${2}^${3}").to_string();
 
-    // 9. Repair ratio symmetric fractions: "x+5 1 = y+4 -3" -> "\frac{x+5}{1} = \frac{y+4}{-3}"
+    // 7. Repair ratio symmetric fractions: "x+5 1 = y+4 -3" -> "\frac{x+5}{1} = \frac{y+4}{-3}"
     text = RE_RATIO_FRACTIONS.replace_all(&text, |caps: &regex::Captures| {
         format!("\\frac{{{}}}{{{}}} = \\frac{{{}}}{{{}}}", &caps[1], &caps[2], &caps[3], &caps[4])
     }).to_string();
 
+    // 8. Unicode Math Symbols to standard LaTeX using \ensuremath (safe in text AND math mode)
+    text = text.replace("∈", r"\ensuremath{\in}")
+               .replace("ℝ", r"\ensuremath{\mathbb{R}}")
+               .replace("ℕ", r"\ensuremath{\mathbb{N}}")
+               .replace("≤", r"\ensuremath{\le}")
+               .replace("≥", r"\ensuremath{\ge}")
+               .replace("≠", r"\ensuremath{\ne}")
+               .replace("×", r"\ensuremath{\times}")
+               .replace("·", r"\ensuremath{\cdot}")
+               .replace("√", r"\ensuremath{\sqrt}")
+               .replace("α", r"\ensuremath{\alpha}")
+               .replace("β", r"\ensuremath{\beta}")
+               .replace("γ", r"\ensuremath{\gamma}")
+               .replace("θ", r"\ensuremath{\theta}")
+               .replace("λ", r"\ensuremath{\lambda}")
+               .replace("μ", r"\ensuremath{\mu}")
+               .replace("π", r"\ensuremath{\pi}")
+               .replace("σ", r"\ensuremath{\sigma}")
+               .replace("ω", r"\ensuremath{\omega}")
+               .replace("φ", r"\ensuremath{\phi}")
+               .replace("ϕ", r"\ensuremath{\phi}");
+
     text
+}
+
+/// Helper function to format non-math text segments for LaTeX export
+fn process_non_math_latex(content: &str) -> String {
+    let mut t = content.to_string();
+
+    // Clean bare matrix wrapping in text mode
+    t = RE_BARE_MATRIX.replace_all(&t, |caps: &regex::Captures| {
+        let mut raw = caps.get(0).unwrap().as_str().trim();
+        while raw.ends_with('$') {
+            raw = raw[..raw.len() - 1].trim();
+        }
+        format!("\\[ {} \\]\n", raw)
+    }).to_string();
+
+    // Auto-wrap bare equation lines with \tan, \sin, \cos, \frac if isolated
+    t = RE_BARE_EQ_LINE.replace_all(&t, r"\[ ${1} \]").to_string();
+
+    // Convert markdown bullet lists (* item or - item)
+    t = RE_LATEX_LIST_ITEM.replace_all(&t, r"\par\textbullet\hspace{0.5em}${1}").to_string();
+
+    // Markdown Bold (**text**)
+    t = RE_SAFE_BOLD.replace_all(&t, r"\textbf{${1}}").to_string();
+
+    // Markdown Italic (*text*)
+    t = RE_SAFE_ITALIC.replace_all(&t, "${1}\\textit{${2}}${3}").to_string();
+
+    // Subpart tagging with automatic spatial-awareness constraints (\needspace prevents splitting across pages)
+    t = RE_SUBPART_DOUBLE.replace_all(&t, r"\par\needspace{2.5cm}\vspace{0.3cm}\noindent\textbf{(${1})}\hspace{0.5em}(${2}) ${3}").to_string();
+    t = RE_SUBPART_ROMAN.replace_all(&t, r"\par\needspace{2.5cm}\vspace{0.25cm}\noindent\hspace*{1.8em}\textbf{(${1})}\hspace{0.5em}${2}").to_string();
+    t = RE_SUBPART_ALPHA_PAREN.replace_all(&t, r"\par\needspace{2.5cm}\vspace{0.3cm}\noindent\textbf{(${1})}\hspace{0.5em}${2}").to_string();
+    t = RE_SUBPART_ALPHA_UNPAREN.replace_all(&t, r"\par\needspace{2.5cm}\vspace{0.3cm}\noindent\textbf{(${1})}\hspace{0.5em}${2}").to_string();
+
+    // Images with keep-with-next spatial glue
+    t = RE_MARKDOWN_IMG_SAFE.replace_all(&t, |caps: &regex::Captures| {
+        let raw_path = &caps[1];
+        let safe_path = raw_path.replace('\\', "/");
+        format!("\\nopagebreak\\begin{{center}}\\includegraphics[width=0.75\\linewidth]{{{}}}\\end{{center}}", safe_path)
+    }).to_string();
+
+    t
+}
+
+/// Pre-processing function to detect misplaced mark allocation tags (e.g. `[1 mark]` or `[4 marks]`)
+/// that appear mid-sentence, at question start, or floating in preamble/setup sentences, and
+/// intelligently re-inject them at the absolute end of the relevant sub-question or question prompt.
+pub fn relocate_misplaced_marks(raw_content: &str) -> String {
+    let text = raw_content.replace("\r\n", "\n");
+
+    // Check if subpart labels exist in the text
+    let mut matches: Vec<(usize, usize, String)> = Vec::new();
+    for mat in RE_SUBPART_SPLIT.find_iter(&text) {
+        matches.push((mat.start(), mat.end(), mat.as_str().to_string()));
+    }
+
+    if matches.is_empty() {
+        // Standalone question without subparts
+        let mut mark_count = 0u32;
+        for cap in RE_MARK_TAG_GENERAL.captures_iter(&text) {
+            if let Some(c) = cap.get(1) {
+                if let Ok(val) = c.as_str().parse::<u32>() {
+                    mark_count = val;
+                }
+            }
+        }
+
+        if mark_count == 0 {
+            return text;
+        }
+
+        // Strip all mark tags from the body
+        let cleaned = RE_MARK_TAG_GENERAL.replace_all(&text, "").to_string();
+        let collapsed = RE_COLLAPSE_SPACES.replace_all(&cleaned, " ").to_string();
+        let trimmed = collapsed.trim();
+        let mark_word = if mark_count == 1 { "mark" } else { "marks" };
+        return format!("{} **[{} {}]**", trimmed, mark_count, mark_word);
+    }
+
+    // Split text into preamble and subparts
+    let preamble = &text[..matches[0].0];
+    let mut preamble_mark = 0u32;
+    for cap in RE_MARK_TAG_GENERAL.captures_iter(preamble) {
+        if let Some(c) = cap.get(1) {
+            if let Ok(val) = c.as_str().parse::<u32>() {
+                preamble_mark = val;
+            }
+        }
+    }
+    let cleaned_preamble = RE_MARK_TAG_GENERAL.replace_all(preamble, "").to_string();
+    let collapsed_preamble = RE_COLLAPSE_SPACES.replace_all(&cleaned_preamble, " ").to_string();
+
+    struct SubpartChunk {
+        header: String,
+        body: String,
+        mark: Option<u32>,
+    }
+
+    let mut chunks: Vec<SubpartChunk> = Vec::new();
+    for i in 0..matches.len() {
+        let header = matches[i].2.clone();
+        let body_start = matches[i].1;
+        let body_end = if i + 1 < matches.len() {
+            matches[i + 1].0
+        } else {
+            text.len()
+        };
+        let raw_body = &text[body_start..body_end];
+
+        let mut subpart_mark: Option<u32> = None;
+        for cap in RE_MARK_TAG_GENERAL.captures_iter(raw_body) {
+            if let Some(c) = cap.get(1) {
+                if let Ok(val) = c.as_str().parse::<u32>() {
+                    subpart_mark = Some(val);
+                }
+            }
+        }
+
+        let cleaned_body = RE_MARK_TAG_GENERAL.replace_all(raw_body, "").to_string();
+        let collapsed_body = RE_COLLAPSE_SPACES.replace_all(&cleaned_body, " ").to_string();
+        chunks.push(SubpartChunk {
+            header,
+            body: collapsed_body.trim().to_string(),
+            mark: subpart_mark,
+        });
+    }
+
+    // If the preamble had a floating mark tag and the first subpart has NO mark tag,
+    // transfer the preamble mark tag to the first subpart.
+    if preamble_mark > 0 && !chunks.is_empty() && chunks[0].mark.is_none() {
+        chunks[0].mark = Some(preamble_mark);
+    }
+
+    // Reassemble document
+    let mut result = String::new();
+    let trimmed_preamble = collapsed_preamble.trim();
+    if !trimmed_preamble.is_empty() {
+        result.push_str(trimmed_preamble);
+        result.push_str("\n\n");
+    }
+
+    for (i, chunk) in chunks.iter().enumerate() {
+        result.push_str(&chunk.header);
+        result.push_str(&chunk.body);
+        if let Some(m) = chunk.mark {
+            let mark_word = if m == 1 { "mark" } else { "marks" };
+            result.push_str(&format!(" **[{} {}]**", m, mark_word));
+        }
+        if i + 1 < chunks.len() {
+            result.push_str("\n\n");
+        }
+    }
+
+    result
+}
+
+/// Robust full pipeline to convert exam question Markdown into valid, beautifully formatted LaTeX.
+pub fn format_markdown_for_latex(raw_content: &str) -> String {
+    let relocated = relocate_misplaced_marks(raw_content);
+    let sanitized = sanitize_for_latex(&relocated);
+    let mut text = sanitized.replace("\r\n", "\n");
+
+    // Format inline marks before bolding, with unbreakable anchor to prevent orphan mark lines
+    text = RE_LATEX_INLINE_MARKS_SAFE
+        .replace_all(&text, |caps: &regex::Captures| {
+            let count_str = caps.get(1).or_else(|| caps.get(2)).map(|m| m.as_str()).unwrap_or("0");
+            let count = count_str.parse::<u32>().unwrap_or(0);
+            if count == 1 {
+                "\\nopagebreak\\null\\hfill\\textbf{[1 mark]}".to_string()
+            } else {
+                format!("\\nopagebreak\\null\\hfill\\textbf{{[{} marks]}}", count)
+            }
+        })
+        .to_string();
+
+    // Tokenize math mode vs text mode
+    let mut last_idx = 0;
+    let mut processed = String::new();
+
+    for mat in RE_MATH_BLOCK.find_iter(&text) {
+        if mat.start() > last_idx {
+            let non_math = &text[last_idx..mat.start()];
+            processed.push_str(&process_non_math_latex(non_math));
+        }
+        processed.push_str(mat.as_str());
+        last_idx = mat.end();
+    }
+    if last_idx < text.len() {
+        let non_math = &text[last_idx..];
+        processed.push_str(&process_non_math_latex(non_math));
+    }
+
+    let mut result = RE_LATEX_MULTIPLE_NL_SAFE.replace_all(&processed, "\n\n").to_string();
+    result = RE_LATEX_LEADING_NUM_SAFE.replace(&result, "").to_string();
+    result
 }
 
 #[allow(dead_code)]
@@ -1343,15 +1675,13 @@ mod tests {
 
     #[test]
     fn test_sanitize_for_latex_math_repairs() {
-        let input = "Given that f(x) = 2x 3 + ax2 + bx + c and -90◦ <= x < 90◦ with sin2α + cos 2 x = 1 and (︂x+5 1 = y+4 -3)︂ d \n 2 \n θ \n dt \n 2 = 1 \n 2 \n a and 20 \n 3 ms-1 with 2kgand4kgrespectively";
+        let input = "Given that f(x) = 2x 3 + ax2 + bx + c and -90◦ <= x < 90◦ and (︂x+5 1 = y+4 -3)︂ d \n 2 \n θ \n dt \n 2 = 1 \n 2 \n a and 20 \n 3 ms-1 with 2kgand4kgrespectively";
         let output = sanitize_for_latex(input);
         assert!(output.contains("2x^3"));
         assert!(output.contains("ax^2"));
         assert!(output.contains("90^\\circ"));
-        assert!(output.contains("\\sin^{2} \\alpha") || output.contains("\\sin^{2}\\alpha"));
-        assert!(output.contains("\\cos^{2} x"));
         assert!(output.contains("\\frac{x+5}{1} = \\frac{y+4}{-3}"));
-        assert!(output.contains("\\frac{d^2 \\theta}{dt^2}"));
+        assert!(output.contains("\\frac{d^2 \\ensuremath{\\theta}}{dt^2}"));
         assert!(output.contains("\\frac{1}{2}a"));
         assert!(output.contains("\\frac{20}{3} \\text{ms-1}"));
         assert!(output.contains("2 \\text{ kg } and4kgrespectively") || output.contains("2 \\text{ kg } and 4 \\text{ kg } respectively"));
@@ -1361,6 +1691,46 @@ mod tests {
         assert!(marks_output.contains("[5 marks]"));
         assert!(marks_output.contains("[1 marks]"));
         assert!(marks_output.contains("[3 marks]"));
+    }
+
+    #[test]
+    fn test_format_markdown_for_latex() {
+        let raw = "(i) A is a 2 by 2 matrix and B is a 2 by 3 matrix.\n\n(a) Show that M is non-singular. **[2 marks]**\n\n* the value of $\\lambda$\n* the value of $a$";
+        let output = format_markdown_for_latex(raw);
+        assert!(output.contains("A is a 2 by 2 matrix"));
+        assert!(!output.contains("a^2 by 2"));
+        assert!(output.contains("Show that"));
+        assert!(!output.contains("showsthat"));
+        assert!(output.contains("\\par\\textbullet\\hspace{0.5em}the value of $\\lambda$"));
+        assert!(output.contains("\\null\\hfill\\textbf{[2 marks]}"));
+        assert!(output.contains("\\needspace{2.5cm}"));
+    }
+
+    #[test]
+    fn test_relocate_misplaced_marks() {
+        // Case 1: Floating in preamble, transferred to subpart (a)
+        let t1 = "A particle moves in a straight line. **[3 marks]**\n(a) Find velocity.\n(b) Find acceleration. **[2 marks]**";
+        let out1 = relocate_misplaced_marks(t1);
+        assert!(!out1.contains("straight line. **[3 marks]**"));
+        assert!(out1.contains("(a) Find velocity. **[3 marks]**"));
+        assert!(out1.contains("(b) Find acceleration. **[2 marks]**"));
+
+        // Case 2: Standalone question with mark at start
+        let t2 = "[4 marks] Calculate the force exerted on the object.";
+        let out2 = relocate_misplaced_marks(t2);
+        assert_eq!(out2, "Calculate the force exerted on the object. **[4 marks]**");
+
+        // Case 3: Mid-sentence mark tag
+        let t3 = "(a) State **[1 mark]** one assumption made in the model.";
+        let out3 = relocate_misplaced_marks(t3);
+        assert_eq!(out3, "(a) State one assumption made in the model. **[1 mark]**");
+
+        // Case 4: Preamble with floating marks when subparts already have marks
+        let t4 = "Giving a reason for your answer, explain whether it is possible **[2 marks]**\n\n(a) AB **[3 marks]**\n\n(b) A + B **[4 marks]**";
+        let out4 = relocate_misplaced_marks(t4);
+        assert!(!out4.contains("possible **[2 marks]**"));
+        assert!(out4.contains("(a) AB **[3 marks]**"));
+        assert!(out4.contains("(b) A + B **[4 marks]**"));
     }
 }
 

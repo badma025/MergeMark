@@ -1,4 +1,4 @@
-import { createContext, useContext, useState, useEffect, ReactNode } from "react";
+import { createContext, useContext, useState, useEffect, useMemo, ReactNode } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { Subject } from "@/components/settings/TaxonomyManager";
@@ -21,9 +21,10 @@ export function TaxonomyProvider({ children }: { children: ReactNode }) {
   const fetchTaxonomy = async () => {
     try {
       const data = await invoke<Subject[]>("get_taxonomy_tree");
-      setSubjects(data);
+      setSubjects(Array.isArray(data) ? data : []);
     } catch (e) {
       console.error("Failed to load taxonomy tree:", e);
+      setSubjects([]);
     } finally {
       setLoading(false);
     }
@@ -41,17 +42,31 @@ export function TaxonomyProvider({ children }: { children: ReactNode }) {
     };
   }, []);
 
-  // Compute the legacy TOPICS_BY_SUBJECT dictionary dynamically
-  const topicsBySubject: TopicsBySubjectDict = {};
-  for (const subject of subjects) {
-    topicsBySubject[subject.name] = {};
-    for (const module of subject.modules) {
-      topicsBySubject[subject.name][module.name] = module.topics.map((t: any) => t.name);
+  // Compute the legacy TOPICS_BY_SUBJECT dictionary dynamically with strict null-safety
+  const topicsBySubject = useMemo<TopicsBySubjectDict>(() => {
+    const dict: TopicsBySubjectDict = {};
+    if (!Array.isArray(subjects)) return dict;
+
+    for (const subject of subjects) {
+      if (!subject || !subject.name) continue;
+      dict[subject.name] = {};
+
+      if (Array.isArray(subject.modules)) {
+        for (const module of subject.modules) {
+          if (!module || !module.name) continue;
+          dict[subject.name][module.name] = Array.isArray(module.topics)
+            ? module.topics
+                .map((t: any) => (typeof t === "string" ? t : t?.name))
+                .filter((n: any): n is string => typeof n === "string" && n.trim().length > 0)
+            : [];
+        }
+      }
     }
-  }
+    return dict;
+  }, [subjects]);
 
   return (
-    <TaxonomyContext.Provider value={{ subjects, topicsBySubject, loading }}>
+    <TaxonomyContext.Provider value={{ subjects: subjects || [], topicsBySubject, loading }}>
       {children}
     </TaxonomyContext.Provider>
   );

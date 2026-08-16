@@ -948,23 +948,31 @@ fn extraction_system_prompt(config: &PipelineConfig) -> String {
 ═══ FEW-SHOT EXAMPLES — Study these input/output pairs carefully ═══
 Example 1 — Pure math with sub-parts
 Input page (Question 4): "4 (a) Solve 2x^2 - 5x + 2 = 0. [3 marks]\n(b) Hence solve 2y^4 - 5y^2 + 2 = 0. [2 marks]"
-Output: {"items": [{"question_number": 4, "content": "(a) Solve $2x^2 - 5x + 2 = 0$.\n\n**[3 marks]**\n\n(b) Hence solve $2y^4 - 5y^2 + 2 = 0$.\n\n**[2 marks]**", "marks": 5, "topics": ["algebra", "quadratics"], "module": "Pure Mathematics", "is_code": false, "diagram_bboxes": [], "diagram_captions": [], "diagram_kinds": [], "bbox_page_indexes": [], "math_snippet": "2x^2 - 5x + 2 = 0", "visual_options": null}]}
+Output: {"items": [{"question_number": 4, "content": "(a) Solve $2x^2 - 5x + 2 = 0$.\n\n**[3 marks]**\n\n(b) Hence solve $2y^4 - 5y^2 + 2 = 0$.\n\n**[2 marks]**", "marks": 5, "difficulty_rating": null, "topics": ["algebra", "quadratics"], "module": "Pure Mathematics", "is_code": false, "diagram_bboxes": [], "diagram_captions": [], "diagram_kinds": [], "bbox_page_indexes": [], "math_snippet": "2x^2 - 5x + 2 = 0", "visual_options": null}]}
 
 Example 2 — Question with a graph figure
 Input page (Question 7): "7 The graph of y = f(x) is shown below.\nFigure 2\n(a) Write down the coordinates of the turning point. [1 mark]\n(b) State the range of f. [1 mark]"
-Output: {"items": [{"question_number": 7, "content": "The graph of $y = f(x)$ is shown below.\n\n[DIAGRAM_PLACEHOLDER]\n\n(a) Write down the coordinates of the turning point.\n\n**[1 mark]**\n\n(b) State the range of $f$.\n\n**[1 mark]**", "marks": 2, "topics": ["functions", "graphs"], "module": "Pure Mathematics", "is_code": false, "diagram_bboxes": [[0.15, 0.20, 0.70, 0.45]], "diagram_captions": ["Graph of y = f(x)"], "diagram_kinds": ["graph"], "bbox_page_indexes": [0], "math_snippet": "y = f(x)", "visual_options": null}]}
+Output: {"items": [{"question_number": 7, "content": "The graph of $y = f(x)$ is shown below.\n\n[DIAGRAM_PLACEHOLDER]\n\n(a) Write down the coordinates of the turning point.\n\n**[1 mark]**\n\n(b) State the range of $f$.\n\n**[1 mark]**", "marks": 2, "difficulty_rating": null, "topics": ["functions", "graphs"], "module": "Pure Mathematics", "is_code": false, "diagram_bboxes": [[0.15, 0.20, 0.70, 0.45]], "diagram_captions": ["Graph of y = f(x)"], "diagram_kinds": ["graph"], "bbox_page_indexes": [0], "math_snippet": "y = f(x)", "visual_options": null}]}
 
 Example 3 — Structured table (trace table) — transcribe as Markdown table, NOT diagram
 Input page (Question 12): "12 Complete the trace table for the algorithm below.\n\n| i | condition | output |\n|---|---|---|\n| 1 | true | 3 |\n| 2 |  |  |\n| 3 |  |  |"
-Output: {"items": [{"question_number": 12, "content": "Complete the trace table for the algorithm below.\n\n| i | condition | output |\n|---|---|---|\n| 1 | true | 3 |\n| 2 |  |  |\n| 3 |  |  |", "marks": 4, "topics": ["algorithms", "trace tables"], "module": "Computer Science", "is_code": false, "diagram_bboxes": [], "diagram_captions": [], "diagram_kinds": [], "bbox_page_indexes": [], "math_snippet": "", "visual_options": null}]}
+Output: {"items": [{"question_number": 12, "content": "Complete the trace table for the algorithm below.\n\n| i | condition | output |\n|---|---|---|\n| 1 | true | 3 |\n| 2 |  |  |\n| 3 |  |  |", "marks": 4, "difficulty_rating": null, "topics": ["algorithms", "trace tables"], "module": "Computer Science", "is_code": false, "diagram_bboxes": [], "diagram_captions": [], "diagram_kinds": [], "bbox_page_indexes": [], "math_snippet": "", "visual_options": null}]}
 
 Example 4 — Multiple-choice with visual options (composite)
 Input page (Question 15): "15 Which graph represents y = sin(x)/x?\nA [graph A]\nB [graph B]\nC [graph C]\nD [graph D]"
-Output: {"items": [{"question_number": 15, "content": "Which graph represents $y = \\frac{\\sin x}{x}$?\n\nA [DIAGRAM_PLACEHOLDER]\nB [DIAGRAM_PLACEHOLDER]\nC [DIAGRAM_PLACEHOLDER]\nD [DIAGRAM_PLACEHOLDER]", "marks": 1, "topics": ["trigonometry", "graphs"], "module": "Pure Mathematics", "is_code": false, "diagram_bboxes": [[0.10, 0.25, 0.80, 0.65]], "diagram_captions": ["Options A, B, C, D"], "diagram_kinds": ["composite_visual_options"], "bbox_page_indexes": [0], "math_snippet": "sin(x)/x", "visual_options": "composite_visual_options"}]}
+Output: {"items": [{"question_number": 15, "content": "Which graph represents $y = \\frac{\\sin x}{x}$?\n\nA [DIAGRAM_PLACEHOLDER]\nB [DIAGRAM_PLACEHOLDER]\nC [DIAGRAM_PLACEHOLDER]\nD [DIAGRAM_PLACEHOLDER]", "marks": 1, "difficulty_rating": null, "topics": ["trigonometry", "graphs"], "module": "Pure Mathematics", "is_code": false, "diagram_bboxes": [[0.10, 0.25, 0.80, 0.65]], "diagram_captions": ["Options A, B, C, D"], "diagram_kinds": ["composite_visual_options"], "bbox_page_indexes": [0], "math_snippet": "sin(x)/x", "visual_options": "composite_visual_options"}]}
 
 Example 5 — Question continues from previous page
 Input page (Question 9 continued): "(c) Find the exact value of the integral. [4 marks]\n\n(Total for Question 9 is 10 marks)\n\n10 (a) ..."
-Output: {"items": [{"question_number": 9, "content": "(c) Find the exact value of the integral.\n\n**[4 marks]**", "marks": 4, "topics": ["calculus", "integration"], "module": "Pure Mathematics", "is_code": false, "diagram_bboxes": [], "diagram_captions": [], "diagram_kinds": [], "bbox_page_indexes": [], "math_snippet": "", "visual_options": null}]}
+Output: {"items": [{"question_number": 9, "content": "(c) Find the exact value of the integral.\n\n**[4 marks]**", "marks": 4, "difficulty_rating": null, "topics": ["calculus", "integration"], "module": "Pure Mathematics", "is_code": false, "diagram_bboxes": [], "diagram_captions": [], "diagram_kinds": [], "bbox_page_indexes": [], "math_snippet": "", "visual_options": null}]}
+
+Example 6 — T. Madas / Worksheet style (Polar curve with leading variable, difficulty rating, and sub-parts)
+Input page: "Question 3 (***+)\nA curve has polar equation\nr = (cos(theta) + sin(theta))/(cos^2(theta) + sin(2*theta) + 1),  0 <= theta < 2*pi\n(a) Find a Cartesian equation of the curve in the form f(x, y) = 0.\n(b) Show that the area bounded by the curve is pi/4."
+Output: {"items": [{"question_number": 3, "content": "A curve has polar equation\n\n$$r = \\frac{\\cos\\theta + \\sin\\theta}{\\cos^2\\theta + \\sin 2\\theta + 1}, \\quad 0 \\le \\theta < 2\\pi$$\n\n(a) Find a Cartesian equation of the curve in the form $f(x, y) = 0$.\n\n(b) Show that the area bounded by the curve is $\\frac{\\pi}{4}$.", "marks": null, "difficulty_rating": "***+", "topics": ["polar coordinates", "curves"], "module": "Pure Mathematics", "is_code": false, "diagram_bboxes": [], "diagram_captions": [], "diagram_kinds": [], "bbox_page_indexes": [], "math_snippet": "r = \\frac{\\cos\\theta + \\sin\\theta}{\\cos^2\\theta + \\sin 2\\theta + 1}", "visual_options": null}]}
+
+Example 7 — Cardioid and Multi-Curve Polar Equations (Ensure $r = $ is NEVER dropped)
+Input page: "Question 8 (****)\nThe diagram above shows the curves with polar equations\nr = 1 + sin 2*theta, 0 <= theta <= pi/2\nr = 1.5, 0 <= theta <= pi/2\nFind the area enclosed between the two curves."
+Output: {"items": [{"question_number": 8, "content": "The diagram above shows the curves with polar equations\n\n$$r = 1 + \\sin 2\\theta, \\quad 0 \\le \\theta \\le \\frac{\\pi}{2}$$\n\nand\n\n$$r = 1.5, \\quad 0 \\le \\theta \\le \\frac{\\pi}{2}$$\n\nFind the area enclosed between the two curves.", "marks": null, "difficulty_rating": "****", "topics": ["polar coordinates", "integration"], "module": "Pure Mathematics", "is_code": false, "diagram_bboxes": [], "diagram_captions": [], "diagram_kinds": [], "bbox_page_indexes": [], "math_snippet": "r = 1 + \\sin 2\\theta", "visual_options": null}]}
 
 END OF EXAMPLES — Follow the same JSON structure, escaping rules, and isolation discipline exactly.
 "#;
@@ -973,6 +981,25 @@ END OF EXAMPLES — Follow the same JSON structure, escaping rules, and isolatio
         r#"You are a precise mathematical OCR engine transcribing exactly ONE requested exam question. Output ONLY a valid JSON object of the form {{"items": [ ... ]}}.
 
 CONTEXT: The user will specify the target question number, paper name, and module name in the user prompt. Transcribe ONLY content belonging to the requested target question. If nothing on the page(s) belongs to the target question, return {{"items": []}}.
+
+═══ MATHEMATICAL NOTATION & DELIMITER RULES (CRITICAL) ═══
+1. STRICT DELIMITERS: Every single inline mathematical expression, variable, greek letter, or formula MUST be enclosed in single dollar signs `$ ... $`. Display equations MUST be placed on their own line enclosed in double dollar signs `$$ ... $$`.
+2. PERFECT DELIMITER PAIRING: Every opened `$` must be closed with `$`. Every opened `$$` must be closed with `$$`. NEVER leave unclosed delimiters, mismatched tags like `$ ... $$`, or omit the opening delimiter (e.g. NEVER emit `\frac{{...}}$` without opening `$`).
+3. ABSOLUTE VARIABLE FIDELITY: Transcribe complete equations verbatim without dropping leading variables, function headers, or curve names. If the source shows "r = ...", "y = ...", "f(x) = ...", "C: r = ...", you MUST include the "r = ", "y = ", etc. inside the math block: `$$r = \\frac{{...}}{{...}}$$`.
+4. DOMAIN & CONSTRAINTS: Include all domain restrictions (e.g. `, \\quad 0 \\le \\theta < 2\\pi`) inside the math delimiters.
+5. NO PLAIN TEXT IN $$: Never wrap standard English sentences or instructions inside `$$ ... $$`.
+
+═══ ADAPTIVE MARK & DIFFICULTY EXTRACTION ═══
+1. STANDARD MARKS: If explicit mark allocations are printed (e.g. `[4 marks]`, `(3 marks)`, `[1 mark]`), sum them as an integer in `"marks"`, and place `**[X marks]**` at the end of each marked sub-part.
+2. DIFFICULTY RATINGS: If difficulty / star ratings are present instead (e.g. `(*)`, `(**)`, `(***)`, `(***+)`, `(****)`, `(*****)`, `(Specialist)`, `(Synoptic)` as in T. Madas worksheets):
+   - Extract the rating string into `"difficulty_rating"` (e.g. `"***+"`).
+   - Set `"marks": null`.
+   - DO NOT invent, hallucinate, or default marks (e.g. do NOT output `marks: 1`) when no mark scheme allocation is printed.
+3. If neither is present, set `"marks": null` and `"difficulty_rating": null`.
+
+═══ SUB-PARTS VS MULTIPLE CHOICE (CRITICAL) ═══
+1. SUB-QUESTIONS: Sub-parts labeled `(a)`, `(b)`, `(c)` or `(i)`, `(ii)` are mathematical sub-questions. Format them in lowercase parentheses `(a)`, `(b)` separated by double newlines (`\n\n`). NEVER convert sub-parts into multiple-choice options.
+2. MULTIPLE CHOICE: Only format as multiple choice (`A ...\nB ...`) if the question is an actual multiple-choice test question with 4 alternative answers to choose from.
 
 ═══ QUESTION ISOLATION RULES (HIGHEST PRIORITY) ═══
 Transcribe the target question and NOTHING ELSE. Sub-parts belonging to other questions must NEVER appear.
@@ -986,15 +1013,14 @@ Transcribe the target question and NOTHING ELSE. Sub-parts belonging to other qu
 OUTPUT STRUCTURE — EVERY item MUST have:
 - "question_number": integer matching the requested target question number.
 - "content": Full text transcription of the target question without summary or leading question number (e.g. "17 Here is..." -> "Here is...").
-  * Format sub-parts (a), (b), (c) separated by double newlines (\n\n) with mark tags `**[X marks]**`.
+  * Format sub-parts (a), (b), (c) separated by double newlines (\n\n).
   * Omit headers, footers, "(Total for Question...)", blank page notices, and dotted answer lines at the end of parts.
   * Structured tables (trace tables, data tables): Transcribe as Markdown tables (| col |), NEVER as diagram boxes.
-  * Math: Wrap inline math in $...$, display equations on their own line in $$...$$. Use valid LaTeX (\\frac, \\sin, \\cos, \\theta). Backslashes MUST be escaped in JSON (\\\\frac). Never wrap English sentences in $$.
+  * Math: Wrap inline math in $...$, display equations on their own line in $$...$$. Use valid LaTeX (\\frac, \\sin, \\cos, \\theta). Backslashes MUST be escaped in JSON (\\\\frac).
   * Code: Markdown backticks (`...`), never LaTeX math mode.
-  * Multiple choice: Keep uppercase options (`A ...\nB ...`).
-  * AQA sub-parts: Render '02.1' as (a), '02.2' as (b). Spaced "01 5" as (e).
   * Insert [DIAGRAM_PLACEHOLDER] chronologically after referencing text.
-- "marks": Total integer marks, or null if unknown.
+- "marks": Total integer marks, or null if unknown / difficulty-rated.
+- "difficulty_rating": String difficulty rating (e.g. "***+", "**") or null if standard marks or unknown.
 {topics_instruction}
 - "module": string — output EXACTLY '{module}'.
 - "is_code": boolean (true only for code/pseudocode).
@@ -3102,7 +3128,7 @@ async fn extract_same_page_batch<C: LlmClient>(
                 let mut requests = Vec::with_capacity(bboxes.len());
                 let mut page_b64 = std::collections::HashMap::new();
                 for (bi, bbox) in bboxes.iter().enumerate() {
-                    let model_idx = indexes.get(bi).and_then(value_to_usize).unwrap_or(0);
+                    let _model_idx = indexes.get(bi).and_then(value_to_usize).unwrap_or(0);
                     let ignore_grid = validate::figure_references(&item_content) > 0 && !validate::is_answer_grid_request(&item_content);
                     if config.pdf_path.is_none() {
                         if let Some(b64) = page.get_b64() {
@@ -3615,22 +3641,30 @@ async fn extract_fallback_page<C: LlmClient>(
 
 RULES:
 - If this page contains NEW question(s) (each with its own printed whole-question number), return ONE item per question:
-  {{ "question_number": <whole number printed>, "content": "<full transcription>", "marks": int|null,
+  {{ "question_number": <whole number printed>, "content": "<full transcription>", "marks": int|null, "difficulty_rating": string|null,
      "topics": array, "module": "{module}", "is_code": bool,
      "diagram_bboxes": [[x,y,w,h]...] relative 0.0-1.0, "bbox_page_indexes": [0,...] }}
+- MATHEMATICAL FIDELITY & STRICT DELIMITERS:
+  * Wrap all inline math in `$ ... $` and display equations in `$$ ... $$`.
+  * Ensure perfect delimiter pairing: every `$` or `$$` opened must be closed with the exact same tag. NEVER omit the opening delimiter (e.g. NEVER emit `\frac{{...}}$`).
+  * Never drop leading variables, function names, or prefixes (e.g. `r = \frac{{...}}`, `y = 2\sin x`, `C: r = ...` MUST include the `r = ` verbatim).
+- ADAPTIVE MARKS VS DIFFICULTY:
+  * If standard marks are printed (`[4 marks]`), output `"marks": 4` and `"difficulty_rating": null`.
+  * If difficulty / star ratings are present (e.g. `(*)`, `(**)`, `(***+)`, `(Specialist)` as in T. Madas worksheets), output `"difficulty_rating": "***+"` and `"marks": null`. DO NOT invent marks.
+- SUB-PARTS VS MULTIPLE CHOICE:
+  * Sub-parts `(a)`, `(b)`, `(c)` are standard question sub-parts separated by `\n\n`. NEVER convert sub-parts into multiple-choice options.
 - MULTIPLE QUESTIONS ON ONE PAGE: when a page has several independent short-answer or multiple-choice questions (e.g. AQA Section B with 4 MCQs), return an item for EACH question. Do NOT bundle them into one item.
 - QUESTION ISOLATION (highest priority): never place sub-parts of two different main questions in one item. A sub-part label ((a), (b), (i), "04.2") belongs to the main number printed in the label, or else to the nearest whole-number heading ABOVE it. A "(Total for Question N is M marks)" footer, or a new whole question number, ENDS that question — everything after it starts a new item. If sub-part lettering restarts at (a), a new main question has begun. When unsure which question owns a line, start a new item rather than merging.
 - If this page is a CONTINUATION of the previous question, is blank, or contains no new question, return {{"items": []}}.
 - ARTIFACT FILTERING: Recognize and completely exclude all non-exam content. Silently ignore margin warnings, printer registration marks, page numbers, and barcodes.
 - STRUCTURAL SPACING: Enforce strict hierarchical spacing. Use double line breaks (\n\n) to clearly separate sub-question identifiers ((a), (b), (i)) and mark allocations (**[X marks]**) from surrounding text.
 - EQUATION COHESION: Treat multi-part mathematical statements (e.g. matrix equations) as a single cohesive unit within a single display math block ($$ ... $$), never orphaning equals signs or matrices on separate lines.
-- MATHEMATICAL ACCURACY: Ensure all mathematical notation is accurately translated into valid, standard LaTeX.
 - ROBUST TABLE RENDERING: Structured tables with headers (trace tables, function tables, working grids) are question content even when EMPTY — transcribe them as standard Markdown tables, NEVER as diagram boxes. Never leak raw \\hline or broken formatting tags.
-- Transcribe fully (never summarize). Preserve punctuation. `**[X marks]**` after each marked sub-part. Math in $...$/$$...$$. Pure matrices in LaTeX \\begin{{array}} or \\begin{{pmatrix}} inside $$...$$. Code in backticks, never math mode. Escape LaTeX backslashes (\\\\frac).
+- Transcribe fully (never summarize). Preserve punctuation. Math in $...$/$$...$$. Pure matrices in LaTeX \\begin{{array}} or \\begin{{pmatrix}} inside $$...$$. Code in backticks, never math mode. Escape LaTeX backslashes (\\\\frac).
 - AQA decimal sub-parts: render '03.1'-style part numbers as (a), (b), (c) — positional: .1 -> a, .2 -> b — and update inline cross-references. AQA also uses SPACED sub-parts: \"01 5\" means Question 1, sub-part 5 — render as (e). The whole question number is ALWAYS the integer (never a decimal like 1.5). The whole decimal run on this page is ONE item with its integer question number.
 - Anything the paper labels as a Figure ("Figure 6" — printed schemas, algorithm screens, grids that are part of the question exhibit) MUST be returned as a diagram box, never as transcribed text.
 - Exclude headers/footers ("Question X continued", "Turn over", totals footers), plain ruled answer lines, answer line templates with operators (e.g. "............ $\\le t <$ ............"), "BLANK PAGE".
-- Content must end with terminal punctuation or a mark tag."#,
+- Content must end with terminal punctuation, a mark tag, or a difficulty rating."#,
         module = config.module_name,
     );
 

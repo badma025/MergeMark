@@ -3,13 +3,8 @@ import { invoke, convertFileSrc } from "@tauri-apps/api/core";
 import { toast } from "sonner";
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter, DialogDescription } from "@/components/ui/dialog";
 import { Button } from "@/components/ui/button";
-import ReactMarkdown from "react-markdown";
-import remarkMath from "remark-math";
-import rehypeKatex from "rehype-katex";
-import remarkGfm from "remark-gfm";
 import "katex/dist/katex.min.css";
-import { preprocessMathString } from '@/lib/utils';
-import { remarkMathFix } from '@/lib/remark-math-fix';
+import { ExamMarkdownRenderer } from "@/components/common/ExamMarkdownRenderer";
 import { Loader2 } from "lucide-react";
 
 export interface ProposedMapping {
@@ -116,54 +111,47 @@ export function ReviewSyncModal({ mappings, onClose, onSuccess }: ReviewSyncModa
                 return (
                   <div key={m.questionId} className="flex gap-4 border-b pb-4 last:border-0 last:pb-0">
                     {/* ── Question column ─────────────────────────────────── */}
-                    <div className="flex-1 prose prose-sm dark:prose-invert border rounded bg-background/50 p-3 opacity-90 overflow-x-auto whitespace-normal break-words">
+                    <div className="flex-1 border rounded bg-background/50 p-3 opacity-90 overflow-x-auto whitespace-normal break-words">
                       <div className="text-xs font-semibold text-muted-foreground mb-2 uppercase tracking-wider">
                         Question {qNum}
                       </div>
-                      <ReactMarkdown 
-                        remarkPlugins={[remarkMath, remarkGfm, remarkMathFix]} 
-                        rehypePlugins={[[rehypeKatex, { throwOnError: false, strict: false }]]}
-                        urlTransform={(value) => value}
-                        components={{
-                          img: ({ node, ...props }) => {
-                            if (props.src && (props.src.match(/^[a-zA-Z]:[\\/]/) || props.src.startsWith("/"))) {
-                              try {
-                                const assetUrl = convertFileSrc(props.src);
-                                return (
-                                  <div className="relative group">
-                                    <img
-                                        {...props}
-                                        src={assetUrl}
-                                        alt={props.alt || "Diagram"}
-                                        loading="lazy"
-                                        decoding="async"
-                                        className="max-w-full rounded-md my-4"
-                                        onError={(e) => {
-                                          console.error("Failed to load image via asset protocol:", props.src, assetUrl);
-                                          const target = e.target as HTMLImageElement;
-                                          target.style.opacity = '0.5';
-                                          target.title = `Failed to load: ${props.src} -> ${assetUrl}`;
-                                        }}
-                                      />
-                                    <div className="hidden group-hover:block absolute bottom-0 left-0 bg-black/80 text-white text-[10px] p-1 truncate max-w-full">
-                                      {props.src}
-                                    </div>
+                      <ExamMarkdownRenderer
+                        content={m.rawContent}
+                        imageRenderer={(src, alt) => {
+                          if (src && (/^[a-zA-Z]:[\\/]/.test(src) || src.startsWith("/"))) {
+                            try {
+                              const assetUrl = convertFileSrc(src);
+                              return (
+                                <div className="relative group">
+                                  <img
+                                    src={assetUrl}
+                                    alt={alt || "Diagram"}
+                                    loading="lazy"
+                                    decoding="async"
+                                    className="max-w-full rounded-md my-4"
+                                    onError={(e) => {
+                                      console.error("Failed to load image via asset protocol:", src, assetUrl);
+                                      const target = e.target as HTMLImageElement;
+                                      target.style.opacity = '0.5';
+                                      target.title = `Failed to load: ${src} -> ${assetUrl}`;
+                                    }}
+                                  />
+                                  <div className="hidden group-hover:block absolute bottom-0 left-0 bg-black/80 text-white text-[10px] p-1 truncate max-w-full">
+                                    {src}
                                   </div>
-                                  );
-                                } catch (e) {
-                                  return <div className="text-sm text-destructive border border-destructive/20 p-2 rounded-md bg-destructive/10 text-center">Failed to convert diagram URL: {props.alt || "Image"}</div>;
-                                }
-                              }
-                              return <img {...props} alt={props.alt || "Diagram"} loading="lazy" decoding="async" className="max-w-full rounded-md my-4" />;
+                                </div>
+                              );
+                            } catch (e) {
+                              return <div className="text-sm text-destructive border border-destructive/20 p-2 rounded-md bg-destructive/10 text-center">Failed to convert diagram URL: {alt || "Image"}</div>;
                             }
-                          }}
-                        >
-                        {preprocessMathString(m.rawContent)}
-                      </ReactMarkdown>
+                          }
+                          return <img src={src} alt={alt || "Diagram"} loading="lazy" decoding="async" className="max-w-full rounded-md my-4" />;
+                        }}
+                      />
                     </div>
 
                     {/* ── Proposed answer column ───────────────────────────── */}
-                    <div className="flex-1 flex flex-col prose prose-sm dark:prose-invert border rounded bg-background p-3 relative overflow-x-auto whitespace-normal break-words">
+                    <div className="flex-1 flex flex-col border rounded bg-background p-3 relative overflow-x-auto whitespace-normal break-words">
                       <div className="flex items-center justify-between gap-2 mb-2">
                         <div className="text-xs font-semibold text-muted-foreground uppercase tracking-wider">
                           Proposed Answer
@@ -177,7 +165,6 @@ export function ReviewSyncModal({ mappings, onClose, onSuccess }: ReviewSyncModa
                           </label>
                           <select
                             id={`swap-${m.questionId}`}
-                            // The selected value is the current question's own number.
                             value={qNum}
                             onChange={(e) => handleSwap(currentIndex, parseInt(e.target.value, 10))}
                             className="text-xs bg-background border border-border rounded px-2 py-1 focus:ring-1 focus:ring-primary focus:outline-none"
@@ -193,36 +180,29 @@ export function ReviewSyncModal({ mappings, onClose, onSuccess }: ReviewSyncModa
                           </select>
                         </div>
                       </div>
-                      <ReactMarkdown 
-                        remarkPlugins={[remarkMath, remarkGfm, remarkMathFix]} 
-                        rehypePlugins={[[rehypeKatex, { throwOnError: false, strict: false }]]}
-                        urlTransform={(value) => value}
-                        components={{
-                          img: ({ node, ...props }) => {
-                            if (props.src && (props.src.match(/^[a-zA-Z]:[\\/]/) || props.src.startsWith("/"))) {
-                              try {
-                                const assetUrl = convertFileSrc(props.src);
-                                return (
-                                  <img
-                                      {...props}
-                                      src={assetUrl}
-                                      alt={props.alt || "Diagram"}
-                                      loading="lazy"
-                                      decoding="async"
-                                      className="max-w-full rounded-md my-4"
-                                      onError={() => console.error("Failed to load image via asset protocol:", props.src)}
-                                    />
-                                  );
-                                } catch (e) {
-                                  return <div className="text-sm text-destructive border border-destructive/20 p-2 rounded-md bg-destructive/10 text-center">Failed to convert diagram URL: {props.alt || "Image"}</div>;
-                                }
-                              }
-                              return <img {...props} alt={props.alt || "Diagram"} loading="lazy" decoding="async" className="max-w-full rounded-md my-4" />;
+                      <ExamMarkdownRenderer
+                        content={m.proposedAnswer}
+                        imageRenderer={(src, alt) => {
+                          if (src && (/^[a-zA-Z]:[\\/]/.test(src) || src.startsWith("/"))) {
+                            try {
+                              const assetUrl = convertFileSrc(src);
+                              return (
+                                <img
+                                  src={assetUrl}
+                                  alt={alt || "Diagram"}
+                                  loading="lazy"
+                                  decoding="async"
+                                  className="max-w-full rounded-md my-4"
+                                  onError={() => console.error("Failed to load image via asset protocol:", src)}
+                                />
+                              );
+                            } catch (e) {
+                              return <div className="text-sm text-destructive border border-destructive/20 p-2 rounded-md bg-destructive/10 text-center">Failed to convert diagram URL: {alt || "Image"}</div>;
                             }
-                          }}
-                        >
-                        {preprocessMathString(m.proposedAnswer)}
-                      </ReactMarkdown>
+                          }
+                          return <img src={src} alt={alt || "Diagram"} loading="lazy" decoding="async" className="max-w-full rounded-md my-4" />;
+                        }}
+                      />
                     </div>
                   </div>
                 );

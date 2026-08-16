@@ -5,5 +5,7 @@ export function cn(...inputs: ClassValue[]) {
   return twMerge(clsx(inputs))
 }
 
-// Re-export new math preprocessing functions
-export { preprocessMathString, sanitizeForLatex } from "./preprocess-math"
+// Re-export markdown and math preprocessing functions
+export { preprocessMathString, preprocessExamMarkdown, sanitizeForLatex } from "./preprocess-math"
+export { healLatexDelimiters } from "./preprocess-exam-markdown"
+export { normalizeMCQOptions } from "./preprocess-mcq"

@@ -99,6 +99,26 @@ pub async fn init_db(app_data_dir: PathBuf) -> Result<SqlitePool, sqlx::Error> {
         .execute(&pool)
         .await;
 
+    // Heal existing polar equations and unbalanced delimiters directly in SQLite
+    if let Ok(rows) = sqlx::query("SELECT id, content FROM questions WHERE content LIKE '%polar%' OR content LIKE '%cardioid%' OR content LIKE '%theta%' OR content LIKE '%cos%' OR content LIKE '%sin%'")
+        .fetch_all(&pool)
+        .await
+    {
+        use sqlx::Row;
+        for row in rows {
+            if let (Ok(id), Ok(content)) = (row.try_get::<String, _>("id"), row.try_get::<String, _>("content")) {
+                let healed = crate::validate::heal_polar_equations(&content);
+                if healed != content {
+                    let _ = sqlx::query("UPDATE questions SET content = ? WHERE id = ?")
+                        .bind(healed)
+                        .bind(id)
+                        .execute(&pool)
+                        .await;
+                }
+            }
+        }
+    }
+
     // ── Idempotency migration ────────────────────────────────────────────────
     // Before the unique index can exist, collapse any duplicate
     // (paper_name, question_number) rows produced by older builds, keeping
@@ -231,6 +251,27 @@ pub async fn init_db(app_data_dir: PathBuf) -> Result<SqlitePool, sqlx::Error> {
             cache_key    TEXT PRIMARY KEY,
             questions    TEXT NOT NULL,
             created_at   INTEGER NOT NULL DEFAULT 0
+        );
+        "#,
+    )
+    .execute(&pool)
+    .await?;
+
+    // ── Import Cost & Spend Audit Log ─────────────────────────────────────
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS import_cost_logs (
+            id                  TEXT PRIMARY KEY,
+            paper_name          TEXT NOT NULL,
+            model_name          TEXT NOT NULL,
+            paper_type          TEXT NOT NULL DEFAULT 'question_paper',
+            questions_count     INTEGER NOT NULL DEFAULT 0,
+            prompt_tokens       INTEGER NOT NULL DEFAULT 0,
+            completion_tokens   INTEGER NOT NULL DEFAULT 0,
+            total_tokens        INTEGER NOT NULL DEFAULT 0,
+            cost_usd            REAL NOT NULL DEFAULT 0.0,
+            duration_ms         INTEGER NOT NULL DEFAULT 0,
+            created_at          INTEGER NOT NULL DEFAULT 0
         );
         "#,
     )
@@ -528,3 +569,151 @@ async fn seed_taxonomy(pool: &SqlitePool) -> Result<(), sqlx::Error> {
 
     Ok(())
 }
+
+// ── Import Cost Log Helpers ──────────────────────────────────────────────────
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, sqlx::FromRow)]
+#[serde(rename_all = "camelCase")]
+pub struct ImportCostRecord {
+    pub id: String,
+    pub paper_name: String,
+    pub model_name: String,
+    pub paper_type: String,
+    pub questions_count: i64,
+    pub prompt_tokens: i64,
+    pub completion_tokens: i64,
+    pub total_tokens: i64,
+    pub cost_usd: f64,
+    pub duration_ms: i64,
+    pub created_at: i64,
+}
+
+pub async fn record_import_cost(
+    pool: &SqlitePool,
+    paper_name: &str,
+    model_name: &str,
+    paper_type: &str,
+    questions_count: i64,
+    prompt_tokens: i64,
+    completion_tokens: i64,
+    cost_usd: f64,
+    duration_ms: i64,
+) -> Result<ImportCostRecord, sqlx::Error> {
+    let id = uuid::Uuid::new_v4().to_string();
+    let total_tokens = prompt_tokens + completion_tokens;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+
+    sqlx::query(
+        r#"
+        INSERT INTO import_cost_logs (
+            id, paper_name, model_name, paper_type,
+            questions_count, prompt_tokens, completion_tokens, total_tokens,
+            cost_usd, duration_ms, created_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        "#,
+    )
+    .bind(&id)
+    .bind(paper_name)
+    .bind(model_name)
+    .bind(paper_type)
+    .bind(questions_count)
+    .bind(prompt_tokens)
+    .bind(completion_tokens)
+    .bind(total_tokens)
+    .bind(cost_usd)
+    .bind(duration_ms)
+    .bind(now)
+    .execute(pool)
+    .await?;
+
+    Ok(ImportCostRecord {
+        id,
+        paper_name: paper_name.to_string(),
+        model_name: model_name.to_string(),
+        paper_type: paper_type.to_string(),
+        questions_count,
+        prompt_tokens,
+        completion_tokens,
+        total_tokens,
+        cost_usd,
+        duration_ms,
+        created_at: now,
+    })
+}
+
+pub async fn prune_orphaned_import_logs(pool: &SqlitePool) -> Result<u64, sqlx::Error> {
+    // If no questions exist in the repository at all, clear all import logs
+    let (total_q,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM questions")
+        .fetch_one(pool)
+        .await?;
+
+    if total_q == 0 {
+        let res = sqlx::query("DELETE FROM import_cost_logs")
+            .execute(pool)
+            .await?;
+        return Ok(res.rows_affected());
+    }
+
+    // Delete logs for papers that have no questions remaining in the repository.
+    // Handles both standard paper names and mark scheme prefix "MS:".
+    let res = sqlx::query(
+        r#"
+        DELETE FROM import_cost_logs
+        WHERE id IN (
+            SELECT l.id FROM import_cost_logs l
+            WHERE NOT EXISTS (
+                SELECT 1 FROM questions q
+                WHERE q.paper_name = l.paper_name
+                   OR (l.paper_name LIKE 'MS:%' AND q.paper_name = SUBSTR(l.paper_name, 4))
+            )
+        )
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    Ok(res.rows_affected())
+}
+
+pub async fn clear_import_cost_history(pool: &SqlitePool) -> Result<u64, sqlx::Error> {
+    let res = sqlx::query("DELETE FROM import_cost_logs")
+        .execute(pool)
+        .await?;
+    Ok(res.rows_affected())
+}
+
+pub async fn delete_import_cost_log(pool: &SqlitePool, id: &str) -> Result<bool, sqlx::Error> {
+    let res = sqlx::query("DELETE FROM import_cost_logs WHERE id = ?")
+        .bind(id)
+        .execute(pool)
+        .await?;
+    Ok(res.rows_affected() > 0)
+}
+
+pub async fn get_import_cost_history(
+    pool: &SqlitePool,
+) -> Result<Vec<ImportCostRecord>, sqlx::Error> {
+    // Always prune logs of deleted papers / empty repo first
+    let _ = prune_orphaned_import_logs(pool).await;
+
+    let rows = sqlx::query_as::<_, ImportCostRecord>(
+        r#"
+        SELECT
+            id, paper_name, model_name, paper_type,
+            questions_count, prompt_tokens, completion_tokens, total_tokens,
+            cost_usd, duration_ms, created_at
+        FROM import_cost_logs
+        ORDER BY created_at DESC
+        LIMIT 100
+        "#,
+    )
+    .fetch_all(pool)
+    .await?;
+
+    Ok(rows)
+}
+

@@ -10,6 +10,7 @@ mod db;
 mod backup;
 mod billing;
 mod commands;
+pub mod cost;
 mod doc_map;
 mod geometry;
 mod json_salvage;
@@ -99,7 +100,13 @@ pub fn run() {
             taxonomy::add_topic,
             taxonomy::rename_topic,
             taxonomy::delete_topic,
-            commands::generate_topics_for_module
+            commands::generate_topics_for_module,
+            commands::get_openrouter_usage,
+            commands::get_import_cost_history,
+            commands::clear_import_cost_history,
+            commands::delete_import_cost_log,
+            commands::prune_orphaned_import_logs,
+            commands::get_generation_cost
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

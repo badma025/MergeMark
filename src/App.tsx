@@ -12,7 +12,6 @@ import { TaxonomyProvider } from "@/lib/TaxonomyContext";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
 import { FlashcardsTab } from "@/components/flashcards/FlashcardsTab";
-import { SplashScreen } from "@/components/common/SplashScreen";
 
 export type SelectedQuestion = Omit<QuestionCardProps, "onAddToWorksheet">;
 
@@ -215,9 +214,6 @@ function App() {
 
         {/* Global toast notifications */}
         <Toaster theme="dark" richColors position="bottom-right" />
-
-        {/* Initial Brand Splash Screen */}
-        <SplashScreen duration={5000} />
       </div>
     </TaxonomyProvider>
   );

@@ -1,19 +1,16 @@
-import { useState, useRef } from "react";
+import { useState, useRef, memo } from "react";
 import "katex/dist/katex.min.css";
 import { RichTextEditor } from "./RichTextEditor";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { Plus, Trash2, Pencil, AlertTriangle, ShieldCheck, Maximize2, ZoomIn, ZoomOut, Download, Copy, Check, X, CheckCircle2, ChevronDown } from "lucide-react";
-import ReactMarkdown from "react-markdown";
-import remarkMath from "remark-math";
-import rehypeKatex from "rehype-katex";
-import remarkGfm from "remark-gfm";
-import { cn, preprocessMathString } from "@/lib/utils";
-import { remarkMathFix } from "@/lib/remark-math-fix";
+import { cn } from "@/lib/utils";
 import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 import { useTaxonomy } from "@/lib/TaxonomyContext";
 import { toast } from "sonner";
+import { ExamMarkdownRenderer } from "@/components/common/ExamMarkdownRenderer";
+import { preprocessExamMarkdown } from "@/lib/preprocess-math";
 
 /**
  * Interactive Diagram Lightbox Modal with zoom, copy, and download controls.
@@ -203,7 +200,7 @@ export interface QuestionCardProps {
   onUpdate?: (id: string, newContent: string, newMarks: number, newAnswerContent?: string, newTopics?: string[], newModule?: string) => void;
 }
 
-export function QuestionCard(props: QuestionCardProps) {
+export const QuestionCard = memo(function QuestionCard(props: QuestionCardProps) {
   const {
     id,
     subject,
@@ -237,8 +234,8 @@ export function QuestionCard(props: QuestionCardProps) {
     console.error("Failed to parse topics:", e);
   }
 
-  let displayContent = stripAnswerSpaces(content ?? "");
-  const strippedAnswerContent = stripAnswerSpaces(answerContent ?? "");
+  let displayContent = preprocessExamMarkdown(stripAnswerSpaces(content ?? ""));
+  const strippedAnswerContent = preprocessExamMarkdown(stripAnswerSpaces(answerContent ?? ""));
 
   // Task 4: math_snippet logic removed — content is the single source of truth.
   // The DB migration sets math_snippet = '' for all existing rows.
@@ -314,9 +311,26 @@ export function QuestionCard(props: QuestionCardProps) {
               {topic}
             </Badge>
           ))}
-          <Badge className="bg-primary/15 text-primary hover:bg-primary/20 border-primary/20 text-xs font-semibold shrink-0">
-            {marks} {marks === 1 ? "mark" : "marks"}
-          </Badge>
+          {(() => {
+            const diffMatch = displayContent.match(/(?:\*{0,2}\[Difficulty:\s*([^*\]\)]+)\*{0,2}\]|\(([★*]{1,5}\+?)\))/i);
+            if (diffMatch) {
+              const rating = (diffMatch[1] || diffMatch[2]).trim();
+              return (
+                <Badge className="bg-amber-500/15 text-amber-300 border-amber-500/30 text-xs font-semibold shrink-0 gap-1">
+                  <span>Difficulty:</span>
+                  <span className="font-mono text-amber-200">{rating}</span>
+                </Badge>
+              );
+            }
+            if (marks != null && marks > 0) {
+              return (
+                <Badge className="bg-primary/15 text-primary hover:bg-primary/20 border-primary/20 text-xs font-semibold shrink-0">
+                  {marks} {marks === 1 ? "mark" : "marks"}
+                </Badge>
+              );
+            }
+            return null;
+          })()}
         </div>
 
         {/* Right: Action buttons (never squished, distinct hover styling) */}
@@ -422,26 +436,14 @@ export function QuestionCard(props: QuestionCardProps) {
       )}
 
       {/* ── Question Content ── */}
-      <div className="relative text-sm leading-relaxed text-foreground prose prose-sm dark:prose-invert max-w-none prose-p:my-1 prose-pre:my-1 break-words [overflow-wrap:anywhere] min-w-0">
+      <div className="relative text-sm leading-relaxed text-foreground min-w-0">
         <div className="overflow-x-auto min-w-0 max-w-full">
-          <ReactMarkdown 
-            remarkPlugins={[remarkMath, remarkGfm, remarkMathFix]} 
-            rehypePlugins={[[rehypeKatex, { throwOnError: false, strict: false }]]}
-            urlTransform={(value) => value}
-            components={{
-              img: ({ node, ...props }) => {
-                if (!props.src) return null;
-                return (
-                  <DiagramImg
-                    src={props.src}
-                    alt={props.alt || "Diagram"}
-                  />
-                );
-              },
-            }}
-          >
-            {preprocessMathString(displayContent)}
-          </ReactMarkdown>
+          <ExamMarkdownRenderer
+            content={displayContent}
+            imageRenderer={(src, alt) => (
+              <DiagramImg src={src} alt={alt || "Diagram"} />
+            )}
+          />
         </div>
 
         {/* ── Mark Scheme Accordion Drawer ── */}
@@ -463,25 +465,13 @@ export function QuestionCard(props: QuestionCardProps) {
             </button>
 
             {isShowingAnswer && (
-              <div className="mt-2 p-3 rounded-lg bg-muted/20 border border-border/60 prose prose-sm dark:prose-invert max-w-none text-sm animate-in fade-in-50 slide-in-from-top-1 duration-150">
-                <ReactMarkdown 
-                  remarkPlugins={[remarkMath, remarkGfm, remarkMathFix]} 
-                  rehypePlugins={[[rehypeKatex, { throwOnError: false, strict: false }]]}
-                  urlTransform={(value) => value}
-                  components={{
-                    img: ({ node, ...props }) => {
-                      if (!props.src) return null;
-                      return (
-                        <DiagramImg
-                          src={props.src}
-                          alt={props.alt || "Diagram"}
-                        />
-                      );
-                    },
-                  }}
-                >
-                  {preprocessMathString(strippedAnswerContent)}
-                </ReactMarkdown>
+              <div className="mt-2 p-3 rounded-lg bg-muted/20 border border-border/60 text-sm animate-in fade-in-50 slide-in-from-top-1 duration-150">
+                <ExamMarkdownRenderer
+                  content={strippedAnswerContent}
+                  imageRenderer={(src, alt) => (
+                    <DiagramImg src={src} alt={alt || "Diagram"} />
+                  )}
+                />
               </div>
             )}
           </div>
@@ -640,4 +630,4 @@ export function QuestionCard(props: QuestionCardProps) {
       </div>
     </article>
   );
-}
+});
