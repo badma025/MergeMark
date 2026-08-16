@@ -156,11 +156,11 @@ export function RepositoryFeed({
         requestAnimationFrame(() => {
           setTimeout(() => {
             (window as unknown as { __dismissSplash?: () => void }).__dismissSplash?.();
-          }, 80);
+          }, 150);
         });
       });
     }
-  }, [loading, taxonomyLoading]);
+  }, [loading, taxonomyLoading, questions.length]);
 
   async function fetchQuestions() {
     setLoading(true);
@@ -286,10 +286,21 @@ export function RepositoryFeed({
     return filtered.reduce((sum, q) => sum + (q.marks || 0), 0);
   }, [filtered]);
 
-  const [displayCount, setDisplayCount] = useState(60);
+  const INITIAL_DISPLAY_COUNT = 12;
+  const [displayCount, setDisplayCount] = useState(INITIAL_DISPLAY_COUNT);
+
+  // Expand displayCount smoothly after initial paint without blocking the UI
+  useEffect(() => {
+    if (!loading && filtered.length > displayCount) {
+      const timer = setTimeout(() => {
+        setDisplayCount(60);
+      }, 400);
+      return () => clearTimeout(timer);
+    }
+  }, [loading, filtered.length, displayCount]);
 
   useEffect(() => {
-    setDisplayCount(60);
+    setDisplayCount(INITIAL_DISPLAY_COUNT);
   }, [
     deferredSearch,
     selectedSubject,
