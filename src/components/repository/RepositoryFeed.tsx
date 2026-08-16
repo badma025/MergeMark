@@ -1,5 +1,5 @@
 import { Search, Plus, X, FileText } from "lucide-react";
-import { useState, useEffect, useRef, useMemo, useDeferredValue, useCallback } from "react";
+import { useState, useEffect, useRef, useMemo, useDeferredValue, useCallback, useLayoutEffect } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { toast } from "sonner";
 import { Input } from "@/components/ui/input";
@@ -78,6 +78,8 @@ export function RepositoryFeed({
   const [questions, setQuestions] = useState<Omit<QuestionCardProps, "onAddToWorksheet" | "onDelete">[]>([]);
   const [loading, setLoading] = useState(true);
   const splashDismissedRef = useRef(false);
+  const paintConfirmedRef = useRef(false);
+  const cardsMountedRef = useRef(false);
   const { subjects, topicsBySubject, loading: taxonomyLoading } = useTaxonomy();
 
   const subjectNames = useMemo(() => (subjects || []).map(s => s?.name).filter(Boolean), [subjects]);
@@ -148,22 +150,14 @@ export function RepositoryFeed({
     return () => window.removeEventListener("refresh-questions", handleRefresh);
   }, [isActive]);
 
-  // Dismiss splash screen ONLY when questions and taxonomy are fully ready and painted in the DOM
-  useEffect(() => {
-    if (!loading && !taxonomyLoading && !splashDismissedRef.current) {
-      splashDismissedRef.current = true;
-      requestAnimationFrame(() => {
-        requestAnimationFrame(() => {
-          setTimeout(() => {
-            (window as unknown as { __dismissSplash?: () => void }).__dismissSplash?.();
-          }, 150);
-        });
-      });
-    }
-  }, [loading, taxonomyLoading, questions.length]);
-
+  // Paint confirmation callback - called when first batch of cards are mounted and painted
+  
   async function fetchQuestions() {
     setLoading(true);
+    // Reset paint confirmation refs for new data load
+    paintConfirmedRef.current = false;
+    cardsMountedRef.current = false;
+    splashDismissedRef.current = false;
     try {
       const data = await invoke<Omit<QuestionCardProps, "onAddToWorksheet" | "onDelete">[]>("get_all_questions");
       setQuestions(data || []);
@@ -301,6 +295,10 @@ export function RepositoryFeed({
 
   useEffect(() => {
     setDisplayCount(INITIAL_DISPLAY_COUNT);
+    // Reset paint confirmation refs when filters change (new card set will render)
+    paintConfirmedRef.current = false;
+    cardsMountedRef.current = false;
+    // Don't reset splashDismissedRef - splash should already be dismissed
   }, [
     deferredSearch,
     selectedSubject,
@@ -314,6 +312,106 @@ export function RepositoryFeed({
   const visibleQuestions = useMemo(() => {
     return filtered.slice(0, displayCount);
   }, [filtered, displayCount]);
+
+  // Paint confirmation callback - called when first batch of cards are mounted and painted
+  // Uses double requestAnimationFrame + visual verification to ensure ACTUAL paint
+  // KaTeX renders synchronously but browser paints asynchronously; content-visibility:auto may defer paint
+  const confirmCardsPainted = useCallback(() => {
+    if (paintConfirmedRef.current) return;
+
+    const requiredCount = Math.min(visibleQuestions.length, INITIAL_DISPLAY_COUNT);
+
+    // First rAF: ensures we're after React commit
+    requestAnimationFrame(() => {
+      // Second rAF: ensures we wait for the NEXT paint frame
+      requestAnimationFrame(() => {
+        const cardElements = document.querySelectorAll('[data-question-card="true"]');
+        if (cardElements.length < requiredCount) {
+          // Cards not even in DOM yet - retry
+          requestAnimationFrame(() => {
+            const retryCards = document.querySelectorAll('[data-question-card="true"]');
+            if (retryCards.length >= requiredCount) {
+              verifyAndDismiss(retryCards, requiredCount);
+            }
+          });
+          return;
+        }
+
+        // Cards in DOM - now verify they're actually VISUALLY rendered (have layout/paint)
+        verifyAndDismiss(cardElements, requiredCount);
+      });
+    });
+  }, [visibleQuestions.length]);
+
+  // Verify cards have actual rendered content (non-zero dimensions = painted)
+  const verifyAndDismiss = useCallback((cards: NodeListOf<Element>, requiredCount: number) => {
+    let paintedCount = 0;
+    cards.forEach((card) => {
+      const rect = card.getBoundingClientRect();
+      const style = window.getComputedStyle(card);
+      // Card is painted if it has layout AND is visible
+      if (rect.width > 0 && rect.height > 0 && style.visibility !== 'hidden' && style.display !== 'none') {
+        paintedCount++;
+      }
+    });
+
+    if (paintedCount >= requiredCount) {
+      paintConfirmedRef.current = true;
+      dismissSplash();
+    } else {
+      // Not fully painted yet - wait one more frame and retry
+      requestAnimationFrame(() => {
+        const retryCards = document.querySelectorAll('[data-question-card="true"]');
+        verifyAndDismiss(retryCards, requiredCount);
+      });
+    }
+  }, []);
+
+  // Single dismissal function - smooth fade out
+  const dismissSplash = useCallback(() => {
+    if (splashDismissedRef.current) return;
+    splashDismissedRef.current = true;
+
+    // One frame to ensure DOM is stable, then fade
+    requestAnimationFrame(() => {
+      (window as unknown as { __dismissSplash?: () => void }).__dismissSplash?.();
+    });
+  }, []);
+
+  // Trigger splash dismissal when: data loaded + taxonomy loaded + (cards painted OR empty state)
+  useEffect(() => {
+    const dataReady = !loading && !taxonomyLoading;
+    const isEmptyState = filtered.length === 0; // No questions match filters (or no questions at all)
+
+    // Dismiss if: data ready AND (cards are painted OR we're in empty state)
+    const shouldDismiss = dataReady && (cardsMountedRef.current && paintConfirmedRef.current || isEmptyState);
+    if (shouldDismiss && !splashDismissedRef.current) {
+      dismissSplash();
+    }
+  }, [loading, taxonomyLoading, visibleQuestions.length, filtered.length, dismissSplash]);
+
+  // Track when cards are mounted and trigger paint confirmation
+  useLayoutEffect(() => {
+    if (visibleQuestions.length > 0 && !cardsMountedRef.current) {
+      cardsMountedRef.current = true;
+      // Schedule paint confirmation after this layout effect flushes
+      requestAnimationFrame(() => {
+        confirmCardsPainted();
+      });
+    }
+  }, [visibleQuestions.length, confirmCardsPainted]);
+
+  // Handle empty state - dismiss splash when data is ready but no cards to show
+  useLayoutEffect(() => {
+    if (!loading && !taxonomyLoading && filtered.length === 0 && !cardsMountedRef.current && !splashDismissedRef.current) {
+      // Data is loaded but no cards will render - dismiss after double rAF for consistency
+      requestAnimationFrame(() => {
+        requestAnimationFrame(() => {
+          dismissSplash();
+        });
+      });
+    }
+  }, [loading, taxonomyLoading, filtered.length, dismissSplash]);
 
   const handleAdd = useCallback((id: string) => {
     const question = questions.find((q) => q.id === id);
@@ -596,14 +694,15 @@ export function RepositoryFeed({
               className="grid gap-4 grid-cols-[repeat(auto-fill,minmax(320px,1fr))]"
               aria-label="Question cards"
             >
-              {visibleQuestions.map((q) => (
-                <li key={q.id} className="min-w-0" style={{ contentVisibility: "auto", containIntrinsicSize: "0 350px" }}>
+              {visibleQuestions.map((q, index) => (
+                <li key={q.id} className="min-w-0" style={index < INITIAL_DISPLAY_COUNT ? {} : { contentVisibility: "auto", containIntrinsicSize: "0 350px" }}>
                   <QuestionCard
                     {...q}
                     isAdded={selectedQuestionIds.includes(q.id)}
                     onAddToWorksheet={handleAdd}
                     onDelete={handleDelete}
                     onUpdate={handleUpdate}
+                    data-question-card="true"
                   />
                 </li>
               ))}

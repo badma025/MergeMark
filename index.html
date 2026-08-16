@@ -35,13 +35,23 @@
         background-color: #09090b;
         user-select: none;
         z-index: 99999;
-        transition: opacity 0.45s cubic-bezier(0.16, 1, 0.3, 1), visibility 0.45s ease-out;
+        /* Start at full opacity - no transition until fade-out class is added */
+        opacity: 1;
+        visibility: visible;
+        pointer-events: auto;
+        transition: opacity 0.5s cubic-bezier(0.16, 1, 0.3, 1), visibility 0.5s ease-out;
         will-change: opacity;
       }
       .splash-container.splash-fade-out {
         opacity: 0;
         visibility: hidden;
         pointer-events: none;
+      }
+      /* Ensure splash is solid during initial load - this rule has higher specificity to override any premature transitions */
+      .splash-container:not(.splash-fade-out) {
+        opacity: 1 !important;
+        visibility: visible !important;
+        pointer-events: auto !important;
       }
       .splash-glow {
         position: absolute;

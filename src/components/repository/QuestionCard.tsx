@@ -279,6 +279,7 @@ export const QuestionCard = memo(function QuestionCard(props: QuestionCardProps)
         "transition-all duration-200 hover:border-primary/40 hover:shadow-md hover:shadow-primary/5 cursor-pointer",
         className
       )}
+      data-question-card="true"
     >
       {/* ── Header: Badges & Action Buttons ── */}
       <div className="flex items-start justify-between gap-3 min-w-0">
