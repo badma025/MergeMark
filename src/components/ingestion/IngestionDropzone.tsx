@@ -63,11 +63,11 @@ export function IngestionDropzone({ isActive = false, onSuccess }: IngestionDrop
   const [pendingMappings, setPendingMappings] = useState<ProposedMapping[] | null>(null);
   const [isDraggingOver, setIsDraggingOver] = useState(false);
   const [isProcessing, setIsProcessing] = useState(false);
-  const [isCancelling, setIsCancelling] = useState(false);
   const [progressMsg, setProgressMsg] = useState("");
   const [lastFile, setLastFile] = useState<string | null>(null);
   const [reports, setReports] = useState<ImportReport[]>([]);
   const [showLogs, setShowLogs] = useState(false);
+  const cancelledRef = useRef(false);
   
   const activeSubject = subjects.find(s => s.id === subject);
   const availableModules = activeSubject ? activeSubject.modules : [];
@@ -176,6 +176,7 @@ export function IngestionDropzone({ isActive = false, onSuccess }: IngestionDrop
       filePath.replace(/\\/g, "/").split("/").pop()?.replace(/\.[^.]+$/, "") ||
       filePath;
 
+    cancelledRef.current = false;
     setLastFile(filePath);
     setIsProcessing(true);
     setProgressMsg("");
@@ -195,6 +196,7 @@ export function IngestionDropzone({ isActive = false, onSuccess }: IngestionDrop
           modelName,
           paperName: effectivePaperName,
         });
+        if (cancelledRef.current) return;
         setPendingMappings(mappings);
       } else {
         const questions = await invoke<any[]>("parse_pdf_vision", { 
@@ -206,6 +208,7 @@ export function IngestionDropzone({ isActive = false, onSuccess }: IngestionDrop
           moduleOverride: moduleOverride.trim() !== "" ? moduleOverride.trim() : null,
           paperName,
         });
+        if (cancelledRef.current) return;
         const count = questions.length;
         toast.success(
           count === 1 ? "1 question extracted!" : `${count} questions extracted!`,
@@ -214,6 +217,7 @@ export function IngestionDropzone({ isActive = false, onSuccess }: IngestionDrop
         if (onSuccess) onSuccess();
       }
     } catch (err) {
+      if (cancelledRef.current) return;
       const errMsg = String(err);
       if (errMsg.includes("Import cancelled by user")) {
         toast.info("Import Cancelled", {
@@ -228,10 +232,11 @@ export function IngestionDropzone({ isActive = false, onSuccess }: IngestionDrop
       }
     } finally {
       notifyUsageChanged();
-      setLastFile(null);
-      setProgressMsg("");
-      setIsProcessing(false);
-      setIsCancelling(false);
+      if (!cancelledRef.current) {
+        setLastFile(null);
+        setProgressMsg("");
+        setIsProcessing(false);
+      }
     }
   }
 
@@ -535,21 +540,24 @@ export function IngestionDropzone({ isActive = false, onSuccess }: IngestionDrop
               </p>
               <button
                 type="button"
-                disabled={isCancelling}
-                onClick={async (e) => {
+                onClick={(e) => {
                   e.stopPropagation();
-                  if (isCancelling) return;
-                  setIsCancelling(true);
-                  setProgressMsg("Cancelling import…");
-                  try {
-                    await invoke("cancel_import");
-                  } catch (err) {
-                    console.error("Failed to cancel import:", err);
-                  }
+                  cancelledRef.current = true;
+                  const currentPaper = lastFile
+                    ? lastFile.replace(/\\/g, "/").split("/").pop()?.replace(/\.[^.]+$/, "") || lastFile
+                    : "import";
+                  setIsProcessing(false);
+                  setProgressMsg("");
+                  setLastFile(null);
+                  toast.info("Import Cancelled", {
+                    description: `Stopped processing ${currentPaper}`,
+                    duration: 3500,
+                  });
+                  invoke("cancel_import").catch(console.error);
                 }}
-                className="pointer-events-auto px-4 py-1.5 text-xs font-semibold text-destructive-foreground bg-destructive hover:bg-destructive/90 disabled:opacity-60 disabled:cursor-not-allowed rounded-md transition-all shadow-sm active:scale-95"
+                className="pointer-events-auto px-4 py-1.5 text-xs font-semibold text-destructive-foreground bg-destructive hover:bg-destructive/90 rounded-md transition-all shadow-sm active:scale-95"
               >
-                {isCancelling ? "Cancelling…" : "Cancel Import"}
+                Cancel Import
               </button>
             </>
           ) : (

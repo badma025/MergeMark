@@ -1313,6 +1313,10 @@ pub async fn parse_pdf_vision(
         }
     };
 
+    if state.cancel_flag.load(std::sync::atomic::Ordering::Relaxed) {
+        return Err("Import cancelled by user".to_string());
+    }
+
     // ── Fast path: pure-text PDF (all pages TextOnly) → heuristic extraction ──
     // If every page is TextOnly (no rendered images = no diagrams, no visual
     // elements), we can skip the expensive PVRV vision pipeline entirely and
@@ -1881,6 +1885,10 @@ pub async fn parse_mark_scheme_vision(
             text,
         }]
     };
+
+    if state.cancel_flag.load(std::sync::atomic::Ordering::Relaxed) {
+        return Err("Import cancelled by user".to_string());
+    }
 
     let diagrams_dir = app.path().app_data_dir().map(|d| d.join("diagrams")).ok();
 

@@ -181,14 +181,31 @@ async fn chat_with_permit<C: LlmClient>(
     if cancel.load(Ordering::Relaxed) {
         return Err(crate::llm::LlmError::Network("Import cancelled by user".to_string()));
     }
-    let _permit = semaphore
-        .acquire()
-        .await
-        .map_err(|_| crate::llm::LlmError::Network("request semaphore closed".to_string()))?;
+    let _permit = tokio::select! {
+        res = semaphore.acquire() => {
+            res.map_err(|_| crate::llm::LlmError::Network("request semaphore closed".to_string()))?
+        }
+        _ = async {
+            while !cancel.load(Ordering::Relaxed) {
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+        } => {
+            return Err(crate::llm::LlmError::Network("Import cancelled by user".to_string()));
+        }
+    };
     if cancel.load(Ordering::Relaxed) {
         return Err(crate::llm::LlmError::Network("Import cancelled by user".to_string()));
     }
-    client.chat(body).await
+    tokio::select! {
+        res = client.chat(body) => res,
+        _ = async {
+            while !cancel.load(Ordering::Relaxed) {
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+        } => {
+            Err(crate::llm::LlmError::Network("Import cancelled by user".to_string()))
+        }
+    }
 }
 
 /// Shared cache for decoded page images. The same page is often decoded
@@ -1204,11 +1221,24 @@ pub async fn run_question_pipeline<C: LlmClient, P: Progress>(
             })
             .buffer_unordered(config.parallelism.max(1));
             let mut ordered = Vec::with_capacity(pages.len());
-            while let Some(result) = structure_results.next().await {
-                if cancel.load(Ordering::Relaxed) {
-                    break;
+            loop {
+                let next_item = tokio::select! {
+                    res = structure_results.next() => res,
+                    _ = async {
+                        while !cancel.load(Ordering::Relaxed) {
+                            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                        }
+                    } => None,
+                };
+                match next_item {
+                    Some(result) => {
+                        if cancel.load(Ordering::Relaxed) {
+                            break;
+                        }
+                        ordered.push(result);
+                    }
+                    None => break,
                 }
-                ordered.push(result);
             }
             ordered.sort_by_key(|(index, _)| *index);
             ordered
@@ -1390,11 +1420,22 @@ pub async fn run_question_pipeline<C: LlmClient, P: Progress>(
         }))
         .buffer_unordered(config.parallelism.max(1));
         let mut ordered_results = Vec::with_capacity(q_pages.len());
-        while let Some(result) = results.next().await {
+        loop {
+            let next_item = tokio::select! {
+                res = results.next() => res,
+                _ = async {
+                    while !cancel.load(Ordering::Relaxed) {
+                        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                    }
+                } => None,
+            };
             if cancel.load(Ordering::Relaxed) {
                 return Err("Import cancelled by user".to_string());
             }
-            ordered_results.push(result);
+            match next_item {
+                Some(result) => ordered_results.push(result),
+                None => break,
+            }
         }
         drop(results);
         ordered_results.sort_by_key(|(position, _)| *position);
@@ -1616,11 +1657,22 @@ pub async fn run_question_pipeline<C: LlmClient, P: Progress>(
         .buffer_unordered(config.parallelism.max(1));
 
         let mut ordered_results = Vec::with_capacity(jobs.len());
-        while let Some(result) = results.next().await {
+        loop {
+            let next_item = tokio::select! {
+                res = results.next() => res,
+                _ = async {
+                    while !cancel.load(Ordering::Relaxed) {
+                        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                    }
+                } => None,
+            };
             if cancel.load(Ordering::Relaxed) {
                 return Err("Import cancelled by user".to_string());
             }
-            ordered_results.push(result);
+            match next_item {
+                Some(result) => ordered_results.push(result),
+                None => break,
+            }
         }
         ordered_results.sort_by_key(|(position, _, _)| *position);
         report.record_timing(
@@ -4222,11 +4274,22 @@ pub async fn run_markscheme_pipeline<C: LlmClient, P: Progress>(
     }))
     .buffer_unordered(config.parallelism.max(1));
     let mut ordered_results = Vec::with_capacity(windows.len());
-    while let Some(result) = results.next().await {
+    loop {
+        let next_item = tokio::select! {
+            res = results.next() => res,
+            _ = async {
+                while !cancel.load(Ordering::Relaxed) {
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                }
+            } => None,
+        };
         if cancel.load(Ordering::Relaxed) {
             return Err("Import cancelled by user".to_string());
         }
-        ordered_results.push(result);
+        match next_item {
+            Some(result) => ordered_results.push(result),
+            None => break,
+        }
     }
     ordered_results.sort_by_key(|(position, _)| *position);
     for ((start, end), (_, (res, local))) in windows.iter().copied().zip(ordered_results) {
