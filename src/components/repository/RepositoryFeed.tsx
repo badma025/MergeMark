@@ -1,5 +1,5 @@
 import { Search, Plus, X, FileText } from "lucide-react";
-import { useState, useEffect, useRef, useMemo, useDeferredValue, useCallback } from "react";
+import { useState, useEffect, useMemo, useDeferredValue, useCallback } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { toast } from "sonner";
 import { Input } from "@/components/ui/input";
@@ -18,13 +18,45 @@ import { AddQuestionModal } from "./AddQuestionModal";
 import { ManagePapersModal } from "./ManagePapersModal";
 import { useTaxonomy } from "@/lib/TaxonomyContext";
 
-// ── Component ─────────────────────────────────────────────────────────────────
-
 export interface RepositoryFeedProps {
   isActive?: boolean;
   onAddToWorksheet: (question: Omit<QuestionCardProps, "onAddToWorksheet" | "onDelete">) => void;
   onAddMultipleToWorksheet?: (questions: Omit<QuestionCardProps, "onAddToWorksheet" | "onDelete">[]) => void;
   selectedQuestionIds?: string[];
+}
+
+function QuestionCardSkeleton() {
+  return (
+    <div className="flex flex-col justify-between rounded-xl border border-border/50 bg-card/40 p-4 sm:p-5 shadow-xs animate-pulse min-h-[220px]">
+      <div className="space-y-3.5">
+        {/* Header Badges & Add Button */}
+        <div className="flex items-center justify-between gap-2">
+          <div className="flex items-center gap-1.5 flex-wrap">
+            <div className="h-5 w-20 rounded-md bg-muted/60" />
+            <div className="h-5 w-24 rounded-md bg-muted/40" />
+            <div className="h-5 w-14 rounded-md bg-muted/40" />
+          </div>
+          <div className="h-7 w-16 rounded-md bg-muted/50 shrink-0" />
+        </div>
+
+        {/* Content Skeleton Lines */}
+        <div className="space-y-2 pt-1">
+          <div className="h-3.5 w-full rounded bg-muted/40" />
+          <div className="h-3.5 w-11/12 rounded bg-muted/30" />
+          <div className="h-3.5 w-3/4 rounded bg-muted/20" />
+        </div>
+      </div>
+
+      {/* Footer Badges & Actions */}
+      <div className="flex items-center justify-between pt-3 border-t border-border/20 mt-4">
+        <div className="h-4 w-28 rounded bg-muted/30" />
+        <div className="flex items-center gap-1.5">
+          <div className="size-6 rounded-md bg-muted/30" />
+          <div className="size-6 rounded-md bg-muted/30" />
+        </div>
+      </div>
+    </div>
+  );
 }
 
 export function RepositoryFeed({
@@ -45,8 +77,7 @@ export function RepositoryFeed({
   const [reviewFilter, setReviewFilter] = useState<"All" | "Clean" | "Needs review">("All");
   const [questions, setQuestions] = useState<Omit<QuestionCardProps, "onAddToWorksheet" | "onDelete">[]>([]);
   const [loading, setLoading] = useState(true);
-  const splashDismissedRef = useRef(false);
-  const { subjects, topicsBySubject, loading: taxonomyLoading } = useTaxonomy();
+  const { subjects, topicsBySubject } = useTaxonomy();
 
   const subjectNames = useMemo(() => (subjects || []).map(s => s?.name).filter(Boolean), [subjects]);
 
@@ -115,20 +146,6 @@ export function RepositoryFeed({
     window.addEventListener("refresh-questions", handleRefresh);
     return () => window.removeEventListener("refresh-questions", handleRefresh);
   }, [isActive]);
-
-  // Coordinate splash dismissal: only fade out when both questions and taxonomy are fully ready and painted in the DOM
-  useEffect(() => {
-    if (!loading && !taxonomyLoading && !splashDismissedRef.current) {
-      splashDismissedRef.current = true;
-      requestAnimationFrame(() => {
-        requestAnimationFrame(() => {
-          setTimeout(() => {
-            (window as unknown as { __dismissSplash?: () => void }).__dismissSplash?.();
-          }, 60);
-        });
-      });
-    }
-  }, [loading, taxonomyLoading]);
 
   async function fetchQuestions() {
     setLoading(true);
@@ -517,8 +534,17 @@ export function RepositoryFeed({
       {/* ── Scrollable question grid ── */}
       <div className="flex-1 min-h-0 overflow-y-auto px-4 sm:px-6 py-4 sm:py-5">
         {loading ? (
-          <div className="flex flex-col items-center justify-center h-48 text-muted-foreground">
-            <p className="text-sm">Loading questions...</p>
+          <div className="flex flex-col gap-6">
+            <ul
+              className="grid gap-4 grid-cols-[repeat(auto-fill,minmax(320px,1fr))]"
+              aria-label="Loading question cards"
+            >
+              {Array.from({ length: 6 }).map((_, i) => (
+                <li key={`skeleton-${i}`} className="min-w-0">
+                  <QuestionCardSkeleton />
+                </li>
+              ))}
+            </ul>
           </div>
         ) : filtered.length === 0 ? (
           <div className="flex flex-col items-center justify-center h-48 text-muted-foreground gap-3">

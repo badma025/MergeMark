@@ -167,12 +167,12 @@
         }, 500);
       };
 
-      // Safety fallback timer (15s) in case of an unexpected crash
+      // Safety fallback timer (3s) in case of an unexpected crash
       setTimeout(function() {
         if (typeof window.__dismissSplash === 'function') {
           window.__dismissSplash();
         }
-      }, 15000);
+      }, 3000);
     </script>
     <script type="module" src="/src/main.tsx"></script>
   </body>
