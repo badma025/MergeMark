@@ -1,4 +1,4 @@
-import { useState, useEffect } from "react";
+import { useState } from "react";
 import { Toaster, toast } from "sonner";
 import { LayoutGrid, UploadCloud, Settings as SettingsIcon, BookOpen, FileText } from "lucide-react";
 import { RepositoryFeed } from "@/components/repository/RepositoryFeed";
@@ -28,14 +28,6 @@ function App() {
   const [activeTab, setActiveTab] = useState<Tab>("repository");
   const [selectedQuestions, setSelectedQuestions] = useState<WorksheetItemData[]>([]);
   const [isWorksheetDrawerOpen, setIsWorksheetDrawerOpen] = useState(false);
-
-  // Dismiss splash screen smoothly once the app shell has mounted
-  useEffect(() => {
-    const timer = setTimeout(() => {
-      (window as unknown as { __dismissSplash?: () => void }).__dismissSplash?.();
-    }, 60);
-    return () => clearTimeout(timer);
-  }, []);
 
   // ── Free-tier upload counter ──────────────────────────────────────────
   const { status: usageStatus, loading: usageLoading } = useUploadCounter();

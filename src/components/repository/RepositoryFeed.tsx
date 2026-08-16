@@ -1,5 +1,5 @@
 import { Search, Plus, X, FileText } from "lucide-react";
-import { useState, useEffect, useMemo, useDeferredValue, useCallback } from "react";
+import { useState, useEffect, useRef, useMemo, useDeferredValue, useCallback } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { toast } from "sonner";
 import { Input } from "@/components/ui/input";
@@ -77,7 +77,8 @@ export function RepositoryFeed({
   const [reviewFilter, setReviewFilter] = useState<"All" | "Clean" | "Needs review">("All");
   const [questions, setQuestions] = useState<Omit<QuestionCardProps, "onAddToWorksheet" | "onDelete">[]>([]);
   const [loading, setLoading] = useState(true);
-  const { subjects, topicsBySubject } = useTaxonomy();
+  const splashDismissedRef = useRef(false);
+  const { subjects, topicsBySubject, loading: taxonomyLoading } = useTaxonomy();
 
   const subjectNames = useMemo(() => (subjects || []).map(s => s?.name).filter(Boolean), [subjects]);
 
@@ -146,6 +147,20 @@ export function RepositoryFeed({
     window.addEventListener("refresh-questions", handleRefresh);
     return () => window.removeEventListener("refresh-questions", handleRefresh);
   }, [isActive]);
+
+  // Dismiss splash screen ONLY when questions and taxonomy are fully ready and painted in the DOM
+  useEffect(() => {
+    if (!loading && !taxonomyLoading && !splashDismissedRef.current) {
+      splashDismissedRef.current = true;
+      requestAnimationFrame(() => {
+        requestAnimationFrame(() => {
+          setTimeout(() => {
+            (window as unknown as { __dismissSplash?: () => void }).__dismissSplash?.();
+          }, 80);
+        });
+      });
+    }
+  }, [loading, taxonomyLoading]);
 
   async function fetchQuestions() {
     setLoading(true);
