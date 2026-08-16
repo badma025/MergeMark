@@ -111,18 +111,20 @@ pub fn render_pdf_pages(path: &Path) -> Result<Vec<PageInput>, String> {
         raw_pages.push((i, text, Some(img)));
     }
 
-    // Phase 2: Parallel WebP compression & Base64 encoding across all CPU cores with Rayon
+    // Phase 2: Parallel JPEG compression & Base64 encoding across all CPU cores with Rayon
     use rayon::prelude::*;
     let pages: Result<Vec<PageInput>, String> = raw_pages
         .into_par_iter()
         .map(|(i, text, img_opt)| {
             if let Some(img) = img_opt {
+                let rgb_img = img.to_rgb8();
                 let mut buf = Cursor::new(Vec::new());
-                img.write_to(&mut buf, image::ImageFormat::WebP)
-                    .map_err(|e| format!("Failed to encode webp on page {}: {:?}", i, e))?;
+                let mut encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut buf, 90);
+                encoder.encode_image(&rgb_img)
+                    .map_err(|e| format!("Failed to encode jpeg on page {}: {:?}", i, e))?;
                 
                 let b64 = format!(
-                    "data:image/webp;base64,{}", 
+                    "data:image/jpeg;base64,{}", 
                     base64::engine::general_purpose::STANDARD.encode(buf.into_inner())
                 );
 
@@ -160,12 +162,14 @@ pub fn load_and_optimize_image_file(path: &Path) -> Result<PageInput, String> {
         img
     };
 
+    let rgb_img = final_img.to_rgb8();
     let mut buf = Cursor::new(Vec::new());
-    final_img.write_to(&mut buf, image::ImageFormat::WebP)
-        .map_err(|e| format!("Failed to encode webp: {}", e))?;
+    let mut encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut buf, 90);
+    encoder.encode_image(&rgb_img)
+        .map_err(|e| format!("Failed to encode jpeg: {}", e))?;
 
     let b64 = format!(
-        "data:image/webp;base64,{}",
+        "data:image/jpeg;base64,{}",
         base64::engine::general_purpose::STANDARD.encode(buf.into_inner())
     );
 

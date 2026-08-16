@@ -254,6 +254,24 @@ export function RepositoryFeed({
     return filtered.reduce((sum, q) => sum + (q.marks || 0), 0);
   }, [filtered]);
 
+  const [displayCount, setDisplayCount] = useState(60);
+
+  useEffect(() => {
+    setDisplayCount(60);
+  }, [
+    deferredSearch,
+    selectedSubject,
+    selectedPaper,
+    selectedMarksRange,
+    selectedTopics,
+    selectedModule,
+    reviewFilter,
+  ]);
+
+  const visibleQuestions = useMemo(() => {
+    return filtered.slice(0, displayCount);
+  }, [filtered, displayCount]);
+
   const handleAdd = useCallback((id: string) => {
     const question = questions.find((q) => q.id === id);
     if (question) {
@@ -521,22 +539,37 @@ export function RepositoryFeed({
             )}
           </div>
         ) : (
-          <ul
-            className="grid gap-4 grid-cols-[repeat(auto-fill,minmax(320px,1fr))]"
-            aria-label="Question cards"
-          >
-            {filtered.map((q) => (
-              <li key={q.id} className="min-w-0" style={{ contentVisibility: "auto", containIntrinsicSize: "0 350px" }}>
-                <QuestionCard
-                  {...q}
-                  isAdded={selectedQuestionIds.includes(q.id)}
-                  onAddToWorksheet={handleAdd}
-                  onDelete={handleDelete}
-                  onUpdate={handleUpdate}
-                />
-              </li>
-            ))}
-          </ul>
+          <div className="flex flex-col gap-6">
+            <ul
+              className="grid gap-4 grid-cols-[repeat(auto-fill,minmax(320px,1fr))]"
+              aria-label="Question cards"
+            >
+              {visibleQuestions.map((q) => (
+                <li key={q.id} className="min-w-0" style={{ contentVisibility: "auto", containIntrinsicSize: "0 350px" }}>
+                  <QuestionCard
+                    {...q}
+                    isAdded={selectedQuestionIds.includes(q.id)}
+                    onAddToWorksheet={handleAdd}
+                    onDelete={handleDelete}
+                    onUpdate={handleUpdate}
+                  />
+                </li>
+              ))}
+            </ul>
+
+            {filtered.length > displayCount && (
+              <div className="flex justify-center pb-4 pt-2">
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={() => setDisplayCount((prev) => prev + 60)}
+                  className="gap-2 text-xs font-semibold px-5 h-9 bg-card/60 hover:bg-card border-border/80 shadow-xs hover:border-primary/50 transition-all"
+                >
+                  <span>Show More Questions ({filtered.length - displayCount} remaining)</span>
+                </Button>
+              </div>
+            )}
+          </div>
         )}
       </div>
 

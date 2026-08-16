@@ -716,7 +716,7 @@ pub async fn compile_worksheet(
     latex.push_str("\\usepackage[T1]{fontenc}\n");
     latex.push_str("\\usepackage[top=2.0cm, bottom=2.2cm, left=2.0cm, right=2.0cm, headheight=24pt, headsep=0.7cm, footskip=1.1cm]{geometry}\n");
     latex.push_str(
-        "\\usepackage{amsmath, amssymb, graphicx, xcolor, mdframed, parskip, enumitem, tabularx, lastpage, needspace, array}\n",
+        "\\usepackage{amsmath, amssymb, mathtools, bm, microtype, graphicx, xcolor, mdframed, parskip, enumitem, tabularx, lastpage, needspace, array}\n",
     );
     latex.push_str("\\usepackage[scaled=0.92]{helvet}\n");
     latex.push_str("\\renewcommand{\\familydefault}{\\sfdefault}\n");
@@ -892,7 +892,7 @@ pub async fn compile_worksheet(
     answer_latex.push_str("\\usepackage[T1]{fontenc}\n");
     answer_latex.push_str("\\usepackage[top=2.0cm, bottom=2.2cm, left=2.0cm, right=2.0cm, headheight=24pt, headsep=0.7cm, footskip=1.1cm]{geometry}\n");
     answer_latex.push_str(
-        "\\usepackage{amsmath, amssymb, graphicx, xcolor, mdframed, parskip, enumitem, lastpage, needspace}\n",
+        "\\usepackage{amsmath, amssymb, mathtools, bm, microtype, graphicx, xcolor, mdframed, parskip, enumitem, lastpage, needspace}\n",
     );
     answer_latex.push_str("\\usepackage[scaled=0.92]{helvet}\n");
     answer_latex.push_str("\\renewcommand{\\familydefault}{\\sfdefault}\n");
