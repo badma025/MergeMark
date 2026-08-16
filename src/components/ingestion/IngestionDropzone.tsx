@@ -63,6 +63,7 @@ export function IngestionDropzone({ isActive = false, onSuccess }: IngestionDrop
   const [pendingMappings, setPendingMappings] = useState<ProposedMapping[] | null>(null);
   const [isDraggingOver, setIsDraggingOver] = useState(false);
   const [isProcessing, setIsProcessing] = useState(false);
+  const [isCancelling, setIsCancelling] = useState(false);
   const [progressMsg, setProgressMsg] = useState("");
   const [lastFile, setLastFile] = useState<string | null>(null);
   const [reports, setReports] = useState<ImportReport[]>([]);
@@ -230,6 +231,7 @@ export function IngestionDropzone({ isActive = false, onSuccess }: IngestionDrop
       setLastFile(null);
       setProgressMsg("");
       setIsProcessing(false);
+      setIsCancelling(false);
     }
   }
 
@@ -533,13 +535,21 @@ export function IngestionDropzone({ isActive = false, onSuccess }: IngestionDrop
               </p>
               <button
                 type="button"
-                onClick={(e) => {
+                disabled={isCancelling}
+                onClick={async (e) => {
                   e.stopPropagation();
-                  invoke("cancel_import").catch(console.error);
+                  if (isCancelling) return;
+                  setIsCancelling(true);
+                  setProgressMsg("Cancelling import…");
+                  try {
+                    await invoke("cancel_import");
+                  } catch (err) {
+                    console.error("Failed to cancel import:", err);
+                  }
                 }}
-                className="pointer-events-auto px-4 py-1.5 text-xs font-semibold text-destructive-foreground bg-destructive hover:bg-destructive/90 rounded-md transition-colors shadow-sm"
+                className="pointer-events-auto px-4 py-1.5 text-xs font-semibold text-destructive-foreground bg-destructive hover:bg-destructive/90 disabled:opacity-60 disabled:cursor-not-allowed rounded-md transition-all shadow-sm active:scale-95"
               >
-                Cancel Import
+                {isCancelling ? "Cancelling…" : "Cancel Import"}
               </button>
             </>
           ) : (

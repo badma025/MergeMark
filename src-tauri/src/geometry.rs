@@ -468,24 +468,16 @@ pub fn sanitize_bbox(b: &[f32], img_w: u32, img_h: u32) -> Option<PixelRect> {
             continue; // starts entirely off-page
         }
 
-        // Apply conservative 2% safety padding so axis ticks, bounds, and labels are never clipped
-        let pad_x = ((x1 - x0) * 0.02).max(0.003);
-        let pad_y = ((y1 - y0) * 0.02).max(0.003);
-        let padded_x0 = (x0 - pad_x).max(0.0);
-        let padded_y0 = (y0 - pad_y).max(0.0);
-        let padded_x1 = (x1 + pad_x).min(1.0);
-        let padded_y1 = (y1 + pad_y).min(1.0);
-
         // Rounding (not floor/ceil) makes pixel-scale round-trips stable.
-        let px = (padded_x0 * img_w as f32).round().max(0.0) as u32;
-        let py = (padded_y0 * img_h as f32).round().max(0.0) as u32;
+        let px = (x0 * img_w as f32).round().max(0.0) as u32;
+        let py = (y0 * img_h as f32).round().max(0.0) as u32;
         let px = px.min(img_w.saturating_sub(1));
         let py = py.min(img_h.saturating_sub(1));
 
         // x0 < 1.0 / y0 < 1.0 were checked above, so the far edges are >= the
         // origin; saturating_sub is belt-and-braces.
-        let far_x = (padded_x1 * img_w as f32).round().max(0.0) as u32;
-        let far_y = (padded_y1 * img_h as f32).round().max(0.0) as u32;
+        let far_x = (x1 * img_w as f32).round().max(0.0) as u32;
+        let far_y = (y1 * img_h as f32).round().max(0.0) as u32;
         let pw = far_x.saturating_sub(px).min(img_w - px);
         let ph = far_y.saturating_sub(py).min(img_h - py);
 

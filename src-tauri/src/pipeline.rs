@@ -176,11 +176,18 @@ async fn chat_with_permit<C: LlmClient>(
     client: &C,
     body: &serde_json::Value,
     semaphore: &Arc<Semaphore>,
+    cancel: &AtomicBool,
 ) -> Result<serde_json::Value, crate::llm::LlmError> {
+    if cancel.load(Ordering::Relaxed) {
+        return Err(crate::llm::LlmError::Network("Import cancelled by user".to_string()));
+    }
     let _permit = semaphore
         .acquire()
         .await
         .map_err(|_| crate::llm::LlmError::Network("request semaphore closed".to_string()))?;
+    if cancel.load(Ordering::Relaxed) {
+        return Err(crate::llm::LlmError::Network("Import cancelled by user".to_string()));
+    }
     client.chat(body).await
 }
 
@@ -1187,7 +1194,7 @@ pub async fn run_question_pipeline<C: LlmClient, P: Progress>(
                         750,
                         Some(llm::ResponseFormat::JsonSchema { schema: structure_json_schema() }),
                     );
-                    let result = match chat_with_permit(client, &body, &semaphore).await {
+                    let result = match chat_with_permit(client, &body, &semaphore, cancel).await {
                         Ok(resp) => llm::message_content(&resp)
                             .map_err(|e| format!("bad response shape ({})", e)),
                         Err(e) => Err(format!("API failure ({})", e)),
@@ -1198,6 +1205,9 @@ pub async fn run_question_pipeline<C: LlmClient, P: Progress>(
             .buffer_unordered(config.parallelism.max(1));
             let mut ordered = Vec::with_capacity(pages.len());
             while let Some(result) = structure_results.next().await {
+                if cancel.load(Ordering::Relaxed) {
+                    break;
+                }
                 ordered.push(result);
             }
             ordered.sort_by_key(|(index, _)| *index);
@@ -1375,11 +1385,15 @@ pub async fn run_question_pipeline<C: LlmClient, P: Progress>(
                 &page_render_cache,
                 &page_image_cache,
                 &request_semaphore,
+                cancel,
             ).map(move |result| (position, result))
         }))
         .buffer_unordered(config.parallelism.max(1));
         let mut ordered_results = Vec::with_capacity(q_pages.len());
         while let Some(result) = results.next().await {
+            if cancel.load(Ordering::Relaxed) {
+                return Err("Import cancelled by user".to_string());
+            }
             ordered_results.push(result);
         }
         drop(results);
@@ -1410,6 +1424,7 @@ pub async fn run_question_pipeline<C: LlmClient, P: Progress>(
                                         &page_render_cache,
                                         &page_image_cache,
                                         &request_semaphore,
+                                        cancel,
                                     )
                                 .await;
                             report.absorb(redo_local);
@@ -1573,6 +1588,7 @@ pub async fn run_question_pipeline<C: LlmClient, P: Progress>(
                             &request_semaphore,
                             &collateral_cache,
                             &all_spans,
+                            cancel,
                         )
                         .await;
                         (position, vec![((*span).clone(), opt)], local_rep)
@@ -1589,6 +1605,7 @@ pub async fn run_question_pipeline<C: LlmClient, P: Progress>(
                             &request_semaphore,
                             &collateral_cache,
                             &all_spans,
+                            cancel,
                         )
                         .await;
                         (position, res_vec, local_rep)
@@ -1600,6 +1617,9 @@ pub async fn run_question_pipeline<C: LlmClient, P: Progress>(
 
         let mut ordered_results = Vec::with_capacity(jobs.len());
         while let Some(result) = results.next().await {
+            if cancel.load(Ordering::Relaxed) {
+                return Err("Import cancelled by user".to_string());
+            }
             ordered_results.push(result);
         }
         ordered_results.sort_by_key(|(position, _, _)| *position);
@@ -1718,10 +1738,15 @@ async fn extract_span<C: LlmClient>(
     request_semaphore: &Arc<Semaphore>,
     collateral_cache: &CollateralCache,
     all_spans: &Arc<Vec<QuestionSpan>>,
+    cancel: &AtomicBool,
 ) -> (Option<BuiltQuestion>, ImportReport) {
     // Own, local report: spans now run in parallel batches, so each unit
     // accumulates its own bookkeeping and the caller absorbs it in order.
     let mut report = ImportReport::default();
+
+    if cancel.load(Ordering::Relaxed) {
+        return (None, report);
+    }
 
     // Check if this question was already fully extracted and validated as collateral
     // during a previous question's call on a shared page. If so, return immediately with 0 API calls!
@@ -1931,11 +1956,11 @@ async fn extract_span<C: LlmClient>(
             );
 
             let api_start = Instant::now();
-            let resp = match chat_with_permit(client, &body, request_semaphore).await {
+            let resp = match chat_with_permit(client, &body, request_semaphore, cancel).await {
                 Ok(r) => r,
                 Err(e) => {
                     last_error = e.to_string();
-                    if attempt == max_attempts {
+                    if attempt == max_attempts || cancel.load(Ordering::Relaxed) {
                         break;
                     }
                     continue;
@@ -2007,7 +2032,7 @@ async fn extract_span<C: LlmClient>(
                     );
 
                     let api_start = Instant::now();
-                    let reduced_resp = match chat_with_permit(client, &reduced_body, request_semaphore).await {
+                    let reduced_resp = match chat_with_permit(client, &reduced_body, request_semaphore, cancel).await {
                         Ok(r) => r,
                         Err(e) => {
                             last_error = e.to_string();
@@ -2927,8 +2952,12 @@ async fn extract_same_page_batch<C: LlmClient>(
     request_semaphore: &Arc<Semaphore>,
     collateral_cache: &CollateralCache,
     all_spans: &Arc<Vec<QuestionSpan>>,
+    cancel: &AtomicBool,
 ) -> (Vec<(QuestionSpan, Option<BuiltQuestion>)>, ImportReport) {
     let mut report = ImportReport::default();
+    if cancel.load(Ordering::Relaxed) {
+        return (Vec::new(), report);
+    }
     let max_attempts = 1 + config.max_repairs;
 
     // Prepare full page image (no vertical clipping so all MCQs and visual options are fully visible)
@@ -2961,6 +2990,7 @@ async fn extract_same_page_batch<C: LlmClient>(
                     request_semaphore,
                     collateral_cache,
                     all_spans,
+                    cancel,
                 ).await;
                 report.absorb(r);
                 out.push(((*span).clone(), q));
@@ -2982,6 +3012,9 @@ async fn extract_same_page_batch<C: LlmClient>(
     let mut accepted_items: Option<Vec<AiQuestion>> = None;
 
     for attempt in 1..=max_attempts {
+        if cancel.load(Ordering::Relaxed) {
+            break;
+        }
         let repair_note = if attempt == 1 {
             String::new()
         } else {
@@ -3020,10 +3053,13 @@ async fn extract_same_page_batch<C: LlmClient>(
             }),
         );
 
-        let resp = match chat_with_permit(client, &body, request_semaphore).await {
+        let resp = match chat_with_permit(client, &body, request_semaphore, cancel).await {
             Ok(r) => r,
             Err(e) => {
                 last_error = e.to_string();
+                if cancel.load(Ordering::Relaxed) {
+                    break;
+                }
                 continue;
             }
         };
@@ -3211,6 +3247,7 @@ async fn extract_same_page_batch<C: LlmClient>(
             request_semaphore,
             collateral_cache,
             all_spans,
+            cancel,
         ).await;
         report.absorb(fallback_rep);
         out.push(((*span).clone(), fallback_q));
@@ -3632,9 +3669,13 @@ async fn extract_fallback_page<C: LlmClient>(
     page_render_cache: &Arc<crate::pdf_render::PageRenderCache>,
     page_image_cache: &Arc<PageImageCache>,
     request_semaphore: &Arc<Semaphore>,
+    cancel: &AtomicBool,
 ) -> (Option<Vec<BuiltQuestion>>, ImportReport) {
     // Own, local report: pages now run in parallel batches.
     let mut report = ImportReport::default();
+    if cancel.load(Ordering::Relaxed) {
+        return (None, report);
+    }
     let max_attempts = 1 + config.max_repairs;
     let system = format!(
         r#"You are a precise mathematical OCR engine. Output ONLY a valid JSON object {{"items": [ ... ]}}.
@@ -3696,6 +3737,9 @@ RULES:
 
     let mut last_error = String::new();
     for attempt in 1..=max_attempts {
+        if cancel.load(Ordering::Relaxed) {
+            break;
+        }
         let user_text = format!(
             "Extract ALL NEW questions on this page (page {}), returning one item per question. Return an empty items array if the page is a continuation or blank.{}",
             page_idx + 1,
@@ -3721,10 +3765,13 @@ RULES:
             config.max_output_tokens,
             Some(llm::ResponseFormat::JsonSchema { schema: extraction_json_schema() }),
         );
-        let resp = match chat_with_permit(client, &body, request_semaphore).await {
+        let resp = match chat_with_permit(client, &body, request_semaphore, cancel).await {
             Ok(r) => r,
             Err(e) => {
                 last_error = e.to_string();
+                if cancel.load(Ordering::Relaxed) {
+                    break;
+                }
                 continue;
             }
         };
@@ -4005,8 +4052,12 @@ async fn read_markscheme_window<C: LlmClient>(
     step: usize,
     system: &str,
     request_semaphore: &Arc<Semaphore>,
+    cancel: &AtomicBool,
 ) -> (Result<Vec<AiAnswer>, String>, ImportReport) {
     let mut report = ImportReport::default();
+    if cancel.load(Ordering::Relaxed) {
+        return (Err("Import cancelled by user".to_string()), report);
+    }
     let images: Vec<String> = pages[start..end]
         .iter()
         .filter_map(|p| p.get_b64().cloned())
@@ -4046,6 +4097,9 @@ async fn read_markscheme_window<C: LlmClient>(
     let max_attempts = 1 + config.max_repairs;
 
     for attempt in 1..=max_attempts {
+        if cancel.load(Ordering::Relaxed) {
+            break;
+        }
         let text = if attempt == 1 {
             user_text.clone()
         } else {
@@ -4062,10 +4116,13 @@ async fn read_markscheme_window<C: LlmClient>(
             config.max_output_tokens,
             Some(llm::ResponseFormat::JsonSchema { schema: extraction_json_schema() }),
         );
-        let resp = match chat_with_permit(client, &body, request_semaphore).await {
+        let resp = match chat_with_permit(client, &body, request_semaphore, cancel).await {
             Ok(r) => r,
             Err(e) => {
                 last_error = e.to_string();
+                if cancel.load(Ordering::Relaxed) {
+                    break;
+                }
                 continue;
             }
         };
@@ -4159,12 +4216,16 @@ pub async fn run_markscheme_pipeline<C: LlmClient, P: Progress>(
             step,
             &system,
             &request_semaphore,
+            cancel,
         )
         .map(move |result| (position, result))
     }))
     .buffer_unordered(config.parallelism.max(1));
     let mut ordered_results = Vec::with_capacity(windows.len());
     while let Some(result) = results.next().await {
+        if cancel.load(Ordering::Relaxed) {
+            return Err("Import cancelled by user".to_string());
+        }
         ordered_results.push(result);
     }
     ordered_results.sort_by_key(|(position, _)| *position);
@@ -4709,7 +4770,7 @@ mod tests {
         let collateral = Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
         let all_spans = Arc::new(vec![span.clone()]);
         let (built_opt, report) =
-            extract_span(&mock, &config(), &span, &span_pages, &cache, &Arc::new(PageImageCache::new()), &semaphore, &collateral, &all_spans).await;
+            extract_span(&mock, &config(), &span, &span_pages, &cache, &Arc::new(PageImageCache::new()), &semaphore, &collateral, &all_spans, &cancel_flag()).await;
         let built = built_opt.expect("question must build after the repair round");
 
         assert_eq!(mock.remaining(), 0, "both attempts consumed");
@@ -4758,7 +4819,7 @@ mod tests {
         let collateral = Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
         let all_spans = Arc::new(vec![span.clone()]);
         let (built_opt, report) =
-            extract_span(&mock, &config(), &span, &span_pages, &cache, &Arc::new(PageImageCache::new()), &semaphore, &collateral, &all_spans).await;
+            extract_span(&mock, &config(), &span, &span_pages, &cache, &Arc::new(PageImageCache::new()), &semaphore, &collateral, &all_spans, &cancel_flag()).await;
         let built = built_opt.expect("split span must build");
 
         assert!(built.content.contains("First page content."));
@@ -4827,7 +4888,7 @@ mod tests {
         let collateral = Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
         let all_spans = Arc::new(vec![span.clone()]);
         let (built_opt, report) =
-            extract_span(&mock, &config(), &span, &span_pages, &cache, &Arc::new(PageImageCache::new()), &semaphore, &collateral, &all_spans).await;
+            extract_span(&mock, &config(), &span, &span_pages, &cache, &Arc::new(PageImageCache::new()), &semaphore, &collateral, &all_spans, &cancel_flag()).await;
         let built = built_opt.expect("transcription must survive even when boxes never pass");
 
         assert!(

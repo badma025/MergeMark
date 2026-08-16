@@ -1490,6 +1490,10 @@ pub async fn parse_pdf_vision(
         pipeline::run_question_pipeline(&client, &pages, &config, &progress, &state.cancel_flag)
             .await?;
 
+    if state.cancel_flag.load(std::sync::atomic::Ordering::Relaxed) {
+        return Err("Import cancelled by user".to_string());
+    }
+
     // Surface the report to the UI — nothing fails silently anymore.
     let _ = app.emit("import-report", &report);
 
@@ -1933,6 +1937,10 @@ pub async fn parse_mark_scheme_vision(
     let (drafts, report): (Vec<AnswerDraft>, ImportReport) =
         pipeline::run_markscheme_pipeline(&client, &pages, &config, &progress, &state.cancel_flag)
             .await?;
+
+    if state.cancel_flag.load(std::sync::atomic::Ordering::Relaxed) {
+        return Err("Import cancelled by user".to_string());
+    }
 
     let _ = app.emit("import-report", &report);
 
