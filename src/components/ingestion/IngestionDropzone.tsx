@@ -590,7 +590,7 @@ export function IngestionDropzone({ isActive = false, onSuccess }: IngestionDrop
       {/* Accepted formats hint */}
       <div className="mt-6 flex items-center gap-2 text-xs text-muted-foreground select-none">
         <FileText className="size-3.5 opacity-60" aria-hidden />
-        <span>Accepted: .pdf, .png, .jpg, .txt</span>
+        <span>Accepted: .pdf, .png, .jpg, .txt (up to 100 pages per file)</span>
       </div>
 
       <ReviewSyncModal

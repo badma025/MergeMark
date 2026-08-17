@@ -76,9 +76,7 @@ pub fn value_to_marks(v: &serde_json::Value) -> Option<i32> {
 ///   * prefixed: "Q1" "Q.1" "Q 1" "Question 1" "QUESTION 3"
 ///
 /// Still rejects:
-///   * zero, numbers > 200 (raised from 60 so IB / CIE papers with many
-///     structured questions don't false-negative — a 200-question paper
-///     is implausible at A-Level),
+///   * zero, numbers > 1000 (raised to accommodate large multi-question worksheets and question bank compilations),
 ///   * decimals like "03.1" / "3.5 V" / "1,2" (sub-parts and quantities),
 ///   * floats (3.7).
 pub fn value_to_question_number(v: &serde_json::Value) -> Option<u32> {
@@ -90,7 +88,7 @@ pub fn value_to_question_number(v: &serde_json::Value) -> Option<u32> {
                 n.as_f64().and_then(|f| {
                     if f.fract() == 0.0 && f >= 0.0 {
                         Some(f as u64)
-                    } else if f >= 1.0 && f < 200.0 {
+                    } else if f >= 1.0 && f < 1000.0 {
                         // Phase 2: AQA sub-part encoded as decimal float.
                         // The LLM sees "01 5" on the page and proposes 1.5.
                         // The fractional part is a single digit (sub-part index),
@@ -120,7 +118,7 @@ pub fn value_to_question_number(v: &serde_json::Value) -> Option<u32> {
         _ => None,
     };
     match raw {
-        Some(n) if (1..=200).contains(&n) => Some(n as u32),
+        Some(n) if (1..=1000).contains(&n) => Some(n as u32),
         _ => None,
     }
 }
@@ -298,7 +296,7 @@ fn re_owned(pattern: String) -> &'static regex::Regex {
 }
 
 pub fn normalize_decimal_parts(content: &str, question_number: u32) -> String {
-    if question_number == 0 || question_number > 99 || content.is_empty() {
+    if question_number == 0 || question_number > 999 || content.is_empty() {
         return content.to_string();
     }
     // Label at line start: optional indent, optional **bold**, the question
@@ -1447,7 +1445,8 @@ mod tests {
         assert_eq!(value_to_question_number(&serde_json::json!("12")), Some(12));
         assert_eq!(value_to_question_number(&serde_json::json!("03.1")), Some(3)); // extracts the integer part
         assert_eq!(value_to_question_number(&serde_json::json!(0)), None);
-        assert_eq!(value_to_question_number(&serde_json::json!(201)), None); // >200
+        assert_eq!(value_to_question_number(&serde_json::json!(1001)), None); // >1000
+        assert_eq!(value_to_question_number(&serde_json::json!(126)), Some(126));
         assert_eq!(value_to_question_number(&serde_json::json!(3.7)), Some(3)); // AQA spaced sub-part
     }
 

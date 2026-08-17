@@ -451,7 +451,7 @@ pub fn scan_text_layer(page_texts: &[String]) -> TextScan {
             let cleaned_num = question_num_str.replace(" ", "");
             let y_frac = (full.start() as f32 / page_len).clamp(0.0, 1.0);
             if let Ok(n) = cleaned_num.parse::<u32>() {
-                if n > 0 && n <= 50 { // Plausible exam range; dense papers rarely exceed 50.
+                if n > 0 && n <= 1000 { // Plausible question number range; supports both single papers and large multi-question compilations.
                     let chars_remaining = text.len() - safe_end;
                     if chars_remaining > 30 {
                         // Edexcel-style heading pattern: "1 A bicycle…"
@@ -1104,8 +1104,8 @@ pub fn build_hybrid_map_with_scan(
             anomalies.push(format!("dropped backwards/duplicate question Q{} (expected > {})", span.number, expected_max_q));
             continue;
         }
-        if expected_max_q > 0 && span.number > expected_max_q + 40 {
-            anomalies.push(format!("dropped likely hallucinated jump to Q{} (gap from {} exceeds 40)", span.number, expected_max_q));
+        if expected_max_q > 0 && span.number > expected_max_q + 500 {
+            anomalies.push(format!("dropped likely hallucinated jump to Q{} (gap from {} exceeds 500)", span.number, expected_max_q));
             continue;
         }
         
@@ -1222,7 +1222,7 @@ fn build_spans_from_vision(
         }
         let mut page_detections = Vec::new();
         for (qi, &q) in p.questions.iter().enumerate() {
-            if q == 0 || q > 100 {
+            if q == 0 || q > 1000 {
                 continue;
             }
             // Page-number heuristic removed here — rely on loose sequence filter
@@ -1248,7 +1248,7 @@ fn build_spans_from_vision(
     // which meant a page with no AI structure (or an empty structures vec)
     // silently lost every text heading on it.
     for h in headings {
-        if h.number == 0 || h.number > 100 {
+        if h.number == 0 || h.number > 1000 {
             continue;
         }
         if !eligible_pages.contains(&h.page) {
@@ -1300,10 +1300,10 @@ fn build_spans_from_vision(
             }
         }
 
-        // Accept any ascending number up to 100, allowing for ANY gap size.
+        // Accept any ascending number up to 1000, allowing for ANY gap size.
         // Text-layer injected headings (qi == 999) are always accepted — they
         // come from the deterministic scanner which is our ground truth.
-        if q <= 100 && (q >= expected_max_q || is_text_layer) {
+        if q <= 1000 && (q >= expected_max_q || is_text_layer) {
             // Veto page number hallucinations: if the AI proposed a number that equals the printed page number,
             // we strictly require the text layer to confirm it. Since our text layer scanner robustly ignores 
             // printed page numbers (by checking AQA padding conventions), it will only confirm real questions.
@@ -1370,7 +1370,7 @@ fn build_spans_from_vision(
             // plausible (same guard as build_map_from_structure). A
             // misread "30" from "[30 marks]" on a cover page otherwise
             // poisons bounds for Q30.
-            if q > 0 && q <= 200 {
+            if q > 0 && q <= 1000 {
                 // Page-number veto: an AI "footer" whose question number
                 // equals the printed page number is almost always the page
                 // number itself misread as a totals line. Require the text
@@ -1807,7 +1807,7 @@ pub fn build_map_from_structure(
             continue;
         }
         for (qi, &q) in p.questions.iter().enumerate() {
-            if q == 0 || q > 200 {
+            if q == 0 || q > 1000 {
                 continue;
             }
             if q as usize == p.page + 1 {
@@ -1822,8 +1822,8 @@ pub fn build_map_from_structure(
     let mut filtered_detections = Vec::new();
     for det in raw_detections {
         let q = det.2;
-        // Accept any ascending number up to 50, allowing for ANY gap size 
-        if q >= expected_max_q && q <= 50 {
+        // Accept any ascending number up to 1000, allowing for ANY gap size 
+        if q >= expected_max_q && q <= 1000 {
             filtered_detections.push(det);
             expected_max_q = q;
         }
@@ -1861,7 +1861,7 @@ pub fn build_map_from_structure(
         if let Some((q, m)) = p.footer {
             // Only trust the footer if its question number is plausible
             // (within range of the running sequence or already in bounds).
-            if q > 0 && q <= 200 {
+            if q > 0 && q <= 1000 {
                 let e = bounds.entry(q).or_insert_with(|| VisionBounds {
                     first_page: p.page,
                     last_page: p.page,
@@ -2440,5 +2440,26 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn large_worksheet_detects_100_plus_questions() {
+        // Construct simulated 126-page worksheet where each page contains a question 1..=126
+        let mut pages = vec!["Instructions\nAnswer all questions on this worksheet.".to_string()];
+        for i in 1..=126 {
+            pages.push(format!("{} (a) Solve this problem about topic {}. **[3 marks]**\n(Total for Question {} is 3 marks)", i, i, i));
+        }
+
+        let scan = scan_text_layer(&pages);
+        let heading_numbers: Vec<u32> = scan.headings.iter().map(|h| h.number).collect();
+        assert_eq!(heading_numbers.len(), 126, "All 126 question headings should be captured");
+        assert_eq!(heading_numbers.first().copied(), Some(1));
+        assert_eq!(heading_numbers.last().copied(), Some(126));
+
+        let map = build_hybrid_map(&pages, &[], pages.len());
+        let span_numbers: Vec<u32> = map.spans.iter().map(|s| s.number).collect();
+        assert_eq!(span_numbers.len(), 126, "All 126 question spans should be built in the document map");
+        assert_eq!(span_numbers.first().copied(), Some(1));
+        assert_eq!(span_numbers.last().copied(), Some(126));
     }
 }

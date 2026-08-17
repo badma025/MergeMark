@@ -74,12 +74,23 @@ fn get_pdfium() -> Result<&'static Pdfium, String> {
     }).as_ref().map_err(|e| e.clone())
 }
 
+pub const MAX_PAGES_PER_IMPORT: usize = 100;
+
 #[allow(dead_code)]
 pub fn render_pdf_pages(path: &Path) -> Result<Vec<PageInput>, String> {
     let pdfium = get_pdfium()?;
 
     let document = pdfium.load_pdf_from_file(path, None)
         .map_err(|e| format!("Failed to load PDF: {:?}", e))?;
+
+    let page_count = document.pages().len() as usize;
+    if page_count > MAX_PAGES_PER_IMPORT {
+        return Err(format!(
+            "Document contains {} pages, which exceeds the limit of {} pages per import. Please split the file into smaller sections.",
+            page_count,
+            MAX_PAGES_PER_IMPORT
+        ));
+    }
 
     let render_dpi = std::env::var("MERGEMARK_RENDER_DPI")
         .unwrap_or_else(|_| "140".to_string())
