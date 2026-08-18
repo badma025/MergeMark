@@ -2145,7 +2145,7 @@ async fn extract_span<C: LlmClient>(
                     Some(llm::ResponseFormat::JsonSchema {
                         schema: extraction_schema.clone(),
                     }),
-                    ImageDetail::Low,
+                    ImageDetail::High,
                     true,
                 )
             } else {
@@ -2185,7 +2185,7 @@ async fn extract_span<C: LlmClient>(
             // usage (local models / mocks) so cost logs stay non-zero.
             // Image-free repairs carry no image cost.
             if usage.total_tokens == 0 && attempt == 1 {
-                report.prompt_tokens += estimate_image_tokens(&images, ImageDetail::Low);
+                report.prompt_tokens += estimate_image_tokens(&images, ImageDetail::High);
             }
             report.record_timing(
                 "extraction",
@@ -2253,7 +2253,7 @@ async fn extract_span<C: LlmClient>(
                         Some(llm::ResponseFormat::JsonSchema {
                             schema: extraction_schema.clone(),
                         }),
-                        ImageDetail::Low,
+                        ImageDetail::High,
                         true,
                     );
 
@@ -2268,7 +2268,7 @@ async fn extract_span<C: LlmClient>(
                     };
                     report.record_usage(&reduced_usage);
                     if reduced_usage.total_tokens == 0 {
-                        report.prompt_tokens += estimate_image_tokens(&reduced_images, ImageDetail::Low);
+                        report.prompt_tokens += estimate_image_tokens(&reduced_images, ImageDetail::High);
                     }
                     report.record_timing(
                         "extraction",
@@ -3276,7 +3276,7 @@ async fn extract_same_page_batch<C: LlmClient>(
                 Some(llm::ResponseFormat::JsonSchema {
                     schema: extraction_schema.clone(),
                 }),
-                ImageDetail::Low,
+                ImageDetail::High,
                 true,
             )
         } else {
@@ -3310,7 +3310,7 @@ async fn extract_same_page_batch<C: LlmClient>(
         };
         report.record_usage(&usage);
         if usage.total_tokens == 0 && attempt == 1 {
-            report.prompt_tokens += estimate_image_tokens(&images, ImageDetail::Low);
+            report.prompt_tokens += estimate_image_tokens(&images, ImageDetail::High);
         }
 
         let content = match llm::message_content(&resp) {
@@ -4007,7 +4007,7 @@ RULES:
                 Some(&user_text),
                 out_tokens,
                 Some(llm::ResponseFormat::JsonSchema { schema: extraction_json_schema() }),
-                ImageDetail::Low,
+                ImageDetail::High,
                 true,
             )
         } else {
@@ -4038,7 +4038,7 @@ RULES:
         };
         report.record_usage(&usage);
         if usage.total_tokens == 0 && attempt == 1 {
-            report.prompt_tokens += estimate_image_tokens(&page_images, ImageDetail::Low);
+            report.prompt_tokens += estimate_image_tokens(&page_images, ImageDetail::High);
         }
         let content = match llm::message_content(&resp) {
             Ok(c) => c,
@@ -4378,7 +4378,7 @@ async fn read_markscheme_window<C: LlmClient>(
                 Some(&user_text),
                 out_tokens,
                 Some(llm::ResponseFormat::JsonSchema { schema: extraction_json_schema() }),
-                ImageDetail::Low,
+                ImageDetail::High,
                 true,
             )
         } else {
@@ -4409,7 +4409,7 @@ async fn read_markscheme_window<C: LlmClient>(
         };
         report.record_usage(&usage);
         if usage.total_tokens == 0 && attempt == 1 {
-            report.prompt_tokens += estimate_image_tokens(&images, ImageDetail::Low);
+            report.prompt_tokens += estimate_image_tokens(&images, ImageDetail::High);
         }
         let content = match llm::message_content(&resp) {
             Ok(c) => c,
