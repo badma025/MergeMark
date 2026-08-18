@@ -205,6 +205,56 @@ pub fn chat_body<S: AsRef<str>>(
     })
 }
 
+/// Build a TEXT-ONLY request body for repairing a failed response. Instead
+/// of re-sending the page images (which dominate token cost), this replays
+/// the original user request, the model's bad output, and a precise repair
+/// instruction as a multi-turn conversation. The model already saw the
+/// images on attempt 1, so structural/JSON/bbox errors can be corrected
+/// without any vision tokens — typically a 5-15x reduction in repair
+/// prompt cost. `response_format`/reasoning match the original call.
+pub fn chat_body_repair(
+    model: &str,
+    system: &str,
+    original_user_text: &str,
+    assistant_response: &str,
+    repair_instruction: &str,
+    max_tokens: u32,
+    response_format: Option<ResponseFormat>,
+    cache: bool,
+) -> Value {
+    let rf = match response_format {
+        Some(ResponseFormat::JsonSchema { schema }) => json!({
+            "type": "json_schema",
+            "json_schema": schema
+        }),
+        _ => json!({ "type": "json_object" }),
+    };
+
+    let m_lower = model.to_lowercase();
+    let reasoning_effort = if m_lower.contains("3.7-flash")
+        || m_lower.contains("3.7_flash")
+        || (m_lower.contains("3.7") && m_lower.contains("flash"))
+    {
+        "low"
+    } else {
+        "none"
+    };
+
+    json!({
+        "model": model,
+        "messages": [
+            { "role": "system", "content": system_message(system, cache) },
+            { "role": "user", "content": original_user_text },
+            { "role": "assistant", "content": assistant_response },
+            { "role": "user", "content": repair_instruction }
+        ],
+        "temperature": 0.1,
+        "max_tokens": max_tokens,
+        "response_format": rf,
+        "reasoning": { "effort": reasoning_effort }
+    })
+}
+
 /// Pull `choices[0].message.content` out of a chat-completion response.
 pub fn message_content(resp: &Value) -> Result<String, LlmError> {
     resp["choices"][0]["message"]["content"]
@@ -630,6 +680,32 @@ mod tests {
             ImageDetail::High, false,
         );
         assert_eq!(body2["messages"][0]["content"], "SYS");
+    }
+
+    #[test]
+    fn chat_body_repair_builds_four_turn_text_only() {
+        let body = chat_body_repair(
+            "google/gemini-2.5-flash",
+            "SYS",
+            "ORIGINAL USER REQUEST",
+            "BAD MODEL OUTPUT",
+            "FIX THIS PLEASE",
+            4096,
+            None,
+            true,
+        );
+        let msgs = body["messages"].as_array().unwrap();
+        assert_eq!(msgs.len(), 4, "repair body has 4 turns");
+        assert_eq!(msgs[0]["role"], "system");
+        assert_eq!(msgs[1]["role"], "user");
+        assert_eq!(msgs[1]["content"], "ORIGINAL USER REQUEST");
+        assert_eq!(msgs[2]["role"], "assistant");
+        assert_eq!(msgs[2]["content"], "BAD MODEL OUTPUT");
+        assert_eq!(msgs[3]["role"], "user");
+        assert_eq!(msgs[3]["content"], "FIX THIS PLEASE");
+        // No images parameter in a text-only repair.
+        assert!(body.get("images").is_none() || body["messages"][1].get("images").is_none());
+        assert_eq!(body["max_tokens"], 4096);
     }
 
     #[test]
