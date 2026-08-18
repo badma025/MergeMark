@@ -95,7 +95,7 @@ impl PipelineConfig {
             allowed_topics: Vec::new(),
             diagrams_dir: None,
             pdf_path,
-            max_repairs: 2,
+            max_repairs: 1,
             max_output_tokens: 32768,
             parallelism: DEFAULT_PARALLEL,
         }
@@ -2916,15 +2916,13 @@ async fn extract_span<C: LlmClient>(
                     accepted = Some((items, salvaged));
                     break;
                 }
-                last_error = box_issues.join("; ");
-                report.repairs += 1;
-                if attempt < max_attempts {
-                    continue;
-                }
-                // Repair budget spent: keep the transcription, drop the bad
-                // boxes — deterministically, and on the record.
+                // Diagram boxes are audited locally and bad boxes can be
+                // pruned without an LLM round-trip — the transcribed text
+                // is already correct. Retrying wastes ~3-4k tokens and,
+                // when the model keeps drawing bad boxes, cascades into a
+                // repair storm that dominates cost.
                 report.anomalies.push(format!(
-                    "Question {}: dropped {} invalid diagram box(es) after repair budget spent — {}",
+                    "Question {}: dropped {} invalid diagram box(es) — {}",
                     span.number,
                     bad.len(),
                     box_issues.join("; ")
@@ -3371,10 +3369,13 @@ async fn extract_same_page_batch<C: LlmClient>(
             }
         };
 
-        if !box_issues.is_empty() && attempt < max_attempts {
-            last_error = box_issues.join("; ");
-            report.repairs += 1;
-            continue;
+        if !box_issues.is_empty() {
+            // Bad diagram boxes are pruned locally; no LLM repair (same
+            // rationale as extract_span — text is already correct).
+            let (kept, dropped) = prune_bad_boxes_from_vec(audited_items, &bad);
+            report.crop_rejections += dropped;
+            accepted_items = Some(kept);
+            break;
         }
 
         accepted_items = Some(audited_items);
@@ -3765,6 +3766,27 @@ fn prune_bad_diagram_boxes(
             }
         }
     }
+}
+
+/// Owned-vector wrapper around prune_bad_diagram_boxes for call sites
+/// that hold a Vec<AiQuestion> (same-page batch). Returns the pruned
+/// vector and the number of boxes dropped (for crop-rejection counting).
+fn prune_bad_boxes_from_vec(
+    mut items: Vec<AiQuestion>,
+    bad: &[(usize, usize)],
+) -> (Vec<AiQuestion>, usize) {
+    let before: usize = items
+        .iter()
+        .filter_map(|i| i.diagram_bboxes.as_ref())
+        .map(|b| b.len())
+        .sum();
+    prune_bad_diagram_boxes(&mut items, bad, &mut ImportReport::default());
+    let after: usize = items
+        .iter()
+        .filter_map(|i| i.diagram_bboxes.as_ref())
+        .map(|b| b.len())
+        .sum();
+    (items, before.saturating_sub(after))
 }
 
 /// Crop + persist one diagram; returns the markdown link on success.
@@ -4178,13 +4200,9 @@ RULES:
             }
         };
         if !box_issues.is_empty() {
-            report.repairs += 1;
-            if attempt < max_attempts {
-                last_error = box_issues.join("; ");
-                continue;
-            }
+            // Prune bad diagram boxes locally instead of repairing.
             report.anomalies.push(format!(
-                "page {}: dropped {} invalid diagram box(es) after repair budget spent — {}",
+                "page {}: dropped {} invalid diagram box(es) — {}",
                 page_idx + 1,
                 bad.len(),
                 box_issues.join("; ")

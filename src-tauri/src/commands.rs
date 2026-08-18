@@ -1412,7 +1412,7 @@ pub async fn parse_pdf_vision(
     );
     config.allowed_topics = allowed_topics;
     config.diagrams_dir = diagrams_dir;
-    config.max_repairs = 2;
+    config.max_repairs = 1;
     // Phase 0: questions now get the same output budget as mark schemes.
     // Long physics questions with sub-parts (a)–(f), derivations, graph
     // descriptions, and circuit analysis routinely hit the previous 16k
@@ -1916,7 +1916,7 @@ pub async fn parse_mark_scheme_vision(
         Some(std::path::PathBuf::from(&file_path)),
     );
     config.diagrams_dir = diagrams_dir;
-    config.max_repairs = 2;
+    config.max_repairs = 1;
     config.max_output_tokens = 32768;
 
     let (route, client) = resolve_llm_client(&state, model_name.clone())
