@@ -1035,6 +1035,30 @@ fn page_band_note(span: &QuestionSpan, page_index_in_span: usize, total_pages_in
     Some(note)
 }
 
+/// Tiered output-token cap per call type. A single-question span
+/// rarely exceeds ~3k output tokens; the previous blanket 32k cap let a
+/// looping/verbose model generate enormously expensive outputs before
+/// truncation. We scale the cap by the number of images in the request
+/// (a proxy for question length/diagram density) while keeping a 16k
+/// ceiling for genuine heavy cases.
+fn tiered_output_tokens(span_pages: usize, question_count: usize) -> u32 {
+    let image_budget = match span_pages {
+        0 => 4096,
+        1 => 8192,
+        2 => 10240,
+        3 => 12288,
+        _ => 16384,
+    };
+    // Same-page batch: N short questions share the call; allow a bit more
+    // but not N × 8k (responses are far shorter than full questions).
+    let batch_budget = if question_count > 1 {
+        2048 + (question_count as u32).saturating_mul(1500)
+    } else {
+        0
+    };
+    image_budget.max(batch_budget).min(16384)
+}
+
 fn extraction_system_prompt(config: &PipelineConfig) -> String {
     let topics_instruction = if config.allowed_topics.is_empty() {
         "- \"topics\": array. MUST be empty []. Do NOT invent topics.".to_string()
@@ -1045,38 +1069,42 @@ fn extraction_system_prompt(config: &PipelineConfig) -> String {
         )
     };
 
-    const FEW_SHOT: &str = r#"
-═══ FEW-SHOT EXAMPLES — Study these input/output pairs carefully ═══
-Example 1 — Pure math with sub-parts
-Input page (Question 4): "4 (a) Solve 2x^2 - 5x + 2 = 0. [3 marks]\n(b) Hence solve 2y^4 - 5y^2 + 2 = 0. [2 marks]"
-Output: {"items": [{"question_number": 4, "content": "(a) Solve $2x^2 - 5x + 2 = 0$.\n\n**[3 marks]**\n\n(b) Hence solve $2y^4 - 5y^2 + 2 = 0$.\n\n**[2 marks]**", "marks": 5, "difficulty_rating": null, "topics": ["algebra", "quadratics"], "module": "Pure Mathematics", "is_code": false, "diagram_bboxes": [], "diagram_captions": [], "diagram_kinds": [], "bbox_page_indexes": [], "math_snippet": "2x^2 - 5x + 2 = 0", "visual_options": null}]}
-
-Example 2 — Question with a graph figure
-Input page (Question 7): "7 The graph of y = f(x) is shown below.\nFigure 2\n(a) Write down the coordinates of the turning point. [1 mark]\n(b) State the range of f. [1 mark]"
-Output: {"items": [{"question_number": 7, "content": "The graph of $y = f(x)$ is shown below.\n\n[DIAGRAM_PLACEHOLDER]\n\n(a) Write down the coordinates of the turning point.\n\n**[1 mark]**\n\n(b) State the range of $f$.\n\n**[1 mark]**", "marks": 2, "difficulty_rating": null, "topics": ["functions", "graphs"], "module": "Pure Mathematics", "is_code": false, "diagram_bboxes": [[0.15, 0.20, 0.70, 0.45]], "diagram_captions": ["Graph of y = f(x)"], "diagram_kinds": ["graph"], "bbox_page_indexes": [0], "math_snippet": "y = f(x)", "visual_options": null}]}
-
-Example 3 — Structured table (trace table) — transcribe as Markdown table, NOT diagram
-Input page (Question 12): "12 Complete the trace table for the algorithm below.\n\n| i | condition | output |\n|---|---|---|\n| 1 | true | 3 |\n| 2 |  |  |\n| 3 |  |  |"
-Output: {"items": [{"question_number": 12, "content": "Complete the trace table for the algorithm below.\n\n| i | condition | output |\n|---|---|---|\n| 1 | true | 3 |\n| 2 |  |  |\n| 3 |  |  |", "marks": 4, "difficulty_rating": null, "topics": ["algorithms", "trace tables"], "module": "Computer Science", "is_code": false, "diagram_bboxes": [], "diagram_captions": [], "diagram_kinds": [], "bbox_page_indexes": [], "math_snippet": "", "visual_options": null}]}
-
-Example 4 — Multiple-choice with visual options (composite)
-Input page (Question 15): "15 Which graph represents y = sin(x)/x?\nA [graph A]\nB [graph B]\nC [graph C]\nD [graph D]"
-Output: {"items": [{"question_number": 15, "content": "Which graph represents $y = \\frac{\\sin x}{x}$?\n\nA [DIAGRAM_PLACEHOLDER]\nB [DIAGRAM_PLACEHOLDER]\nC [DIAGRAM_PLACEHOLDER]\nD [DIAGRAM_PLACEHOLDER]", "marks": 1, "difficulty_rating": null, "topics": ["trigonometry", "graphs"], "module": "Pure Mathematics", "is_code": false, "diagram_bboxes": [[0.10, 0.25, 0.80, 0.65]], "diagram_captions": ["Options A, B, C, D"], "diagram_kinds": ["composite_visual_options"], "bbox_page_indexes": [0], "math_snippet": "sin(x)/x", "visual_options": "composite_visual_options"}]}
-
-Example 5 — Question continues from previous page
-Input page (Question 9 continued): "(c) Find the exact value of the integral. [4 marks]\n\n(Total for Question 9 is 10 marks)\n\n10 (a) ..."
-Output: {"items": [{"question_number": 9, "content": "(c) Find the exact value of the integral.\n\n**[4 marks]**", "marks": 4, "difficulty_rating": null, "topics": ["calculus", "integration"], "module": "Pure Mathematics", "is_code": false, "diagram_bboxes": [], "diagram_captions": [], "diagram_kinds": [], "bbox_page_indexes": [], "math_snippet": "", "visual_options": null}]}
-
-Example 6 — T. Madas / Worksheet style (Polar curve with leading variable, difficulty rating, and sub-parts)
-Input page: "Question 3 (***+)\nA curve has polar equation\nr = (cos(theta) + sin(theta))/(cos^2(theta) + sin(2*theta) + 1),  0 <= theta < 2*pi\n(a) Find a Cartesian equation of the curve in the form f(x, y) = 0.\n(b) Show that the area bounded by the curve is pi/4."
-Output: {"items": [{"question_number": 3, "content": "A curve has polar equation\n\n$$r = \\frac{\\cos\\theta + \\sin\\theta}{\\cos^2\\theta + \\sin 2\\theta + 1}, \\quad 0 \\le \\theta < 2\\pi$$\n\n(a) Find a Cartesian equation of the curve in the form $f(x, y) = 0$.\n\n(b) Show that the area bounded by the curve is $\\frac{\\pi}{4}$.", "marks": null, "difficulty_rating": "***+", "topics": ["polar coordinates", "curves"], "module": "Pure Mathematics", "is_code": false, "diagram_bboxes": [], "diagram_captions": [], "diagram_kinds": [], "bbox_page_indexes": [], "math_snippet": "r = \\frac{\\cos\\theta + \\sin\\theta}{\\cos^2\\theta + \\sin 2\\theta + 1}", "visual_options": null}]}
-
-Example 7 — Cardioid and Multi-Curve Polar Equations (Ensure $r = $ is NEVER dropped)
-Input page: "Question 8 (****)\nThe diagram above shows the curves with polar equations\nr = 1 + sin 2*theta, 0 <= theta <= pi/2\nr = 1.5, 0 <= theta <= pi/2\nFind the area enclosed between the two curves."
-Output: {"items": [{"question_number": 8, "content": "The diagram above shows the curves with polar equations\n\n$$r = 1 + \\sin 2\\theta, \\quad 0 \\le \\theta \\le \\frac{\\pi}{2}$$\n\nand\n\n$$r = 1.5, \\quad 0 \\le \\theta \\le \\frac{\\pi}{2}$$\n\nFind the area enclosed between the two curves.", "marks": null, "difficulty_rating": "****", "topics": ["polar coordinates", "integration"], "module": "Pure Mathematics", "is_code": false, "diagram_bboxes": [], "diagram_captions": [], "diagram_kinds": [], "bbox_page_indexes": [], "math_snippet": "r = 1 + \\sin 2\\theta", "visual_options": null}]}
-
-END OF EXAMPLES — Follow the same JSON structure, escaping rules, and isolation discipline exactly.
+    // Few-shot examples are selected contextually: a generic sub-parts
+    // example plus a graph/diagram example are always included; the polar
+    // example is added only for Further Maths modules where it applies.
+    // This trims the per-call system prompt by ~1000 tokens for the common
+    // case while keeping every relevant demonstration present.
+    let example_subparts = r#"
+=== EXAMPLE 1: Question with sub-parts ===
+Input (Question 4): "4 (a) Solve 2x^2 - 5x + 2 = 0. [3 marks] (b) Hence solve 2y^4 - 5y^2 + 2 = 0. [2 marks]"
+Output: {"items":[{"question_number":4,"content":"(a) Solve $2x^2 - 5x + 2 = 0$.\n\n**[3 marks]**\n\n(b) Hence solve $2y^4 - 5y^2 + 2 = 0$.\n\n**[2 marks]**","marks":5,"topics":["algebra"],"module":"{module}","is_code":false,"diagram_bboxes":[],"diagram_captions":[],"diagram_kinds":[],"bbox_page_indexes":[],"math_snippet":"2x^2 - 5x + 2 = 0","visual_options":null}]}
 "#;
+    let example_graph = r#"
+=== EXAMPLE 2: Question with a graph/figure ===
+Input (Question 7): "7 The graph of y = f(x) is shown. (a) Write down the turning point. [1 mark]"
+Output: {"items":[{"question_number":7,"content":"The graph of $y = f(x)$ is shown.\n\n[DIAGRAM_PLACEHOLDER]\n\n(a) Write down the coordinates of the turning point.\n\n**[1 mark]**","marks":1,"topics":["functions"],"module":"{module}","is_code":false,"diagram_bboxes":[[0.15,0.20,0.70,0.45]],"diagram_captions":["Graph of y = f(x)"],"diagram_kinds":["graph"],"bbox_page_indexes":[0],"math_snippet":"y = f(x)","visual_options":null}]}
+"#;
+    let example_polar = r#"
+=== EXAMPLE 3: Polar curve (Further Maths) ===
+Input: "Question 3 (***) A curve has polar equation r = (cos θ + sin θ)/(cos^2 θ + sin 2θ + 1), 0 <= θ < 2π. (a) Find a Cartesian equation..."
+Output: {"items":[{"question_number":3,"content":"A curve has polar equation\n\n$$r = \\frac{\\cos\\theta + \\sin\\theta}{\\cos^2\\theta + \\sin 2\\theta + 1}, \\quad 0 \\le \\theta < 2\\pi$$\n\n(a) Find a Cartesian equation of the curve in the form $f(x, y) = 0$.","marks":null,"topics":["polar coordinates"],"module":"{module}","is_code":false,"diagram_bboxes":[],"diagram_captions":[],"diagram_kinds":[],"bbox_page_indexes":[],"math_snippet":"r = ...","visual_options":null}]}
+"#;
+    let is_further = config.module_name.to_lowercase().contains("further")
+        || config.subject.to_lowercase().contains("further");
+    let few_shot = if is_further {
+        format!(
+            "\n=== FEW-SHOT EXAMPLES ===\n{}\n{}\n{}\nFollow the same JSON structure, escaping rules, and isolation discipline exactly.\n",
+            example_subparts.replace("{module}", &config.module_name),
+            example_graph.replace("{module}", &config.module_name),
+            example_polar.replace("{module}", &config.module_name),
+        )
+    } else {
+        format!(
+            "\n=== FEW-SHOT EXAMPLES ===\n{}\n{}\nFollow the same JSON structure, escaping rules, and isolation discipline exactly.\n",
+            example_subparts.replace("{module}", &config.module_name),
+            example_graph.replace("{module}", &config.module_name),
+        )
+    };
 
     format!(
         r#"You are a precise mathematical OCR engine transcribing exactly ONE requested exam question. Output ONLY a valid JSON object of the form {{"items": [ ... ]}}.
@@ -1136,7 +1164,7 @@ OUTPUT STRUCTURE — EVERY item MUST have:
 "#,
         topics_instruction = topics_instruction,
         module = config.module_name,
-        few_shot = FEW_SHOT,
+        few_shot = few_shot,
     )
 }
 
@@ -2070,19 +2098,16 @@ async fn extract_span<C: LlmClient>(
         // JSON Schema for structured extraction output
         let extraction_schema = extraction_json_schema();
         let mut last_error = String::new();
+        let mut last_response = String::new();
         let mut accepted: Option<(Vec<AiQuestion>, bool)> = None; // (items, salvaged_truncated)
 
         for attempt in 1..=max_attempts {
-            let repair_note = if attempt == 1 {
-                String::new()
-            } else {
-                format!(
-                    "\n\nPREVIOUS ATTEMPT FAILED VALIDATION: {}. Regenerate the COMPLETE corrected JSON for Question {}.",
-                    last_error, span.number
-                )
-            };
+            // user_text is the original (attempt-1) request. On repair
+            // attempts it is replayed verbatim by chat_body_repair along
+            // with the bad output and a precise fix instruction, so it
+            // must NOT include a repair note here.
             let user_text = format!(
-                "TARGET: Question {}\nPAPER: '{}'\nMODULE: '{}'\n\nTranscribe Question {} from the attached page image(s).{}{}{}{}",
+                "TARGET: Question {}\nPAPER: '{}'\nMODULE: '{}'\n\nTranscribe Question {} from the attached page image(s).{}{}{}",
                 span.number,
                 config.paper_name,
                 config.module_name,
@@ -2104,20 +2129,45 @@ async fn extract_span<C: LlmClient>(
                         span.number, split_context
                     )
                 },
-                repair_note
             );
-            let body = llm::chat_body(
-                &config.model,
-                &system,
-                &images,
-                Some(&user_text),
-                config.max_output_tokens,
-                Some(llm::ResponseFormat::JsonSchema {
-                    schema: extraction_schema.clone(),
-                }),
-                ImageDetail::High,
-                true,
-            );
+            // Tiered output cap scales with span length; capped at 16k to
+            // bound runaway generations. The first attempt sends images
+            // (high detail); repair retries are text-only (the model saw
+            // the images on attempt 1 and only needs to fix structure).
+            let out_tokens = tiered_output_tokens(span_pages.len(), 1);
+            let body = if attempt == 1 {
+                llm::chat_body(
+                    &config.model,
+                    &system,
+                    &images,
+                    Some(&user_text),
+                    out_tokens,
+                    Some(llm::ResponseFormat::JsonSchema {
+                        schema: extraction_schema.clone(),
+                    }),
+                    ImageDetail::High,
+                    true,
+                )
+            } else {
+                // Replay the original request, the model's bad output, and
+                // a precise repair instruction — no images, ~5-15x cheaper.
+                let repair_instruction = format!(
+                    "Your previous response failed validation: {}.\nReturn the COMPLETE corrected JSON for Question {} with no commentary.",
+                    last_error, span.number
+                );
+                llm::chat_body_repair(
+                    &config.model,
+                    &system,
+                    &user_text,
+                    &last_response,
+                    &repair_instruction,
+                    out_tokens,
+                    Some(llm::ResponseFormat::JsonSchema {
+                        schema: extraction_schema.clone(),
+                    }),
+                    true,
+                )
+            };
 
             let api_start = Instant::now();
             let (resp, usage) = match chat_with_permit(client, &body, request_semaphore, cancel).await {
@@ -2133,12 +2183,13 @@ async fn extract_span<C: LlmClient>(
             report.record_usage(&usage);
             // Fall back to an image-aware estimate when the provider omits
             // usage (local models / mocks) so cost logs stay non-zero.
-            if usage.total_tokens == 0 {
+            // Image-free repairs carry no image cost.
+            if usage.total_tokens == 0 && attempt == 1 {
                 report.prompt_tokens += estimate_image_tokens(&images, ImageDetail::High);
             }
             report.record_timing(
                 "extraction",
-                "api_call",
+                if attempt == 1 { "api_call" } else { "api_call_repair" },
                 Some(span_pages[0].0 + 1),
                 Some(span.number),
                 api_start.elapsed().as_millis() as u64,
@@ -2150,6 +2201,9 @@ async fn extract_span<C: LlmClient>(
                     continue;
                 }
             };
+            // Stash the raw response so a subsequent image-free repair can
+            // replay it as the assistant turn.
+            last_response = content.clone();
 
             let mut parsed = parse_llm_json::<AiQuestionPage>(&content);
 
@@ -3185,22 +3239,16 @@ async fn extract_same_page_batch<C: LlmClient>(
     let system = extraction_system_prompt(config);
     let extraction_schema = extraction_json_schema();
     let mut last_error = String::new();
+    let mut last_response = String::new();
     let mut accepted_items: Option<Vec<AiQuestion>> = None;
 
     for attempt in 1..=max_attempts {
         if cancel.load(Ordering::Relaxed) {
             break;
         }
-        let repair_note = if attempt == 1 {
-            String::new()
-        } else {
-            format!(
-                "\n\nPREVIOUS ATTEMPT FAILED VALIDATION: {}. Regenerate corrected JSON for Questions {}.",
-                last_error, q_str
-            )
-        };
+        // Original (attempt-1) request; replayed verbatim on repairs.
         let user_text = format!(
-            "TARGET QUESTIONS: Questions {}\nPAPER: '{}'\nMODULE: '{}'\n\nTranscribe Questions {} from the attached page image (page {}), returning ONE item per question in the items array.{}{}",
+            "TARGET QUESTIONS: Questions {}\nPAPER: '{}'\nMODULE: '{}'\n\nTranscribe Questions {} from the attached page image (page {}), returning ONE item per question in the items array.{}",
             q_str,
             config.paper_name,
             config.module_name,
@@ -3215,21 +3263,40 @@ async fn extract_same_page_batch<C: LlmClient>(
                     page.text
                 )
             },
-            repair_note
         );
 
-        let body = llm::chat_body(
-            &config.model,
-            &system,
-            &images,
-            Some(&user_text),
-            config.max_output_tokens,
-            Some(llm::ResponseFormat::JsonSchema {
-                schema: extraction_schema.clone(),
-            }),
-            ImageDetail::High,
-            true,
-        );
+        let out_tokens = tiered_output_tokens(1, spans.len());
+        let body = if attempt == 1 {
+            llm::chat_body(
+                &config.model,
+                &system,
+                &images,
+                Some(&user_text),
+                out_tokens,
+                Some(llm::ResponseFormat::JsonSchema {
+                    schema: extraction_schema.clone(),
+                }),
+                ImageDetail::High,
+                true,
+            )
+        } else {
+            let repair_instruction = format!(
+                "Your previous response failed validation: {}.\nReturn the COMPLETE corrected JSON for Questions {} with no commentary.",
+                last_error, q_str
+            );
+            llm::chat_body_repair(
+                &config.model,
+                &system,
+                &user_text,
+                &last_response,
+                &repair_instruction,
+                out_tokens,
+                Some(llm::ResponseFormat::JsonSchema {
+                    schema: extraction_schema.clone(),
+                }),
+                true,
+            )
+        };
 
         let (resp, usage) = match chat_with_permit(client, &body, request_semaphore, cancel).await {
             Ok(pair) => pair,
@@ -3242,7 +3309,7 @@ async fn extract_same_page_batch<C: LlmClient>(
             }
         };
         report.record_usage(&usage);
-        if usage.total_tokens == 0 {
+        if usage.total_tokens == 0 && attempt == 1 {
             report.prompt_tokens += estimate_image_tokens(&images, ImageDetail::High);
         }
 
@@ -3253,6 +3320,7 @@ async fn extract_same_page_batch<C: LlmClient>(
                 continue;
             }
         };
+        last_response = content.clone();
 
         let page_out = match parse_llm_json::<AiQuestionPage>(&content) {
             ParseOutcome::Clean(v) => v,
@@ -3918,37 +3986,46 @@ RULES:
     let decoded_pages = prepared.decoded_pages;
 
     let mut last_error = String::new();
+    let mut last_response = String::new();
     for attempt in 1..=max_attempts {
         if cancel.load(Ordering::Relaxed) {
             break;
         }
         let user_text = format!(
-            "Extract ALL NEW questions on this page (page {}), returning one item per question. Return an empty items array if the page is a continuation or blank.{}",
+            "Extract ALL NEW questions on this page (page {}), returning one item per question. Return an empty items array if the page is a continuation or blank.",
             page_idx + 1,
-            if attempt == 1 {
-                String::new()
-            } else {
-                format!(
-                    "\n\nPREVIOUS ATTEMPT FAILED VALIDATION: {}. Regenerate corrected JSON.",
-                    last_error
-                )
-            }
         );
-        // Phase 0: never pass sentinel b64 values as images. Build a
-        // (possibly-empty) image slice from the page; `chat_body` will
-        // produce a text-only body when no images are supplied. Mirror
-        // the mapped path's local_to_chunk so audit/save can resolve
-        // bbox_page_indexes correctly even when sentinels are filtered.
-        let body = llm::chat_body(
-            &config.model,
-            &system,
-            &page_images,
-            Some(&user_text),
-            config.max_output_tokens,
-            Some(llm::ResponseFormat::JsonSchema { schema: extraction_json_schema() }),
-            ImageDetail::High,
-            true,
-        );
+        // Phase 0: never pass sentinel b64 values as images. The first
+        // attempt sends images; repair retries are text-only (the model
+        // saw the images on attempt 1 and only needs to fix structure).
+        let out_tokens = tiered_output_tokens(1, 4);
+        let body = if attempt == 1 {
+            llm::chat_body(
+                &config.model,
+                &system,
+                &page_images,
+                Some(&user_text),
+                out_tokens,
+                Some(llm::ResponseFormat::JsonSchema { schema: extraction_json_schema() }),
+                ImageDetail::High,
+                true,
+            )
+        } else {
+            let repair_instruction = format!(
+                "Your previous response failed validation: {}.\nReturn the COMPLETE corrected JSON with no commentary.",
+                last_error
+            );
+            llm::chat_body_repair(
+                &config.model,
+                &system,
+                &user_text,
+                &last_response,
+                &repair_instruction,
+                out_tokens,
+                Some(llm::ResponseFormat::JsonSchema { schema: extraction_json_schema() }),
+                true,
+            )
+        };
         let (resp, usage) = match chat_with_permit(client, &body, request_semaphore, cancel).await {
             Ok(pair) => pair,
             Err(e) => {
@@ -3960,7 +4037,7 @@ RULES:
             }
         };
         report.record_usage(&usage);
-        if usage.total_tokens == 0 {
+        if usage.total_tokens == 0 && attempt == 1 {
             report.prompt_tokens += estimate_image_tokens(&page_images, ImageDetail::High);
         }
         let content = match llm::message_content(&resp) {
@@ -3970,6 +4047,7 @@ RULES:
                 continue;
             }
         };
+        last_response = content.clone();
         let page_out = match parse_llm_json::<AiQuestionPage>(&content) {
             ParseOutcome::Clean(v) => v,
             ParseOutcome::Salvaged { value, dropped_tail } => {
@@ -4281,6 +4359,7 @@ async fn read_markscheme_window<C: LlmClient>(
     );
 
     let mut last_error = String::new();
+    let mut last_response = String::new();
     let mut accepted: Option<Vec<AiAnswer>> = None;
     let max_attempts = 1 + config.max_repairs;
 
@@ -4288,24 +4367,36 @@ async fn read_markscheme_window<C: LlmClient>(
         if cancel.load(Ordering::Relaxed) {
             break;
         }
-        let text = if attempt == 1 {
-            user_text.clone()
+        // First attempt sends images; repairs are text-only (replay
+        // original request + bad output + fix instruction).
+        let out_tokens = tiered_output_tokens(images.len().min(4), 1);
+        let body = if attempt == 1 {
+            llm::chat_body(
+                &config.model,
+                system,
+                &images,
+                Some(&user_text),
+                out_tokens,
+                Some(llm::ResponseFormat::JsonSchema { schema: extraction_json_schema() }),
+                ImageDetail::High,
+                true,
+            )
         } else {
-            format!(
-                "{}\n\nPREVIOUS ATTEMPT FAILED VALIDATION: {}. Regenerate the complete corrected JSON.",
-                user_text, last_error
+            let repair_instruction = format!(
+                "Your previous response failed validation: {}.\nReturn the COMPLETE corrected JSON with no commentary.",
+                last_error
+            );
+            llm::chat_body_repair(
+                &config.model,
+                system,
+                &user_text,
+                &last_response,
+                &repair_instruction,
+                out_tokens,
+                Some(llm::ResponseFormat::JsonSchema { schema: extraction_json_schema() }),
+                true,
             )
         };
-        let body = llm::chat_body(
-            &config.model,
-            system,
-            &images,
-            Some(&text),
-            config.max_output_tokens,
-            Some(llm::ResponseFormat::JsonSchema { schema: extraction_json_schema() }),
-            ImageDetail::High,
-            true,
-        );
         let (resp, usage) = match chat_with_permit(client, &body, request_semaphore, cancel).await {
             Ok(pair) => pair,
             Err(e) => {
@@ -4317,7 +4408,7 @@ async fn read_markscheme_window<C: LlmClient>(
             }
         };
         report.record_usage(&usage);
-        if usage.total_tokens == 0 {
+        if usage.total_tokens == 0 && attempt == 1 {
             report.prompt_tokens += estimate_image_tokens(&images, ImageDetail::High);
         }
         let content = match llm::message_content(&resp) {
@@ -4327,6 +4418,7 @@ async fn read_markscheme_window<C: LlmClient>(
                 continue;
             }
         };
+        last_response = content.clone();
         match parse_llm_json::<AiAnswerEnvelope>(&content) {
             ParseOutcome::Clean(AiAnswerEnvelope::Wrapped { answers })
             | ParseOutcome::Clean(AiAnswerEnvelope::Bare(answers))
@@ -4691,11 +4783,21 @@ mod tests {
         assert_eq!(built.len(), 2);
         assert!(report.repairs >= 1);
         assert!(report.quarantined.is_empty());
-        // The repair response mentions the failure:
+        // The repair response is now a multi-turn text-only body:
+        // [system, original user (images stripped), assistant (bad
+        // output), user (repair instruction)]. The repair instruction
+        // is in messages[3] and references the validation failure.
         let bodies = mock.bodies();
         let repair_body = &bodies[3];
-        let user_msg = repair_body["messages"][1]["content"].as_str().unwrap();
-        assert!(user_msg.contains("Question 1") && user_msg.contains("PREVIOUS ATTEMPT FAILED VALIDATION"));
+        let msgs = repair_body["messages"].as_array().unwrap();
+        // Repair body has 4 turns (no images) vs 2 for the first attempt.
+        assert_eq!(msgs.len(), 4, "repair should be a 4-turn text-only body");
+        let original_user = msgs[1]["content"].as_str().unwrap();
+        let repair_user = msgs[3]["content"].as_str().unwrap();
+        assert!(original_user.contains("Question 1"), "original request replayed");
+        assert!(repair_user.contains("failed validation"), "repair instruction present");
+        // Repair must NOT carry images (text-only).
+        assert!(repair_body.get("images").is_none() || msgs[1].as_object().unwrap().get("images").is_none());
     }
 
     #[tokio::test]
