@@ -262,7 +262,7 @@ pub fn usage_from_response(resp: &Value) -> TokenUsage {
     TokenUsage {
         prompt_tokens: prompt,
         completion_tokens: completion,
-        total_tokens,
+        total_tokens: total,
         cached_tokens: cached,
     }
 }
