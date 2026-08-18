@@ -42,9 +42,11 @@ export interface ImportCostRecord {
 }
 
 const MODEL_PRICING_ESTIMATES: Record<string, { input: number; output: number; name: string }> = {
-  "google/gemini-3.7-flash": { input: 0.10, output: 0.40, name: "Gemini 3.7 Flash (Fast & Cheap)" },
-  "google/gemini-2.5-flash": { input: 0.10, output: 0.40, name: "Gemini 2.5 Flash" },
+  "google/gemini-3.7-flash": { input: 0.30, output: 2.50, name: "Gemini 3.7 Flash (Thinking)" },
+  "google/gemini-2.5-flash": { input: 0.30, output: 2.50, name: "Gemini 2.5 Flash (Default Free Tier)" },
   "google/gemini-2.0-flash-001": { input: 0.10, output: 0.40, name: "Gemini 2.0 Flash" },
+  "google/gemini-flash-1.5": { input: 0.075, output: 0.30, name: "Gemini 1.5 Flash" },
+  "deepseek/deepseek-r1": { input: 0.80, output: 2.40, name: "DeepSeek R1 (Reasoning)" },
   "deepseek/deepseek-chat": { input: 0.14, output: 0.28, name: "DeepSeek V3" },
   "openai/gpt-4o-mini": { input: 0.15, output: 0.60, name: "GPT-4o mini" },
   "anthropic/claude-3.5-haiku": { input: 0.80, output: 4.00, name: "Claude 3.5 Haiku" },
@@ -58,15 +60,19 @@ export function getRecordCost(record: ImportCostRecord): number {
     return record.costUsd;
   }
   const m = (record.modelName || "").toLowerCase();
-  let inRate = 0.10;
-  let outRate = 0.40;
-  if (m.includes("deepseek")) {
+  let inRate = 0.30;
+  let outRate = 2.50;
+  if (m.includes("gemini-2.0-flash") || m.includes("gemini-1.5-flash")) {
+    inRate = 0.10; outRate = 0.40;
+  } else if (m.includes("deepseek-r1")) {
+    inRate = 0.80; outRate = 2.40;
+  } else if (m.includes("deepseek")) {
     inRate = 0.14; outRate = 0.28;
   } else if (m.includes("gpt-4o-mini")) {
     inRate = 0.15; outRate = 0.60;
   } else if (m.includes("haiku")) {
     inRate = 0.80; outRate = 4.00;
-  } else if (m.includes("gpt-4o")) {
+  } else if (m.includes("gpt-4o") || m.includes("o1") || m.includes("o3")) {
     inRate = 2.50; outRate = 10.00;
   } else if (m.includes("sonnet")) {
     inRate = 3.00; outRate = 15.00;

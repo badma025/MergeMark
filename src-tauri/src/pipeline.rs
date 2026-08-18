@@ -21,7 +21,7 @@
 use crate::doc_map::{self, PageStructureProposal, QuestionSpan, ValidatedPageStructure};
 use crate::geometry;
 use crate::json_salvage::{parse_llm_json, ParseOutcome};
-use crate::llm::{self, LlmClient};
+use crate::llm::{self, LlmClient, TokenUsage, ImageDetail};
 use crate::validate;
 use std::path::PathBuf;
 use std::collections::VecDeque;
@@ -162,6 +162,14 @@ pub struct ImportReport {
     pub anomalies: Vec<String>,
     pub timings: Vec<TimingEntry>,
     pub total_elapsed_ms: u64,
+    /// Real provider-reported token counts accumulated across all API calls
+    /// made for this import (vision image tiles included). Zero when the
+    /// provider omits a `usage` block or in tests; the command layer falls
+    /// back to an image-aware estimate in that case.
+    pub prompt_tokens: u64,
+    pub completion_tokens: u64,
+    pub total_tokens: u64,
+    pub cached_tokens: u64,
 }
 
 /// Concurrent vision calls in flight at once. Validation is per unit of work
@@ -177,7 +185,7 @@ async fn chat_with_permit<C: LlmClient>(
     body: &serde_json::Value,
     semaphore: &Arc<Semaphore>,
     cancel: &AtomicBool,
-) -> Result<serde_json::Value, crate::llm::LlmError> {
+) -> Result<(serde_json::Value, TokenUsage), crate::llm::LlmError> {
     if cancel.load(Ordering::Relaxed) {
         return Err(crate::llm::LlmError::Network("Import cancelled by user".to_string()));
     }
@@ -197,7 +205,7 @@ async fn chat_with_permit<C: LlmClient>(
         return Err(crate::llm::LlmError::Network("Import cancelled by user".to_string()));
     }
     tokio::select! {
-        res = client.chat(body) => res,
+        res = client.chat_usage(body) => res,
         _ = async {
             while !cancel.load(Ordering::Relaxed) {
                 tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -206,6 +214,30 @@ async fn chat_with_permit<C: LlmClient>(
             Err(crate::llm::LlmError::Network("Import cancelled by user".to_string()))
         }
     }
+}
+
+/// Rough image-token estimate used only when the provider omits a `usage`
+/// block (e.g. some Ollama/local builds and the deterministic test mock).
+/// `detail: low` is a single ~85-token thumbnail tile; `high` averages
+/// ~1100 tokens for a typical A4 exam page at 2-3 768 px tiles. The text
+/// layer and prompts add only a few hundred tokens at this scale, so the
+/// image count dominates.
+fn estimate_image_tokens(images: &[String], detail: ImageDetail) -> u64 {
+    images
+        .iter()
+        .filter(|b64| {
+            let t = b64.trim();
+            !t.is_empty()
+                && t != "__SKIP__"
+                && t != "SKIP"
+                && t != "__TEXT_ONLY__"
+                && t != "TEXT_ONLY"
+        })
+        .map(|_| match detail {
+            ImageDetail::Low => 85,
+            ImageDetail::High => 1100,
+        })
+        .sum()
 }
 
 /// Shared cache for decoded page images. The same page is often decoded
@@ -240,6 +272,39 @@ impl PageImageCache {
         }
         Some(decoded)
     }
+}
+
+/// Downscale a base64 page image to at most `max_dim` px on its long edge and
+/// re-encode as WebP, returning a new base64 data-URL-free string. Used to
+/// feed the low-detail structure pass: OpenAI/Gemini bill a single flat
+/// thumbnail tile for images ≤ 768 px at `detail: low`, so this avoids
+/// shipping full 140-DPI (~1158×1636) renders that would otherwise be
+/// upscaled and tiled. The transcription pass keeps full-resolution high
+/// detail images, so accuracy is unaffected.
+pub fn downscale_image_for_low_detail(b64: &str, max_dim: u32) -> Option<String> {
+    use base64::Engine;
+    let img = geometry::decode_page_image(b64)?;
+    let (w, h) = img.dimensions();
+    let final_img = if w > max_dim || h > max_dim {
+        let scale = max_dim as f32 / (w.max(h) as f32);
+        let new_w = (w as f32 * scale).round().max(1.0) as u32;
+        let new_h = (h as f32 * scale).round().max(1.0) as u32;
+        image::DynamicImage::ImageRgba8(image::imageops::resize(
+            &img,
+            new_w,
+            new_h,
+            image::imageops::FilterType::Triangle,
+        ))
+    } else {
+        img
+    };
+    let mut buf = std::io::Cursor::new(Vec::with_capacity(
+        (final_img.width() as usize * final_img.height() as usize) / 8,
+    ));
+    final_img
+        .write_to(&mut buf, image::ImageFormat::WebP)
+        .ok()?;
+    Some(base64::engine::general_purpose::STANDARD.encode(buf.into_inner()))
 }
 
 struct ChunkImageInput {
@@ -411,6 +476,18 @@ impl ImportReport {
         self.skipped_pages.extend(o.skipped_pages);
         self.anomalies.extend(o.anomalies);
         self.timings.extend(o.timings);
+        self.prompt_tokens += o.prompt_tokens;
+        self.completion_tokens += o.completion_tokens;
+        self.total_tokens += o.total_tokens;
+        self.cached_tokens += o.cached_tokens;
+    }
+
+    /// Accumulate one API call's provider-reported token usage.
+    pub fn record_usage(&mut self, usage: &TokenUsage) {
+        self.prompt_tokens += usage.prompt_tokens;
+        self.completion_tokens += usage.completion_tokens;
+        self.total_tokens += usage.total_tokens.max(usage.prompt_tokens + usage.completion_tokens);
+        self.cached_tokens += usage.cached_tokens;
     }
 
     /// Record a timing entry.
@@ -1116,6 +1193,8 @@ pub async fn run_question_pipeline<C: LlmClient, P: Progress>(
         PAGE_RENDER_CACHE_CAPACITY,
     ));
     let request_semaphore = Arc::new(Semaphore::new(config.parallelism.max(1)));
+    // Created before the structure pass so the low-detail downscale and the
+    // later extraction path share one decoded copy per page.
     let page_image_cache = Arc::new(PageImageCache::new());
 
     // Prefer the free PDF text layer: it avoids one vision request per page.
@@ -1183,6 +1262,7 @@ pub async fn run_question_pipeline<C: LlmClient, P: Progress>(
                         return (
                             page_index,
                             Ok(r#"{"question_numbers_visible":[],"page_role":"BLANK"}"#.to_string()),
+                            TokenUsage::default(),
                         );
                     }
                     let mut images = Vec::new();
@@ -1193,10 +1273,18 @@ pub async fn run_question_pipeline<C: LlmClient, P: Progress>(
                                 return (
                                     page_index,
                                     Ok(r#"{"question_numbers_visible":[],"page_role":"BLANK"}"#.to_string()),
+                                    TokenUsage::default(),
                                 );
                             }
                         }
-                        images.push(b64.clone());
+                        // Structure pass only needs headings and y-bands, so
+                        // ship a 768px low-detail thumbnail. This is a flat
+                        // ~85-token image tile vs 2-4 high-detail tiles.
+                        if let Some(small) = downscale_image_for_low_detail(b64, 768) {
+                            images.push(small);
+                        } else {
+                            images.push(b64.clone());
+                        }
                     }
                     let (img_slice, text_opt): (&[String], Option<&str>) = if is_text_only {
                         (&[], Some(page.text.as_str()))
@@ -1210,17 +1298,34 @@ pub async fn run_question_pipeline<C: LlmClient, P: Progress>(
                         text_opt,
                         750,
                         Some(llm::ResponseFormat::JsonSchema { schema: structure_json_schema() }),
+                        ImageDetail::Low,
+                        false,
                     );
-                    let result = match chat_with_permit(client, &body, &semaphore, cancel).await {
-                        Ok(resp) => llm::message_content(&resp)
-                            .map_err(|e| format!("bad response shape ({})", e)),
-                        Err(e) => Err(format!("API failure ({})", e)),
+                    let (content, usage) = match chat_with_permit(client, &body, &semaphore, cancel).await {
+                        Ok((resp, usage)) => (
+                            llm::message_content(&resp)
+                                .map_err(|e| format!("bad response shape ({})", e)),
+                            usage,
+                        ),
+                        Err(e) => (Err(format!("API failure ({})", e)), TokenUsage::default()),
                     };
-                    (page_index, result)
+                    // Low-detail structure calls that don't round-trip a
+                    // usage block (local models / mocks) fall back to the
+                    // flat ~85-token thumbnail estimate.
+                    let usage = if usage.total_tokens == 0 && !images.is_empty() {
+                        TokenUsage {
+                            prompt_tokens: estimate_image_tokens(&images, ImageDetail::Low),
+                            ..TokenUsage::default()
+                        }
+                    } else {
+                        usage
+                    };
+                    (page_index, content, usage)
                 }
             })
             .buffer_unordered(config.parallelism.max(1));
             let mut ordered = Vec::with_capacity(pages.len());
+            let mut structure_usage = TokenUsage::default();
             loop {
                 let next_item = tokio::select! {
                     res = structure_results.next() => res,
@@ -1231,17 +1336,21 @@ pub async fn run_question_pipeline<C: LlmClient, P: Progress>(
                     } => None,
                 };
                 match next_item {
-                    Some(result) => {
+                    Some((index, result, usage)) => {
+                        structure_usage.prompt_tokens += usage.prompt_tokens;
+                        structure_usage.completion_tokens += usage.completion_tokens;
+                        structure_usage.total_tokens += usage.total_tokens;
+                        structure_usage.cached_tokens += usage.cached_tokens;
                         if cancel.load(Ordering::Relaxed) {
                             break;
                         }
-                        ordered.push(result);
+                        ordered.push((index, result));
                     }
                     None => break,
                 }
             }
             ordered.sort_by_key(|(index, _)| *index);
-            ordered
+            (ordered, structure_usage)
         };
 
         // Build the text-layer-only map concurrently. This is fast (ms)
@@ -1255,7 +1364,8 @@ pub async fn run_question_pipeline<C: LlmClient, P: Progress>(
         // permits. When the text layer is sufficient, the structure pass
         // still runs but its results are simply unused — no correctness
         // impact, and the parallel work is "free" since permits were idle.
-        let (ordered, _) = tokio::join!(structure_future, map_setup_future);
+        let ((ordered, structure_usage), _) = tokio::join!(structure_future, map_setup_future);
+        report.record_usage(&structure_usage);
 
         structure_timing_ms = structure_start.elapsed().as_millis() as u64;
         for (i, res) in ordered {
@@ -2005,11 +2115,13 @@ async fn extract_span<C: LlmClient>(
                 Some(llm::ResponseFormat::JsonSchema {
                     schema: extraction_schema.clone(),
                 }),
+                ImageDetail::High,
+                true,
             );
 
             let api_start = Instant::now();
-            let resp = match chat_with_permit(client, &body, request_semaphore, cancel).await {
-                Ok(r) => r,
+            let (resp, usage) = match chat_with_permit(client, &body, request_semaphore, cancel).await {
+                Ok(pair) => pair,
                 Err(e) => {
                     last_error = e.to_string();
                     if attempt == max_attempts || cancel.load(Ordering::Relaxed) {
@@ -2018,6 +2130,12 @@ async fn extract_span<C: LlmClient>(
                     continue;
                 }
             };
+            report.record_usage(&usage);
+            // Fall back to an image-aware estimate when the provider omits
+            // usage (local models / mocks) so cost logs stay non-zero.
+            if usage.total_tokens == 0 {
+                report.prompt_tokens += estimate_image_tokens(&images, ImageDetail::High);
+            }
             report.record_timing(
                 "extraction",
                 "api_call",
@@ -2081,17 +2199,23 @@ async fn extract_span<C: LlmClient>(
                         Some(llm::ResponseFormat::JsonSchema {
                             schema: extraction_schema.clone(),
                         }),
+                        ImageDetail::High,
+                        true,
                     );
 
                     let api_start = Instant::now();
-                    let reduced_resp = match chat_with_permit(client, &reduced_body, request_semaphore, cancel).await {
-                        Ok(r) => r,
+                    let (reduced_resp, reduced_usage) = match chat_with_permit(client, &reduced_body, request_semaphore, cancel).await {
+                        Ok(pair) => pair,
                         Err(e) => {
                             last_error = e.to_string();
                             report.repairs += 1;
                             continue;
                         }
                     };
+                    report.record_usage(&reduced_usage);
+                    if reduced_usage.total_tokens == 0 {
+                        report.prompt_tokens += estimate_image_tokens(&reduced_images, ImageDetail::High);
+                    }
                     report.record_timing(
                         "extraction",
                         "api_call_reduced",
@@ -3103,10 +3227,12 @@ async fn extract_same_page_batch<C: LlmClient>(
             Some(llm::ResponseFormat::JsonSchema {
                 schema: extraction_schema.clone(),
             }),
+            ImageDetail::High,
+            true,
         );
 
-        let resp = match chat_with_permit(client, &body, request_semaphore, cancel).await {
-            Ok(r) => r,
+        let (resp, usage) = match chat_with_permit(client, &body, request_semaphore, cancel).await {
+            Ok(pair) => pair,
             Err(e) => {
                 last_error = e.to_string();
                 if cancel.load(Ordering::Relaxed) {
@@ -3115,6 +3241,10 @@ async fn extract_same_page_batch<C: LlmClient>(
                 continue;
             }
         };
+        report.record_usage(&usage);
+        if usage.total_tokens == 0 {
+            report.prompt_tokens += estimate_image_tokens(&images, ImageDetail::High);
+        }
 
         let content = match llm::message_content(&resp) {
             Ok(c) => c,
@@ -3816,9 +3946,11 @@ RULES:
             Some(&user_text),
             config.max_output_tokens,
             Some(llm::ResponseFormat::JsonSchema { schema: extraction_json_schema() }),
+            ImageDetail::High,
+            true,
         );
-        let resp = match chat_with_permit(client, &body, request_semaphore, cancel).await {
-            Ok(r) => r,
+        let (resp, usage) = match chat_with_permit(client, &body, request_semaphore, cancel).await {
+            Ok(pair) => pair,
             Err(e) => {
                 last_error = e.to_string();
                 if cancel.load(Ordering::Relaxed) {
@@ -3827,6 +3959,10 @@ RULES:
                 continue;
             }
         };
+        report.record_usage(&usage);
+        if usage.total_tokens == 0 {
+            report.prompt_tokens += estimate_image_tokens(&page_images, ImageDetail::High);
+        }
         let content = match llm::message_content(&resp) {
             Ok(c) => c,
             Err(e) => {
@@ -4167,9 +4303,11 @@ async fn read_markscheme_window<C: LlmClient>(
             Some(&text),
             config.max_output_tokens,
             Some(llm::ResponseFormat::JsonSchema { schema: extraction_json_schema() }),
+            ImageDetail::High,
+            true,
         );
-        let resp = match chat_with_permit(client, &body, request_semaphore, cancel).await {
-            Ok(r) => r,
+        let (resp, usage) = match chat_with_permit(client, &body, request_semaphore, cancel).await {
+            Ok(pair) => pair,
             Err(e) => {
                 last_error = e.to_string();
                 if cancel.load(Ordering::Relaxed) {
@@ -4178,6 +4316,10 @@ async fn read_markscheme_window<C: LlmClient>(
                 continue;
             }
         };
+        report.record_usage(&usage);
+        if usage.total_tokens == 0 {
+            report.prompt_tokens += estimate_image_tokens(&images, ImageDetail::High);
+        }
         let content = match llm::message_content(&resp) {
             Ok(c) => c,
             Err(e) => {

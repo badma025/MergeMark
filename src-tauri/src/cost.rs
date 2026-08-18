@@ -43,23 +43,43 @@ pub struct OpenRouterCredits {
     pub total_usage: f64,
 }
 
-/// Calculate estimated or exact cost based on model and token counts
+/// Calculate estimated or exact cost based on model and token counts.
+/// Rates are USD per 1 M tokens, approximating OpenRouter list prices as
+/// of mid-2025. These are only used when the provider omits a real `usage`
+/// block (local models / tests) — the command layer prefers the
+/// provider-reported counts accumulated in `ImportReport`.
+///
+/// Vision image tokens are already included in the provider's
+/// `prompt_tokens` for OpenAI/Gemini/Anthropic, so no separate image
+/// surcharge is applied here.
 pub fn calculate_cost(model: &str, prompt_tokens: u64, completion_tokens: u64) -> f64 {
     let m = model.to_lowercase();
-    let (in_rate, out_rate) = if m.contains("gemini") {
-        (0.10, 0.40)
+    let (in_rate, out_rate) = if m.contains("gemini-2.5-flash") || m.contains("gemini-2.0-flash") {
+        // Gemini 2.5/2.0 Flash — the default free-tier model
+        (0.30, 2.50)
+    } else if m.contains("gemini-flash") || m.contains("gemini-1.5-flash") {
+        (0.075, 0.30)
+    } else if m.contains("gemini-2.5-pro") || m.contains("gemini-pro") {
+        (1.25, 10.00)
+    } else if m.contains("deepseek-r1") {
+        (0.80, 2.40)
+    } else if m.contains("deepseek-chat") || m.contains("deepseek-v3") {
+        (0.14, 0.28)
     } else if m.contains("deepseek") {
         (0.14, 0.28)
     } else if m.contains("gpt-4o-mini") {
         (0.15, 0.60)
-    } else if m.contains("claude-3-5-haiku") || m.contains("haiku") {
-        (0.80, 4.00)
     } else if m.contains("gpt-4o") {
         (2.50, 10.00)
-    } else if m.contains("claude-3-7-sonnet") || m.contains("claude-3-5-sonnet") || m.contains("sonnet") {
+    } else if m.contains("claude-3-5-haiku") || m.contains("claude-haiku") {
+        (0.80, 4.00)
+    } else if m.contains("claude-3-7-sonnet") || m.contains("claude-3-5-sonnet") || m.contains("claude-sonnet") {
         (3.00, 15.00)
+    } else if m.contains("o1") || m.contains("o3") {
+        (15.00, 60.00)
     } else {
-        (0.15, 0.50)
+        // Unknown model — assume near-flash pricing as a conservative lower bound
+        (0.30, 2.50)
     };
 
     let in_cost = (prompt_tokens as f64 / 1_000_000.0) * in_rate;

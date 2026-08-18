@@ -36,6 +36,11 @@ export interface ImportReport {
   anomalies: string[];
   timings: TimingEntry[];
   totalElapsedMs?: number;
+  /** Real provider-reported token counts accumulated across all API calls. */
+  promptTokens?: number;
+  completionTokens?: number;
+  totalTokens?: number;
+  cachedTokens?: number;
 }
 
 // ── IngestionDropzone ─────────────────────────────────────────────────────────

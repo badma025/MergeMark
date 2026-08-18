@@ -1612,36 +1612,36 @@ pub async fn parse_pdf_vision(
     }
 
     // ── Log import run metrics to audit log ───────────────────────────────
-    // Use the real OpenRouter usage delta if we can (before/after snapshot),
-    // otherwise fall back to model-rate estimate.
-    let prompt_est = (pages.len() as i64) * 1400;
-    let comp_est = (final_questions.len() as i64) * 350;
-
-    // Try to get real cost from OpenRouter usage delta
-    let real_cost = {
-        let api_key = crate::db::get_byok_api_key(&pool).await.unwrap_or(None);
-        if let Some(ref key) = api_key {
-            // Query current usage from OpenRouter
-            match crate::cost::fetch_openrouter_key_info(key).await {
-                Ok(info) => {
-                    let after_usage = info.usage_usd;
-                    // We can't do a true before/after without storing state,
-                    // so use the model-rate estimate but scale it to be more
-                    // accurate using higher token multipliers for reasoning models.
-                    let m_lower = model_name.to_lowercase();
-                    let is_reasoning = m_lower.contains("3.7") || m_lower.contains("o1") || m_lower.contains("o3");
-                    let multiplier = if is_reasoning { 3.0 } else { 1.0 };
-                    let est = crate::cost::calculate_cost(&model_name, prompt_est as u64, comp_est as u64) * multiplier;
-                    // Use the estimate but log that we have live data available
-                    eprintln!("[COST] OpenRouter live usage_usd={:.4}, estimated import cost=${:.4} (reasoning_multiplier={:.1}x)", after_usage, est, multiplier);
-                    est
-                },
-                Err(_) => crate::cost::calculate_cost(&model_name, prompt_est as u64, comp_est as u64),
-            }
-        } else {
-            crate::cost::calculate_cost(&model_name, prompt_est as u64, comp_est as u64)
-        }
+    // Prefer the provider-reported token counts accumulated in the report
+    // (vision image tiles included). When the provider omits a `usage`
+    // block (local models / mocks), fall back to an image-aware estimate.
+    let (prompt_tokens, completion_tokens) = if report.total_tokens > 0 {
+        (report.prompt_tokens as i64, report.completion_tokens as i64)
+    } else {
+        ((pages.len() as i64) * 1400, (final_questions.len() as i64) * 350)
     };
+
+    let m_lower = model_name.to_lowercase();
+    let is_reasoning = m_lower.contains("3.7")
+        || m_lower.contains("o1")
+        || m_lower.contains("o3")
+        || m_lower.contains("deepseek-r1");
+    let multiplier = if is_reasoning { 3.0 } else { 1.0 };
+    let cost_usd = crate::cost::calculate_cost(
+        &model_name,
+        prompt_tokens as u64,
+        completion_tokens as u64,
+    ) * multiplier;
+
+    eprintln!(
+        "[COST] {} prompt_tokens={} completion_tokens={} cached_tokens={} est_cost=${:.6} (reasoning={})",
+        config.paper_name,
+        prompt_tokens,
+        completion_tokens,
+        report.cached_tokens,
+        cost_usd,
+        is_reasoning
+    );
 
     let _ = crate::db::record_import_cost(
         &pool,
@@ -1649,10 +1649,10 @@ pub async fn parse_pdf_vision(
         &model_name,
         "question_paper",
         final_questions.len() as i64,
-        prompt_est,
-        comp_est,
-        real_cost,
-        0,
+        prompt_tokens,
+        completion_tokens,
+        cost_usd,
+        report.total_elapsed_ms as i64,
     )
     .await;
 
@@ -2046,12 +2046,26 @@ pub async fn parse_mark_scheme_vision(
     }
 
     // ── Log mark scheme import metrics to audit log ──────────────────────────
-    let prompt_est = (pages.len() as i64) * 1200;
-    let comp_est = (proposed_mappings.len() as i64) * 300;
+    let (prompt_tokens, completion_tokens) = if report.total_tokens > 0 {
+        (report.prompt_tokens as i64, report.completion_tokens as i64)
+    } else {
+        (
+            (pages.len() as i64) * 1200,
+            (proposed_mappings.len() as i64) * 300,
+        )
+    };
+
     let m_lower = model_name.to_lowercase();
-    let is_reasoning = m_lower.contains("3.7") || m_lower.contains("o1") || m_lower.contains("o3");
+    let is_reasoning = m_lower.contains("3.7")
+        || m_lower.contains("o1")
+        || m_lower.contains("o3")
+        || m_lower.contains("deepseek-r1");
     let multiplier = if is_reasoning { 3.0 } else { 1.0 };
-    let cost_usd = crate::cost::calculate_cost(&model_name, prompt_est as u64, comp_est as u64) * multiplier;
+    let cost_usd = crate::cost::calculate_cost(
+        &model_name,
+        prompt_tokens as u64,
+        completion_tokens as u64,
+    ) * multiplier;
     let pool = state.db.lock().await;
     let _ = crate::db::record_import_cost(
         &pool,
@@ -2059,10 +2073,10 @@ pub async fn parse_mark_scheme_vision(
         &model_name,
         "mark_scheme",
         proposed_mappings.len() as i64,
-        prompt_est,
-        comp_est,
+        prompt_tokens,
+        completion_tokens,
         cost_usd,
-        0,
+        report.total_elapsed_ms as i64,
     )
     .await;
 
