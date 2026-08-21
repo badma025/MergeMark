@@ -1211,7 +1211,7 @@ pub async fn compile_worksheet(
 
 // ── Per-page text-layer extraction (hint text + document-map scan) ───────────
 
-fn extract_page_texts(file_path: &str, num_pages: usize) -> Vec<String> {
+pub(crate) fn extract_page_texts(file_path: &str, num_pages: usize) -> Vec<String> {
     let mut texts = vec![String::new(); num_pages];
     if !file_path.to_lowercase().ends_with(".pdf") {
         return texts;
@@ -1257,6 +1257,10 @@ pub async fn parse_pdf_vision(
     paper_name: String,
     state: State<'_, AppState>,
 ) -> Result<Vec<Question>, String> {
+    // Unambiguous build marker: if the running binary does not print this,
+    // it predates the figure-fix-v3 build. Rebuild before trusting any cost
+    // measurement.
+    eprintln!("[BUILD] figure-fix-v5: text-first merges multi-item responses");
     let _concurrency_guard = state.extraction_in_progress.try_lock().map_err(|_| {
         "Another extraction is already in progress. Please wait for it to finish.".to_string()
     })?;
@@ -1422,6 +1426,16 @@ pub async fn parse_pdf_vision(
     // question that requires a full retry is far more expensive).
     config.max_output_tokens = 32768;
 
+    // Text-layer-first extraction: the PDF text layer is authoritative for
+    // digital papers (the vision structure pass is skipped for them), so each
+    // question is transcribed from text with ZERO image tokens and vision is
+    // used only when a figure is actually needed. This is the dominant cost
+    // lever on pixel-billed providers (Gemini). Disable with
+    // MERGEMARK_TEXT_FIRST=0.
+    config.text_first = std::env::var("MERGEMARK_TEXT_FIRST")
+        .map(|v| v != "0")
+        .unwrap_or(true);
+
     let (route, client) = resolve_llm_client(&state, model_name.clone())
         .await
         .map_err(|e| e.hint.unwrap_or(e.message))?;
@@ -1498,9 +1512,52 @@ pub async fn parse_pdf_vision(
     }
     drop(pool_check);
 
+    // ── Deterministic figure detection (free, on-device) ───────────────────
+    // A single pass over the PDF content stream locates every figure region
+    // with zero AI calls. The pipeline uses these to attach figure crops to
+    // text-first questions, removing the vision figure pass entirely. Only
+    // runs for real PDFs; detection failures degrade to the vision path (the
+    // pipeline falls back whenever a question references a figure it cannot
+    // supply deterministically).
+    let ext = std::path::Path::new(&file_path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_lowercase();
+    let page_figures: Vec<Vec<crate::pdf_render::DetectedFigure>> = if ext == "pdf" {
+        let path_clone = file_path.clone();
+        tokio::task::spawn_blocking(move || {
+            crate::pdf_render::detect_pdf_figures(std::path::Path::new(&path_clone))
+        })
+        .await
+        .map_err(|e| format!("Thread-pool error: {}", e))?
+        .unwrap_or_else(|e| {
+            eprintln!("[DETECT_FIGURES] deterministic detection failed: {}", e);
+            Vec::new()
+        })
+    } else {
+        Vec::new()
+    };
+    // Observable signal for the import logs: if the binary is current, this
+    // ALWAYS prints (even "found 0 figures"). Its absence means the running
+    // binary predates deterministic detection.
+    let detected_total: usize = page_figures.iter().map(Vec::len).sum();
+    eprintln!(
+        "[DETECT_FIGURES] found {} figures across {} pages (free, on-device)",
+        detected_total,
+        page_figures.len()
+    );
+
     let (built, mut report): (Vec<BuiltQuestion>, ImportReport) =
-        pipeline::run_question_pipeline(&client, &pages, &config, &progress, &state.cancel_flag)
-            .await?;
+        pipeline::run_question_pipeline(
+            &client,
+            &pages,
+            &page_figures,
+            &config,
+            &progress,
+            &state.cancel_flag,
+        )
+        .await?;
 
     if state.cancel_flag.load(std::sync::atomic::Ordering::Relaxed) {
         return Err("Import cancelled by user".to_string());

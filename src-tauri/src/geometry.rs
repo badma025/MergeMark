@@ -862,6 +862,160 @@ pub fn union_relative_bboxes(boxes: &[Vec<f32>]) -> Option<Vec<f32>> {
     valid.then(|| vec![min_x, min_y, max_x - min_x, max_y - min_y])
 }
 
+// ── Deterministic figure detection (PDF content stream) ────────────────────
+//
+// The vision model is replaced by a free, on-device pass over the PDF's vector
+// content: every Image/Path object has exact page-space bounds from pdfium.
+// This module contains the pure geometry: normalization, clustering, and the
+// filter predicates. `pdf_render::detect_pdf_figures` is the thin wrapper that
+// feeds it raw object bounds; these functions are unit-testable without pdfium.
+// Box convention matches the rest of the codebase: normalized [x, y, w, h] in
+// 0..1 with y measured from the top of the page.
+
+/// Convert PDF-space bounds (origin bottom-left, in points) into the app's
+/// normalized [x, y, w, h] (y from top). Clamped to the page.
+pub fn normalize_pdf_box(
+    left: f32,
+    right: f32,
+    top: f32,
+    bottom: f32,
+    page_w: f32,
+    page_h: f32,
+) -> [f32; 4] {
+    let x = (left / page_w).clamp(0.0, 1.0);
+    let y = (1.0 - top / page_h).clamp(0.0, 1.0);
+    let w = ((right - left) / page_w).clamp(0.0, 1.0);
+    let h = ((top - bottom) / page_h).clamp(0.0, 1.0);
+    [x, y, w, h]
+}
+
+/// Reject degenerate figure boxes: area below the floor or either dimension
+/// below the floor. Kills specks, tick marks, borders, and underlines.
+pub fn is_tiny_figure(b: &[f32; 4], min_area_frac: f32, min_dim_frac: f32) -> bool {
+    let area = b[2] * b[3];
+    area < min_area_frac || b[2] < min_dim_frac || b[3] < min_dim_frac
+}
+
+/// Reject "rule lines": extremely thin boxes (ruled answer lines, borders,
+/// continuation rules). Aspect ratio beyond `max_aspect` in either direction.
+pub fn is_rule_line(b: &[f32; 4], max_aspect: f32) -> bool {
+    let (w, h) = (b[2], b[3]);
+    if w <= 0.0 || h <= 0.0 {
+        return true;
+    }
+    let aspect = w / h;
+    aspect > max_aspect || aspect < 1.0 / max_aspect
+}
+
+/// Fraction of `b`'s area covered by the given text-segment rectangles
+/// (normalized [x, y, w, h], y from top). Overlaps are counted once per
+/// segment (not unioned), capped at 1.0. A high share means the region is
+/// question text or a table, not a figure.
+pub fn text_density_in_box(b: &[f32; 4], text_rects: &[[f32; 4]]) -> f32 {
+    let box_area = b[2] * b[3];
+    if box_area <= 0.0 {
+        return 1.0;
+    }
+    let mut covered = 0.0f32;
+    for tr in text_rects {
+        let ix0 = b[0].max(tr[0]);
+        let ix1 = (b[0] + b[2]).min(tr[0] + tr[2]);
+        let iy0 = b[1].max(tr[1]);
+        let iy1 = (b[1] + b[3]).min(tr[1] + tr[3]);
+        if ix0 < ix1 && iy0 < iy1 {
+            covered += (ix1 - ix0) * (iy1 - iy0);
+        }
+    }
+    (covered / box_area).min(1.0)
+}
+
+fn boxes_overlap_expanded(a: [f32; 4], b: [f32; 4], gap: f32) -> bool {
+    let (ax0, ax1) = (a[0] - gap, a[0] + a[2] + gap);
+    let (bx0, bx1) = (b[0] - gap, b[0] + b[2] + gap);
+    let (ay0, ay1) = (a[1] - gap, a[1] + a[3] + gap);
+    let (by0, by1) = (b[1] - gap, b[1] + b[3] + gap);
+    ax0 < bx1 && bx0 < ax1 && ay0 < by1 && by0 < ay1
+}
+
+fn union_box(a: [f32; 4], b: [f32; 4]) -> [f32; 4] {
+    let x = a[0].min(b[0]);
+    let y = a[1].min(b[1]);
+    let x1 = (a[0] + a[2]).max(b[0] + b[2]);
+    let y1 = (a[1] + a[3]).max(b[1] + b[3]);
+    [x, y, x1 - x, y1 - y]
+}
+
+/// Greedily union boxes whose 1-D projections overlap after expanding each by
+/// `gap_frac` of the page. A circuit or graph is drawn as many small paths;
+/// this merges them into one figure region. Larger boxes seed clusters first
+/// so a dominant figure is not absorbed into a neighbouring speck's box.
+pub fn cluster_boxes(mut boxes: Vec<[f32; 4]>, gap_frac: f32) -> Vec<[f32; 4]> {
+    if boxes.is_empty() {
+        return boxes;
+    }
+    boxes.sort_by(|a, b| {
+        (b[2] * b[3])
+            .partial_cmp(&(a[2] * a[3]))
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    let mut clusters: Vec<[f32; 4]> = Vec::with_capacity(boxes.len());
+    for b in boxes {
+        let mut merged = None;
+        for (i, c) in clusters.iter().enumerate() {
+            if boxes_overlap_expanded(b, *c, gap_frac) {
+                merged = Some(i);
+                break;
+            }
+        }
+        match merged {
+            Some(i) => clusters[i] = union_box(clusters[i], b),
+            None => clusters.push(b),
+        }
+    }
+    clusters
+}
+
+/// One-stop predicate for a candidate figure region: rejects specks, rule
+/// lines, header (top 5%) / footer (bottom 8%) bands, and text-dense regions.
+pub fn is_probable_figure_box(
+    b: &[f32; 4],
+    text_rects: &[[f32; 4]],
+    min_area_frac: f32,
+    min_dim_frac: f32,
+    max_aspect: f32,
+    max_text_density: f32,
+) -> bool {
+    if is_tiny_figure(b, min_area_frac, min_dim_frac) || is_rule_line(b, max_aspect) {
+        return false;
+    }
+    if b[1] < 0.05 || b[1] + b[3] > 0.92 {
+        return false;
+    }
+    text_density_in_box(b, text_rects) <= max_text_density
+}
+
+/// Infer a semantic kind from a figure caption (or nearby text), mirroring the
+/// vision prompt's `diagram_kinds` vocabulary closely enough for the `graph_like`
+/// crop flag and the report card.
+pub fn caption_kind_from_text(caption: &str) -> Option<String> {
+    let lower = caption.to_ascii_lowercase();
+    if lower.contains("flow") {
+        Some("flowchart".to_string())
+    } else if lower.contains("graph")
+        || lower.contains("chart")
+        || lower.contains("plot")
+        || lower.contains("curve")
+    {
+        Some("graph".to_string())
+    } else if lower.contains("circuit") {
+        Some("circuit".to_string())
+    } else if lower.contains("diagram") || lower.contains("sketch") {
+        Some("diagram".to_string())
+    } else {
+        None
+    }
+}
+
 /// Expand a pixel-space rectangle without changing the coordinate-system
 /// meaning of its edges. `left` and `top` move the origin toward zero;
 /// `right` and `bottom` move the far edge toward the page bounds.
@@ -1732,5 +1886,91 @@ mod tests {
         let decoded = decode_page_image(&b64).expect("result must decode");
         let (w, h) = decoded.dimensions();
         assert!(w <= API_IMAGE_MAX_DIM && h <= API_IMAGE_MAX_DIM);
+    }
+
+    // ── Deterministic figure detection geometry ────────────────────────────
+
+    #[test]
+    fn normalize_pdf_box_flips_y_origin() {
+        // PDF origin is bottom-left; y must flip to top-down, x unchanged.
+        let b = normalize_pdf_box(100.0, 300.0, 700.0, 400.0, 800.0, 1000.0);
+        assert!((b[0] - 0.125).abs() < 1e-5);
+        assert!((b[1] - 0.30).abs() < 1e-5);
+        assert!((b[2] - 0.25).abs() < 1e-5);
+        assert!((b[3] - 0.30).abs() < 1e-5);
+    }
+
+    #[test]
+    fn normalize_pdf_box_clamps_out_of_page_bounds() {
+        let b = normalize_pdf_box(-50.0, 900.0, 1100.0, -50.0, 800.0, 1000.0);
+        assert!(b[0] >= 0.0 && b[0] <= 1.0);
+        assert!(b[1] >= 0.0 && b[1] <= 1.0);
+        assert!(b[2] >= 0.0 && b[2] <= 1.0);
+        assert!(b[3] >= 0.0 && b[3] <= 1.0);
+    }
+
+    #[test]
+    fn cluster_merges_overlapping_paths_into_one_figure() {
+        // Two overlapping path boxes (a graph drawn from several strokes).
+        let boxes = vec![
+            [0.30, 0.30, 0.20, 0.20],
+            [0.40, 0.40, 0.15, 0.15],
+            [0.60, 0.60, 0.05, 0.05],
+        ];
+        let clustered = cluster_boxes(boxes, 0.02);
+        assert_eq!(clustered.len(), 2, "two near boxes merge, distant one stays separate");
+        let merged = clustered.iter().find(|b| b[2] >= 0.25).expect("merged box");
+        assert!(merged[0] <= 0.30 && merged[1] <= 0.30, "union covers both origins");
+        let far = clustered.iter().find(|b| b[2] < 0.25).unwrap();
+        assert!((far[0] - 0.60).abs() < 1e-4);
+    }
+
+    #[test]
+    fn cluster_merges_boxes_separated_by_small_gap() {
+        let boxes = vec![[0.10, 0.50, 0.10, 0.10], [0.215, 0.50, 0.10, 0.10]];
+        let clustered = cluster_boxes(boxes, 0.02);
+        assert_eq!(clustered.len(), 1, "a 1.5% gap merges when tolerance is 2%");
+    }
+
+    #[test]
+    fn rule_line_and_speck_are_rejected() {
+        let text: [[f32; 4]; 0] = [];
+        let rule = [0.20, 0.70, 0.60, 0.008]; // wide, thin → ruled answer line
+        let speck = [0.50, 0.50, 0.005, 0.005]; // tiny → OCR noise
+        let graph = [0.30, 0.35, 0.30, 0.25]; // legit figure
+        assert!(!is_probable_figure_box(&rule, &text, 0.003, 0.015, 8.0, 0.4));
+        assert!(!is_probable_figure_box(&speck, &text, 0.003, 0.015, 8.0, 0.4));
+        assert!(is_probable_figure_box(&graph, &text, 0.003, 0.015, 8.0, 0.4));
+    }
+
+    #[test]
+    fn text_dense_region_is_rejected() {
+        // A box almost fully covered by text segments is question text, not a figure.
+        let text_rects: [[f32; 4]; 3] = [
+            [0.10, 0.10, 0.60, 0.05],
+            [0.10, 0.16, 0.60, 0.05],
+            [0.10, 0.22, 0.60, 0.05],
+        ];
+        assert!(text_density_in_box(&[0.10, 0.10, 0.60, 0.17], &text_rects) > 0.4);
+        assert!(text_density_in_box(&[0.30, 0.40, 0.10, 0.10], &text_rects) < 0.4);
+    }
+
+    #[test]
+    fn header_and_footer_boxes_are_rejected() {
+        let text: [[f32; 4]; 0] = [];
+        let header = [0.20, 0.02, 0.30, 0.02];
+        let footer = [0.20, 0.93, 0.30, 0.05];
+        let middle = [0.20, 0.30, 0.30, 0.20];
+        assert!(!is_probable_figure_box(&header, &text, 0.003, 0.015, 8.0, 0.4));
+        assert!(!is_probable_figure_box(&footer, &text, 0.003, 0.015, 8.0, 0.4));
+        assert!(is_probable_figure_box(&middle, &text, 0.003, 0.015, 8.0, 0.4));
+    }
+
+    #[test]
+    fn caption_kind_keywords() {
+        assert_eq!(caption_kind_from_text("Figure 1: circuit diagram"), Some("circuit".into()));
+        assert_eq!(caption_kind_from_text("Graph of y against x"), Some("graph".into()));
+        assert_eq!(caption_kind_from_text("Flow chart of the process"), Some("flowchart".into()));
+        assert_eq!(caption_kind_from_text("Figure 4"), None);
     }
 }

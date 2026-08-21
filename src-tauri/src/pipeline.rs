@@ -83,6 +83,12 @@ pub struct PipelineConfig {
     pub max_output_tokens: u32,
     /// Maximum concurrent API requests.
     pub parallelism: usize,
+    /// Try extracting each question from the PDF text layer FIRST (zero image
+    /// tokens). Only falls back to vision when the text attempt needs a
+    /// figure or fails validation. Off by default (tests keep the old
+    /// behaviour); enabled by the production import command when the paper's
+    /// text map is sufficient.
+    pub text_first: bool,
 }
 
 impl PipelineConfig {
@@ -98,6 +104,7 @@ impl PipelineConfig {
             max_repairs: 2,
             max_output_tokens: 32768,
             parallelism: DEFAULT_PARALLEL,
+            text_first: false,
         }
     }
 }
@@ -160,6 +167,14 @@ pub struct ImportReport {
     pub crop_rejections: usize,
     pub diagrams_saved: usize,
     pub diagrams_deduped: usize,
+    /// Questions transcribed from the text layer alone (zero image tokens).
+    pub text_first: usize,
+    /// Read-from-figure questions answered from deterministic figure crops
+    /// (~4k image tokens each instead of ~10k+ per full page).
+    pub crop_first: usize,
+    /// Figures located deterministically from the PDF content stream (zero
+    /// image tokens) — the free alternative to the vision figure pass.
+    pub figures_detected: usize,
     pub anomalies: Vec<String>,
     pub timings: Vec<TimingEntry>,
     pub total_elapsed_ms: u64,
@@ -437,10 +452,16 @@ impl ImportReport {
     pub fn absorb(&mut self, o: ImportReport) {
         self.pages_processed += o.pages_processed;
         self.repairs += o.repairs;
+        for (rule, count) in o.repair_reasons {
+            *self.repair_reasons.entry(rule).or_insert(0) += count;
+        }
         self.salvage_events += o.salvage_events;
         self.crop_rejections += o.crop_rejections;
         self.diagrams_saved += o.diagrams_saved;
         self.diagrams_deduped += o.diagrams_deduped;
+        self.text_first += o.text_first;
+        self.crop_first += o.crop_first;
+        self.figures_detected += o.figures_detected;
         self.mark_checks.extend(o.mark_checks);
         self.quarantined.extend(o.quarantined);
         self.skipped_pages.extend(o.skipped_pages);
@@ -1098,6 +1119,48 @@ OUTPUT STRUCTURE — EVERY item MUST have:
     )
 }
 
+/// System prompt for TEXT-LAYER-ONLY extraction (no images attached). Used for
+/// questions whose figures are supplied deterministically by the PDF content
+/// stream detector (`page_figures`), so the model transcribes the text and
+/// marks where a figure belongs; the crops are spliced in by Rust afterwards.
+fn text_first_system_prompt(config: &PipelineConfig) -> String {
+    let base = extraction_system_prompt(config);
+    format!(
+        r#"{base}
+
+══════ TEXT-ONLY MODE OVERRIDE (READ CAREFULLY — THESE RULES REPLACE THE FEW-SHOT DIAGRAM RULES ABOVE) ══════
+- NO IMAGES ARE ATTACHED. The RAW TEXT below is the complete and authoritative source for the target question. Transcribe the question's text, sub-parts, and marks EXACTLY from it.
+- If the question references a figure ("Figure 1", "the diagram below", "the circuit", "the graph"), insert the placeholder [DIAGRAM_PLACEHOLDER] IMMEDIATELY after the sentence or clause that references it — never at the end of the question, and never more than once per referenced figure. The figure itself will be attached by the system afterwards.
+- "diagram_bboxes", "diagram_captions", "diagram_kinds", "bbox_page_indexes" MUST all be empty arrays and "visual_options" MUST be null — figure crops are supplied by the system, not by you.
+- Do NOT invent content, values, or diagrams that are not in the text.
+- All other rules (math delimiters, marks, sub-parts, topics, module, question isolation) still apply exactly as above.
+"#,
+        base = base,
+    )
+}
+
+/// System prompt for CROP-FIRST extraction: the attached images are the
+/// question's figure(s), already cropped by the detector, so the model can
+/// READ values off them without paying for full-page image tokens. The
+/// question wording comes from the RAW TEXT; the crops carry the exhibit.
+fn crop_first_system_prompt(config: &PipelineConfig) -> String {
+    let base = extraction_system_prompt(config);
+    format!(
+        r#"{base}
+
+══════ CROP-FIRST MODE OVERRIDE (READ CAREFULLY — THESE RULES REPLACE THE FEW-SHOT DIAGRAM RULES ABOVE) ══════
+- The attached image(s) are the question's figure(s), ALREADY CROPPED by the system. They contain the data (values, coordinates, readings, graph shapes) needed to answer the question.
+- READ any required values, coordinates, or readings from the figure image(s). The answer may depend entirely on what the figure shows — if so, state the value you read from the figure.
+- The RAW TEXT below is authoritative for the QUESTION WORDING; transcribe the question's text, sub-parts, and marks EXACTLY from it.
+- "diagram_bboxes", "diagram_captions", "diagram_kinds", "bbox_page_indexes" MUST all be empty arrays and "visual_options" MUST be null — the figure content is already provided as an image, do NOT box it.
+- Do NOT insert [DIAGRAM_PLACEHOLDER].
+- Do NOT invent content, values, or diagrams that are not in the text or figure image.
+- All other rules (math delimiters, marks, sub-parts, topics, module, question isolation) still apply exactly as above.
+"#,
+        base = base,
+    )
+}
+
 fn markscheme_system_prompt() -> String {
     r#"You are an expert examiner transcribing a mark scheme into Markdown. Return ONLY a valid JSON object: {"answers": [...]} (or an empty array [] / {"answers": []} when the pages contain no real answers).
 
@@ -1136,6 +1199,7 @@ RULES:
 pub async fn run_question_pipeline<C: LlmClient, P: Progress>(
     client: &C,
     pages: &[PageInput],
+    page_figures: &[Vec<crate::pdf_render::DetectedFigure>],
     config: &PipelineConfig,
     progress: &P,
     cancel: &AtomicBool,
@@ -1145,6 +1209,7 @@ pub async fn run_question_pipeline<C: LlmClient, P: Progress>(
         paper_name: config.paper_name.clone(),
         kind: "questions".to_string(),
         pages_total: pages.len(),
+        figures_detected: page_figures.iter().map(Vec::len).sum(),
         ..Default::default()
     };
     let page_render_cache = Arc::new(crate::pdf_render::PageRenderCache::new(
@@ -1659,6 +1724,7 @@ pub async fn run_question_pipeline<C: LlmClient, P: Progress>(
             let job = &jobs[position];
             let client = client;
             let config = config;
+            let page_figures = page_figures;
             let page_render_cache = Arc::clone(&page_render_cache);
             let page_image_cache = Arc::clone(&page_image_cache);
             let request_semaphore = Arc::clone(&request_semaphore);
@@ -1672,11 +1738,13 @@ pub async fn run_question_pipeline<C: LlmClient, P: Progress>(
                             config,
                             span,
                             pages,
+                            page_figures,
                             &page_render_cache,
                             &page_image_cache,
                             &request_semaphore,
                             &collateral_cache,
                             &all_spans,
+                            config.text_first && text_map_available,
                             cancel,
                         )
                         .await;
@@ -1689,11 +1757,13 @@ pub async fn run_question_pipeline<C: LlmClient, P: Progress>(
                             spans,
                             *page_idx,
                             page_input,
+                            page_figures,
                             &page_render_cache,
                             &page_image_cache,
                             &request_semaphore,
                             &collateral_cache,
                             &all_spans,
+                            config.text_first && text_map_available,
                             cancel,
                         )
                         .await;
@@ -1805,6 +1875,15 @@ pub async fn run_question_pipeline<C: LlmClient, P: Progress>(
     report.marks_checksum_ok = None;
     report.total_elapsed_ms = overall_start.elapsed().as_millis() as u64;
 
+    eprintln!(
+        "[PATH_SUMMARY] {} questions: {} text-first (0 img), {} crop-first (~4k img), {} full-page vision (figures detected: {})",
+        report.questions_extracted,
+        report.text_first,
+        report.crop_first,
+        report.questions_extracted.saturating_sub(report.text_first + report.crop_first),
+        report.figures_detected,
+    );
+
     Ok((built, report))
 }
 
@@ -1824,6 +1903,704 @@ fn push_mark_check(span: &QuestionSpan, q: &BuiltQuestion, report: &mut ImportRe
 /// Thread-safe collateral question cache shared across concurrent extraction jobs in a paper run.
 type CollateralCache = Arc<tokio::sync::Mutex<std::collections::HashMap<u32, BuiltQuestion>>>;
 
+/// Deterministic gate for text-layer-first extraction: if the span's text
+/// layer references a figure (Figure N, diagram, graph, circuit, sketch, …),
+/// the figures MUST be boxed and extracted as images, which requires the
+/// vision path. Text-first is only safe for questions whose text is fully
+/// self-contained. When in doubt, this returns true so the question keeps the
+/// proven vision path.
+fn text_references_figure(text: &str) -> bool {
+    use std::sync::OnceLock;
+    static RE_FIGURE: OnceLock<regex::Regex> = OnceLock::new();
+    RE_FIGURE
+        .get_or_init(|| {
+            regex::Regex::new(
+                r"(?i)\bfigure\s*\d+|\bfig\.?\s*\d+|\bdiagram|\bgraph\b|\bchart\b|\bcircuit\b|\bsketch\b|\bnot drawn to scale\b|\bshown below\b|\bas shown\b|\bpictured\b|\billustrated\b|\bcurve\b|\baxes\b|\bplot\b|\bscheme\b|\bschema\b",
+            )
+            .unwrap()
+        })
+        .is_match(text)
+}
+
+/// Extract the numbers of explicit "Figure N" / "Fig. N" references in the
+/// span's text layer.
+fn figure_reference_numbers(text: &str) -> Vec<u32> {
+    use std::sync::OnceLock;
+    static RE_FIG_NUM: OnceLock<regex::Regex> = OnceLock::new();
+    RE_FIG_NUM
+        .get_or_init(|| regex::Regex::new(r"(?i)\bfigure\s*(\d+)|\bfig\.?\s*(\d+)").unwrap())
+        .captures_iter(text)
+        .filter_map(|c| {
+            c.get(1)
+                .or_else(|| c.get(2))
+                .and_then(|m| m.as_str().parse::<u32>().ok())
+        })
+        .collect()
+}
+
+/// Heuristic: does the question's wording demand the ANSWER be READ from a
+/// figure? These are exactly the questions a text-only transcription cannot
+/// satisfy — the text alone never contains the value, so the figure must be
+/// SHOWN to the model (crop-first, or the full page as a fallback). Kept
+/// deliberately narrow so it does not force every figure question back onto
+/// the expensive full-page path.
+fn figure_read_required(text: &str) -> bool {
+    use std::sync::OnceLock;
+    static RE_READ: OnceLock<regex::Regex> = OnceLock::new();
+    RE_READ
+        .get_or_init(|| {
+            regex::Regex::new(
+                r"(?i)read\s+the\s+(?:coordinates|value|reading|data)|write\s+down\s+the\s+value\s+(?:from|of\s+the\s+(?:resistor|voltmeter|ammeter|meter|graph))|what\s+is\s+the\s+reading\s+on|state\s+the\s+value\s+of\s+the\s+(?:resistor|voltmeter|ammeter|meter|component)|use\s+the\s+graph\s+to\s+(?:determine|find|state)|using\s+the\s+(?:graph|figure).*?(?:determine|find|state|read|calculate)",
+            )
+            .unwrap()
+        })
+        .is_match(text)
+}
+
+/// The deterministic figures from `page_figures` that fall inside this span's
+/// vertical band on its OWN pages. Same band logic the vision path uses to
+/// crop page images (start_y_frac/end_y_frac on the span's first/last page,
+/// full height on interior pages).
+fn span_band_figures<'a>(
+    span: &QuestionSpan,
+    span_pages: &[(usize, &PageInput)],
+    page_figures: &'a [Vec<crate::pdf_render::DetectedFigure>],
+) -> Vec<(usize, &'a crate::pdf_render::DetectedFigure)> {
+    let mut out = Vec::new();
+    for (global_pi, _page) in span_pages {
+        let is_first_page_of_span = *global_pi == span.start_page;
+        let is_last_page_of_span = *global_pi == span.end_page;
+        let (s, e) = if is_first_page_of_span && is_last_page_of_span {
+            (span.start_y_frac, span.end_y_frac)
+        } else if is_first_page_of_span {
+            (span.start_y_frac, None)
+        } else if is_last_page_of_span {
+            (None, span.end_y_frac)
+        } else {
+            (None, None)
+        };
+        for fig in page_figures.get(*global_pi).map(Vec::as_slice).unwrap_or(&[]) {
+            let cy = fig.bbox[1] + fig.bbox[3] / 2.0;
+            let in_band = match (s, e) {
+                (Some(s), Some(e)) => cy >= s && cy <= e,
+                (Some(s), None) => cy >= s,
+                (None, Some(e)) => cy <= e,
+                (None, None) => true,
+            };
+            if in_band {
+                out.push((*global_pi, fig));
+            }
+        }
+    }
+    out
+}
+
+/// Dedup-aware accumulator for figure candidates.
+fn add_unique_figure<'a>(
+    out: &mut Vec<(usize, &'a crate::pdf_render::DetectedFigure)>,
+    pi: usize,
+    fig: &'a crate::pdf_render::DetectedFigure,
+) {
+    if out.iter().any(|(sp, f)| *sp == pi && f.bbox == fig.bbox) {
+        return;
+    }
+    out.push((pi, fig));
+}
+
+/// All deterministic figures this question can be shown: band-eligible ones on
+/// its own pages, PLUS any figure anywhere in the paper (including the span's
+/// own pages) whose caption matches a referenced "Figure N". The vertical band
+/// describes which decorative/unlabelled figures sit in the question's answer
+/// area; a NUMBERED figure is identified by its caption wherever it appears —
+/// AQA usually places it ABOVE the question text, just outside the band, so
+/// skipping the span's own pages here is what silently kept figure questions
+/// on the expensive full-page vision path.
+fn span_figure_candidates<'a>(
+    span: &QuestionSpan,
+    span_pages: &[(usize, &PageInput)],
+    page_figures: &'a [Vec<crate::pdf_render::DetectedFigure>],
+    referenced: &[u32],
+) -> Vec<(usize, &'a crate::pdf_render::DetectedFigure)> {
+    let mut out: Vec<(usize, &crate::pdf_render::DetectedFigure)> = Vec::new();
+
+    // 1. Band-eligible figures on the span's own pages (covers unlabelled
+    //    exhibits like "the circuit shown below").
+    for (pi, fig) in span_band_figures(span, span_pages, page_figures) {
+        add_unique_figure(&mut out, pi, fig);
+    }
+
+    // 2. Caption-matched figures for referenced numbers, ANYWHERE in the
+    //    paper — including pages already scanned in step 1 (the band filter
+    //    may have rejected the figure's position, but the caption is its
+    //    identity). At most one figure per referenced number.
+    for (pi, figs) in page_figures.iter().enumerate() {
+        for fig in figs {
+            if let Some(n) = fig_number_from_caption(fig.caption.as_deref()) {
+                if referenced.contains(&n)
+                    && !out
+                        .iter()
+                        .any(|(_, f)| fig_number_from_caption(f.caption.as_deref()) == Some(n))
+                {
+                    add_unique_figure(&mut out, pi, fig);
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Extract the figure number from a "Figure N" / "Fig. N" caption.
+fn fig_number_from_caption(caption: Option<&str>) -> Option<u32> {
+    use std::sync::OnceLock;
+    static RE_CAPTION: OnceLock<regex::Regex> = OnceLock::new();
+    let re = RE_CAPTION
+        .get_or_init(|| regex::Regex::new(r"(?i)fig(?:ure)?\.?\s*(\d+)").unwrap());
+    re.captures(caption?)?
+        .get(1)?
+        .as_str()
+        .parse::<u32>()
+        .ok()
+}
+
+/// Find the byte offset just AFTER the first "Figure N" reference in `content`
+/// at or past `from`, when that reference names `num`.
+fn find_figure_reference_after(content: &str, num: u32, from: usize) -> Option<usize> {
+    use std::sync::OnceLock;
+    static RE_REF: OnceLock<regex::Regex> = OnceLock::new();
+    let re = RE_REF
+        .get_or_init(|| regex::Regex::new(r"(?i)\bfigure\s*(\d+)|\bfig\.?\s*(\d+)").unwrap());
+    for m in re.find_iter(&content[from..]) {
+        let n = m
+            .as_str()
+            .chars()
+            .filter(|c| c.is_ascii_digit())
+            .collect::<String>()
+            .parse::<u32>()
+            .ok()?;
+        if n == num {
+            return Some(from + m.end());
+        }
+    }
+    None
+}
+
+/// Splice deterministic figure crops into a text-first question's content.
+///
+/// Order of placement:
+///   1. one crop link per `[DIAGRAM_PLACEHOLDER]` the model emitted,
+///   2. otherwise immediately after the matching "Figure N" reference,
+///   3. remaining figures appended at the end.
+/// Every crop goes through the standard save guard chain (`persist_diagrams`
+/// → `save_diagram`), so the detector proposes but the existing Rust guards
+/// still dispose: sanitizer, header/footer margins, answer-space, blank guard,
+/// grid rejection, signature dedup.
+async fn attach_detected_figures(
+    config: &PipelineConfig,
+    span: &QuestionSpan,
+    span_pages: &[(usize, &PageInput)],
+    page_figures: &[Vec<crate::pdf_render::DetectedFigure>],
+    page_render_cache: &Arc<crate::pdf_render::PageRenderCache>,
+    content: &mut String,
+    report: &mut ImportReport,
+) {
+    let referenced = figure_reference_numbers(content);
+    let eligible = span_figure_candidates(span, span_pages, page_figures, &referenced);
+    if eligible.is_empty() {
+        return;
+    }
+    let mut requests = Vec::with_capacity(eligible.len());
+    let mut page_b64 = std::collections::HashMap::new();
+    let mut figs: Vec<&crate::pdf_render::DetectedFigure> = Vec::with_capacity(eligible.len());
+    for (global_pi, fig) in eligible {
+        let graph_like = fig
+            .kind
+            .as_deref()
+            .map(|kind| {
+                let kind = kind.to_ascii_lowercase();
+                kind.contains("graph") || kind.contains("chart") || kind.contains("plot")
+            })
+            .unwrap_or(false);
+        let ignore_grid =
+            validate::figure_references(content) > 0 && !validate::is_answer_grid_request(content);
+        if config.pdf_path.is_none() {
+            if let Some(page) = span_pages.iter().find(|(pi, _)| *pi == global_pi) {
+                if let Some(b64) = page.1.get_b64() {
+                    page_b64.entry(global_pi).or_insert_with(|| b64.clone());
+                }
+            }
+        }
+        requests.push(DiagramSaveRequest {
+            global_page_idx: global_pi,
+            bbox: fig.bbox.to_vec(),
+            ignore_grid,
+            graph_like,
+        });
+        figs.push(fig);
+    }
+
+    let persisted = match persist_diagrams(
+        requests,
+        page_b64,
+        config.clone(),
+        Arc::clone(page_render_cache),
+        Vec::new(),
+    )
+    .await
+    {
+        Ok(p) => p,
+        Err(error) => {
+            report.anomalies.push(format!(
+                "Question {} deterministic diagram persistence failed: {}",
+                span.number, error
+            ));
+            return;
+        }
+    };
+    report.absorb(persisted.report);
+
+    let mut insert_offset = 0usize;
+    for (link_opt, fig) in persisted.links.into_iter().zip(figs) {
+        let Some(link) = link_opt else { continue };
+        if let Some(rel) = content[insert_offset..].find("[DIAGRAM_PLACEHOLDER]") {
+            let abs = insert_offset + rel;
+            content.replace_range(abs..abs + "[DIAGRAM_PLACEHOLDER]".len(), &link);
+            insert_offset = abs + link.len();
+            continue;
+        }
+        if let Some(num) = fig_number_from_caption(fig.caption.as_deref()) {
+            if let Some(pos) = find_figure_reference_after(content, num, insert_offset) {
+                content.insert_str(pos, &link);
+                insert_offset = pos + link.len();
+                continue;
+            }
+        }
+        content.push_str(&link);
+    }
+    // Any placeholder that survived (model over-emitted, or every crop was
+    // rejected) is dropped — never leak a bare token into a question card.
+    *content = content.replace("[DIAGRAM_PLACEHOLDER]", "");
+}
+
+/// Text-layer-first extraction attempt: transcribe the target question from
+/// the PDF text layer ALONE (zero image tokens — the dominant cost on
+/// pixel-billed providers like Gemini). Returns `Some((question, report))`
+/// when the text layer was reliable and the model produced a valid,
+/// figure-free transcription. Returns `None` (and the caller falls through to
+/// the vision path) when the model needs a figure, returns nothing, or fails
+/// validation.
+async fn try_text_first_extraction<C: LlmClient>(
+    client: &C,
+    config: &PipelineConfig,
+    span: &QuestionSpan,
+    span_pages: &[(usize, &PageInput)],
+    available_figures: usize,
+    request_semaphore: &Arc<Semaphore>,
+    cancel: &AtomicBool,
+) -> Option<(BuiltQuestion, ImportReport)> {
+    let mut report = ImportReport::default();
+    if cancel.load(Ordering::Relaxed) {
+        return None;
+    }
+
+    let raw_text: String = span_pages
+        .iter()
+        .map(|(pi, p)| {
+            if p.text.trim().is_empty() {
+                String::new()
+            } else {
+                format!("RAW TEXT PAGE {}:\n{}\n\n", pi + 1, p.text)
+            }
+        })
+        .collect();
+    if raw_text.trim().is_empty() {
+        return None; // no text to work from — vision handles it
+    }
+    let system = text_first_system_prompt(config);
+    let user_text = format!(
+        "TARGET: Question {}\nPAPER: '{}'\nMODULE: '{}'\n\nTranscribe Question {} from the RAW TEXT below. NO IMAGES ARE ATTACHED — the text layer is authoritative.\n\n{}",
+        span.number,
+        config.paper_name,
+        config.module_name,
+        span.number,
+        raw_text
+    );
+    let body = llm::chat_body(
+        &config.model,
+        &system,
+        &[] as &[String],
+        llm::ImageDetail::Low,
+        Some(&user_text),
+        config.max_output_tokens,
+        Some(llm::ResponseFormat::JsonSchema {
+            schema: extraction_json_schema(),
+        }),
+    );
+
+    let api_start = Instant::now();
+    let resp = match chat_with_permit(client, &body, request_semaphore, cancel).await {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!(
+                "[TEXT_FIRST_FALLBACK] question={} reason=api_error err={}",
+                span.number, e
+            );
+            report.anomalies.push(format!(
+                "Question {} text-first attempt API failure ({}); falling back to vision",
+                span.number, e
+            ));
+            return None;
+        }
+    };
+    report.record_timing(
+        "extraction",
+        "text_first",
+        Some(span_pages[0].0 + 1),
+        Some(span.number),
+        api_start.elapsed().as_millis() as u64,
+    );
+    let content = match llm::message_content(&resp) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!(
+                "[TEXT_FIRST_FALLBACK] question={} reason=malformed_message err={}",
+                span.number, e
+            );
+            report.anomalies.push(format!(
+                "Question {} text-first response malformed ({}); falling back to vision",
+                span.number, e
+            ));
+            return None;
+        }
+    };
+
+    let page = match parse_llm_json::<AiQuestionPage>(&content) {
+        ParseOutcome::Clean(v) => v,
+        ParseOutcome::Salvaged {
+            value,
+            dropped_tail,
+        } => {
+            if dropped_tail {
+                eprintln!(
+                    "[TEXT_FIRST_FALLBACK] question={} reason=truncated",
+                    span.number
+                );
+                return None; // truncated — vision will get the full page
+            }
+            value
+        }
+        ParseOutcome::Malformed { error } => {
+            eprintln!(
+                "[TEXT_FIRST_FALLBACK] question={} reason=invalid_json err={}",
+                span.number, error
+            );
+            report.anomalies.push(format!(
+                "Question {} text-first JSON invalid ({}); falling back to vision",
+                span.number, error
+            ));
+            return None;
+        }
+    };
+
+    // Text-first acceptance gates — ALL must hold, otherwise fall back.
+    if page.items.is_empty() {
+        eprintln!(
+            "[TEXT_FIRST_FALLBACK] question={} reason=empty_items",
+            span.number
+        );
+        return None;
+    }
+    // All items for the target question. Large multi-page questions often come
+    // back SPLIT across sub-parts; the vision path merges those, so text-first
+    // does too — a fragile "exactly one item" gate is what dumped Q2 into the
+    // expensive vision repair loop on this run.
+    let target_items: Vec<AiQuestion> = page
+        .items
+        .into_iter()
+        .filter(|i| {
+            i.question_number
+                .as_ref()
+                .and_then(validate::value_to_question_number)
+                == Some(span.number)
+        })
+        .collect();
+    if target_items.is_empty() {
+        eprintln!(
+            "[TEXT_FIRST_FALLBACK] question={} reason=no_target_items",
+            span.number
+        );
+        return None;
+    }
+    if target_items
+        .iter()
+        .all(|i| i.content.as_deref().unwrap_or("").trim().is_empty())
+    {
+        eprintln!(
+            "[TEXT_FIRST_FALLBACK] question={} reason=empty_content",
+            span.number
+        );
+        return None;
+    }
+    // A figure is needed → vision will box it. With deterministic detection
+    // enabled the caller can supply figures (`available_figures > 0`); the
+    // model's placeholders are then accepted and filled in from the crops.
+    // Count placeholders across ALL items (a split response may park them in
+    // different sub-parts).
+    let placeholder_count: usize = target_items
+        .iter()
+        .map(|i| {
+            i.content
+                .as_deref()
+                .unwrap_or("")
+                .matches("[DIAGRAM_PLACEHOLDER]")
+                .count()
+        })
+        .sum();
+    if placeholder_count > available_figures {
+        eprintln!(
+            "[TEXT_FIRST_FALLBACK] question={} reason=figure_needed placeholders={} figures={}",
+            span.number, placeholder_count, available_figures
+        );
+        return None;
+    }
+    if target_items
+        .iter()
+        .any(|i| i.diagram_bboxes.as_ref().is_some_and(|b| !b.is_empty()))
+    {
+        eprintln!(
+            "[TEXT_FIRST_FALLBACK] question={} reason=unexpected_bboxes",
+            span.number
+        );
+        return None;
+    }
+    let wrapped = AiQuestionPage {
+        items: target_items.clone(),
+    };
+    if !validate_span_items(&wrapped, span).is_empty() {
+        eprintln!(
+            "[TEXT_FIRST_FALLBACK] question={} reason=validation",
+            span.number
+        );
+        return None;
+    }
+
+    // Mirror the vision tail: accumulate content/topics/marks then assemble.
+    // `[DIAGRAM_PLACEHOLDER]` tokens are preserved here — the caller splices
+    // deterministic figure links into them when figures were supplied.
+    let mut contents = Vec::new();
+    let mut topics_acc = Vec::new();
+    let mut is_code_acc = false;
+    let mut ai_marks: Option<i32> = None;
+    for item in target_items {
+        let item_content = item.content.unwrap_or_default();
+        contents.push(item_content);
+        if let Some(t) = item.topics {
+            for topic in value_to_topics(&t) {
+                if config.allowed_topics.is_empty() || config.allowed_topics.contains(&topic) {
+                    topics_acc.push(topic);
+                }
+            }
+        }
+        if item.is_code == Some(true) {
+            is_code_acc = true;
+        }
+        if let Some(m) = item.marks.as_ref().and_then(validate::value_to_marks) {
+            ai_marks = Some(ai_marks.map_or(m, |existing: i32| existing + m));
+        }
+    }
+    let built = assemble_built_question(
+        span,
+        config,
+        contents,
+        topics_acc,
+        is_code_acc,
+        false,
+        Vec::new(),
+        ai_marks,
+    )?;
+    Some((built, report))
+}
+
+/// Long-edge cap for crop-first figure images. 512px = 4×4 Gemini tiles ≈
+/// 4.1k image tokens, versus ~10.3k for a 640px full page — the crop-first
+/// win. Resolution is still plenty for axis labels and tick values.
+const CROP_FIRST_MAX_DIM: u32 = 512;
+
+/// Crop-first vision attempt for READ-FROM-FIGURE questions: send only the
+/// detected figure crops (≤512px each) instead of full pages, with the
+/// question wording from the text layer. The model reads the value off the
+/// crop. Returns `Some((question, report))` on success; `None` (and the caller
+/// falls through to the full-page vision path) on any failure — no repair
+/// loop, one cheap attempt.
+async fn try_crop_first_extraction<C: LlmClient>(
+    client: &C,
+    config: &PipelineConfig,
+    span: &QuestionSpan,
+    span_pages: &[(usize, &PageInput)],
+    combined_text: &str,
+    candidates: &[(usize, &crate::pdf_render::DetectedFigure)],
+    page_render_cache: &Arc<crate::pdf_render::PageRenderCache>,
+    request_semaphore: &Arc<Semaphore>,
+    cancel: &AtomicBool,
+) -> Option<(BuiltQuestion, ImportReport)> {
+    let mut report = ImportReport::default();
+
+    // 1. Crop each candidate figure from its page into a small image. `ignore_grid`
+    //    is true: a graph's gridlines are exhibit content, not an answer grid.
+    let mut crop_b64s: Vec<String> = Vec::with_capacity(candidates.len());
+    for (pi, fig) in candidates {
+        let img = if let Some(pdf_path) = &config.pdf_path {
+            page_render_cache.get_or_render(pdf_path, *pi).ok()
+        } else {
+            span_pages
+                .iter()
+                .find(|(sp, _)| sp == pi)
+                .and_then(|(_, p)| p.get_b64())
+                .and_then(|b64| geometry::decode_page_image(&b64))
+                .map(std::sync::Arc::new)
+        };
+        let Some(img) = img else { continue };
+        let Ok(crop) =
+            geometry::crop_diagram_with_options(img.as_ref(), &fig.bbox, 8, true, false)
+        else {
+            continue;
+        };
+        let Some(b64) =
+            geometry::encode_webp_resized(&image::DynamicImage::ImageRgba8(crop), CROP_FIRST_MAX_DIM)
+        else {
+            continue;
+        };
+        crop_b64s.push(b64);
+    }
+    if crop_b64s.is_empty() {
+        return None;
+    }
+
+    // 2. One call: figure crops + question wording from the text layer.
+    let user_text = format!(
+        "TARGET: Question {}\nPAPER: '{}'\nMODULE: '{}'\n\nRead the values needed to answer Question {} from the attached figure image(s), and transcribe the question exactly.\n\nRAW TEXT (authoritative for wording):\n{}",
+        span.number,
+        config.paper_name,
+        config.module_name,
+        span.number,
+        combined_text,
+    );
+    let body = llm::chat_body(
+        &config.model,
+        &crop_first_system_prompt(config),
+        &crop_b64s,
+        llm::ImageDetail::High,
+        Some(&user_text),
+        config.max_output_tokens,
+        Some(llm::ResponseFormat::JsonSchema {
+            schema: extraction_json_schema(),
+        }),
+    );
+    let resp = match chat_with_permit(client, &body, request_semaphore, cancel).await {
+        Ok(r) => r,
+        Err(e) => {
+            report.anomalies.push(format!(
+                "Question {} crop-first call failed ({}); falling back to full-page vision",
+                span.number, e
+            ));
+            return None;
+        }
+    };
+    let content = match llm::message_content(&resp) {
+        Ok(c) => c,
+        Err(e) => {
+            report.anomalies.push(format!(
+                "Question {} crop-first response unreadable ({}); falling back",
+                span.number, e
+            ));
+            return None;
+        }
+    };
+
+    // 3. Acceptance: a single clean item for the target question.
+    let page = match parse_llm_json::<AiQuestionPage>(&content) {
+        ParseOutcome::Clean(v) => v,
+        ParseOutcome::Salvaged { value, dropped_tail } => {
+            if dropped_tail {
+                return None;
+            }
+            value
+        }
+        ParseOutcome::Malformed { error } => {
+            report.anomalies.push(format!(
+                "Question {} crop-first JSON invalid ({}); falling back",
+                span.number, error
+            ));
+            return None;
+        }
+    };
+    if page.items.is_empty() {
+        return None;
+    }
+    let target_items: Vec<AiQuestion> = page
+        .items
+        .into_iter()
+        .filter(|i| {
+            i.question_number
+                .as_ref()
+                .and_then(validate::value_to_question_number)
+                == Some(span.number)
+        })
+        .collect();
+    if target_items.len() != 1 {
+        return None;
+    }
+    let filtered_page = AiQuestionPage {
+        items: target_items.clone(),
+    };
+    let violations = validate_span_items(&filtered_page, span);
+    if !violations.is_empty() {
+        report.anomalies.push(format!(
+            "Question {} crop-first validation failed ({}); falling back",
+            span.number,
+            violations.join("; ")
+        ));
+        return None;
+    }
+
+    // 4. Build the question (mirrors the text-first build tail). Placeholders
+    //    are stripped — the figure crops are attached by the caller afterwards.
+    let mut contents = Vec::new();
+    let mut topics_acc = Vec::new();
+    let mut is_code_acc = false;
+    let mut ai_marks: Option<i32> = None;
+    for item in target_items {
+        let item_content = item
+            .content
+            .unwrap_or_default()
+            .replace("[DIAGRAM_PLACEHOLDER]", "");
+        contents.push(item_content);
+        if let Some(t) = item.topics {
+            for topic in value_to_topics(&t) {
+                if config.allowed_topics.is_empty() || config.allowed_topics.contains(&topic) {
+                    topics_acc.push(topic);
+                }
+            }
+        }
+        if item.is_code == Some(true) {
+            is_code_acc = true;
+        }
+        if let Some(m) = item.marks.as_ref().and_then(validate::value_to_marks) {
+            ai_marks = Some(ai_marks.map_or(m, |existing: i32| existing + m));
+        }
+    }
+    let built = assemble_built_question(
+        span,
+        config,
+        contents,
+        topics_acc,
+        is_code_acc,
+        false,
+        Vec::new(),
+        ai_marks,
+    )?;
+    Some((built, report))
+}
+
 /// Repair-loop core: repeatedly ask → parse → validate; quote failures back.
 /// Returns (Some(question), report) on acceptance (possibly flagged),
 /// (None, report) on quarantine — the LOCAL report is absorbed by the caller
@@ -1833,11 +2610,13 @@ async fn extract_span<C: LlmClient>(
     config: &PipelineConfig,
     span: &QuestionSpan,
     span_pages: &[(usize, &PageInput)],
+    page_figures: &[Vec<crate::pdf_render::DetectedFigure>],
     page_render_cache: &Arc<crate::pdf_render::PageRenderCache>,
     page_image_cache: &Arc<PageImageCache>,
     request_semaphore: &Arc<Semaphore>,
     collateral_cache: &CollateralCache,
     all_spans: &Arc<Vec<QuestionSpan>>,
+    text_first: bool,
     cancel: &AtomicBool,
 ) -> (Option<BuiltQuestion>, ImportReport) {
     // Own, local report: spans now run in parallel batches, so each unit
@@ -1858,6 +2637,133 @@ async fn extract_span<C: LlmClient>(
         report.pages_processed += (span.start_page..=span.end_page).count().max(1);
         push_mark_check(span, &cached_q, &mut report);
         return (Some(cached_q), report);
+    }
+
+    // ── Text-layer-first extraction ──────────────────────────────────────
+    // For digital papers the PDF text layer is authoritative enough that the
+    // vision structure pass was skipped. Try transcribing this question from
+    // the text layer ALONE (zero image tokens — the dominant cost on Gemini).
+    // Only fall back to the vision path below when the model signals it needs
+    // a figure, returns nothing, or fails validation.
+    //
+    // Figure questions used to be forced through vision because figure boxing
+    // was vision-only. With `page_figures` the detector supplies the figure
+    // regions for free, so figure questions CAN go text-first: the model
+    // transcribes the text (emitting [DIAGRAM_PLACEHOLDER] where a figure is
+    // referenced) and the deterministic crops are spliced in afterwards.
+    // `span_figure_candidates` finds the figure even when it sits on the page
+    // AFTER the question text (adjacent-page + whole-paper caption match), so
+    // most figure questions never touch the vision path at all.
+    //
+    // Two cases still need vision:
+    //   1. Read-from-figure questions ("use the graph to determine…") — the
+    //      answer literally lives in the figure, so the model must SEE it.
+    //      They get the cheap crop-first path below (detected figure crops)
+    //      instead of full pages.
+    //   2. A figure reference with nothing detected anywhere (scanned /
+    //      unusual encodings) — full-page vision as before.
+    let combined_text: String = span_pages
+        .iter()
+        .map(|(_, p)| p.text.trim())
+        .filter(|t| !t.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    let has_text = !combined_text.trim().is_empty();
+    let text_refs_figure = has_text && text_references_figure(&combined_text);
+    let must_read = has_text && figure_read_required(&combined_text);
+    let referenced = if has_text {
+        figure_reference_numbers(&combined_text)
+    } else {
+        Vec::new()
+    };
+    let candidates = span_figure_candidates(span, span_pages, page_figures, &referenced);
+    let fig_count = candidates.len();
+    let needs_vision = must_read || (text_refs_figure && fig_count == 0);
+
+    if text_first && has_text && !needs_vision {
+        if let Some((mut built_q, mut tf_report)) = try_text_first_extraction(
+            client,
+            config,
+            span,
+            span_pages,
+            fig_count,
+            request_semaphore,
+            cancel,
+        )
+        .await
+        {
+            eprintln!(
+                "[TEXT_FIRST] Question {} transcribed from text layer (0 image tokens)",
+                span.number
+            );
+            tf_report.text_first += 1;
+            if fig_count > 0 {
+                attach_detected_figures(
+                    config,
+                    span,
+                    span_pages,
+                    page_figures,
+                    page_render_cache,
+                    &mut built_q.content,
+                    &mut tf_report,
+                )
+                .await;
+            }
+            tf_report.pages_processed += (span.start_page..=span.end_page).count().max(1);
+            push_mark_check(span, &built_q, &mut tf_report);
+            report.absorb(tf_report);
+            return (Some(built_q), report);
+        }
+    }
+
+    // ── Crop-first vision: read-from-figure questions ────────────────────
+    // The question must be READ from a figure, so the text layer alone can
+    // never supply the answer — but we don't need the full pages either. Send
+    // ONLY the detected figure crops (≤512px each, ~4k image tokens) with the
+    // question wording from the text layer. The crops are attached to the card
+    // afterwards via the standard save guard chain. Any failure falls through
+    // to the full-page vision path below, unchanged.
+    if text_first && needs_vision && must_read && has_text && !candidates.is_empty() {
+        if let Some((mut built_q, mut crop_report)) = try_crop_first_extraction(
+            client,
+            config,
+            span,
+            span_pages,
+            &combined_text,
+            &candidates,
+            page_render_cache,
+            request_semaphore,
+            cancel,
+        )
+        .await
+        {
+            eprintln!(
+                "[CROP_FIRST] Question {} answered from {} figure crop(s) (~{} image tokens)",
+                span.number,
+                candidates.len(),
+                candidates.len() * 4128
+            );
+            crop_report.crop_first += 1;
+            attach_detected_figures(
+                config,
+                span,
+                span_pages,
+                page_figures,
+                page_render_cache,
+                &mut built_q.content,
+                &mut crop_report,
+            )
+            .await;
+            crop_report.pages_processed += (span.start_page..=span.end_page).count().max(1);
+            push_mark_check(span, &built_q, &mut crop_report);
+            report.absorb(crop_report);
+            return (Some(built_q), report);
+        } else {
+            eprintln!(
+                "[CROP_FIRST_FALLBACK] Question {} crop-first attempt failed; using full pages",
+                span.number
+            );
+        }
     }
 
     let max_attempts = 1 + config.max_repairs;
@@ -3159,17 +4065,81 @@ async fn extract_same_page_batch<C: LlmClient>(
     spans: &[&QuestionSpan],
     page_idx: usize,
     page: &PageInput,
+    page_figures: &[Vec<crate::pdf_render::DetectedFigure>],
     page_render_cache: &Arc<crate::pdf_render::PageRenderCache>,
     page_image_cache: &Arc<PageImageCache>,
     request_semaphore: &Arc<Semaphore>,
     collateral_cache: &CollateralCache,
     all_spans: &Arc<Vec<QuestionSpan>>,
+    text_first: bool,
     cancel: &AtomicBool,
 ) -> (Vec<(QuestionSpan, Option<BuiltQuestion>)>, ImportReport) {
     let mut report = ImportReport::default();
     if cancel.load(Ordering::Relaxed) {
         return (Vec::new(), report);
     }
+
+    // ── Text-layer-first for shared-page batches ─────────────────────────
+    // Same-page batches are the LARGEST remaining vision cost: every shared
+    // page pays one full-page image call. If every question on the page can
+    // be transcribed from the text layer (figures attached deterministically
+    // via the caption-aware candidate lookup), skip the vision call entirely.
+    // If ANY question in the batch needs vision, the whole batch falls back
+    // to the single shared-page vision call below (unchanged behaviour).
+    if text_first && !page.text.trim().is_empty() {
+        let span_pages = [(page_idx, page)];
+        let combined_text = page.text.trim().to_string();
+        let text_refs_figure = text_references_figure(&combined_text);
+        let must_read = figure_read_required(&combined_text);
+        let referenced = figure_reference_numbers(&combined_text);
+        let mut tf_out: Vec<(QuestionSpan, Option<BuiltQuestion>)> = Vec::with_capacity(spans.len());
+        let mut tf_report = ImportReport::default();
+        let mut all_ok = true;
+        for span in spans {
+            let candidates = span_figure_candidates(span, &span_pages, page_figures, &referenced);
+            let fig_count = candidates.len();
+            let needs_vision = must_read || (text_refs_figure && fig_count == 0);
+            if needs_vision {
+                all_ok = false;
+                break;
+            }
+            let Some((mut built_q, mut r)) = try_text_first_extraction(
+                client,
+                config,
+                span,
+                &span_pages,
+                fig_count,
+                request_semaphore,
+                cancel,
+            )
+            .await
+            else {
+                all_ok = false;
+                break;
+            };
+            r.text_first += 1;
+            if fig_count > 0 {
+                attach_detected_figures(
+                    config,
+                    span,
+                    &span_pages,
+                    page_figures,
+                    page_render_cache,
+                    &mut built_q.content,
+                    &mut r,
+                )
+                .await;
+            }
+            r.pages_processed += 1;
+            push_mark_check(span, &built_q, &mut r);
+            tf_report.absorb(r);
+            tf_out.push(((*span).clone(), Some(built_q)));
+        }
+        if all_ok {
+            return (tf_out, tf_report);
+        }
+    }
+
     let max_attempts = 1 + config.max_repairs;
 
     // Prepare full page image (no vertical clipping so all MCQs and visual options are fully visible)
@@ -3197,11 +4167,13 @@ async fn extract_same_page_batch<C: LlmClient>(
                     config,
                     span,
                     &[(page_idx, page)],
+                    &[], // batch fallback keeps the vision path — no deterministic attach
                     page_render_cache,
                     page_image_cache,
                     request_semaphore,
                     collateral_cache,
                     all_spans,
+                    false,
                     cancel,
                 ).await;
                 report.absorb(r);
@@ -3455,11 +4427,13 @@ async fn extract_same_page_batch<C: LlmClient>(
             config,
             span,
             &[(page_idx, page)],
+            &[], // page fallback keeps the vision path — no deterministic attach
             page_render_cache,
             page_image_cache,
             request_semaphore,
             collateral_cache,
             all_spans,
+            false,
             cancel,
         ).await;
         report.absorb(fallback_rep);
@@ -4673,7 +5647,7 @@ mod tests {
         ]);
         let pgs = paper_pages();
         let (built, report) =
-            run_question_pipeline(&mock, &pgs, &config(), &NullProgress, &cancel_flag())
+            run_question_pipeline(&mock, &pgs, &[], &config(), &NullProgress, &cancel_flag())
                 .await
                 .unwrap();
         println!("BUILT: {:#?}", built);
@@ -4707,7 +5681,7 @@ mod tests {
         ]);
         let pgs = paper_pages();
         let (built, report) =
-            run_question_pipeline(&mock, &pgs, &config(), &NullProgress, &cancel_flag())
+            run_question_pipeline(&mock, &pgs, &[], &config(), &NullProgress, &cancel_flag())
                 .await
                 .unwrap();
         assert_eq!(built.len(), 2);
@@ -4737,7 +5711,7 @@ mod tests {
         ]);
         let pgs = paper_pages();
         let (built, report) =
-            run_question_pipeline(&mock, &pgs, &config(), &NullProgress, &cancel_flag())
+            run_question_pipeline(&mock, &pgs, &[], &config(), &NullProgress, &cancel_flag())
                 .await
                 .unwrap();
         assert_eq!(built.len(), 2); // Q1 fallback + Q2
@@ -4766,7 +5740,7 @@ mod tests {
         ]);
         let pgs = paper_pages();
         let (built, report) =
-            run_question_pipeline(&mock, &pgs, &config(), &NullProgress, &cancel_flag())
+            run_question_pipeline(&mock, &pgs, &[], &config(), &NullProgress, &cancel_flag())
                 .await
                 .unwrap();
         assert_eq!(built.len(), 2);
@@ -4793,7 +5767,7 @@ mod tests {
         ]);
         let pgs = paper_pages();
         let (built, report) =
-            run_question_pipeline(&mock, &pgs, &config(), &NullProgress, &cancel_flag())
+            run_question_pipeline(&mock, &pgs, &[], &config(), &NullProgress, &cancel_flag())
                 .await
                 .unwrap();
         assert_eq!(built.len(), 2);
@@ -4899,7 +5873,7 @@ mod tests {
         let collateral = Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
         let all_spans = Arc::new(vec![span.clone()]);
         let (built_opt, _report) =
-            extract_span(&mock, &config(), &span, &span_pages, &cache, &Arc::new(PageImageCache::new()), &semaphore, &collateral, &all_spans, &cancel_flag()).await;
+            extract_span(&mock, &config(), &span, &span_pages, &[], &cache, &Arc::new(PageImageCache::new()), &semaphore, &collateral, &all_spans, false, &cancel_flag()).await;
         assert!(built_opt.is_some());
         assert_eq!(
             body_image_details(&mock.bodies()[0]),
@@ -4932,7 +5906,7 @@ mod tests {
         let collateral = Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
         let all_spans = Arc::new(vec![span.clone()]);
         let (built_opt, _report) =
-            extract_span(&mock, &config(), &span, &span_pages, &cache, &Arc::new(PageImageCache::new()), &semaphore, &collateral, &all_spans, &cancel_flag()).await;
+            extract_span(&mock, &config(), &span, &span_pages, &[], &cache, &Arc::new(PageImageCache::new()), &semaphore, &collateral, &all_spans, false, &cancel_flag()).await;
         assert!(built_opt.is_some());
         assert_eq!(
             body_image_details(&mock.bodies()[0]),
@@ -5137,7 +6111,7 @@ mod tests {
         let collateral = Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
         let all_spans = Arc::new(vec![span.clone()]);
         let (built_opt, report) =
-            extract_span(&mock, &config(), &span, &span_pages, &cache, &Arc::new(PageImageCache::new()), &semaphore, &collateral, &all_spans, &cancel_flag()).await;
+            extract_span(&mock, &config(), &span, &span_pages, &[], &cache, &Arc::new(PageImageCache::new()), &semaphore, &collateral, &all_spans, false, &cancel_flag()).await;
         let built = built_opt.expect("question must build after the repair round");
 
         assert_eq!(mock.remaining(), 0, "both attempts consumed");
@@ -5186,7 +6160,7 @@ mod tests {
         let collateral = Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
         let all_spans = Arc::new(vec![span.clone()]);
         let (built_opt, report) =
-            extract_span(&mock, &config(), &span, &span_pages, &cache, &Arc::new(PageImageCache::new()), &semaphore, &collateral, &all_spans, &cancel_flag()).await;
+            extract_span(&mock, &config(), &span, &span_pages, &[], &cache, &Arc::new(PageImageCache::new()), &semaphore, &collateral, &all_spans, false, &cancel_flag()).await;
         let built = built_opt.expect("split span must build");
 
         assert!(built.content.contains("First page content."));
@@ -5255,7 +6229,7 @@ mod tests {
         let collateral = Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
         let all_spans = Arc::new(vec![span.clone()]);
         let (built_opt, report) =
-            extract_span(&mock, &config(), &span, &span_pages, &cache, &Arc::new(PageImageCache::new()), &semaphore, &collateral, &all_spans, &cancel_flag()).await;
+            extract_span(&mock, &config(), &span, &span_pages, &[], &cache, &Arc::new(PageImageCache::new()), &semaphore, &collateral, &all_spans, false, &cancel_flag()).await;
         let built = built_opt.expect("transcription must survive even when boxes never pass");
 
         assert!(
@@ -5303,7 +6277,7 @@ mod tests {
         let collateral = Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
         let all_spans = Arc::new(vec![span.clone()]);
         let (built_opt, report) =
-            extract_span(&mock, &config(), &span, &span_pages, &cache, &Arc::new(PageImageCache::new()), &semaphore, &collateral, &all_spans, &cancel_flag()).await;
+            extract_span(&mock, &config(), &span, &span_pages, &[], &cache, &Arc::new(PageImageCache::new()), &semaphore, &collateral, &all_spans, false, &cancel_flag()).await;
         let built = built_opt.expect("transcription must survive the repeated failure");
 
         // Guard triggers on the second identical rejection: only 2 of the
@@ -5323,6 +6297,887 @@ mod tests {
                 .any(|a| a.contains("dropped 1 invalid diagram box")),
             "the drop must be on the record: {:?}",
             report.anomalies
+        );
+    }
+
+    // ── Text-layer-first extraction ────────────────────────────────────────
+    // With text_first enabled, a question whose pages carry a rich text layer
+    // is transcribed with ZERO image tokens; vision is only used when the
+    // model signals a figure is needed.
+
+    fn body_has_image(body: &serde_json::Value) -> bool {
+        body["messages"][1]["content"]
+            .as_array()
+            .map(|items| items.iter().any(|c| c["type"] == "image_url"))
+            .unwrap_or(false)
+    }
+
+    fn text_image_page() -> PageInput {
+        let mut g = gray_blank(1200, 1600);
+        g_hline(&mut g, 400);
+        g_blob(&mut g, 800, 100, 500);
+        PageInput {
+            kind: PageInputKind::Image { b64: png_b64(&g) },
+            text: "State the value of $x$ when $2x + 4 = 10$.\n\n[2 marks]\n\nShow your working.".into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn text_first_extracts_from_text_with_zero_images() {
+        let pgs = vec![text_image_page()];
+        let span_pages: Vec<(usize, &PageInput)> = vec![(0, &pgs[0])];
+        let span = doc_map::QuestionSpan {
+            number: 30,
+            start_page: 0,
+            end_page: 0,
+            start_y_frac: None,
+            end_y_frac: None,
+            expected_marks: Some(2),
+            reliable_pages: vec![],
+            ambiguous_pages: vec![],
+        };
+        let mock = MockLlm::new(vec![ok_chat(
+            r#"{"items":[{"question_number":30,"content":"State the value of $x$ when $2x + 4 = 10$.\n\n**[2 marks]**\n\nShow your working.","marks":2,"topics":["algebra"],"module":"Algebra","is_code":false,"diagram_bboxes":[],"diagram_captions":[],"diagram_kinds":[],"bbox_page_indexes":[],"math_snippet":"2x + 4 = 10","visual_options":null}]}"#,
+        )]);
+        let cache = Arc::new(crate::pdf_render::PageRenderCache::new(
+            PAGE_RENDER_CACHE_CAPACITY,
+        ));
+        let semaphore = Arc::new(Semaphore::new(1));
+        let collateral = Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
+        let all_spans = Arc::new(vec![span.clone()]);
+        let mut cfg = config();
+        cfg.text_first = true;
+        let (built_opt, report) =
+            extract_span(&mock, &cfg, &span, &span_pages, &[], &cache, &Arc::new(PageImageCache::new()), &semaphore, &collateral, &all_spans, true, &cancel_flag()).await;
+        let built = built_opt.expect("text-first extraction must build a question");
+        assert!(built.content.contains("2x + 4 = 10"));
+        assert_eq!(report.text_first, 1, "text-first counter incremented");
+        assert!(
+            !body_has_image(&mock.bodies()[0]),
+            "text-first request must send ZERO images"
+        );
+        assert_eq!(mock.remaining(), 0, "exactly one text-only call");
+    }
+
+    #[tokio::test]
+    async fn text_first_merges_multi_item_response() {
+        // Large multi-page questions come back SPLIT across sub-parts — two
+        // items for one question number. Text-first must merge them (like the
+        // vision path does), not reject and dump the question into the
+        // expensive full-page vision loop.
+        let pgs = vec![text_image_page()];
+        let span_pages: Vec<(usize, &PageInput)> = vec![(0, &pgs[0])];
+        let span = doc_map::QuestionSpan {
+            number: 30,
+            start_page: 0,
+            end_page: 0,
+            start_y_frac: None,
+            end_y_frac: None,
+            expected_marks: None,
+            reliable_pages: vec![],
+            ambiguous_pages: vec![],
+        };
+        let mock = MockLlm::new(vec![ok_chat(
+            r#"{"items":[
+                {"question_number":30,"content":"Part one: factorise $x^2 - 5x + 6$.","marks":2,"topics":["algebra"],"module":"Algebra","is_code":false,"diagram_bboxes":[],"diagram_captions":[],"diagram_kinds":[],"bbox_page_indexes":[],"math_snippet":"x^2 - 5x + 6","visual_options":null},
+                {"question_number":30,"content":"Part two: hence solve $x^2 - 5x + 6 = 0$.","marks":3,"topics":["algebra"],"module":"Algebra","is_code":false,"diagram_bboxes":[],"diagram_captions":[],"diagram_kinds":[],"bbox_page_indexes":[],"math_snippet":"x = 2, x = 3","visual_options":null}
+            ]}"#,
+        )]);
+        let cache = Arc::new(crate::pdf_render::PageRenderCache::new(
+            PAGE_RENDER_CACHE_CAPACITY,
+        ));
+        let semaphore = Arc::new(Semaphore::new(1));
+        let collateral = Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
+        let all_spans = Arc::new(vec![span.clone()]);
+        let mut cfg = config();
+        cfg.text_first = true;
+        let (built_opt, report) =
+            extract_span(&mock, &cfg, &span, &span_pages, &[], &cache, &Arc::new(PageImageCache::new()), &semaphore, &collateral, &all_spans, true, &cancel_flag()).await;
+        let built = built_opt.expect("split response must still build a question");
+        assert!(built.content.contains("Part one"), "first sub-part merged: {}", built.content);
+        assert!(built.content.contains("Part two"), "second sub-part merged: {}", built.content);
+        assert_eq!(built.marks, 5, "marks summed across both sub-parts");
+        assert_eq!(report.text_first, 1, "one text-first success, no vision fallback");
+        assert_eq!(mock.remaining(), 0, "exactly one text-only call");
+        assert!(
+            !body_has_image(&mock.bodies()[0]),
+            "merged extraction must still send ZERO images"
+        );
+    }
+
+    #[tokio::test]
+    async fn text_first_falls_back_to_vision_when_figure_needed() {
+        // The text layer references a figure the model can't see → it emits
+        // [DIAGRAM_PLACEHOLDER] → the pipeline must re-ask WITH the image.
+        let pgs = vec![text_image_page()];
+        let span_pages: Vec<(usize, &PageInput)> = vec![(0, &pgs[0])];
+        let span = doc_map::QuestionSpan {
+            number: 30,
+            start_page: 0,
+            end_page: 0,
+            start_y_frac: None,
+            end_y_frac: None,
+            expected_marks: Some(2),
+            reliable_pages: vec![],
+            ambiguous_pages: vec![],
+        };
+        let mock = MockLlm::new(vec![
+            // Text-first attempt: model says it needs the figure.
+            ok_chat(
+                r#"{"items":[{"question_number":30,"content":"Refer to Figure 3 shown below. [DIAGRAM_PLACEHOLDER] **[2 marks]**","marks":2,"topics":[],"module":"Algebra","is_code":false,"diagram_bboxes":[],"diagram_captions":[],"diagram_kinds":[],"bbox_page_indexes":[],"math_snippet":"","visual_options":null}]}"#,
+            ),
+            // Vision fallback: full transcription (no figure reference, so
+            // figure-consistency validation passes cleanly).
+            ok_chat(
+                r#"{"items":[{"question_number":30,"content":"The graph crosses the $x$-axis at $x = 3$. **[2 marks]**","marks":2,"topics":["graphs"],"module":"Algebra","is_code":false,"diagram_bboxes":[],"diagram_captions":[],"diagram_kinds":[],"bbox_page_indexes":[],"math_snippet":"x = 3","visual_options":null}]}"#,
+            ),
+        ]);
+        let cache = Arc::new(crate::pdf_render::PageRenderCache::new(
+            PAGE_RENDER_CACHE_CAPACITY,
+        ));
+        let semaphore = Arc::new(Semaphore::new(1));
+        let collateral = Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
+        let all_spans = Arc::new(vec![span.clone()]);
+        let mut cfg = config();
+        cfg.text_first = true;
+        let (built_opt, report) =
+            extract_span(&mock, &cfg, &span, &span_pages, &[], &cache, &Arc::new(PageImageCache::new()), &semaphore, &collateral, &all_spans, true, &cancel_flag()).await;
+        let built = built_opt.expect("vision fallback must build the question");
+        assert!(built.content.contains("x = 3"), "vision answer used: {}", built.content);
+        assert_eq!(mock.bodies().len(), 2, "text-first + vision fallback");
+        assert!(
+            body_has_image(&mock.bodies()[1]),
+            "the fallback call must include the page image"
+        );
+        assert_eq!(report.text_first, 0, "no text-first success recorded");
+    }
+
+    #[tokio::test]
+    async fn text_first_skipped_when_text_references_figure() {
+        // If the text layer says "Figure 1 shows...", the question MUST go
+        // through vision so the figure gets boxed and extracted — text-first
+        // must not swallow the figure.
+        let pgs = vec![PageInput {
+            kind: PageInputKind::Image { b64: text_image_page().get_b64().unwrap().to_string() },
+            text: "Figure 1 shows a circuit. State the total resistance.\n\n[2 marks]".into(),
+        }];
+        let span_pages: Vec<(usize, &PageInput)> = vec![(0, &pgs[0])];
+        let span = doc_map::QuestionSpan {
+            number: 30,
+            start_page: 0,
+            end_page: 0,
+            start_y_frac: None,
+            end_y_frac: None,
+            expected_marks: Some(2),
+            reliable_pages: vec![],
+            ambiguous_pages: vec![],
+        };
+        let mock = MockLlm::new(vec![ok_chat(
+            r#"{"items":[{"question_number":30,"content":"The total resistance is $6\\,\\Omega$. **[2 marks]**","marks":2,"topics":["circuits"],"module":"Algebra","is_code":false,"diagram_bboxes":[],"diagram_captions":[],"diagram_kinds":[],"bbox_page_indexes":[],"math_snippet":"6\\Omega","visual_options":null}]}"#,
+        )]);
+        let cache = Arc::new(crate::pdf_render::PageRenderCache::new(
+            PAGE_RENDER_CACHE_CAPACITY,
+        ));
+        let semaphore = Arc::new(Semaphore::new(1));
+        let collateral = Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
+        let all_spans = Arc::new(vec![span.clone()]);
+        let mut cfg = config();
+        cfg.text_first = true;
+        let (built_opt, report) =
+            extract_span(&mock, &cfg, &span, &span_pages, &[], &cache, &Arc::new(PageImageCache::new()), &semaphore, &collateral, &all_spans, true, &cancel_flag()).await;
+        let built = built_opt.expect("vision path must build the question");
+        assert!(built.content.contains("6"), "vision answer used: {}", built.content);
+        assert_eq!(report.text_first, 0, "figure question must not go text-first");
+        assert_eq!(
+            mock.bodies().len(),
+            1,
+            "only one call — the vision call, no text-first attempt"
+        );
+        assert!(
+            body_has_image(&mock.bodies()[0]),
+            "figure question must be sent WITH the image"
+        );
+    }
+
+    #[tokio::test]
+    async fn text_first_disabled_keeps_vision_path() {
+        let pgs = vec![text_image_page()];
+        let span_pages: Vec<(usize, &PageInput)> = vec![(0, &pgs[0])];
+        let span = doc_map::QuestionSpan {
+            number: 30,
+            start_page: 0,
+            end_page: 0,
+            start_y_frac: None,
+            end_y_frac: None,
+            expected_marks: Some(2),
+            reliable_pages: vec![],
+            ambiguous_pages: vec![],
+        };
+        let mock = MockLlm::new(vec![ok_chat(
+            r#"{"items":[{"question_number":30,"content":"State the value of $x$ when $2x + 4 = 10$. **[2 marks]**","marks":2,"topics":["algebra"],"module":"Algebra","is_code":false,"diagram_bboxes":[],"diagram_captions":[],"diagram_kinds":[],"bbox_page_indexes":[],"math_snippet":"2x + 4 = 10","visual_options":null}]}"#,
+        )]);
+        let cache = Arc::new(crate::pdf_render::PageRenderCache::new(
+            PAGE_RENDER_CACHE_CAPACITY,
+        ));
+        let semaphore = Arc::new(Semaphore::new(1));
+        let collateral = Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
+        let all_spans = Arc::new(vec![span.clone()]);
+        let cfg = config(); // text_first defaults to false
+        let (built_opt, _report) =
+            extract_span(&mock, &cfg, &span, &span_pages, &[], &cache, &Arc::new(PageImageCache::new()), &semaphore, &collateral, &all_spans, false, &cancel_flag()).await;
+        let built = built_opt.expect("vision path must build the question");
+        assert!(built.content.contains("2x + 4 = 10"));
+        assert!(
+            body_has_image(&mock.bodies()[0]),
+            "with text_first disabled the image must be sent"
+        );
+    }
+
+    /// A page whose raster shows two distinct solid figure regions (a figure
+    /// that must not be blank-guarded away during crop tests).
+    fn two_figures_page() -> PageInput {
+        let mut g = gray_blank(1200, 1600);
+        for y in 600..900u32 {
+            for x in 200..700u32 {
+                g.put_pixel(x, y, image::Luma([40u8]));
+            }
+        }
+        for y in 1000..1300u32 {
+            for x in 200..700u32 {
+                g.put_pixel(x, y, image::Luma([40u8]));
+            }
+        }
+        PageInput {
+            kind: PageInputKind::Image { b64: png_b64(&g) },
+            text: "30. Figure 1 shows a circuit and Figure 2 shows a waveform.\n\n[4 marks]".into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn detected_figures_attach_to_text_first_question() {
+        // A figure-referencing question goes TEXT-FIRST because the content
+        // stream supplied 2 deterministic figures (fig_count == fig_refs).
+        // The model emits two placeholders; the detector's crops are spliced
+        // in and saved through the standard guard chain.
+        let pgs = vec![two_figures_page()];
+        let span_pages: Vec<(usize, &PageInput)> = vec![(0, &pgs[0])];
+        let span = doc_map::QuestionSpan {
+            number: 30,
+            start_page: 0,
+            end_page: 0,
+            start_y_frac: None,
+            end_y_frac: None,
+            expected_marks: Some(4),
+            reliable_pages: vec![],
+            ambiguous_pages: vec![],
+        };
+        let page_figures = vec![vec![
+            crate::pdf_render::DetectedFigure {
+                bbox: [200.0 / 1200.0, 600.0 / 1600.0, 500.0 / 1200.0, 300.0 / 1600.0],
+                caption: Some("Figure 1".to_string()),
+                kind: Some("circuit".to_string()),
+            },
+            crate::pdf_render::DetectedFigure {
+                bbox: [200.0 / 1200.0, 1000.0 / 1600.0, 500.0 / 1200.0, 300.0 / 1600.0],
+                caption: Some("Figure 2".to_string()),
+                kind: Some("graph".to_string()),
+            },
+        ]];
+        let mock = MockLlm::new(vec![ok_chat(
+            r#"{"items":[{"question_number":30,"content":"Figure 1 shows a circuit. [DIAGRAM_PLACEHOLDER] Figure 2 shows a waveform. [DIAGRAM_PLACEHOLDER] **[4 marks]**","marks":4,"topics":[],"module":"Algebra","is_code":false,"diagram_bboxes":[],"diagram_captions":[],"diagram_kinds":[],"bbox_page_indexes":[],"math_snippet":"","visual_options":null}]}"#,
+        )]);
+        let dir = std::env::temp_dir().join(format!("mm_attach_{}", uuid::Uuid::new_v4()));
+        let mut cfg = config();
+        cfg.text_first = true;
+        cfg.diagrams_dir = Some(dir.clone());
+        let cache = Arc::new(crate::pdf_render::PageRenderCache::new(
+            PAGE_RENDER_CACHE_CAPACITY,
+        ));
+        let semaphore = Arc::new(Semaphore::new(1));
+        let collateral = Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
+        let all_spans = Arc::new(vec![span.clone()]);
+        let (built_opt, report) = extract_span(
+            &mock,
+            &cfg,
+            &span,
+            &span_pages,
+            &page_figures,
+            &cache,
+            &Arc::new(PageImageCache::new()),
+            &semaphore,
+            &collateral,
+            &all_spans,
+            true,
+            &cancel_flag(),
+        )
+        .await;
+        let built = built_opt.expect("text-first must build the question");
+        assert_eq!(report.text_first, 1, "question transcribed from text");
+        assert_eq!(
+            report.diagrams_saved, 2,
+            "both deterministic figures cropped and saved"
+        );
+        assert_eq!(
+            built.content.matches("![Diagram](").count(),
+            2,
+            "both figure links spliced into the content: {}",
+            built.content
+        );
+        assert!(
+            !body_has_image(&mock.bodies()[0]),
+            "figure question went text-first: zero image tokens"
+        );
+        assert_eq!(mock.remaining(), 0, "exactly one text-only call");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn vision_fallback_when_figure_read_required() {
+        // "Use the graph to determine" + zero deterministic figures → the
+        // answer must be READ from the figure, so the question keeps the
+        // proven vision path with the page image attached.
+        let pgs = vec![PageInput {
+            kind: PageInputKind::Image {
+                b64: text_image_page().get_b64().unwrap().to_string(),
+            },
+            text: "Use the graph to determine the value of $x$. Figure 3 shows the graph.\n\n[2 marks]"
+                .into(),
+        }];
+        let span_pages: Vec<(usize, &PageInput)> = vec![(0, &pgs[0])];
+        let span = doc_map::QuestionSpan {
+            number: 30,
+            start_page: 0,
+            end_page: 0,
+            start_y_frac: None,
+            end_y_frac: None,
+            expected_marks: Some(2),
+            reliable_pages: vec![],
+            ambiguous_pages: vec![],
+        };
+        let mock = MockLlm::new(vec![ok_chat(
+            r#"{"items":[{"question_number":30,"content":"From the graph, $x = 4.2$. **[2 marks]**","marks":2,"topics":["graphs"],"module":"Algebra","is_code":false,"diagram_bboxes":[],"diagram_captions":[],"diagram_kinds":[],"bbox_page_indexes":[],"math_snippet":"x = 4.2","visual_options":null}]}"#,
+        )]);
+        let cache = Arc::new(crate::pdf_render::PageRenderCache::new(
+            PAGE_RENDER_CACHE_CAPACITY,
+        ));
+        let semaphore = Arc::new(Semaphore::new(1));
+        let collateral = Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
+        let all_spans = Arc::new(vec![span.clone()]);
+        let mut cfg = config();
+        cfg.text_first = true;
+        let (built_opt, report) = extract_span(
+            &mock,
+            &cfg,
+            &span,
+            &span_pages,
+            &[],
+            &cache,
+            &Arc::new(PageImageCache::new()),
+            &semaphore,
+            &collateral,
+            &all_spans,
+            true,
+            &cancel_flag(),
+        )
+        .await;
+        let built = built_opt.expect("vision path must build the question");
+        assert!(built.content.contains("4.2"), "vision answer used");
+        assert_eq!(report.text_first, 0, "no text-first success recorded");
+        assert_eq!(mock.bodies().len(), 1, "exactly one vision call");
+        assert!(
+            body_has_image(&mock.bodies()[0]),
+            "figure-read question must be sent WITH the page image"
+        );
+    }
+
+    fn fig_on_page(caption: &str, bbox: [f32; 4]) -> crate::pdf_render::DetectedFigure {
+        crate::pdf_render::DetectedFigure {
+            bbox,
+            caption: Some(caption.to_string()),
+            kind: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn adjacent_page_figure_enables_text_first() {
+        // The question on page 0 references "Figure 2", but the figure is
+        // detected on the NEXT page (page 1) — the common AQA layout. The
+        // adjacent-page caption lookup must let the question go text-first
+        // (zero image tokens) instead of falling back to vision.
+        let pgs = vec![PageInput {
+            kind: PageInputKind::Image {
+                b64: text_image_page().get_b64().unwrap().to_string(),
+            },
+            text: "30. Figure 2 shows a circuit. State the total resistance.\n\n[2 marks]".into(),
+        }];
+        let span_pages: Vec<(usize, &PageInput)> = vec![(0, &pgs[0])];
+        let span = doc_map::QuestionSpan {
+            number: 30,
+            start_page: 0,
+            end_page: 0,
+            start_y_frac: None,
+            end_y_frac: None,
+            expected_marks: Some(2),
+            reliable_pages: vec![],
+            ambiguous_pages: vec![],
+        };
+        let page_figures = vec![
+            vec![],
+            vec![fig_on_page("Figure 2", [0.10, 0.10, 0.50, 0.50])],
+        ];
+        let mock = MockLlm::new(vec![ok_chat(
+            r#"{"items":[{"question_number":30,"content":"Figure 2 shows a circuit. The total resistance is $6\\,\\Omega$. **[2 marks]**","marks":2,"topics":["circuits"],"module":"Algebra","is_code":false,"diagram_bboxes":[],"diagram_captions":[],"diagram_kinds":[],"bbox_page_indexes":[],"math_snippet":"6\\Omega","visual_options":null}]}"#,
+        )]);
+        let cache = Arc::new(crate::pdf_render::PageRenderCache::new(
+            PAGE_RENDER_CACHE_CAPACITY,
+        ));
+        let semaphore = Arc::new(Semaphore::new(1));
+        let collateral = Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
+        let all_spans = Arc::new(vec![span.clone()]);
+        let mut cfg = config();
+        cfg.text_first = true;
+        let (built_opt, report) = extract_span(
+            &mock,
+            &cfg,
+            &span,
+            &span_pages,
+            &page_figures,
+            &cache,
+            &Arc::new(PageImageCache::new()),
+            &semaphore,
+            &collateral,
+            &all_spans,
+            true,
+            &cancel_flag(),
+        )
+        .await;
+        let built = built_opt.expect("adjacent-page figure must keep this question text-first");
+        assert!(built.content.contains("6"), "text-first answer used");
+        assert_eq!(report.text_first, 1, "question transcribed from text");
+        assert_eq!(mock.bodies().len(), 1, "exactly one text-only call");
+        assert!(
+            !body_has_image(&mock.bodies()[0]),
+            "no image tokens — the figure came from the detector on page 1"
+        );
+    }
+
+    #[tokio::test]
+    async fn whole_paper_caption_match_finds_distant_figure() {
+        // "Figure 5" is referenced but only detected far away on page 12 —
+        // the whole-paper caption pass must still find it so the question
+        // goes text-first.
+        let pgs = vec![PageInput {
+            kind: PageInputKind::Image {
+                b64: text_image_page().get_b64().unwrap().to_string(),
+            },
+            text: "30. Figure 5 shows a velocity–time graph. State the acceleration.\n\n[2 marks]"
+                .into(),
+        }];
+        let span_pages: Vec<(usize, &PageInput)> = vec![(0, &pgs[0])];
+        let span = doc_map::QuestionSpan {
+            number: 30,
+            start_page: 0,
+            end_page: 0,
+            start_y_frac: None,
+            end_y_frac: None,
+            expected_marks: Some(2),
+            reliable_pages: vec![],
+            ambiguous_pages: vec![],
+        };
+        let mut page_figures: Vec<Vec<crate::pdf_render::DetectedFigure>> = vec![Vec::new(); 13];
+        page_figures[12] = vec![fig_on_page("Figure 5", [0.10, 0.10, 0.50, 0.50])];
+        let mock = MockLlm::new(vec![ok_chat(
+            r#"{"items":[{"question_number":30,"content":"Figure 5 shows a velocity–time graph. The acceleration is $4\\,\\text{m}\\,\\text{s}^{-2}$. **[2 marks]**","marks":2,"topics":["kinematics"],"module":"Algebra","is_code":false,"diagram_bboxes":[],"diagram_captions":[],"diagram_kinds":[],"bbox_page_indexes":[],"math_snippet":"4\\text{m s}^{-2}","visual_options":null}]}"#,
+        )]);
+        let cache = Arc::new(crate::pdf_render::PageRenderCache::new(
+            PAGE_RENDER_CACHE_CAPACITY,
+        ));
+        let semaphore = Arc::new(Semaphore::new(1));
+        let collateral = Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
+        let all_spans = Arc::new(vec![span.clone()]);
+        let mut cfg = config();
+        cfg.text_first = true;
+        let (built_opt, report) = extract_span(
+            &mock,
+            &cfg,
+            &span,
+            &span_pages,
+            &page_figures,
+            &cache,
+            &Arc::new(PageImageCache::new()),
+            &semaphore,
+            &collateral,
+            &all_spans,
+            true,
+            &cancel_flag(),
+        )
+        .await;
+        let built = built_opt.expect("distant caption match must keep the question text-first");
+        assert!(built.content.contains("4"), "text-first answer used");
+        assert_eq!(report.text_first, 1, "question transcribed from text");
+        assert_eq!(mock.bodies().len(), 1, "exactly one text-only call");
+    }
+
+    #[test]
+    fn caption_match_finds_figure_above_band_on_span_page() {
+        // The regression: AQA places the figure ABOVE the question text, so
+        // its centre sits OUTSIDE the question's vertical band. The band pass
+        // rejects it, and the caption pass used to skip the span's own pages
+        // entirely → fig_count = 0 → the question fell to full-page vision.
+        // The caption identity must supply it regardless of position.
+        let pgs = vec![text_image_page()];
+        let span_pages: Vec<(usize, &PageInput)> = vec![(0, &pgs[0])];
+        let span = doc_map::QuestionSpan {
+            number: 30,
+            start_page: 0,
+            end_page: 0,
+            start_y_frac: Some(0.60),
+            end_y_frac: None,
+            expected_marks: Some(2),
+            reliable_pages: vec![],
+            ambiguous_pages: vec![],
+        };
+        // Figure centred at y ≈ 0.20 — well above the band that starts at 0.60.
+        let page_figures = vec![vec![fig_on_page("Figure 3", [0.10, 0.05, 0.50, 0.30])]];
+        let candidates = span_figure_candidates(&span, &span_pages, &page_figures, &[3]);
+        assert_eq!(
+            candidates.len(),
+            1,
+            "figure above the question band must be found by caption"
+        );
+        let empty = span_figure_candidates(&span, &span_pages, &page_figures, &[]);
+        assert!(
+            empty.is_empty(),
+            "without a numbered reference the band filter still applies"
+        );
+    }
+
+    #[tokio::test]
+    async fn same_page_batch_uses_text_first_when_all_questions_safe() {
+        // Shared-page batches were the last full-page-vision cost: one page
+        // image call per shared page. When every question on the page is
+        // text-first-safe (figures attached deterministically), the batch
+        // must skip the vision call entirely.
+        let pgs = vec![PageInput {
+            kind: PageInputKind::Image {
+                b64: text_image_page().get_b64().unwrap().to_string(),
+            },
+            text: "8. Figure 5 shows a graph. State the gradient.\n\n[2 marks]\n\n9. State the value of $x$.\n\n[1 mark]"
+                .into(),
+        }];
+        let spans = vec![
+            doc_map::QuestionSpan {
+                number: 8,
+                start_page: 0,
+                end_page: 0,
+                start_y_frac: None,
+                end_y_frac: None,
+                expected_marks: Some(2),
+                reliable_pages: vec![],
+                ambiguous_pages: vec![],
+            },
+            doc_map::QuestionSpan {
+                number: 9,
+                start_page: 0,
+                end_page: 0,
+                start_y_frac: None,
+                end_y_frac: None,
+                expected_marks: Some(1),
+                reliable_pages: vec![],
+                ambiguous_pages: vec![],
+            },
+        ];
+        let span_refs: Vec<&doc_map::QuestionSpan> = spans.iter().collect();
+        let page_figures = vec![vec![fig_on_page("Figure 5", [0.08, 0.45, 0.50, 0.30])]];
+        let mock = MockLlm::new(vec![
+            ok_chat(
+                r#"{"items":[{"question_number":8,"content":"Figure 5 shows a graph. The gradient is $3$. **[2 marks]**","marks":2,"topics":[],"module":"Algebra","is_code":false,"diagram_bboxes":[],"diagram_captions":[],"diagram_kinds":[],"bbox_page_indexes":[],"math_snippet":"3","visual_options":null}]}"#,
+            ),
+            ok_chat(
+                r#"{"items":[{"question_number":9,"content":"The value of $x$ is $7$. **[1 mark]**","marks":1,"topics":[],"module":"Algebra","is_code":false,"diagram_bboxes":[],"diagram_captions":[],"diagram_kinds":[],"bbox_page_indexes":[],"math_snippet":"7","visual_options":null}]}"#,
+            ),
+        ]);
+        let dir = std::env::temp_dir().join(format!("mm_batch_tf_{}", uuid::Uuid::new_v4()));
+        let mut cfg = config();
+        cfg.text_first = true;
+        cfg.diagrams_dir = Some(dir.clone());
+        let cache = Arc::new(crate::pdf_render::PageRenderCache::new(
+            PAGE_RENDER_CACHE_CAPACITY,
+        ));
+        let semaphore = Arc::new(Semaphore::new(1));
+        let collateral = Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
+        let all_spans = Arc::new(spans.clone());
+        let (results, report) = extract_same_page_batch(
+            &mock,
+            &cfg,
+            &span_refs,
+            0,
+            &pgs[0],
+            &page_figures,
+            &cache,
+            &Arc::new(PageImageCache::new()),
+            &semaphore,
+            &collateral,
+            &all_spans,
+            true,
+            &cancel_flag(),
+        )
+        .await;
+        assert_eq!(results.len(), 2, "both batch questions extracted");
+        assert!(
+            results.iter().all(|(_, q)| q.is_some()),
+            "both questions built"
+        );
+        assert_eq!(report.text_first, 2, "both transcribed from text");
+        assert_eq!(mock.bodies().len(), 2, "two text-only calls, zero vision");
+        assert!(
+            mock.bodies().iter().all(|b| !body_has_image(b)),
+            "no image tokens for a text-first-safe shared page"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// TEMPORARY verification: reconstruct the fixture's real spans from its
+    /// text layer and print the gate decision per question, to prove the
+    /// caption-match fix flips figure questions away from full-page vision.
+    /// Skips silently when the fixture or pdfium is unavailable.
+    #[test]
+    fn diagnostic_gate_decisions_on_fixture() {
+        let manifest = env!("CARGO_MANIFEST_DIR");
+        let path = std::path::Path::new(manifest).join("../physics '24.pdf");
+        if !path.exists() {
+            eprintln!("[GATE] fixture missing");
+            return;
+        }
+        // Run BOTH text sources: pdfium (what my fix was validated against)
+        // and pdf_extract (what production actually feeds the pipeline).
+        let pdfium_texts = match crate::pdf_render::pdf_page_texts(&path) {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("[GATE] pdfium unavailable: {}", e);
+                return;
+            }
+        };
+        let production_texts =
+            crate::commands::extract_page_texts(&path.to_string_lossy(), pdfium_texts.len());
+        let page_figures = match crate::pdf_render::detect_pdf_figures(&path) {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("[GATE] detection failed: {}", e);
+                return;
+            }
+        };
+
+        for (label, page_texts) in [
+            ("pdfium", pdfium_texts),
+            ("pdf_extract(PROD)", production_texts),
+        ] {
+            let scan = doc_map::scan_text_layer(&page_texts);
+            let map =
+                doc_map::build_hybrid_map_with_scan(&page_texts, &[], page_texts.len(), &scan);
+            let mut counts = [0usize; 4]; // text_first, crop_first_ready, vision, no_text
+            for span in &map.spans {
+                let combined: Vec<&str> = (span.start_page..=span.end_page)
+                    .filter(|&p| p < page_texts.len())
+                    .map(|p| page_texts[p].trim())
+                    .filter(|t| !t.is_empty())
+                    .collect();
+                let combined_text = combined.join("\n\n");
+                let has_text = !combined_text.trim().is_empty();
+                let text_refs_figure = has_text && text_references_figure(&combined_text);
+                let must_read = has_text && figure_read_required(&combined_text);
+                let referenced = if has_text {
+                    figure_reference_numbers(&combined_text)
+                } else {
+                    Vec::new()
+                };
+                let dummy = PageInput {
+                    kind: PageInputKind::TextOnly,
+                    text: String::new(),
+                };
+                let span_pages: Vec<(usize, &PageInput)> =
+                    (span.start_page..=span.end_page).map(|p| (p, &dummy)).collect();
+                let fig_count =
+                    span_figure_candidates(span, &span_pages, &page_figures, &referenced).len();
+                let needs_vision = must_read || (text_refs_figure && fig_count == 0);
+                let (kind, idx) = if !has_text {
+                    ("no_text", 3)
+                } else if !needs_vision {
+                    ("text_first", 0)
+                } else if must_read {
+                    ("crop_first_ready", 1)
+                } else {
+                    ("full_page_vision", 2)
+                };
+                counts[idx] += 1;
+                if label != "pdf_extract(PROD)" || kind != "text_first" {
+                    eprintln!(
+                        "[GATE:{}] Q{} pages {}..{} refs={:?} fig_count={} must_read={} -> {}",
+                        label,
+                        span.number,
+                        span.start_page + 1,
+                        span.end_page + 1,
+                        referenced,
+                        fig_count,
+                        must_read,
+                        kind
+                    );
+                }
+            }
+            eprintln!(
+                "[GATE:{}] SUMMARY: {} text_first, {} crop_first_ready, {} full_page_vision, {} no_text",
+                label, counts[0], counts[1], counts[2], counts[3]
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn crop_first_reads_figure_crop_not_full_page() {
+        // Read-from-figure question + detected figure → the vision call must
+        // send ONLY the ≤512px figure crop (not the full page), and the crop
+        // is attached to the card afterwards.
+        let pgs = vec![PageInput {
+            kind: PageInputKind::Image {
+                b64: text_image_page().get_b64().unwrap().to_string(),
+            },
+            text: "Use the graph to determine the value of $x$. Figure 3 shows the graph.\n\n[2 marks]"
+                .into(),
+        }];
+        let span_pages: Vec<(usize, &PageInput)> = vec![(0, &pgs[0])];
+        let span = doc_map::QuestionSpan {
+            number: 30,
+            start_page: 0,
+            end_page: 0,
+            start_y_frac: None,
+            end_y_frac: None,
+            expected_marks: Some(2),
+            reliable_pages: vec![],
+            ambiguous_pages: vec![],
+        };
+        let page_figures =
+            vec![vec![fig_on_page("Figure 3", [0.08, 0.45, 0.50, 0.30])]];
+        let mock = MockLlm::new(vec![ok_chat(
+            r#"{"items":[{"question_number":30,"content":"From the graph, $x = 4.2$. **[2 marks]**","marks":2,"topics":["graphs"],"module":"Algebra","is_code":false,"diagram_bboxes":[],"diagram_captions":[],"diagram_kinds":[],"bbox_page_indexes":[],"math_snippet":"x = 4.2","visual_options":null}]}"#,
+        )]);
+        let dir = std::env::temp_dir().join(format!("mm_cropfirst_{}", uuid::Uuid::new_v4()));
+        let mut cfg = config();
+        cfg.text_first = true;
+        cfg.diagrams_dir = Some(dir.clone());
+        let cache = Arc::new(crate::pdf_render::PageRenderCache::new(
+            PAGE_RENDER_CACHE_CAPACITY,
+        ));
+        let semaphore = Arc::new(Semaphore::new(1));
+        let collateral = Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
+        let all_spans = Arc::new(vec![span.clone()]);
+        let (built_opt, report) = extract_span(
+            &mock,
+            &cfg,
+            &span,
+            &span_pages,
+            &page_figures,
+            &cache,
+            &Arc::new(PageImageCache::new()),
+            &semaphore,
+            &collateral,
+            &all_spans,
+            true,
+            &cancel_flag(),
+        )
+        .await;
+        let built = built_opt.expect("crop-first must build the question");
+        assert!(built.content.contains("4.2"), "value read from the crop");
+        assert_eq!(report.text_first, 0, "not a text-first success");
+        assert_eq!(mock.bodies().len(), 1, "exactly one crop-first call");
+        // The image attached to the call is the ≤512px crop, not the full page.
+        let bodies = mock.bodies();
+        let urls: Vec<&str> = bodies[0]["messages"][1]["content"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|c| c["type"] == "image_url")
+            .filter_map(|c| c["image_url"]["url"].as_str())
+            .collect();
+        assert_eq!(urls.len(), 1, "crop-first body carries exactly one image");
+        let decoded = geometry::decode_page_image(urls[0]).expect("crop must decode");
+        let (w, h) = decoded.dimensions();
+        assert!(
+            w.max(h) <= 512,
+            "crop-first image was {}x{} — must be a ≤512px figure crop, not a page",
+            w,
+            h
+        );
+        assert_eq!(
+            built.content.matches("![Diagram](").count(),
+            1,
+            "the crop is attached to the card: {}",
+            built.content
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn crop_first_falls_back_to_full_page_when_parse_fails() {
+        // A broken crop-first response must fall through to the unchanged
+        // full-page vision path so the question is never lost.
+        let pgs = vec![PageInput {
+            kind: PageInputKind::Image {
+                b64: text_image_page().get_b64().unwrap().to_string(),
+            },
+            text: "Use the graph to determine the value of $x$. Figure 3 shows the graph.\n\n[2 marks]"
+                .into(),
+        }];
+        let span_pages: Vec<(usize, &PageInput)> = vec![(0, &pgs[0])];
+        let span = doc_map::QuestionSpan {
+            number: 30,
+            start_page: 0,
+            end_page: 0,
+            start_y_frac: None,
+            end_y_frac: None,
+            expected_marks: Some(2),
+            reliable_pages: vec![],
+            ambiguous_pages: vec![],
+        };
+        let page_figures =
+            vec![vec![fig_on_page("Figure 3", [0.08, 0.45, 0.50, 0.30])]];
+        let mock = MockLlm::new(vec![
+            ok_chat("this is not json — crop-first must fail and fall back"),
+            ok_chat(
+                r#"{"items":[{"question_number":30,"content":"From the graph, $x = 4.2$. **[2 marks]**","marks":2,"topics":["graphs"],"module":"Algebra","is_code":false,"diagram_bboxes":[],"diagram_captions":[],"diagram_kinds":[],"bbox_page_indexes":[],"math_snippet":"x = 4.2","visual_options":null}]}"#,
+            ),
+        ]);
+        let cache = Arc::new(crate::pdf_render::PageRenderCache::new(
+            PAGE_RENDER_CACHE_CAPACITY,
+        ));
+        let semaphore = Arc::new(Semaphore::new(1));
+        let collateral = Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
+        let all_spans = Arc::new(vec![span.clone()]);
+        let mut cfg = config();
+        cfg.text_first = true;
+        let (built_opt, _report) = extract_span(
+            &mock,
+            &cfg,
+            &span,
+            &span_pages,
+            &page_figures,
+            &cache,
+            &Arc::new(PageImageCache::new()),
+            &semaphore,
+            &collateral,
+            &all_spans,
+            true,
+            &cancel_flag(),
+        )
+        .await;
+        let built = built_opt.expect("full-page fallback must build the question");
+        assert!(built.content.contains("4.2"), "fallback answer used");
+        assert_eq!(
+            mock.bodies().len(),
+            2,
+            "crop-first attempt then full-page fallback"
+        );
+        assert!(
+            body_has_image(&mock.bodies()[1]),
+            "the fallback call sends the full page image"
         );
     }
 
@@ -5458,7 +7313,7 @@ mod tests {
             },
         ];
         let (built, report) =
-            run_question_pipeline(&mock, &pgs, &config(), &NullProgress, &cancel_flag())
+            run_question_pipeline(&mock, &pgs, &[], &config(), &NullProgress, &cancel_flag())
                 .await
                 .unwrap();
 
@@ -5500,7 +7355,7 @@ mod tests {
             },
         ];
         let (built, report) =
-            run_question_pipeline(&mock, &pgs, &config(), &NullProgress, &cancel_flag())
+            run_question_pipeline(&mock, &pgs, &[], &config(), &NullProgress, &cancel_flag())
                 .await
                 .unwrap();
 
@@ -5544,7 +7399,7 @@ mod tests {
         let mut cfg = config();
         cfg.parallelism = 1;
         let (built, report) =
-            run_question_pipeline(&mock, &pgs, &cfg, &NullProgress, &cancel_flag())
+            run_question_pipeline(&mock, &pgs, &[], &cfg, &NullProgress, &cancel_flag())
                 .await
                 .unwrap();
 

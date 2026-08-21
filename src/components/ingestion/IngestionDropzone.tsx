@@ -31,6 +31,9 @@ export interface ImportReport {
   repairs: number;
   repairReasons?: Record<string, number>;
   salvageEvents: number;
+  textFirst?: number;
+  cropFirst?: number;
+  figuresDetected?: number;
   cropRejections: number;
   diagramsSaved: number;
   diagramsDeduped: number;
@@ -667,6 +670,15 @@ export function IngestionDropzone({ isActive = false, onSuccess }: IngestionDrop
                         <span>Repairs: {r.repairs}</span>
                         <span>Salvaged: {r.salvageEvents}</span>
                         <span>Crops Rejected: {r.cropRejections}</span>
+                        {r.figuresDetected !== undefined && r.figuresDetected > 0 && (
+                          <span className="text-emerald-500 font-semibold">Figures detected: {r.figuresDetected} (free)</span>
+                        )}
+                        {r.cropFirst !== undefined && r.cropFirst > 0 && (
+                          <span className="text-emerald-500 font-semibold">Crop-first: {r.cropFirst} (tiny figure crops)</span>
+                        )}
+                        {r.textFirst !== undefined && r.textFirst > 0 && (
+                          <span className="text-emerald-500 font-semibold">Text-first: {r.textFirst} (0 image tokens)</span>
+                        )}
                       </div>
 
                       {r.repairReasons && Object.keys(r.repairReasons).length > 0 && (
