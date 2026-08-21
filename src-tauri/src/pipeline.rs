@@ -2383,11 +2383,26 @@ fn build_question_from_parsed_page(
         })
         .sum();
     if placeholder_count > available_figures {
-        eprintln!(
-            "[TEXT_FIRST_FALLBACK] question={} reason=figure_needed placeholders={} figures={}",
-            span.number, placeholder_count, available_figures
-        );
-        return None;
+        // The model sometimes emits one placeholder PER REFERENCE of the same
+        // figure (e.g. "Figure 9" appears in parts (a), (b), (c) → several
+        // placeholders). If the DISTINCT figure numbers it references fit
+        // within the figures we can supply, the excess placeholders are
+        // duplicates — accept and let `attach_detected_figures` collapse them
+        // (it places one crop per placeholder in order and drops the rest).
+        // Otherwise the question genuinely needs more figures than the
+        // detector found → vision must see the full page.
+        let distinct_refs: std::collections::HashSet<u32> = target_items
+            .iter()
+            .flat_map(|i| figure_reference_numbers(i.content.as_deref().unwrap_or("")))
+            .collect();
+        let duplicates_only = !distinct_refs.is_empty() && distinct_refs.len() <= available_figures;
+        if !duplicates_only {
+            eprintln!(
+                "[TEXT_FIRST_FALLBACK] question={} reason=figure_needed placeholders={} figures={} distinct_refs={}",
+                span.number, placeholder_count, available_figures, distinct_refs.len()
+            );
+            return None;
+        }
     }
     if target_items
         .iter()
@@ -6860,6 +6875,83 @@ mod tests {
         let (p, c) = usage_arc.snapshot();
         assert_eq!(p, 4200, "real prompt tokens accumulated");
         assert_eq!(c, 312, "real completion tokens accumulated");
+    }
+
+    #[test]
+    fn text_first_accepts_duplicate_placeholders_for_one_referenced_figure() {
+        // Q6 regression: the model emits one [DIAGRAM_PLACEHOLDER] PER
+        // REFERENCE of the same figure ("Figure 9" appears in parts (a), (b),
+        // (c) → 2 placeholders). One distinct figure, one available → the
+        // gate must accept and leave the extras for attach to collapse.
+        let cfg = config();
+        let span = doc_map::QuestionSpan {
+            number: 30,
+            start_page: 0,
+            end_page: 0,
+            start_y_frac: None,
+            end_y_frac: None,
+            expected_marks: Some(2),
+            reliable_pages: vec![],
+            ambiguous_pages: vec![],
+        };
+        let page = AiQuestionPage {
+            items: vec![AiQuestion {
+                question_number: Some(serde_json::json!(30)),
+                content: Some(
+                    "(a) Use Figure 9 to find the value. [DIAGRAM_PLACEHOLDER]\n\n(b) State the gradient of Figure 9. [DIAGRAM_PLACEHOLDER] **[2 marks]**"
+                        .to_string(),
+                ),
+                marks: Some(serde_json::json!(2)),
+                ..Default::default()
+            }],
+        };
+        let built = build_question_from_parsed_page(page, &span, &cfg, 1);
+        assert!(
+            built.is_some(),
+            "duplicate placeholders for ONE referenced figure must not fall back to vision"
+        );
+        let built = built.unwrap();
+        // `clean_marker_markdown` may rewrite DIAGRAM_PLACEHOLDER to
+        // VISUAL_MCQ_PLACEHOLDER; either way both figure markers survive for
+        // attach to place one crop and collapse the rest.
+        assert_eq!(
+            built.content.matches("PLACEHOLDER]").count(),
+            2,
+            "both figure markers survive for attach to collapse"
+        );
+    }
+
+    #[test]
+    fn text_first_falls_back_when_distinct_figures_exceed_supply() {
+        // Two placeholders referencing TWO DIFFERENT figures with only ONE
+        // figure available → genuinely under-supplied → vision.
+        let cfg = config();
+        let span = doc_map::QuestionSpan {
+            number: 30,
+            start_page: 0,
+            end_page: 0,
+            start_y_frac: None,
+            end_y_frac: None,
+            expected_marks: Some(2),
+            reliable_pages: vec![],
+            ambiguous_pages: vec![],
+        };
+        let page = AiQuestionPage {
+            items: vec![AiQuestion {
+                question_number: Some(serde_json::json!(30)),
+                content: Some(
+                    "(a) Use Figure 9. [DIAGRAM_PLACEHOLDER]\n\n(b) Use Figure 10. [DIAGRAM_PLACEHOLDER] **[2 marks]**"
+                        .to_string(),
+                ),
+                marks: Some(serde_json::json!(2)),
+                ..Default::default()
+            }],
+        };
+        let built = build_question_from_parsed_page(page, &span, &cfg, 1);
+        assert!(
+            built.is_none(),
+            "2 distinct figures with 1 available must still fall back to vision"
+        );
     }
 
     #[tokio::test]
