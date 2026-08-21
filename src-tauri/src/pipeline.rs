@@ -175,6 +175,9 @@ pub struct ImportReport {
     /// Figures located deterministically from the PDF content stream (zero
     /// image tokens) — the free alternative to the vision figure pass.
     pub figures_detected: usize,
+    /// Real billed tokens accumulated from API `usage` blocks across the run.
+    pub prompt_tokens: u64,
+    pub completion_tokens: u64,
     pub anomalies: Vec<String>,
     pub timings: Vec<TimingEntry>,
     pub total_elapsed_ms: u64,
@@ -211,11 +214,42 @@ pub fn repair_is_non_convergent(
 const DEFAULT_PARALLEL: usize = 4;
 const PAGE_RENDER_CACHE_CAPACITY: usize = 4;
 
+/// Process-wide accumulator for real API token usage across one pipeline run.
+/// Every `chat_with_permit` call adds its response's `usage` block, so the
+/// import cost estimate uses actual billed tokens instead of guesses.
+#[derive(Debug, Default)]
+pub struct TokenTotals {
+    pub prompt_tokens: std::sync::atomic::AtomicU64,
+    pub completion_tokens: std::sync::atomic::AtomicU64,
+}
+
+impl TokenTotals {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn add(&self, prompt: u64, completion: u64) {
+        self.prompt_tokens
+            .fetch_add(prompt, std::sync::atomic::Ordering::Relaxed);
+        self.completion_tokens
+            .fetch_add(completion, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub fn snapshot(&self) -> (u64, u64) {
+        (
+            self.prompt_tokens.load(std::sync::atomic::Ordering::Relaxed),
+            self.completion_tokens
+                .load(std::sync::atomic::Ordering::Relaxed),
+        )
+    }
+}
+
 async fn chat_with_permit<C: LlmClient>(
     client: &C,
     body: &serde_json::Value,
     semaphore: &Arc<Semaphore>,
     cancel: &AtomicBool,
+    usage: &Arc<TokenTotals>,
 ) -> Result<serde_json::Value, crate::llm::LlmError> {
     if cancel.load(Ordering::Relaxed) {
         return Err(crate::llm::LlmError::Network("Import cancelled by user".to_string()));
@@ -238,8 +272,11 @@ async fn chat_with_permit<C: LlmClient>(
     tokio::select! {
         res = client.chat(body) => {
             if let Ok(resp) = &res {
+                let u = crate::llm::usage_from_response(resp);
+                if u.prompt_tokens > 0 || u.completion_tokens > 0 {
+                    usage.add(u.prompt_tokens, u.completion_tokens);
+                }
                 if std::env::var_os("MERGEMARK_LOG_USAGE").is_some() {
-                    let u = crate::llm::usage_from_response(resp);
                     eprintln!(
                         "[TOKENS] prompt={} completion={} total={}",
                         u.prompt_tokens, u.completion_tokens, u.total_tokens
@@ -462,6 +499,8 @@ impl ImportReport {
         self.text_first += o.text_first;
         self.crop_first += o.crop_first;
         self.figures_detected += o.figures_detected;
+        self.prompt_tokens += o.prompt_tokens;
+        self.completion_tokens += o.completion_tokens;
         self.mark_checks.extend(o.mark_checks);
         self.quarantined.extend(o.quarantined);
         self.skipped_pages.extend(o.skipped_pages);
@@ -531,7 +570,7 @@ struct AiQuestion {
     visual_options: Option<String>,
 }
 
-#[derive(Debug, Default, serde::Deserialize)]
+#[derive(Debug, Default, serde::Deserialize, Clone)]
 #[serde(default)]
 struct AiQuestionPage {
     items: Vec<AiQuestion>,
@@ -1123,19 +1162,68 @@ OUTPUT STRUCTURE — EVERY item MUST have:
 /// questions whose figures are supplied deterministically by the PDF content
 /// stream detector (`page_figures`), so the model transcribes the text and
 /// marks where a figure belongs; the crops are spliced in by Rust afterwards.
+///
+/// Deliberately does NOT reuse `extraction_system_prompt`: that prompt carries
+/// seven few-shot examples whose entire purpose is teaching `diagram_bboxes`
+/// — content this mode forbids. A compact prompt (rules only + one example)
+/// saves ~2k tokens per call, and since text-first calls dominate the import
+/// bill (~30 per paper), that is the single largest cost lever.
 fn text_first_system_prompt(config: &PipelineConfig) -> String {
-    let base = extraction_system_prompt(config);
-    format!(
-        r#"{base}
+    let topics_instruction = if config.allowed_topics.is_empty() {
+        "- \"topics\": array. MUST be empty []. Do NOT invent topics.".to_string()
+    } else {
+        format!(
+            "- \"topics\": array. At least one. Select ONLY from this exact list: {:?}. Never invent topics.",
+            config.allowed_topics
+        )
+    };
 
-══════ TEXT-ONLY MODE OVERRIDE (READ CAREFULLY — THESE RULES REPLACE THE FEW-SHOT DIAGRAM RULES ABOVE) ══════
-- NO IMAGES ARE ATTACHED. The RAW TEXT below is the complete and authoritative source for the target question. Transcribe the question's text, sub-parts, and marks EXACTLY from it.
-- If the question references a figure ("Figure 1", "the diagram below", "the circuit", "the graph"), insert the placeholder [DIAGRAM_PLACEHOLDER] IMMEDIATELY after the sentence or clause that references it — never at the end of the question, and never more than once per referenced figure. The figure itself will be attached by the system afterwards.
-- "diagram_bboxes", "diagram_captions", "diagram_kinds", "bbox_page_indexes" MUST all be empty arrays and "visual_options" MUST be null — figure crops are supplied by the system, not by you.
-- Do NOT invent content, values, or diagrams that are not in the text.
-- All other rules (math delimiters, marks, sub-parts, topics, module, question isolation) still apply exactly as above.
+    format!(
+        r#"You are a precise mathematical OCR engine transcribing exam questions from a PDF TEXT LAYER. Output ONLY a valid JSON object of the form {{"items": [ ... ]}}.
+
+CONTEXT: The user will specify the target question number(s), paper name, and module name. Transcribe ONLY content belonging to the requested question(s). If nothing on the page(s) belongs to a requested question, omit its item.
+
+⚠️ TEXT-ONLY MODE: NO IMAGES ARE ATTACHED. The RAW TEXT below is the complete and authoritative source. Transcribe the question's text, sub-parts, and marks EXACTLY from it. Do NOT invent content, values, or diagrams that are not in the text. If the question references a figure ("Figure 1", "the diagram below", "the circuit", "the graph"), insert the placeholder [DIAGRAM_PLACEHOLDER] immediately after the sentence or clause that references it — never at the end of the question. Emit EXACTLY ONE placeholder per DISTINCT figure, even when the same figure is referenced several times (e.g. "Figure 9" appears in parts (a), (b), (c) — still ONE placeholder for Figure 9). The figure itself will be attached by the system afterwards.
+
+═══ MATHEMATICAL NOTATION & DELIMITER RULES (CRITICAL) ═══
+1. STRICT DELIMITERS: Every single inline mathematical expression, variable, greek letter, or formula MUST be enclosed in single dollar signs `$ ... $`. Display equations MUST be placed on their own line enclosed in double dollar signs `$$ ... $$`.
+2. PERFECT DELIMITER PAIRING: Every opened `$` must be closed with `$`. Every opened `$$` must be closed with `$$`. NEVER leave unclosed delimiters or mismatched tags.
+3. ABSOLUTE VARIABLE FIDELITY: Transcribe complete equations verbatim without dropping leading variables, function headers, or curve names ("r = ...", "y = ...", "f(x) = ...").
+4. DOMAIN & CONSTRAINTS: Include all domain restrictions (e.g. `, \quad 0 \le \theta < 2\pi`) inside the math delimiters.
+5. NO PLAIN TEXT IN $$: Never wrap standard English sentences or instructions inside `$$ ... $$`.
+
+═══ ADAPTIVE MARK & DIFFICULTY EXTRACTION ═══
+1. STANDARD MARKS: If explicit mark allocations are printed (e.g. `[4 marks]`, `(3 marks)`, `[1 mark]`), sum them as an integer in `"marks"`, and place `**[X marks]**` at the end of each marked sub-part.
+2. DIFFICULTY RATINGS: If difficulty / star ratings are present instead (e.g. `(*)`, `(**)`, `(***)`, `(***+)`, `(****)`, `(*****)`, `(Specialist)`, `(Synoptic)`): extract the rating string into `"difficulty_rating"`, set `"marks": null`, and DO NOT invent marks.
+3. If neither is present, set `"marks": null` and `"difficulty_rating": null`.
+
+═══ SUB-PARTS VS MULTIPLE CHOICE (CRITICAL) ═══
+1. SUB-QUESTIONS: Sub-parts labeled `(a)`, `(b)`, `(c)` or `(i)`, `(ii)` are mathematical sub-questions. Format them in lowercase parentheses `(a)`, `(b)` separated by double newlines (`\n\n`). NEVER convert sub-parts into multiple-choice options.
+2. MULTIPLE CHOICE: Only format as multiple choice (`A ...\nB ...`) if the question is an actual multiple-choice test question with 4 alternative answers to choose from.
+
+═══ QUESTION ISOLATION RULES (HIGHEST PRIORITY) ═══
+1. Transcribe the target question and NOTHING ELSE. A sub-part belongs to the question printed in its label, or the nearest whole-number heading above it. If not the target question, DROP it.
+2. HARD STOP: Immediately stop transcribing when you meet another question heading, a sub-part label for a different main question, a totals footer ("(Total for Question N is M marks)"), or a new question separator.
+3. SUB-PARTS: Continue in printed order ((a), (b), (c)...). If numbering restarts at (a) after a totals footer, it belongs to the next question — DROP it.
+4. ISOLATION: Never merge or renumber neighbouring questions.
+
+═══ OUTPUT STRUCTURE — EVERY item MUST have ═══
+- "question_number": integer matching the requested question number.
+- "content": Full text transcription without summary or leading question number. Format sub-parts separated by double newlines. Structured tables (trace tables, data tables): Markdown tables (| col |), NEVER as diagram boxes. Math: `$...$` / `$$...$$` with valid LaTeX (\\frac, \\sin, \\cos, \\theta); backslashes MUST be escaped in JSON (\\\\frac). Code: Markdown backticks, never LaTeX math mode.
+- "marks": integer total, or null.
+- "difficulty_rating": string rating or null.
+{topics_instruction}
+- "module": string — output EXACTLY '{module}'.
+- "is_code": boolean (true only for code/pseudocode).
+- "math_snippet": string — the key equation/expression, or "".
+- "diagram_bboxes", "diagram_captions", "diagram_kinds", "bbox_page_indexes" MUST be empty arrays and "visual_options" MUST be null — figure crops are supplied by the system, not by you.
+
+EXAMPLE — multi-part question with marks:
+Input: "7 (a) Solve 2x^2 - 5x + 2 = 0. [3 marks]\n(b) Hence solve 2y^4 - 5y^2 + 2 = 0. [2 marks]"
+Output: {{"items": [{{"question_number": 7, "content": "(a) Solve $2x^2 - 5x + 2 = 0$.\n\n**[3 marks]**\n\n(b) Hence solve $2y^4 - 5y^2 + 2 = 0$.\n\n**[2 marks]**", "marks": 5, "difficulty_rating": null, "topics": [], "module": "{module}", "is_code": false, "diagram_bboxes": [], "diagram_captions": [], "diagram_kinds": [], "bbox_page_indexes": [], "math_snippet": "2x^2 - 5x + 2 = 0", "visual_options": null}}]}}
 "#,
-        base = base,
+        topics_instruction = topics_instruction,
+        module = config.module_name,
     )
 }
 
@@ -1217,6 +1305,7 @@ pub async fn run_question_pipeline<C: LlmClient, P: Progress>(
     ));
     let request_semaphore = Arc::new(Semaphore::new(config.parallelism.max(1)));
     let page_image_cache = Arc::new(PageImageCache::new());
+    let usage = Arc::new(TokenTotals::new());
 
     // Prefer the free PDF text layer: it avoids one vision request per page.
     let page_texts: Vec<String> = pages.iter().map(|p| p.text.clone()).collect();
@@ -1278,6 +1367,7 @@ pub async fn run_question_pipeline<C: LlmClient, P: Progress>(
                 let is_text_only = matches!(page.kind, PageInputKind::TextOnly);
                 let semaphore = Arc::clone(&request_semaphore);
                 let system_structure = system_structure.clone();
+                let usage = Arc::clone(&usage);
                 async move {
                     if is_non_question_by_text {
                         return (
@@ -1324,7 +1414,7 @@ pub async fn run_question_pipeline<C: LlmClient, P: Progress>(
                         750,
                         Some(llm::ResponseFormat::JsonSchema { schema: structure_json_schema() }),
                     );
-                    let result = match chat_with_permit(client, &body, &semaphore, cancel).await {
+                    let result = match chat_with_permit(client, &body, &semaphore, cancel, &usage).await {
                         Ok(resp) => llm::message_content(&resp)
                             .map_err(|e| format!("bad response shape ({})", e)),
                         Err(e) => Err(format!("API failure ({})", e)),
@@ -1529,6 +1619,7 @@ pub async fn run_question_pipeline<C: LlmClient, P: Progress>(
                 &page_image_cache,
                 &request_semaphore,
                 cancel,
+                &usage,
             ).map(move |result| (position, result))
         }))
         .buffer_unordered(config.parallelism.max(1));
@@ -1579,6 +1670,7 @@ pub async fn run_question_pipeline<C: LlmClient, P: Progress>(
                                         &page_image_cache,
                                         &request_semaphore,
                                         cancel,
+                                        &usage,
                                     )
                                 .await;
                             report.absorb(redo_local);
@@ -1730,6 +1822,7 @@ pub async fn run_question_pipeline<C: LlmClient, P: Progress>(
             let request_semaphore = Arc::clone(&request_semaphore);
             let collateral_cache = Arc::clone(&collateral_cache);
             let all_spans = Arc::clone(&all_spans);
+            let usage = Arc::clone(&usage);
             async move {
                 match job {
                     ExtractionJob::Single { span, pages } => {
@@ -1746,6 +1839,7 @@ pub async fn run_question_pipeline<C: LlmClient, P: Progress>(
                             &all_spans,
                             config.text_first && text_map_available,
                             cancel,
+                            &usage,
                         )
                         .await;
                         (position, vec![((*span).clone(), opt)], local_rep)
@@ -1765,6 +1859,7 @@ pub async fn run_question_pipeline<C: LlmClient, P: Progress>(
                             &all_spans,
                             config.text_first && text_map_available,
                             cancel,
+                            &usage,
                         )
                         .await;
                         (position, res_vec, local_rep)
@@ -1874,6 +1969,9 @@ pub async fn run_question_pipeline<C: LlmClient, P: Progress>(
     // Removed printed paper total checksum warning as requested
     report.marks_checksum_ok = None;
     report.total_elapsed_ms = overall_start.elapsed().as_millis() as u64;
+    let (prompt_tok, completion_tok) = usage.snapshot();
+    report.prompt_tokens = prompt_tok;
+    report.completion_tokens = completion_tok;
 
     eprintln!(
         "[PATH_SUMMARY] {} questions: {} text-first (0 img), {} crop-first (~4k img), {} full-page vision (figures detected: {})",
@@ -2181,127 +2279,56 @@ async fn attach_detected_figures(
     *content = content.replace("[DIAGRAM_PLACEHOLDER]", "");
 }
 
-/// Text-layer-first extraction attempt: transcribe the target question from
-/// the PDF text layer ALONE (zero image tokens — the dominant cost on
-/// pixel-billed providers like Gemini). Returns `Some((question, report))`
-/// when the text layer was reliable and the model produced a valid,
-/// figure-free transcription. Returns `None` (and the caller falls through to
-/// the vision path) when the model needs a figure, returns nothing, or fails
-/// validation.
-async fn try_text_first_extraction<C: LlmClient>(
-    client: &C,
-    config: &PipelineConfig,
-    span: &QuestionSpan,
-    span_pages: &[(usize, &PageInput)],
-    available_figures: usize,
-    request_semaphore: &Arc<Semaphore>,
-    cancel: &AtomicBool,
-) -> Option<(BuiltQuestion, ImportReport)> {
-    let mut report = ImportReport::default();
-    if cancel.load(Ordering::Relaxed) {
-        return None;
-    }
-
-    let raw_text: String = span_pages
-        .iter()
-        .map(|(pi, p)| {
-            if p.text.trim().is_empty() {
-                String::new()
-            } else {
-                format!("RAW TEXT PAGE {}:\n{}\n\n", pi + 1, p.text)
-            }
+/// Slim JSON schema for TEXT-ONLY calls: the full extraction schema minus the
+/// five diagram-bbox fields, which text-first mode forbids. `AiQuestion`
+/// fields are `#[serde(default)]`, so the omitted keys parse to empty/null
+/// defaults and the gates in `build_question_from_parsed_page` still fire.
+fn text_first_json_schema() -> serde_json::Value {
+    static SCHEMA: std::sync::OnceLock<serde_json::Value> = std::sync::OnceLock::new();
+    SCHEMA
+        .get_or_init(|| {
+            serde_json::json!({
+                "name": "QuestionExtractionTextOnly",
+                "strict": true,
+                "schema": {
+                    "type": "object",
+                    "properties": {
+                        "items": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "question_number": { "type": "integer", "minimum": 1, "maximum": 100 },
+                                    "content": { "type": "string" },
+                                    "marks": { "type": ["integer", "null"], "minimum": 0 },
+                                    "topics": { "type": "array", "items": { "type": "string" } },
+                                    "module": { "type": "string" },
+                                    "is_code": { "type": "boolean" },
+                                    "math_snippet": { "type": "string" }
+                                },
+                                "required": ["question_number", "content", "marks", "topics", "module", "is_code", "math_snippet"],
+                                "additionalProperties": false
+                            }
+                        }
+                    },
+                    "required": ["items"],
+                    "additionalProperties": false
+                }
+            })
         })
-        .collect();
-    if raw_text.trim().is_empty() {
-        return None; // no text to work from — vision handles it
-    }
-    let system = text_first_system_prompt(config);
-    let user_text = format!(
-        "TARGET: Question {}\nPAPER: '{}'\nMODULE: '{}'\n\nTranscribe Question {} from the RAW TEXT below. NO IMAGES ARE ATTACHED — the text layer is authoritative.\n\n{}",
-        span.number,
-        config.paper_name,
-        config.module_name,
-        span.number,
-        raw_text
-    );
-    let body = llm::chat_body(
-        &config.model,
-        &system,
-        &[] as &[String],
-        llm::ImageDetail::Low,
-        Some(&user_text),
-        config.max_output_tokens,
-        Some(llm::ResponseFormat::JsonSchema {
-            schema: extraction_json_schema(),
-        }),
-    );
+        .clone()
+}
 
-    let api_start = Instant::now();
-    let resp = match chat_with_permit(client, &body, request_semaphore, cancel).await {
-        Ok(r) => r,
-        Err(e) => {
-            eprintln!(
-                "[TEXT_FIRST_FALLBACK] question={} reason=api_error err={}",
-                span.number, e
-            );
-            report.anomalies.push(format!(
-                "Question {} text-first attempt API failure ({}); falling back to vision",
-                span.number, e
-            ));
-            return None;
-        }
-    };
-    report.record_timing(
-        "extraction",
-        "text_first",
-        Some(span_pages[0].0 + 1),
-        Some(span.number),
-        api_start.elapsed().as_millis() as u64,
-    );
-    let content = match llm::message_content(&resp) {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!(
-                "[TEXT_FIRST_FALLBACK] question={} reason=malformed_message err={}",
-                span.number, e
-            );
-            report.anomalies.push(format!(
-                "Question {} text-first response malformed ({}); falling back to vision",
-                span.number, e
-            ));
-            return None;
-        }
-    };
-
-    let page = match parse_llm_json::<AiQuestionPage>(&content) {
-        ParseOutcome::Clean(v) => v,
-        ParseOutcome::Salvaged {
-            value,
-            dropped_tail,
-        } => {
-            if dropped_tail {
-                eprintln!(
-                    "[TEXT_FIRST_FALLBACK] question={} reason=truncated",
-                    span.number
-                );
-                return None; // truncated — vision will get the full page
-            }
-            value
-        }
-        ParseOutcome::Malformed { error } => {
-            eprintln!(
-                "[TEXT_FIRST_FALLBACK] question={} reason=invalid_json err={}",
-                span.number, error
-            );
-            report.anomalies.push(format!(
-                "Question {} text-first JSON invalid ({}); falling back to vision",
-                span.number, error
-            ));
-            return None;
-        }
-    };
-
-    // Text-first acceptance gates — ALL must hold, otherwise fall back.
+/// Text-first acceptance gates + assembly, shared by the single-question
+/// path and the combined per-page batch path so they can never diverge.
+/// Takes an already-parsed model page and returns the `BuiltQuestion` or
+/// `None` (fall back to vision / individual re-ask).
+fn build_question_from_parsed_page(
+    page: AiQuestionPage,
+    span: &QuestionSpan,
+    config: &PipelineConfig,
+    available_figures: usize,
+) -> Option<BuiltQuestion> {
     if page.items.is_empty() {
         eprintln!(
             "[TEXT_FIRST_FALLBACK] question={} reason=empty_items",
@@ -2407,7 +2434,7 @@ async fn try_text_first_extraction<C: LlmClient>(
             ai_marks = Some(ai_marks.map_or(m, |existing: i32| existing + m));
         }
     }
-    let built = assemble_built_question(
+    assemble_built_question(
         span,
         config,
         contents,
@@ -2416,8 +2443,263 @@ async fn try_text_first_extraction<C: LlmClient>(
         false,
         Vec::new(),
         ai_marks,
-    )?;
+    )
+}
+
+/// Text-layer-first extraction attempt: transcribe the target question from
+/// the PDF text layer ALONE (zero image tokens — the dominant cost on
+/// pixel-billed providers like Gemini). Returns `Some((question, report))`
+/// when the text layer was reliable and the model produced a valid,
+/// figure-free transcription. Returns `None` (and the caller falls through to
+/// the vision path) when the model needs a figure, returns nothing, or fails
+/// validation.
+async fn try_text_first_extraction<C: LlmClient>(
+    client: &C,
+    config: &PipelineConfig,
+    span: &QuestionSpan,
+    span_pages: &[(usize, &PageInput)],
+    available_figures: usize,
+    request_semaphore: &Arc<Semaphore>,
+    cancel: &AtomicBool,
+    usage: &Arc<TokenTotals>,
+) -> Option<(BuiltQuestion, ImportReport)> {
+    let mut report = ImportReport::default();
+    if cancel.load(Ordering::Relaxed) {
+        return None;
+    }
+
+    let raw_text: String = span_pages
+        .iter()
+        .map(|(pi, p)| {
+            if p.text.trim().is_empty() {
+                String::new()
+            } else {
+                format!("RAW TEXT PAGE {}:\n{}\n\n", pi + 1, p.text)
+            }
+        })
+        .collect();
+    if raw_text.trim().is_empty() {
+        return None; // no text to work from — vision handles it
+    }
+    let system = text_first_system_prompt(config);
+    let user_text = format!(
+        "TARGET: Question {}\nPAPER: '{}'\nMODULE: '{}'\n\nTranscribe Question {} from the RAW TEXT below. NO IMAGES ARE ATTACHED — the text layer is authoritative.\n\n{}",
+        span.number,
+        config.paper_name,
+        config.module_name,
+        span.number,
+        raw_text
+    );
+    let body = llm::chat_body(
+        &config.model,
+        &system,
+        &[] as &[String],
+        llm::ImageDetail::Low,
+        Some(&user_text),
+        config.max_output_tokens,
+        Some(llm::ResponseFormat::JsonSchema {
+            schema: text_first_json_schema(),
+        }),
+    );
+
+    let api_start = Instant::now();
+    let resp = match chat_with_permit(client, &body, request_semaphore, cancel, usage).await {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!(
+                "[TEXT_FIRST_FALLBACK] question={} reason=api_error err={}",
+                span.number, e
+            );
+            report.anomalies.push(format!(
+                "Question {} text-first attempt API failure ({}); falling back to vision",
+                span.number, e
+            ));
+            return None;
+        }
+    };
+    report.record_timing(
+        "extraction",
+        "text_first",
+        Some(span_pages[0].0 + 1),
+        Some(span.number),
+        api_start.elapsed().as_millis() as u64,
+    );
+    let content = match llm::message_content(&resp) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!(
+                "[TEXT_FIRST_FALLBACK] question={} reason=malformed_message err={}",
+                span.number, e
+            );
+            report.anomalies.push(format!(
+                "Question {} text-first response malformed ({}); falling back to vision",
+                span.number, e
+            ));
+            return None;
+        }
+    };
+
+    let page = match parse_llm_json::<AiQuestionPage>(&content) {
+        ParseOutcome::Clean(v) => v,
+        ParseOutcome::Salvaged {
+            value,
+            dropped_tail,
+        } => {
+            if dropped_tail {
+                eprintln!(
+                    "[TEXT_FIRST_FALLBACK] question={} reason=truncated",
+                    span.number
+                );
+                return None; // truncated — vision will get the full page
+            }
+            value
+        }
+        ParseOutcome::Malformed { error } => {
+            eprintln!(
+                "[TEXT_FIRST_FALLBACK] question={} reason=invalid_json err={}",
+                span.number, error
+            );
+            report.anomalies.push(format!(
+                "Question {} text-first JSON invalid ({}); falling back to vision",
+                span.number, error
+            ));
+            return None;
+        }
+    };
+
+    // Text-first acceptance gates + assembly — shared with the combined
+    // per-page batch path so the two can never diverge.
+    let built = build_question_from_parsed_page(page, span, config, available_figures)?;
     Some((built, report))
+}
+
+/// Combined text-first extraction for a shared page: ONE API call transcribes
+/// ALL target question numbers at once (the response `items` array already
+/// supports multiple entries), avoiding N repetitions of the system-prompt /
+/// schema overhead that dominates text-first cost on multi-question pages.
+/// Each span still runs the standard acceptance gates via
+/// `build_question_from_parsed_page`. Returns one `Option<BuiltQuestion>` per
+/// span (index-aligned); `None` entries are re-asked individually by the
+/// caller, which ultimately falls back to vision.
+async fn try_text_first_batch_extraction<C: LlmClient>(
+    client: &C,
+    config: &PipelineConfig,
+    spans: &[&QuestionSpan],
+    span_pages: &[(usize, &PageInput)],
+    fig_counts: &[usize],
+    request_semaphore: &Arc<Semaphore>,
+    cancel: &AtomicBool,
+    usage: &Arc<TokenTotals>,
+) -> (Vec<Option<BuiltQuestion>>, ImportReport) {
+    let mut report = ImportReport::default();
+    let n = spans.len();
+    let mut out: Vec<Option<BuiltQuestion>> = (0..n).map(|_| None).collect();
+    if n == 0 || cancel.load(Ordering::Relaxed) {
+        return (out, report);
+    }
+
+    let raw_text: String = span_pages
+        .iter()
+        .map(|(pi, p)| {
+            if p.text.trim().is_empty() {
+                String::new()
+            } else {
+                format!("RAW TEXT PAGE {}:\n{}\n\n", pi + 1, p.text)
+            }
+        })
+        .collect();
+    if raw_text.trim().is_empty() {
+        return (out, report);
+    }
+
+    let numbers: Vec<String> = spans.iter().map(|s| s.number.to_string()).collect();
+    let system = text_first_system_prompt(config);
+    let user_text = format!(
+        "TARGET QUESTIONS: {}\nPAPER: '{}'\nMODULE: '{}'\n\nTranscribe ALL of the listed questions from the RAW TEXT below. Return one item per question — each item carries its OWN \"question_number\", marks, and content. NO IMAGES ARE ATTACHED — the text layer is authoritative.\n\n{}",
+        numbers.join(", "),
+        config.paper_name,
+        config.module_name,
+        raw_text
+    );
+    let body = llm::chat_body(
+        &config.model,
+        &system,
+        &[] as &[String],
+        llm::ImageDetail::Low,
+        Some(&user_text),
+        config.max_output_tokens,
+        Some(llm::ResponseFormat::JsonSchema {
+            schema: text_first_json_schema(),
+        }),
+    );
+
+    eprintln!(
+        "[TEXT_FIRST_BATCH] page={} questions={} one combined text-only call",
+        span_pages[0].0 + 1,
+        numbers.join(",")
+    );
+
+    let api_start = Instant::now();
+    let resp = match chat_with_permit(client, &body, request_semaphore, cancel, usage).await {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("[TEXT_FIRST_FALLBACK] batch reason=api_error err={}", e);
+            report.anomalies.push(format!(
+                "Combined text-first batch API failure ({}); re-asking individually",
+                e
+            ));
+            return (out, report);
+        }
+    };
+    report.record_timing(
+        "extraction",
+        "text_first_batch",
+        Some(span_pages[0].0 + 1),
+        spans.first().map(|s| s.number),
+        api_start.elapsed().as_millis() as u64,
+    );
+    let content = match llm::message_content(&resp) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!(
+                "[TEXT_FIRST_FALLBACK] batch reason=malformed_message err={}",
+                e
+            );
+            report.anomalies.push(format!(
+                "Combined text-first batch malformed response ({}); re-asking individually",
+                e
+            ));
+            return (out, report);
+        }
+    };
+
+    let page = match parse_llm_json::<AiQuestionPage>(&content) {
+        ParseOutcome::Clean(v) => v,
+        ParseOutcome::Salvaged { value, dropped_tail } => {
+            if dropped_tail {
+                eprintln!("[TEXT_FIRST_FALLBACK] batch reason=truncated");
+                return (out, report); // truncated — re-ask individually
+            }
+            value
+        }
+        ParseOutcome::Malformed { error } => {
+            eprintln!(
+                "[TEXT_FIRST_FALLBACK] batch reason=invalid_json err={}",
+                error
+            );
+            report.anomalies.push(format!(
+                "Combined text-first batch JSON invalid ({}); re-asking individually",
+                error
+            ));
+            return (out, report);
+        }
+    };
+
+    for (i, span) in spans.iter().enumerate() {
+        let available_figures = fig_counts.get(i).copied().unwrap_or(0);
+        out[i] = build_question_from_parsed_page(page.clone(), span, config, available_figures);
+    }
+    (out, report)
 }
 
 /// Long-edge cap for crop-first figure images. 512px = 4×4 Gemini tiles ≈
@@ -2441,6 +2723,7 @@ async fn try_crop_first_extraction<C: LlmClient>(
     page_render_cache: &Arc<crate::pdf_render::PageRenderCache>,
     request_semaphore: &Arc<Semaphore>,
     cancel: &AtomicBool,
+    usage: &Arc<TokenTotals>,
 ) -> Option<(BuiltQuestion, ImportReport)> {
     let mut report = ImportReport::default();
 
@@ -2495,7 +2778,7 @@ async fn try_crop_first_extraction<C: LlmClient>(
             schema: extraction_json_schema(),
         }),
     );
-    let resp = match chat_with_permit(client, &body, request_semaphore, cancel).await {
+    let resp = match chat_with_permit(client, &body, request_semaphore, cancel, usage).await {
         Ok(r) => r,
         Err(e) => {
             report.anomalies.push(format!(
@@ -2618,6 +2901,7 @@ async fn extract_span<C: LlmClient>(
     all_spans: &Arc<Vec<QuestionSpan>>,
     text_first: bool,
     cancel: &AtomicBool,
+    usage: &Arc<TokenTotals>,
 ) -> (Option<BuiltQuestion>, ImportReport) {
     // Own, local report: spans now run in parallel batches, so each unit
     // accumulates its own bookkeeping and the caller absorbs it in order.
@@ -2689,6 +2973,7 @@ async fn extract_span<C: LlmClient>(
             fig_count,
             request_semaphore,
             cancel,
+            usage,
         )
         .await
         {
@@ -2734,6 +3019,7 @@ async fn extract_span<C: LlmClient>(
             page_render_cache,
             request_semaphore,
             cancel,
+            usage,
         )
         .await
         {
@@ -2977,7 +3263,7 @@ async fn extract_span<C: LlmClient>(
             );
 
             let api_start = Instant::now();
-            let resp = match chat_with_permit(client, &body, request_semaphore, cancel).await {
+            let resp = match chat_with_permit(client, &body, request_semaphore, cancel, usage).await {
                 Ok(r) => r,
                 Err(e) => {
                     last_error = e.to_string();
@@ -3063,7 +3349,7 @@ async fn extract_span<C: LlmClient>(
                     );
 
                     let api_start = Instant::now();
-                    let reduced_resp = match chat_with_permit(client, &reduced_body, request_semaphore, cancel).await {
+                    let reduced_resp = match chat_with_permit(client, &reduced_body, request_semaphore, cancel, usage).await {
                         Ok(r) => r,
                         Err(e) => {
                             last_error = e.to_string();
@@ -4073,6 +4359,7 @@ async fn extract_same_page_batch<C: LlmClient>(
     all_spans: &Arc<Vec<QuestionSpan>>,
     text_first: bool,
     cancel: &AtomicBool,
+    usage: &Arc<TokenTotals>,
 ) -> (Vec<(QuestionSpan, Option<BuiltQuestion>)>, ImportReport) {
     let mut report = ImportReport::default();
     if cancel.load(Ordering::Relaxed) {
@@ -4094,49 +4381,122 @@ async fn extract_same_page_batch<C: LlmClient>(
         let referenced = figure_reference_numbers(&combined_text);
         let mut tf_out: Vec<(QuestionSpan, Option<BuiltQuestion>)> = Vec::with_capacity(spans.len());
         let mut tf_report = ImportReport::default();
-        let mut all_ok = true;
-        for span in spans {
-            let candidates = span_figure_candidates(span, &span_pages, page_figures, &referenced);
-            let fig_count = candidates.len();
-            let needs_vision = must_read || (text_refs_figure && fig_count == 0);
-            if needs_vision {
-                all_ok = false;
-                break;
+
+        // Per-span figure counts for the placeholder gate in the shared build
+        // helper (a question that needs a figure the detector can't supply
+        // must still go to vision, exactly as the old per-span loop decided).
+        let fig_counts: Vec<usize> = spans
+            .iter()
+            .map(|span| span_figure_candidates(span, &span_pages, page_figures, &referenced).len())
+            .collect();
+        let needs_vision =
+            must_read || (text_refs_figure && fig_counts.iter().any(|&c| c == 0));
+
+        if !needs_vision {
+            if spans.len() >= 2 {
+                // ONE combined call transcribes every question on the page,
+                // avoiding N repetitions of the system-prompt/schema overhead.
+                let (batch_opts, batch_rep) = try_text_first_batch_extraction(
+                    client,
+                    config,
+                    spans,
+                    &span_pages,
+                    &fig_counts,
+                    request_semaphore,
+                    cancel,
+                    usage,
+                )
+                .await;
+                tf_report.absorb(batch_rep);
+                for (i, span) in spans.iter().enumerate() {
+                    let mut built_q = match batch_opts.get(i).and_then(|o| o.clone()) {
+                        Some(q) => q,
+                        None => {
+                            // Combined call missed/rejected this span → re-ask
+                            // it alone. extract_span with text_first=true retries
+                            // the text layer first, then falls back to vision.
+                            let (q, r) = extract_span(
+                                client,
+                                config,
+                                span,
+                                &span_pages,
+                                page_figures,
+                                page_render_cache,
+                                page_image_cache,
+                                request_semaphore,
+                                collateral_cache,
+                                all_spans,
+                                true,
+                                cancel,
+                                usage,
+                            )
+                            .await;
+                            tf_report.absorb(r);
+                            tf_out.push(((*span).clone(), q));
+                            continue;
+                        }
+                    };
+                    eprintln!(
+                        "[TEXT_FIRST] Question {} transcribed from text layer (0 image tokens)",
+                        span.number
+                    );
+                    tf_report.text_first += 1;
+                    if fig_counts[i] > 0 {
+                        attach_detected_figures(
+                            config,
+                            span,
+                            &span_pages,
+                            page_figures,
+                            page_render_cache,
+                            &mut built_q.content,
+                            &mut tf_report,
+                        )
+                        .await;
+                    }
+                    tf_report.pages_processed += 1;
+                    push_mark_check(span, &built_q, &mut tf_report);
+                    tf_out.push(((*span).clone(), Some(built_q)));
+                }
+                return (tf_out, tf_report);
             }
-            let Some((mut built_q, mut r)) = try_text_first_extraction(
+
+            // Single span on the page — the plain per-question text-first path.
+            let span = spans[0];
+            if let Some((mut built_q, mut r)) = try_text_first_extraction(
                 client,
                 config,
                 span,
                 &span_pages,
-                fig_count,
+                fig_counts[0],
                 request_semaphore,
                 cancel,
+                usage,
             )
             .await
-            else {
-                all_ok = false;
-                break;
-            };
-            r.text_first += 1;
-            if fig_count > 0 {
-                attach_detected_figures(
-                    config,
-                    span,
-                    &span_pages,
-                    page_figures,
-                    page_render_cache,
-                    &mut built_q.content,
-                    &mut r,
-                )
-                .await;
+            {
+                eprintln!(
+                    "[TEXT_FIRST] Question {} transcribed from text layer (0 image tokens)",
+                    span.number
+                );
+                r.text_first += 1;
+                if fig_counts[0] > 0 {
+                    attach_detected_figures(
+                        config,
+                        span,
+                        &span_pages,
+                        page_figures,
+                        page_render_cache,
+                        &mut built_q.content,
+                        &mut r,
+                    )
+                    .await;
+                }
+                r.pages_processed += 1;
+                push_mark_check(span, &built_q, &mut r);
+                tf_report.absorb(r);
+                tf_out.push(((*span).clone(), Some(built_q)));
+                return (tf_out, tf_report);
             }
-            r.pages_processed += 1;
-            push_mark_check(span, &built_q, &mut r);
-            tf_report.absorb(r);
-            tf_out.push(((*span).clone(), Some(built_q)));
-        }
-        if all_ok {
-            return (tf_out, tf_report);
         }
     }
 
@@ -4175,6 +4535,7 @@ async fn extract_same_page_batch<C: LlmClient>(
                     all_spans,
                     false,
                     cancel,
+                    usage,
                 ).await;
                 report.absorb(r);
                 out.push(((*span).clone(), q));
@@ -4238,7 +4599,7 @@ async fn extract_same_page_batch<C: LlmClient>(
             }),
         );
 
-        let resp = match chat_with_permit(client, &body, request_semaphore, cancel).await {
+        let resp = match chat_with_permit(client, &body, request_semaphore, cancel, usage).await {
             Ok(r) => r,
             Err(e) => {
                 last_error = e.to_string();
@@ -4435,6 +4796,7 @@ async fn extract_same_page_batch<C: LlmClient>(
             all_spans,
             false,
             cancel,
+            usage,
         ).await;
         report.absorb(fallback_rep);
         out.push(((*span).clone(), fallback_q));
@@ -4857,6 +5219,7 @@ async fn extract_fallback_page<C: LlmClient>(
     page_image_cache: &Arc<PageImageCache>,
     request_semaphore: &Arc<Semaphore>,
     cancel: &AtomicBool,
+    usage: &Arc<TokenTotals>,
 ) -> (Option<Vec<BuiltQuestion>>, ImportReport) {
     // Own, local report: pages now run in parallel batches.
     let mut report = ImportReport::default();
@@ -4953,7 +5316,7 @@ RULES:
             config.max_output_tokens,
             Some(llm::ResponseFormat::JsonSchema { schema: extraction_json_schema() }),
         );
-        let resp = match chat_with_permit(client, &body, request_semaphore, cancel).await {
+        let resp = match chat_with_permit(client, &body, request_semaphore, cancel, usage).await {
             Ok(r) => r,
             Err(e) => {
                 last_error = e.to_string();
@@ -5241,6 +5604,7 @@ async fn read_markscheme_window<C: LlmClient>(
     system: &str,
     request_semaphore: &Arc<Semaphore>,
     cancel: &AtomicBool,
+    usage: &Arc<TokenTotals>,
 ) -> (Result<Vec<AiAnswer>, String>, ImportReport) {
     let mut report = ImportReport::default();
     if cancel.load(Ordering::Relaxed) {
@@ -5306,7 +5670,7 @@ async fn read_markscheme_window<C: LlmClient>(
             config.max_output_tokens,
             Some(llm::ResponseFormat::JsonSchema { schema: extraction_json_schema() }),
         );
-        let resp = match chat_with_permit(client, &body, request_semaphore, cancel).await {
+        let resp = match chat_with_permit(client, &body, request_semaphore, cancel, usage).await {
             Ok(r) => r,
             Err(e) => {
                 last_error = e.to_string();
@@ -5368,6 +5732,7 @@ pub async fn run_markscheme_pipeline<C: LlmClient, P: Progress>(
         PAGE_RENDER_CACHE_CAPACITY,
     ));
     let request_semaphore = Arc::new(Semaphore::new(config.parallelism.max(1)));
+    let usage = Arc::new(TokenTotals::new());
     let mut drafts: Vec<AnswerDraft> = Vec::new();
     let mut alt_count: std::collections::HashMap<u32, u32> = std::collections::HashMap::new();
     // Paper-global diagram dedupe: windows overlap, so the same worked
@@ -5407,6 +5772,7 @@ pub async fn run_markscheme_pipeline<C: LlmClient, P: Progress>(
             &system,
             &request_semaphore,
             cancel,
+            &usage,
         )
         .map(move |result| (position, result))
     }))
@@ -5573,6 +5939,9 @@ pub async fn run_markscheme_pipeline<C: LlmClient, P: Progress>(
         }
 
     report.total_elapsed_ms = overall_start.elapsed().as_millis() as u64;
+    let (prompt_tok, completion_tok) = usage.snapshot();
+    report.prompt_tokens = prompt_tok;
+    report.completion_tokens = completion_tok;
     Ok((drafts, report))
 } // Tests — the golden suite. Deterministic: MockLlm replays scripted model
   // behaviour (valid, hallucinating, truncating, junk) so every failure class
@@ -5609,6 +5978,10 @@ mod tests {
 
     fn cancel_flag() -> AtomicBool {
         AtomicBool::new(false)
+    }
+
+    fn usage() -> Arc<TokenTotals> {
+        Arc::new(TokenTotals::new())
     }
 
     fn paper_pages() -> Vec<PageInput> {
@@ -5873,7 +6246,7 @@ mod tests {
         let collateral = Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
         let all_spans = Arc::new(vec![span.clone()]);
         let (built_opt, _report) =
-            extract_span(&mock, &config(), &span, &span_pages, &[], &cache, &Arc::new(PageImageCache::new()), &semaphore, &collateral, &all_spans, false, &cancel_flag()).await;
+            extract_span(&mock, &config(), &span, &span_pages, &[], &cache, &Arc::new(PageImageCache::new()), &semaphore, &collateral, &all_spans, false, &cancel_flag(), &usage()).await;
         assert!(built_opt.is_some());
         assert_eq!(
             body_image_details(&mock.bodies()[0]),
@@ -5906,7 +6279,7 @@ mod tests {
         let collateral = Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
         let all_spans = Arc::new(vec![span.clone()]);
         let (built_opt, _report) =
-            extract_span(&mock, &config(), &span, &span_pages, &[], &cache, &Arc::new(PageImageCache::new()), &semaphore, &collateral, &all_spans, false, &cancel_flag()).await;
+            extract_span(&mock, &config(), &span, &span_pages, &[], &cache, &Arc::new(PageImageCache::new()), &semaphore, &collateral, &all_spans, false, &cancel_flag(), &usage()).await;
         assert!(built_opt.is_some());
         assert_eq!(
             body_image_details(&mock.bodies()[0]),
@@ -6111,7 +6484,7 @@ mod tests {
         let collateral = Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
         let all_spans = Arc::new(vec![span.clone()]);
         let (built_opt, report) =
-            extract_span(&mock, &config(), &span, &span_pages, &[], &cache, &Arc::new(PageImageCache::new()), &semaphore, &collateral, &all_spans, false, &cancel_flag()).await;
+            extract_span(&mock, &config(), &span, &span_pages, &[], &cache, &Arc::new(PageImageCache::new()), &semaphore, &collateral, &all_spans, false, &cancel_flag(), &usage()).await;
         let built = built_opt.expect("question must build after the repair round");
 
         assert_eq!(mock.remaining(), 0, "both attempts consumed");
@@ -6160,7 +6533,7 @@ mod tests {
         let collateral = Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
         let all_spans = Arc::new(vec![span.clone()]);
         let (built_opt, report) =
-            extract_span(&mock, &config(), &span, &span_pages, &[], &cache, &Arc::new(PageImageCache::new()), &semaphore, &collateral, &all_spans, false, &cancel_flag()).await;
+            extract_span(&mock, &config(), &span, &span_pages, &[], &cache, &Arc::new(PageImageCache::new()), &semaphore, &collateral, &all_spans, false, &cancel_flag(), &usage()).await;
         let built = built_opt.expect("split span must build");
 
         assert!(built.content.contains("First page content."));
@@ -6229,7 +6602,7 @@ mod tests {
         let collateral = Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
         let all_spans = Arc::new(vec![span.clone()]);
         let (built_opt, report) =
-            extract_span(&mock, &config(), &span, &span_pages, &[], &cache, &Arc::new(PageImageCache::new()), &semaphore, &collateral, &all_spans, false, &cancel_flag()).await;
+            extract_span(&mock, &config(), &span, &span_pages, &[], &cache, &Arc::new(PageImageCache::new()), &semaphore, &collateral, &all_spans, false, &cancel_flag(), &usage()).await;
         let built = built_opt.expect("transcription must survive even when boxes never pass");
 
         assert!(
@@ -6277,7 +6650,7 @@ mod tests {
         let collateral = Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
         let all_spans = Arc::new(vec![span.clone()]);
         let (built_opt, report) =
-            extract_span(&mock, &config(), &span, &span_pages, &[], &cache, &Arc::new(PageImageCache::new()), &semaphore, &collateral, &all_spans, false, &cancel_flag()).await;
+            extract_span(&mock, &config(), &span, &span_pages, &[], &cache, &Arc::new(PageImageCache::new()), &semaphore, &collateral, &all_spans, false, &cancel_flag(), &usage()).await;
         let built = built_opt.expect("transcription must survive the repeated failure");
 
         // Guard triggers on the second identical rejection: only 2 of the
@@ -6348,7 +6721,7 @@ mod tests {
         let mut cfg = config();
         cfg.text_first = true;
         let (built_opt, report) =
-            extract_span(&mock, &cfg, &span, &span_pages, &[], &cache, &Arc::new(PageImageCache::new()), &semaphore, &collateral, &all_spans, true, &cancel_flag()).await;
+            extract_span(&mock, &cfg, &span, &span_pages, &[], &cache, &Arc::new(PageImageCache::new()), &semaphore, &collateral, &all_spans, true, &cancel_flag(), &usage()).await;
         let built = built_opt.expect("text-first extraction must build a question");
         assert!(built.content.contains("2x + 4 = 10"));
         assert_eq!(report.text_first, 1, "text-first counter incremented");
@@ -6392,7 +6765,7 @@ mod tests {
         let mut cfg = config();
         cfg.text_first = true;
         let (built_opt, report) =
-            extract_span(&mock, &cfg, &span, &span_pages, &[], &cache, &Arc::new(PageImageCache::new()), &semaphore, &collateral, &all_spans, true, &cancel_flag()).await;
+            extract_span(&mock, &cfg, &span, &span_pages, &[], &cache, &Arc::new(PageImageCache::new()), &semaphore, &collateral, &all_spans, true, &cancel_flag(), &usage()).await;
         let built = built_opt.expect("split response must still build a question");
         assert!(built.content.contains("Part one"), "first sub-part merged: {}", built.content);
         assert!(built.content.contains("Part two"), "second sub-part merged: {}", built.content);
@@ -6403,6 +6776,90 @@ mod tests {
             !body_has_image(&mock.bodies()[0]),
             "merged extraction must still send ZERO images"
         );
+    }
+
+    #[test]
+    fn text_first_prompt_is_slimmed() {
+        let cfg = config();
+        let slim = text_first_system_prompt(&cfg);
+        let full = extraction_system_prompt(&cfg);
+        assert!(
+            !slim.contains("FEW-SHOT"),
+            "slim text-first prompt must not carry the 7 box-drawing examples"
+        );
+        assert!(
+            !slim.contains("Example 1"),
+            "slim text-first prompt must not carry few-shot example bodies"
+        );
+        assert!(
+            slim.len() < full.len(),
+            "slim prompt ({} chars) must be shorter than the full prompt ({} chars)",
+            slim.len(),
+            full.len()
+        );
+        assert!(
+            slim.contains("[DIAGRAM_PLACEHOLDER]"),
+            "slim prompt must keep the figure-placeholder rule"
+        );
+        assert!(
+            slim.contains("QUESTION ISOLATION"),
+            "slim prompt must keep the isolation rules"
+        );
+    }
+
+    #[test]
+    fn text_first_schema_omits_bbox_fields() {
+        let schema = text_first_json_schema();
+        let props = &schema["schema"]["properties"]["items"]["items"]["properties"];
+        assert!(
+            props.get("diagram_bboxes").is_none(),
+            "slim schema must not require diagram_bboxes"
+        );
+        assert!(
+            props.get("visual_options").is_none(),
+            "slim schema must not require visual_options"
+        );
+        assert!(props.get("content").is_some(), "content stays");
+        assert!(props.get("marks").is_some(), "marks stays");
+    }
+
+    #[tokio::test]
+    async fn token_totals_accumulate_real_usage() {
+        // The response `usage` block must flow into the shared accumulator
+        // (which `run_question_pipeline` copies into the report for the cost
+        // estimate).
+        let pgs = vec![text_image_page()];
+        let span_pages: Vec<(usize, &PageInput)> = vec![(0, &pgs[0])];
+        let span = doc_map::QuestionSpan {
+            number: 30,
+            start_page: 0,
+            end_page: 0,
+            start_y_frac: None,
+            end_y_frac: None,
+            expected_marks: Some(2),
+            reliable_pages: vec![],
+            ambiguous_pages: vec![],
+        };
+        let resp = serde_json::json!({
+            "choices": [{ "message": { "content": r#"{"items":[{"question_number":30,"content":"State the value of $x$ when $2x + 4 = 10$. **[2 marks]**","marks":2,"topics":[],"module":"Algebra","is_code":false,"diagram_bboxes":[],"diagram_captions":[],"diagram_kinds":[],"bbox_page_indexes":[],"math_snippet":"2x + 4 = 10","visual_options":null}]}"# } }],
+            "usage": { "prompt_tokens": 4200, "completion_tokens": 312, "total_tokens": 4512 }
+        });
+        let mock = MockLlm::new(vec![Ok(resp)]);
+        let cache = Arc::new(crate::pdf_render::PageRenderCache::new(
+            PAGE_RENDER_CACHE_CAPACITY,
+        ));
+        let semaphore = Arc::new(Semaphore::new(1));
+        let collateral = Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
+        let all_spans = Arc::new(vec![span.clone()]);
+        let mut cfg = config();
+        cfg.text_first = true;
+        let usage_arc = usage();
+        let (built_opt, _report) =
+            extract_span(&mock, &cfg, &span, &span_pages, &[], &cache, &Arc::new(PageImageCache::new()), &semaphore, &collateral, &all_spans, true, &cancel_flag(), &usage_arc).await;
+        assert!(built_opt.is_some(), "question built");
+        let (p, c) = usage_arc.snapshot();
+        assert_eq!(p, 4200, "real prompt tokens accumulated");
+        assert_eq!(c, 312, "real completion tokens accumulated");
     }
 
     #[tokio::test]
@@ -6441,7 +6898,7 @@ mod tests {
         let mut cfg = config();
         cfg.text_first = true;
         let (built_opt, report) =
-            extract_span(&mock, &cfg, &span, &span_pages, &[], &cache, &Arc::new(PageImageCache::new()), &semaphore, &collateral, &all_spans, true, &cancel_flag()).await;
+            extract_span(&mock, &cfg, &span, &span_pages, &[], &cache, &Arc::new(PageImageCache::new()), &semaphore, &collateral, &all_spans, true, &cancel_flag(), &usage()).await;
         let built = built_opt.expect("vision fallback must build the question");
         assert!(built.content.contains("x = 3"), "vision answer used: {}", built.content);
         assert_eq!(mock.bodies().len(), 2, "text-first + vision fallback");
@@ -6484,7 +6941,7 @@ mod tests {
         let mut cfg = config();
         cfg.text_first = true;
         let (built_opt, report) =
-            extract_span(&mock, &cfg, &span, &span_pages, &[], &cache, &Arc::new(PageImageCache::new()), &semaphore, &collateral, &all_spans, true, &cancel_flag()).await;
+            extract_span(&mock, &cfg, &span, &span_pages, &[], &cache, &Arc::new(PageImageCache::new()), &semaphore, &collateral, &all_spans, true, &cancel_flag(), &usage()).await;
         let built = built_opt.expect("vision path must build the question");
         assert!(built.content.contains("6"), "vision answer used: {}", built.content);
         assert_eq!(report.text_first, 0, "figure question must not go text-first");
@@ -6524,7 +6981,7 @@ mod tests {
         let all_spans = Arc::new(vec![span.clone()]);
         let cfg = config(); // text_first defaults to false
         let (built_opt, _report) =
-            extract_span(&mock, &cfg, &span, &span_pages, &[], &cache, &Arc::new(PageImageCache::new()), &semaphore, &collateral, &all_spans, false, &cancel_flag()).await;
+            extract_span(&mock, &cfg, &span, &span_pages, &[], &cache, &Arc::new(PageImageCache::new()), &semaphore, &collateral, &all_spans, false, &cancel_flag(), &usage()).await;
         let built = built_opt.expect("vision path must build the question");
         assert!(built.content.contains("2x + 4 = 10"));
         assert!(
@@ -6609,6 +7066,7 @@ mod tests {
             &all_spans,
             true,
             &cancel_flag(),
+            &usage(),
         )
         .await;
         let built = built_opt.expect("text-first must build the question");
@@ -6678,6 +7136,7 @@ mod tests {
             &all_spans,
             true,
             &cancel_flag(),
+            &usage(),
         )
         .await;
         let built = built_opt.expect("vision path must build the question");
@@ -6749,6 +7208,7 @@ mod tests {
             &all_spans,
             true,
             &cancel_flag(),
+            &usage(),
         )
         .await;
         let built = built_opt.expect("adjacent-page figure must keep this question text-first");
@@ -6810,6 +7270,7 @@ mod tests {
             &all_spans,
             true,
             &cancel_flag(),
+            &usage(),
         )
         .await;
         let built = built_opt.expect("distant caption match must keep the question text-first");
@@ -6889,14 +7350,13 @@ mod tests {
         ];
         let span_refs: Vec<&doc_map::QuestionSpan> = spans.iter().collect();
         let page_figures = vec![vec![fig_on_page("Figure 5", [0.08, 0.45, 0.50, 0.30])]];
-        let mock = MockLlm::new(vec![
-            ok_chat(
-                r#"{"items":[{"question_number":8,"content":"Figure 5 shows a graph. The gradient is $3$. **[2 marks]**","marks":2,"topics":[],"module":"Algebra","is_code":false,"diagram_bboxes":[],"diagram_captions":[],"diagram_kinds":[],"bbox_page_indexes":[],"math_snippet":"3","visual_options":null}]}"#,
-            ),
-            ok_chat(
-                r#"{"items":[{"question_number":9,"content":"The value of $x$ is $7$. **[1 mark]**","marks":1,"topics":[],"module":"Algebra","is_code":false,"diagram_bboxes":[],"diagram_captions":[],"diagram_kinds":[],"bbox_page_indexes":[],"math_snippet":"7","visual_options":null}]}"#,
-            ),
-        ]);
+        // ONE combined text-first call returns both questions' items.
+        let mock = MockLlm::new(vec![ok_chat(
+            r#"{"items":[
+                {"question_number":8,"content":"Figure 5 shows a graph. The gradient is $3$. **[2 marks]**","marks":2,"topics":[],"module":"Algebra","is_code":false,"diagram_bboxes":[],"diagram_captions":[],"diagram_kinds":[],"bbox_page_indexes":[],"math_snippet":"3","visual_options":null},
+                {"question_number":9,"content":"The value of $x$ is $7$. **[1 mark]**","marks":1,"topics":[],"module":"Algebra","is_code":false,"diagram_bboxes":[],"diagram_captions":[],"diagram_kinds":[],"bbox_page_indexes":[],"math_snippet":"7","visual_options":null}
+            ]}"#,
+        )]);
         let dir = std::env::temp_dir().join(format!("mm_batch_tf_{}", uuid::Uuid::new_v4()));
         let mut cfg = config();
         cfg.text_first = true;
@@ -6921,6 +7381,7 @@ mod tests {
             &all_spans,
             true,
             &cancel_flag(),
+            &usage(),
         )
         .await;
         assert_eq!(results.len(), 2, "both batch questions extracted");
@@ -6929,12 +7390,198 @@ mod tests {
             "both questions built"
         );
         assert_eq!(report.text_first, 2, "both transcribed from text");
-        assert_eq!(mock.bodies().len(), 2, "two text-only calls, zero vision");
+        assert_eq!(mock.bodies().len(), 1, "ONE combined text-first call");
         assert!(
             mock.bodies().iter().all(|b| !body_has_image(b)),
             "no image tokens for a text-first-safe shared page"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn combined_batch_one_call_for_three_questions() {
+        // Three questions sharing one page must be transcribed in a SINGLE
+        // combined text-first call (one prompt-overhead payment, not three).
+        let pgs = vec![PageInput {
+            kind: PageInputKind::Image {
+                b64: text_image_page().get_b64().unwrap().to_string(),
+            },
+            text: "9. State the value of $x$.\n\n[1 mark]\n\n10. Factorise $x^2 - 1$.\n\n[2 marks]\n\n11. Solve $2x = 8$.\n\n[1 mark]"
+                .into(),
+        }];
+        let spans = vec![
+            doc_map::QuestionSpan {
+                number: 9,
+                start_page: 0,
+                end_page: 0,
+                start_y_frac: None,
+                end_y_frac: None,
+                expected_marks: Some(1),
+                reliable_pages: vec![],
+                ambiguous_pages: vec![],
+            },
+            doc_map::QuestionSpan {
+                number: 10,
+                start_page: 0,
+                end_page: 0,
+                start_y_frac: None,
+                end_y_frac: None,
+                expected_marks: Some(2),
+                reliable_pages: vec![],
+                ambiguous_pages: vec![],
+            },
+            doc_map::QuestionSpan {
+                number: 11,
+                start_page: 0,
+                end_page: 0,
+                start_y_frac: None,
+                end_y_frac: None,
+                expected_marks: Some(1),
+                reliable_pages: vec![],
+                ambiguous_pages: vec![],
+            },
+        ];
+        let span_refs: Vec<&doc_map::QuestionSpan> = spans.iter().collect();
+        let mock = MockLlm::new(vec![ok_chat(
+            r#"{"items":[
+                {"question_number":9,"content":"The value of $x$ is $7$. **[1 mark]**","marks":1,"topics":[],"module":"Algebra","is_code":false,"diagram_bboxes":[],"diagram_captions":[],"diagram_kinds":[],"bbox_page_indexes":[],"math_snippet":"x = 7","visual_options":null},
+                {"question_number":10,"content":"Factorise $x^2 - 1$. **[2 marks]**","marks":2,"topics":[],"module":"Algebra","is_code":false,"diagram_bboxes":[],"diagram_captions":[],"diagram_kinds":[],"bbox_page_indexes":[],"math_snippet":"x^2 - 1","visual_options":null},
+                {"question_number":11,"content":"$x = 4$. **[1 mark]**","marks":1,"topics":[],"module":"Algebra","is_code":false,"diagram_bboxes":[],"diagram_captions":[],"diagram_kinds":[],"bbox_page_indexes":[],"math_snippet":"x = 4","visual_options":null}
+            ]}"#,
+        )]);
+        let mut cfg = config();
+        cfg.text_first = true;
+        let cache = Arc::new(crate::pdf_render::PageRenderCache::new(
+            PAGE_RENDER_CACHE_CAPACITY,
+        ));
+        let semaphore = Arc::new(Semaphore::new(1));
+        let collateral = Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
+        let all_spans = Arc::new(spans.clone());
+        let (results, report) = extract_same_page_batch(
+            &mock,
+            &cfg,
+            &span_refs,
+            0,
+            &pgs[0],
+            &[],
+            &cache,
+            &Arc::new(PageImageCache::new()),
+            &semaphore,
+            &collateral,
+            &all_spans,
+            true,
+            &cancel_flag(),
+            &usage(),
+        )
+        .await;
+        assert_eq!(results.len(), 3, "all three batch questions extracted");
+        assert!(
+            results.iter().all(|(_, q)| q.is_some()),
+            "all three questions built"
+        );
+        assert_eq!(report.text_first, 3, "all transcribed from text");
+        assert_eq!(mock.bodies().len(), 1, "ONE combined call, not three");
+        assert!(
+            mock.bodies().iter().all(|b| !body_has_image(b)),
+            "no image tokens on a text-only combined batch"
+        );
+        assert_eq!(mock.remaining(), 0, "no phantom extra calls");
+    }
+
+    #[tokio::test]
+    async fn combined_batch_partial_fallback_reasks_missing_question() {
+        // The combined call misses ONE of three questions → only that span is
+        // re-asked individually (text-first), the other two keep the combined
+        // result. No question is ever lost.
+        let pgs = vec![PageInput {
+            kind: PageInputKind::Image {
+                b64: text_image_page().get_b64().unwrap().to_string(),
+            },
+            text: "9. State the value of $x$.\n\n[1 mark]\n\n10. Factorise $x^2 - 1$.\n\n[2 marks]\n\n11. Solve $2x = 8$.\n\n[1 mark]"
+                .into(),
+        }];
+        let spans = vec![
+            doc_map::QuestionSpan {
+                number: 9,
+                start_page: 0,
+                end_page: 0,
+                start_y_frac: None,
+                end_y_frac: None,
+                expected_marks: Some(1),
+                reliable_pages: vec![],
+                ambiguous_pages: vec![],
+            },
+            doc_map::QuestionSpan {
+                number: 10,
+                start_page: 0,
+                end_page: 0,
+                start_y_frac: None,
+                end_y_frac: None,
+                expected_marks: Some(2),
+                reliable_pages: vec![],
+                ambiguous_pages: vec![],
+            },
+            doc_map::QuestionSpan {
+                number: 11,
+                start_page: 0,
+                end_page: 0,
+                start_y_frac: None,
+                end_y_frac: None,
+                expected_marks: Some(1),
+                reliable_pages: vec![],
+                ambiguous_pages: vec![],
+            },
+        ];
+        let span_refs: Vec<&doc_map::QuestionSpan> = spans.iter().collect();
+        // Combined call omits Q11; the individual re-ask supplies it.
+        let mock = MockLlm::new(vec![
+            ok_chat(
+                r#"{"items":[
+                    {"question_number":9,"content":"The value of $x$ is $7$. **[1 mark]**","marks":1,"topics":[],"module":"Algebra","is_code":false,"diagram_bboxes":[],"diagram_captions":[],"diagram_kinds":[],"bbox_page_indexes":[],"math_snippet":"x = 7","visual_options":null},
+                    {"question_number":10,"content":"Factorise $x^2 - 1$. **[2 marks]**","marks":2,"topics":[],"module":"Algebra","is_code":false,"diagram_bboxes":[],"diagram_captions":[],"diagram_kinds":[],"bbox_page_indexes":[],"math_snippet":"x^2 - 1","visual_options":null}
+                ]}"#,
+            ),
+            ok_chat(
+                r#"{"items":[{"question_number":11,"content":"$x = 4$. **[1 mark]**","marks":1,"topics":[],"module":"Algebra","is_code":false,"diagram_bboxes":[],"diagram_captions":[],"diagram_kinds":[],"bbox_page_indexes":[],"math_snippet":"x = 4","visual_options":null}]}"#,
+            ),
+        ]);
+        let mut cfg = config();
+        cfg.text_first = true;
+        let cache = Arc::new(crate::pdf_render::PageRenderCache::new(
+            PAGE_RENDER_CACHE_CAPACITY,
+        ));
+        let semaphore = Arc::new(Semaphore::new(1));
+        let collateral = Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
+        let all_spans = Arc::new(spans.clone());
+        let (results, report) = extract_same_page_batch(
+            &mock,
+            &cfg,
+            &span_refs,
+            0,
+            &pgs[0],
+            &[],
+            &cache,
+            &Arc::new(PageImageCache::new()),
+            &semaphore,
+            &collateral,
+            &all_spans,
+            true,
+            &cancel_flag(),
+            &usage(),
+        )
+        .await;
+        assert_eq!(results.len(), 3, "all three questions still extracted");
+        assert!(
+            results.iter().all(|(_, q)| q.is_some()),
+            "the missing question was recovered, none lost"
+        );
+        assert_eq!(report.text_first, 3, "all three via the text layer");
+        assert_eq!(
+            mock.bodies().len(),
+            2,
+            "one combined call + one individual re-ask"
+        );
+        assert_eq!(mock.remaining(), 0, "no extra calls");
     }
 
     /// TEMPORARY verification: reconstruct the fixture's real spans from its
@@ -7082,6 +7729,7 @@ mod tests {
             &all_spans,
             true,
             &cancel_flag(),
+            &usage(),
         )
         .await;
         let built = built_opt.expect("crop-first must build the question");
@@ -7166,6 +7814,7 @@ mod tests {
             &all_spans,
             true,
             &cancel_flag(),
+            &usage(),
         )
         .await;
         let built = built_opt.expect("full-page fallback must build the question");

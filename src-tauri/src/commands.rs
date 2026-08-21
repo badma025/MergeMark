@@ -1260,7 +1260,7 @@ pub async fn parse_pdf_vision(
     // Unambiguous build marker: if the running binary does not print this,
     // it predates the figure-fix-v3 build. Rebuild before trusting any cost
     // measurement.
-    eprintln!("[BUILD] figure-fix-v5: text-first merges multi-item responses");
+    eprintln!("[BUILD] figure-fix-v6: accurate cost metering + slim text-first prompts + text-first batching");
     let _concurrency_guard = state.extraction_in_progress.try_lock().map_err(|_| {
         "Another extraction is already in progress. Please wait for it to finish.".to_string()
     })?;
@@ -1669,10 +1669,18 @@ pub async fn parse_pdf_vision(
     }
 
     // ── Log import run metrics to audit log ───────────────────────────────
-    // Use the real OpenRouter usage delta if we can (before/after snapshot),
-    // otherwise fall back to model-rate estimate.
-    let prompt_est = (pages.len() as i64) * 1400;
-    let comp_est = (final_questions.len() as i64) * 350;
+    // Use the REAL token totals accumulated from every API response's `usage`
+    // block during the run (pipeline `report.prompt_tokens/completion_tokens`),
+    // multiplied by the model's actual per-million rates. Fall back to a crude
+    // pages/questions guess only when the provider returned no usage data.
+    let (prompt_tok, comp_tok) = if report.prompt_tokens > 0 || report.completion_tokens > 0 {
+        (report.prompt_tokens, report.completion_tokens)
+    } else {
+        (
+            (pages.len() as u64) * 1400,
+            (final_questions.len() as u64) * 350,
+        )
+    };
 
     // Try to get real cost from OpenRouter usage delta
     let real_cost = {
@@ -1688,15 +1696,15 @@ pub async fn parse_pdf_vision(
                     let m_lower = model_name.to_lowercase();
                     let is_reasoning = m_lower.contains("3.7") || m_lower.contains("o1") || m_lower.contains("o3");
                     let multiplier = if is_reasoning { 3.0 } else { 1.0 };
-                    let est = crate::cost::calculate_cost(&model_name, prompt_est as u64, comp_est as u64) * multiplier;
+                    let est = crate::cost::calculate_cost(&model_name, prompt_tok, comp_tok) * multiplier;
                     // Use the estimate but log that we have live data available
-                    eprintln!("[COST] OpenRouter live usage_usd={:.4}, estimated import cost=${:.4} (reasoning_multiplier={:.1}x)", after_usage, est, multiplier);
+                    eprintln!("[COST] OpenRouter live usage_usd={:.4}, estimated import cost=${:.4} (prompt={} completion={} reasoning_multiplier={:.1}x)", after_usage, est, prompt_tok, comp_tok, multiplier);
                     est
                 },
-                Err(_) => crate::cost::calculate_cost(&model_name, prompt_est as u64, comp_est as u64),
+                Err(_) => crate::cost::calculate_cost(&model_name, prompt_tok, comp_tok),
             }
         } else {
-            crate::cost::calculate_cost(&model_name, prompt_est as u64, comp_est as u64)
+            crate::cost::calculate_cost(&model_name, prompt_tok, comp_tok)
         }
     };
 
@@ -1706,8 +1714,8 @@ pub async fn parse_pdf_vision(
         &model_name,
         "question_paper",
         final_questions.len() as i64,
-        prompt_est,
-        comp_est,
+        prompt_tok as i64,
+        comp_tok as i64,
         real_cost,
         0,
     )
@@ -2103,12 +2111,15 @@ pub async fn parse_mark_scheme_vision(
     }
 
     // ── Log mark scheme import metrics to audit log ──────────────────────────
-    let prompt_est = (pages.len() as i64) * 1200;
-    let comp_est = (proposed_mappings.len() as i64) * 300;
+    let (prompt_est, comp_est) = if report.prompt_tokens > 0 || report.completion_tokens > 0 {
+        (report.prompt_tokens, report.completion_tokens)
+    } else {
+        ((pages.len() as u64) * 1200, (proposed_mappings.len() as u64) * 300)
+    };
     let m_lower = model_name.to_lowercase();
     let is_reasoning = m_lower.contains("3.7") || m_lower.contains("o1") || m_lower.contains("o3");
     let multiplier = if is_reasoning { 3.0 } else { 1.0 };
-    let cost_usd = crate::cost::calculate_cost(&model_name, prompt_est as u64, comp_est as u64) * multiplier;
+    let cost_usd = crate::cost::calculate_cost(&model_name, prompt_est, comp_est) * multiplier;
     let pool = state.db.lock().await;
     let _ = crate::db::record_import_cost(
         &pool,
@@ -2116,8 +2127,8 @@ pub async fn parse_mark_scheme_vision(
         &model_name,
         "mark_scheme",
         proposed_mappings.len() as i64,
-        prompt_est,
-        comp_est,
+        prompt_est as i64,
+        comp_est as i64,
         cost_usd,
         0,
     )

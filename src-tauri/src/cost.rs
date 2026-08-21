@@ -43,11 +43,21 @@ pub struct OpenRouterCredits {
     pub total_usage: f64,
 }
 
-/// Calculate estimated or exact cost based on model and token counts
+/// Calculate estimated or exact cost based on model and token counts.
+///
+/// Rates are the real OpenRouter list prices as of Aug 2026:
+/// - `google/gemini-2.5-flash`: $0.30 in / $2.50 out (the pinned default model)
+/// - `google/gemini-3.7-flash`: $0.375 in / $1.875 out (reasoning model)
+/// The generic `gemini` fallback uses the 2.5-flash rates so unknown Gemini
+/// variants are never underpriced by the old 2.0-flash figures.
 pub fn calculate_cost(model: &str, prompt_tokens: u64, completion_tokens: u64) -> f64 {
     let m = model.to_lowercase();
-    let (in_rate, out_rate) = if m.contains("gemini") {
-        (0.10, 0.40)
+    let (in_rate, out_rate) = if m.contains("gemini-3.7-flash") || m.contains("gemini-3.7_flash") {
+        (0.375, 1.875)
+    } else if m.contains("gemini-2.5-flash") || m.contains("gemini-2.5_flash") {
+        (0.30, 2.50)
+    } else if m.contains("gemini") {
+        (0.30, 2.50)
     } else if m.contains("deepseek") {
         (0.14, 0.28)
     } else if m.contains("gpt-4o-mini") {
@@ -198,4 +208,42 @@ pub async fn fetch_openrouter_credits(api_key: &str) -> Result<OpenRouterCredits
         total_credits,
         total_usage,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn close(a: f64, b: f64) -> bool {
+        (a - b).abs() < 1e-9
+    }
+
+    #[test]
+    fn gemini_2_5_flash_uses_real_openrouter_rates() {
+        // google/gemini-2.5-flash is $0.30/M in, $2.50/M out.
+        let c = calculate_cost("google/gemini-2.5-flash", 1_000_000, 1_000_000);
+        assert!(close(c, 2.80), "got {}", c);
+        // A realistic import: ~150k prompt, ~10k completion.
+        let c2 = calculate_cost("google/gemini-2.5-flash", 150_000, 10_000);
+        assert!(close(c2, 0.045 + 0.025), "got {}", c2);
+    }
+
+    #[test]
+    fn gemini_3_7_flash_uses_real_openrouter_rates() {
+        // google/gemini-3.7-flash is $0.375/M in, $1.875/M out.
+        let c = calculate_cost("google/gemini-3.7-flash", 1_000_000, 1_000_000);
+        assert!(close(c, 2.25), "got {}", c);
+    }
+
+    #[test]
+    fn generic_gemini_falls_back_to_2_5_flash_rates() {
+        let c = calculate_cost("google/gemini-something-future", 1_000_000, 1_000_000);
+        assert!(close(c, 2.80), "generic gemini must not use old 2.0-flash rates, got {}", c);
+    }
+
+    #[test]
+    fn deepseek_rates_unchanged() {
+        let c = calculate_cost("deepseek/deepseek-chat", 1_000_000, 1_000_000);
+        assert!(close(c, 0.42), "got {}", c);
+    }
 }

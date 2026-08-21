@@ -299,14 +299,26 @@ impl LlmClient for ReqwestLlm {
                         let body_text = match r.text().await {
                             Ok(body) => body,
                             Err(error) => {
+                                // Connection-level failure (reset / truncated
+                                // chunked framing) under parallel load: the
+                                // request may or may not have been billed, but
+                                // the response was never delivered. Retry it
+                                // like a network error instead of losing the
+                                // call and forcing a vision fallback.
                                 eprintln!(
-                                    "[LLM][BODY_READ_ERROR] status={} error={}",
+                                    "[LLM][BODY_READ_ERROR] status={} error={} (retrying)",
                                     status, error
                                 );
-                                return Err(LlmError::BadShape(format!(
-                                    "unable to read provider response body: {}",
-                                    error
-                                )));
+                                attempt += 1;
+                                if attempt > 3 {
+                                    return Err(LlmError::BadShape(format!(
+                                        "unable to read provider response body: {}",
+                                        error
+                                    )));
+                                }
+                                tokio::time::sleep(std::time::Duration::from_secs(5) + retry_jitter())
+                                    .await;
+                                continue;
                             }
                         };
                         let trimmed_body = body_text.trim();
@@ -348,14 +360,25 @@ impl LlmClient for ReqwestLlm {
                         let resp: serde_json::Value = match serde_json::from_str(&body_text) {
                             Ok(value) => value,
                             Err(error) => {
+                                // A 200 with a non-JSON body is usually a
+                                // truncated/buffered response — retry it once
+                                // rather than discarding the call. If the body
+                                // is genuinely malformed the retries exhaust and
+                                // the caller gets the error as before.
                                 eprintln!(
-                                    "[LLM][RESPONSE_JSON_ERROR] error={} raw_body:\n{}",
+                                    "[LLM][RESPONSE_JSON_ERROR] error={} raw_body:\n{} (retrying)",
                                     error, body_text
                                 );
-                                return Err(LlmError::BadShape(format!(
-                                    "invalid provider response JSON: {}",
-                                    error
-                                )));
+                                attempt += 1;
+                                if attempt > 3 {
+                                    return Err(LlmError::BadShape(format!(
+                                        "invalid provider response JSON: {}",
+                                        error
+                                    )));
+                                }
+                                tokio::time::sleep(std::time::Duration::from_secs(5) + retry_jitter())
+                                    .await;
+                                continue;
                             }
                         };
                         // Empty-content guard: some Kilo-Gateway providers

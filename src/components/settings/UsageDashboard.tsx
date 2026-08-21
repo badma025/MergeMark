@@ -42,8 +42,8 @@ export interface ImportCostRecord {
 }
 
 const MODEL_PRICING_ESTIMATES: Record<string, { input: number; output: number; name: string }> = {
-  "google/gemini-3.7-flash": { input: 0.10, output: 0.40, name: "Gemini 3.7 Flash (Fast & Cheap)" },
-  "google/gemini-2.5-flash": { input: 0.10, output: 0.40, name: "Gemini 2.5 Flash" },
+  "google/gemini-3.7-flash": { input: 0.375, output: 1.875, name: "Gemini 3.7 Flash (Fast & Cheap)" },
+  "google/gemini-2.5-flash": { input: 0.30, output: 2.50, name: "Gemini 2.5 Flash" },
   "google/gemini-2.0-flash-001": { input: 0.10, output: 0.40, name: "Gemini 2.0 Flash" },
   "deepseek/deepseek-chat": { input: 0.14, output: 0.28, name: "DeepSeek V3" },
   "openai/gpt-4o-mini": { input: 0.15, output: 0.60, name: "GPT-4o mini" },
@@ -60,7 +60,11 @@ export function getRecordCost(record: ImportCostRecord): number {
   const m = (record.modelName || "").toLowerCase();
   let inRate = 0.10;
   let outRate = 0.40;
-  if (m.includes("deepseek")) {
+  if (m.includes("gemini-3.7-flash")) {
+    inRate = 0.375; outRate = 1.875;
+  } else if (m.includes("gemini-2.5-flash") || m.includes("gemini")) {
+    inRate = 0.30; outRate = 2.50;
+  } else if (m.includes("deepseek")) {
     inRate = 0.14; outRate = 0.28;
   } else if (m.includes("gpt-4o-mini")) {
     inRate = 0.15; outRate = 0.60;
