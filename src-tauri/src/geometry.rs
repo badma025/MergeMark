@@ -1143,6 +1143,62 @@ pub fn decode_page_image(b64: &str) -> Option<image::DynamicImage> {
     image::load_from_memory(&bytes).ok()
 }
 
+/// Default long-edge cap for images sent to vision APIs. The extraction path
+/// downscales every API-bound page/band to this size; the structure pass and
+/// mark-scheme windows use the same ceiling. For providers billed by pixels
+/// (Gemini, Anthropic) this is the dominant cost lever: 768 → 640 cuts image
+/// tiles ~26%, and 640 → 512 cuts them a further ~35%. Override at runtime
+/// with `MERGEMARK_VISION_MAX_DIM` (clamped to 256..=1024).
+pub const API_IMAGE_MAX_DIM: u32 = 640;
+
+/// Resolve the API long-edge cap, honouring the `MERGEMARK_VISION_MAX_DIM`
+/// environment override. Values outside 256..=1024 are rejected so a typo
+/// can't accidentally explode (or erase) the image payload.
+pub fn api_image_max_dim() -> u32 {
+    std::env::var("MERGEMARK_VISION_MAX_DIM")
+        .ok()
+        .and_then(|v| v.trim().parse::<u32>().ok())
+        .filter(|v| (256..=1024).contains(v))
+        .unwrap_or(API_IMAGE_MAX_DIM)
+}
+
+/// Downscale so the longest edge <= `max_dim`, then WebP-encode the result.
+/// Returns raw base64 (no data-URL prefix) so `chat_body` wraps it as
+/// `data:image/webp;base64,...`. Returns None if the encode fails.
+pub fn encode_webp_resized(img: &image::DynamicImage, max_dim: u32) -> Option<String> {
+    use base64::Engine;
+    use image::GenericImageView;
+    let (w, h) = img.dimensions();
+    let rgb = img.to_rgb8();
+    let final_img = if w > max_dim || h > max_dim {
+        let scale = max_dim as f32 / (w.max(h) as f32);
+        let new_w = (w as f32 * scale).round().max(1.0) as u32;
+        let new_h = (h as f32 * scale).round().max(1.0) as u32;
+        image::DynamicImage::ImageRgb8(image::imageops::resize(
+            &rgb,
+            new_w,
+            new_h,
+            image::imageops::FilterType::Triangle,
+        ))
+    } else {
+        image::DynamicImage::ImageRgb8(rgb)
+    };
+
+    let mut buf = std::io::Cursor::new(Vec::with_capacity(
+        (final_img.width() as usize * final_img.height() as usize) / 8,
+    ));
+    final_img.write_to(&mut buf, image::ImageFormat::WebP).ok()?;
+    Some(base64::engine::general_purpose::STANDARD.encode(buf.into_inner()))
+}
+
+/// Decode (data-URL or raw base64) an image and return it WebP-encoded and
+/// downscaled to a longest edge of `max_dim`. Returns None when the input
+/// cannot be decoded or the encode fails.
+pub fn resize_b64_to_max_dim(b64: &str, max_dim: u32) -> Option<String> {
+    let img = decode_page_image(b64)?;
+    encode_webp_resized(&img, max_dim)
+}
+
 // ── Vertical page band crop (Phase 1) ─────────────────────────────────────
 //
 // When a page contains multiple questions (MCQs, short-answer bands, or a
@@ -1207,8 +1263,9 @@ pub fn crop_page_vertical_from_image(
     let cropped_rgba = image::imageops::crop_imm(img, 0, y0, w, band_h).to_image();
     let cropped = image::DynamicImage::ImageRgba8(cropped_rgba).to_rgb8();
 
-    // Scale to optimal vision tile dimension (max_dim: 768) to prevent tile explosions
-    let max_dim: u32 = 768;
+    // Scale to the API long-edge cap (default 640, env-overridable) to keep
+    // band crops within a few vision tiles.
+    let max_dim = api_image_max_dim();
     let (cw, ch) = (cropped.width(), cropped.height());
     let final_img = if cw > max_dim || ch > max_dim {
         let scale = max_dim as f32 / (cw.max(ch) as f32);
@@ -1291,6 +1348,7 @@ pub fn strip_data_url(b64: &str) -> &str {
 mod tests {
     use super::*;
     use base64::Engine;
+    use image::GenericImageView;
 
     const W: u32 = 1654;
     const H: u32 = 2339;
@@ -1634,5 +1692,45 @@ mod tests {
         let sc = tile_signature(&chart);
         assert!(signature_distance(&s1, &s2) < 4, "same table, resized → duplicate");
         assert!(signature_distance(&s1, &sc) >= 6, "table vs chart → distinct");
+    }
+
+    #[test]
+    fn encode_webp_resized_caps_long_edge() {
+        let img = image::DynamicImage::ImageRgb8(image::RgbImage::from_fn(1600, 2000, |x, y| {
+            image::Rgb([(x % 255) as u8, (y % 255) as u8, 180])
+        }));
+        let b64 = encode_webp_resized(&img, API_IMAGE_MAX_DIM).expect("encode must succeed");
+        let decoded = decode_page_image(&b64).expect("result must decode");
+        let (w, h) = decoded.dimensions();
+        assert!(w <= API_IMAGE_MAX_DIM && h <= API_IMAGE_MAX_DIM);
+        assert!(!b64.starts_with("data:image/"), "must be raw base64, no prefix");
+    }
+
+    #[test]
+    fn encode_webp_resized_keeps_small_images_unchanged() {
+        let img = image::DynamicImage::ImageRgb8(image::RgbImage::from_fn(300, 200, |x, y| {
+            image::Rgb([(x % 255) as u8, (y % 255) as u8, 90])
+        }));
+        let b64 = encode_webp_resized(&img, API_IMAGE_MAX_DIM).expect("encode must succeed");
+        let decoded = decode_page_image(&b64).expect("result must decode");
+        let (w, h) = decoded.dimensions();
+        assert_eq!((w, h), (300, 200), "small image must not be upscaled");
+    }
+
+    #[test]
+    fn resize_b64_to_max_dim_handles_data_url() {
+        let img = image::DynamicImage::ImageRgb8(image::RgbImage::from_fn(1400, 1000, |x, y| {
+            image::Rgb([(x % 255) as u8, (y % 255) as u8, 40])
+        }));
+        let mut png = std::io::Cursor::new(Vec::new());
+        img.write_to(&mut png, image::ImageFormat::Png).unwrap();
+        let raw = base64::engine::general_purpose::STANDARD.encode(png.into_inner());
+        let data_url = format!("data:image/png;base64,{}", raw);
+
+        let b64 = resize_b64_to_max_dim(&data_url, API_IMAGE_MAX_DIM).expect("resize must succeed");
+        assert!(!b64.starts_with("data:image/"));
+        let decoded = decode_page_image(&b64).expect("result must decode");
+        let (w, h) = decoded.dimensions();
+        assert!(w <= API_IMAGE_MAX_DIM && h <= API_IMAGE_MAX_DIM);
     }
 }

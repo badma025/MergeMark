@@ -29,6 +29,7 @@ export interface ImportReport {
   marksChecksumOk: boolean | null;
   quarantined: Quarantine[];
   repairs: number;
+  repairReasons?: Record<string, number>;
   salvageEvents: number;
   cropRejections: number;
   diagramsSaved: number;
@@ -667,6 +668,24 @@ export function IngestionDropzone({ isActive = false, onSuccess }: IngestionDrop
                         <span>Salvaged: {r.salvageEvents}</span>
                         <span>Crops Rejected: {r.cropRejections}</span>
                       </div>
+
+                      {r.repairReasons && Object.keys(r.repairReasons).length > 0 && (
+                        <div className="mt-3">
+                          <span className="text-xs font-semibold text-orange-500 uppercase tracking-wider">
+                            Repair reasons ({r.repairs}) — each re-sends the same images
+                          </span>
+                          <ul className="mt-2 space-y-1">
+                            {Object.entries(r.repairReasons)
+                              .sort((a, b) => b[1] - a[1])
+                              .map(([rule, count]) => (
+                                <li key={rule} className="text-xs text-foreground bg-orange-500/10 px-3 py-1.5 rounded-md border border-orange-500/20 flex justify-between">
+                                  <span className="font-mono">{rule}</span>
+                                  <span className="font-semibold">{count}</span>
+                                </li>
+                              ))}
+                          </ul>
+                        </div>
+                      )}
                     </div>
                   );
                 })}

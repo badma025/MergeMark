@@ -155,6 +155,7 @@ pub struct ImportReport {
     pub quarantined: Vec<QuarantineEvent>,
     pub skipped_pages: Vec<SkippedPage>,
     pub repairs: usize,
+    pub repair_reasons: std::collections::BTreeMap<String, usize>,
     pub salvage_events: usize,
     pub crop_rejections: usize,
     pub diagrams_saved: usize,
@@ -162,6 +163,29 @@ pub struct ImportReport {
     pub anomalies: Vec<String>,
     pub timings: Vec<TimingEntry>,
     pub total_elapsed_ms: u64,
+}
+
+impl ImportReport {
+    /// Record one repair round under a stable rule name so the cost audit can
+    /// show exactly which validation gates are burning API calls (each repair
+    /// re-sends the same images — on Gemini that's the dominant cost).
+    pub fn note_repair(&mut self, rule: &str) {
+        self.repairs += 1;
+        *self.repair_reasons.entry(rule.to_string()).or_insert(0) += 1;
+    }
+}
+
+/// Convergence guard for repair loops. When a validation failure produces the
+/// EXACT same error string on two consecutive attempts, the model is stuck on
+/// this prompt — re-sending the identical images with the identical repair
+/// note will not converge, so callers should stop paying for it and resolve
+/// via their budget-spent path (prune-and-accept, anomaly, or quarantine).
+pub fn repair_is_non_convergent(
+    attempt: u32,
+    prev_error: Option<&str>,
+    new_error: &str,
+) -> bool {
+    attempt > 1 && !new_error.is_empty() && prev_error == Some(new_error)
 }
 
 /// Concurrent vision calls in flight at once. Validation is per unit of work
@@ -197,7 +221,18 @@ async fn chat_with_permit<C: LlmClient>(
         return Err(crate::llm::LlmError::Network("Import cancelled by user".to_string()));
     }
     tokio::select! {
-        res = client.chat(body) => res,
+        res = client.chat(body) => {
+            if let Ok(resp) = &res {
+                if std::env::var_os("MERGEMARK_LOG_USAGE").is_some() {
+                    let u = crate::llm::usage_from_response(resp);
+                    eprintln!(
+                        "[TOKENS] prompt={} completion={} total={}",
+                        u.prompt_tokens, u.completion_tokens, u.total_tokens
+                    );
+                }
+            }
+            res
+        },
         _ = async {
             while !cancel.load(Ordering::Relaxed) {
                 tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -344,7 +379,7 @@ async fn prepare_chunk_images(
                     ));
                 } else if let Some(img) = &decoded {
                     let (w, h) = img.dimensions();
-                    let max_dim: u32 = 768;
+                    let max_dim = geometry::api_image_max_dim();
                     if w > max_dim || h > max_dim {
                         let scale = max_dim as f32 / (w.max(h) as f32);
                         let new_w = (w as f32 * scale).round().max(1.0) as u32;
@@ -1195,8 +1230,20 @@ pub async fn run_question_pipeline<C: LlmClient, P: Progress>(
                                     Ok(r#"{"question_numbers_visible":[],"page_role":"BLANK"}"#.to_string()),
                                 );
                             }
+                            // Downscale the page to the API long-edge cap. The
+                            // structure pass only needs question numbers and
+                            // footers; the cap is the same ceiling extraction
+                            // already uses successfully for full transcription.
+                            images.push(
+                                geometry::encode_webp_resized(
+                                    &decoded,
+                                    geometry::api_image_max_dim(),
+                                )
+                                .unwrap_or_else(|| b64.clone()),
+                            );
+                        } else {
+                            images.push(b64.clone());
                         }
-                        images.push(b64.clone());
                     }
                     let (img_slice, text_opt): (&[String], Option<&str>) = if is_text_only {
                         (&[], Some(page.text.as_str()))
@@ -1207,6 +1254,7 @@ pub async fn run_question_pipeline<C: LlmClient, P: Progress>(
                         &config.model,
                         &system_structure,
                         img_slice,
+                        llm::ImageDetail::High,
                         text_opt,
                         750,
                         Some(llm::ResponseFormat::JsonSchema { schema: structure_json_schema() }),
@@ -1960,6 +2008,11 @@ async fn extract_span<C: LlmClient>(
         // JSON Schema for structured extraction output
         let extraction_schema = extraction_json_schema();
         let mut last_error = String::new();
+        // Convergence guard: if a repair round produces the EXACT same
+        // validation failure as the previous round, the model is stuck on
+        // this prompt — re-sending the same images will not converge, so we
+        // stop paying for it and resolve via the budget-spent paths.
+        let mut last_repair_error: Option<String> = None;
         let mut accepted: Option<(Vec<AiQuestion>, bool)> = None; // (items, salvaged_truncated)
 
         for attempt in 1..=max_attempts {
@@ -1996,10 +2049,20 @@ async fn extract_span<C: LlmClient>(
                 },
                 repair_note
             );
+            let all_band_crops = !page_crop_offsets.is_empty()
+                && page_crop_offsets
+                    .iter()
+                    .all(|(s, e)| *s != 0.0 || *e != 1.0);
+            let detail = if all_band_crops {
+                llm::ImageDetail::Low
+            } else {
+                llm::ImageDetail::High
+            };
             let body = llm::chat_body(
                 &config.model,
                 &system,
                 &images,
+                detail,
                 Some(&user_text),
                 config.max_output_tokens,
                 Some(llm::ResponseFormat::JsonSchema {
@@ -2069,10 +2132,20 @@ async fn extract_span<C: LlmClient>(
                         .take_while(|&&chunk_idx| chunk_idx < 2)
                         .count();
                     let reduced_images = images[..reduced_image_count].to_vec();
+                    let reduced_all_band_crops = reduced_image_count > 0
+                        && page_crop_offsets[..reduced_image_count]
+                            .iter()
+                            .all(|(s, e)| *s != 0.0 || *e != 1.0);
+                    let reduced_detail = if reduced_all_band_crops {
+                        llm::ImageDetail::Low
+                    } else {
+                        llm::ImageDetail::High
+                    };
                     let reduced_body = llm::chat_body(
                         &config.model,
                         &system,
                         &reduced_images,
+                        reduced_detail,
                         Some(&format!(
                             "{}\n\nNOTE: This is a retry with fewer pages due to payload size issues. Transcribe Question {} from these pages only.",
                             user_text, span.number
@@ -2088,7 +2161,7 @@ async fn extract_span<C: LlmClient>(
                         Ok(r) => r,
                         Err(e) => {
                             last_error = e.to_string();
-                            report.repairs += 1;
+                            report.note_repair("eof_reduced_api_error");
                             continue;
                         }
                     };
@@ -2103,7 +2176,7 @@ async fn extract_span<C: LlmClient>(
                         Ok(c) => c,
                         Err(e) => {
                             last_error = e.to_string();
-                            report.repairs += 1;
+                            report.note_repair("eof_reduced_message_error");
                             continue;
                         }
                     };
@@ -2204,8 +2277,20 @@ async fn extract_span<C: LlmClient>(
                 }
                 ParseOutcome::Malformed { error } => {
                     last_error = format!("invalid JSON: {}", error);
-                    report.repairs += 1;
-                    continue;
+                    report.note_repair("malformed_json");
+                    let non_convergent =
+                        repair_is_non_convergent(attempt, last_repair_error.as_deref(), &last_error);
+                    if attempt < max_attempts && !non_convergent {
+                        last_repair_error = Some(last_error.clone());
+                        continue;
+                    }
+                    if non_convergent {
+                        eprintln!(
+                            "WARNING: Question {} repeated identical malformed JSON; quarantining instead of re-sending.",
+                            span.number
+                        );
+                    }
+                    break;
                 }
             };
 
@@ -2326,14 +2411,24 @@ async fn extract_span<C: LlmClient>(
                     contents.len()
                 );
                 eprintln!("WARNING: Question {} extraction returned an empty items array.", span.number);
-                if attempt < config.max_repairs {
-                    last_error = format!(
-                        "Extraction for Question {} returned an empty items array. Please transcribe Question {} and all its sub-parts from the provided page(s).",
-                        span.number, span.number
-                    );
-                    report.repairs += 1;
+                let new_error = format!(
+                    "Extraction for Question {} returned an empty items array. Please transcribe Question {} and all its sub-parts from the provided page(s).",
+                    span.number, span.number
+                );
+                let non_convergent =
+                    repair_is_non_convergent(attempt, last_repair_error.as_deref(), &new_error);
+                if attempt < config.max_repairs && !non_convergent {
+                    last_error = new_error;
+                    report.note_repair("empty_items");
+                    last_repair_error = Some(last_error.clone());
                     continue;
                 } else {
+                    if non_convergent {
+                        eprintln!(
+                            "WARNING: Question {} repeated identical empty-items failure; quarantining instead of re-sending.",
+                            span.number
+                        );
+                    }
                     report.quarantined.push(QuarantineEvent {
                         scope: "question".to_string(),
                         page: Some(span.start_page + 1),
@@ -2379,7 +2474,7 @@ async fn extract_span<C: LlmClient>(
                         "You extracted data for questions {:?}, but NONE of it was Question {}. Please extract ONLY Question {}.",
                         extracted, span.number, span.number
                     );
-                    report.repairs += 1;
+                    report.note_repair("wrong_question_number");
                 }
             }
 
@@ -2551,8 +2646,18 @@ async fn extract_span<C: LlmClient>(
                             span.number,
                             second_content.chars().take(40).collect::<String>()
                         );
-                        report.repairs += 1;
-                        continue;
+                        report.note_repair("misnumbered_new_question");
+                        if attempt < max_attempts
+                            && !repair_is_non_convergent(
+                                attempt,
+                                last_repair_error.as_deref(),
+                                &last_error,
+                            )
+                        {
+                            last_repair_error = Some(last_error.clone());
+                            continue;
+                        }
+                        break;
                     } else {
                         // Genuine continuation — keep only the first item; discard
                         // the redundant second item (continuation should extend span,
@@ -2564,8 +2669,18 @@ async fn extract_span<C: LlmClient>(
                         "You returned {} items for Question {}. You MUST combine all sub-parts into a SINGLE item's `content` string, separated by double newlines.",
                         page_items.items.len(), span.number
                     );
-                    report.repairs += 1;
-                    continue;
+                    report.note_repair("multi_item_split");
+                    if attempt < max_attempts
+                        && !repair_is_non_convergent(
+                            attempt,
+                            last_repair_error.as_deref(),
+                            &last_error,
+                        )
+                    {
+                        last_repair_error = Some(last_error.clone());
+                        continue;
+                    }
+                    break;
                 }
             }
 
@@ -2577,8 +2692,18 @@ async fn extract_span<C: LlmClient>(
                     format!("You extracted data for questions [{}], but NONE of it was Question {}. Please extract ONLY Question {}.",
                         dropped_numbers.join(", "), span.number, span.number)
                 };
-                report.repairs += 1;
-                continue;
+                report.note_repair("empty_after_retention");
+                if attempt < max_attempts
+                    && !repair_is_non_convergent(
+                        attempt,
+                        last_repair_error.as_deref(),
+                        &last_error,
+                    )
+                {
+                    last_repair_error = Some(last_error.clone());
+                    continue;
+                }
+                break;
             }
 
             // Un-shift diagram bounding boxes back to full-page coordinates
@@ -2612,8 +2737,18 @@ async fn extract_span<C: LlmClient>(
                     );
                 }
                 last_error = validation_errors.join("; ");
-                report.repairs += 1;
-                continue;
+                report.note_repair("schema_validation");
+                if attempt < max_attempts
+                    && !repair_is_non_convergent(
+                        attempt,
+                        last_repair_error.as_deref(),
+                        &last_error,
+                    )
+                {
+                    last_repair_error = Some(last_error.clone());
+                    continue;
+                }
+                break;
             }
 
             // ── Figure-reference consistency: a referenced Figure must be
@@ -2644,9 +2779,16 @@ async fn extract_span<C: LlmClient>(
                         span.number, error
                     );
                 }
-                report.repairs += 1;
-                if attempt < max_attempts {
+                report.note_repair("figure_consistency");
+                if attempt < max_attempts
+                    && !repair_is_non_convergent(
+                        attempt,
+                        last_repair_error.as_deref(),
+                        &last_error,
+                    )
+                {
                     last_error = cons_errors.join("; ");
+                    last_repair_error = Some(last_error.clone());
                     continue;
                 }
                 report.anomalies.push(format!(
@@ -2691,8 +2833,18 @@ async fn extract_span<C: LlmClient>(
                 Ok(result) => result,
                 Err(error) => {
                     last_error = format!("diagram audit task failed: {}", error);
-                    report.repairs += 1;
-                    continue;
+                    report.note_repair("diagram_audit_task_failed");
+                    if attempt < max_attempts
+                        && !repair_is_non_convergent(
+                            attempt,
+                            last_repair_error.as_deref(),
+                            &last_error,
+                        )
+                    {
+                        last_repair_error = Some(last_error.clone());
+                        continue;
+                    }
+                    break;
                 }
             };
             if !box_issues.is_empty() {
@@ -2739,19 +2891,27 @@ async fn extract_span<C: LlmClient>(
                     break;
                 }
                 last_error = box_issues.join("; ");
-                report.repairs += 1;
-                if attempt < max_attempts {
+                report.note_repair("diagram_box_issues");
+                // Convergence guard: identical rejection on the previous
+                // attempt means the model is stuck on this box — re-sending
+                // the same images won't fix it. Skip the redundant call and
+                // go straight to the budget-spent prune-and-accept path.
+                let mut items = page_items.items;
+                if attempt < max_attempts
+                    && !repair_is_non_convergent(attempt, last_repair_error.as_deref(), &last_error)
+                {
+                    last_repair_error = Some(last_error.clone());
                     continue;
                 }
-                // Repair budget spent: keep the transcription, drop the bad
-                // boxes — deterministically, and on the record.
+                // Repair budget spent (or non-convergent): keep the
+                // transcription, drop the bad boxes — deterministically, and
+                // on the record.
                 report.anomalies.push(format!(
                     "Question {}: dropped {} invalid diagram box(es) after repair budget spent — {}",
                     span.number,
                     bad.len(),
                     box_issues.join("; ")
                 ));
-                let mut items = page_items.items;
                 prune_bad_diagram_boxes(&mut items, &bad, &mut report);
                 accepted = Some((items, salvaged));
                 break;
@@ -3098,6 +3258,7 @@ async fn extract_same_page_batch<C: LlmClient>(
             &config.model,
             &system,
             &images,
+            llm::ImageDetail::High,
             Some(&user_text),
             config.max_output_tokens,
             Some(llm::ResponseFormat::JsonSchema {
@@ -3136,14 +3297,14 @@ async fn extract_same_page_batch<C: LlmClient>(
             }
             ParseOutcome::Malformed { error } => {
                 last_error = format!("invalid JSON: {}", error);
-                report.repairs += 1;
+                report.note_repair("batch_malformed_json");
                 continue;
             }
         };
 
         if page_out.items.is_empty() {
             last_error = format!("returned empty items array for Questions {}", q_str);
-            report.repairs += 1;
+            report.note_repair("batch_empty_items");
             continue;
         }
 
@@ -3168,14 +3329,14 @@ async fn extract_same_page_batch<C: LlmClient>(
             Ok(res) => res,
             Err(e) => {
                 last_error = format!("diagram audit failed: {}", e);
-                report.repairs += 1;
+                report.note_repair("batch_diagram_audit_failed");
                 continue;
             }
         };
 
         if !box_issues.is_empty() && attempt < max_attempts {
             last_error = box_issues.join("; ");
-            report.repairs += 1;
+            report.note_repair("batch_diagram_box_issues");
             continue;
         }
 
@@ -3813,6 +3974,7 @@ RULES:
             &config.model,
             &system,
             &page_images,
+            llm::ImageDetail::High,
             Some(&user_text),
             config.max_output_tokens,
             Some(llm::ResponseFormat::JsonSchema { schema: extraction_json_schema() }),
@@ -3850,7 +4012,7 @@ RULES:
             }
             ParseOutcome::Malformed { error } => {
                 last_error = format!("invalid JSON: {}", error);
-                report.repairs += 1;
+                report.note_repair("fallback_malformed_json");
                 continue;
             }
         };
@@ -3904,7 +4066,7 @@ RULES:
             }
         }
         if !number_valid {
-            report.repairs += 1;
+            report.note_repair("fallback_bad_question_number");
             continue;
         }
 
@@ -3920,7 +4082,7 @@ RULES:
             }
         }
         if !all_fig_errors.is_empty() {
-            report.repairs += 1;
+            report.note_repair("fallback_figure_consistency");
             if attempt < max_attempts {
                 last_error = all_fig_errors.join("; ");
                 continue;
@@ -3959,12 +4121,12 @@ RULES:
             Ok(result) => result,
             Err(error) => {
                 last_error = format!("diagram audit task failed: {}", error);
-                report.repairs += 1;
+                report.note_repair("fallback_diagram_audit_failed");
                 continue;
             }
         };
         if !box_issues.is_empty() {
-            report.repairs += 1;
+            report.note_repair("fallback_diagram_box_issues");
             if attempt < max_attempts {
                 last_error = box_issues.join("; ");
                 continue;
@@ -4113,6 +4275,7 @@ async fn read_markscheme_window<C: LlmClient>(
     let images: Vec<String> = pages[start..end]
         .iter()
         .filter_map(|p| p.get_b64().cloned())
+        .map(|b64| geometry::resize_b64_to_max_dim(&b64, geometry::api_image_max_dim()).unwrap_or(b64))
         .collect();
     let mut chunk_text = String::new();
     for i in start..end {
@@ -4164,6 +4327,7 @@ async fn read_markscheme_window<C: LlmClient>(
             &config.model,
             system,
             &images,
+            llm::ImageDetail::High,
             Some(&text),
             config.max_output_tokens,
             Some(llm::ResponseFormat::JsonSchema { schema: extraction_json_schema() }),
@@ -4201,7 +4365,7 @@ async fn read_markscheme_window<C: LlmClient>(
             }
             ParseOutcome::Malformed { error } => {
                 last_error = format!("invalid JSON: {}", error);
-                report.repairs += 1;
+                report.note_repair("markscheme_malformed_json");
             }
         }
     }
@@ -4681,6 +4845,146 @@ mod tests {
         assert!(report.quarantined[0].scope.contains("mark-scheme"));
     }
 
+    // ── Vision detail policy & resolution cap ─────────────────────────────
+    // Band-cropped single-question images go out as detail:"low" (OpenAI tile
+    // savings); any call containing a full page stays detail:"high". Full-page
+    // sends from the structure pass and mark-scheme windows are downscaled to
+    // ≤768px so pixel-billed providers (Gemini/Claude) pay for fewer pixels.
+
+    fn large_image_page() -> PageInput {
+        let mut g = gray_blank(1200, 1600);
+        g_hline(&mut g, 400);
+        g_vline(&mut g, 600, 0, 1599);
+        g_blob(&mut g, 800, 100, 500);
+        PageInput {
+            kind: PageInputKind::Image { b64: png_b64(&g) },
+            text: String::new(),
+        }
+    }
+
+    fn body_image_details(body: &serde_json::Value) -> Vec<String> {
+        body["messages"][1]["content"]
+            .as_array()
+            .map(|items| {
+                items
+                    .iter()
+                    .filter(|c| c["type"] == "image_url")
+                    .filter_map(|c| c["image_url"]["detail"].as_str().map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    #[tokio::test]
+    async fn band_crop_requested_at_low_detail() {
+        let pgs = vec![large_image_page()];
+        let span_pages: Vec<(usize, &PageInput)> = vec![(0, &pgs[0])];
+        let span = doc_map::QuestionSpan {
+            number: 30,
+            start_page: 0,
+            end_page: 0,
+            start_y_frac: Some(0.2),
+            end_y_frac: Some(0.7),
+            expected_marks: Some(6),
+            reliable_pages: vec![],
+            ambiguous_pages: vec![],
+        };
+        let mock = MockLlm::new(vec![ok_chat(
+            r#"{"items":[{"question_number":30,"content":"State the value. **[6 marks]**","marks":6}]}"#,
+        )]);
+        let cache = Arc::new(crate::pdf_render::PageRenderCache::new(
+            PAGE_RENDER_CACHE_CAPACITY,
+        ));
+        let semaphore = Arc::new(Semaphore::new(1));
+        let collateral = Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
+        let all_spans = Arc::new(vec![span.clone()]);
+        let (built_opt, _report) =
+            extract_span(&mock, &config(), &span, &span_pages, &cache, &Arc::new(PageImageCache::new()), &semaphore, &collateral, &all_spans, &cancel_flag()).await;
+        assert!(built_opt.is_some());
+        assert_eq!(
+            body_image_details(&mock.bodies()[0]),
+            vec!["low".to_string()],
+            "band crops must be sent at low detail"
+        );
+    }
+
+    #[tokio::test]
+    async fn full_page_requested_at_high_detail() {
+        let pgs = vec![large_image_page()];
+        let span_pages: Vec<(usize, &PageInput)> = vec![(0, &pgs[0])];
+        let span = doc_map::QuestionSpan {
+            number: 30,
+            start_page: 0,
+            end_page: 0,
+            start_y_frac: None,
+            end_y_frac: None,
+            expected_marks: Some(6),
+            reliable_pages: vec![],
+            ambiguous_pages: vec![],
+        };
+        let mock = MockLlm::new(vec![ok_chat(
+            r#"{"items":[{"question_number":30,"content":"State the value. **[6 marks]**","marks":6}]}"#,
+        )]);
+        let cache = Arc::new(crate::pdf_render::PageRenderCache::new(
+            PAGE_RENDER_CACHE_CAPACITY,
+        ));
+        let semaphore = Arc::new(Semaphore::new(1));
+        let collateral = Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
+        let all_spans = Arc::new(vec![span.clone()]);
+        let (built_opt, _report) =
+            extract_span(&mock, &config(), &span, &span_pages, &cache, &Arc::new(PageImageCache::new()), &semaphore, &collateral, &all_spans, &cancel_flag()).await;
+        assert!(built_opt.is_some());
+        assert_eq!(
+            body_image_details(&mock.bodies()[0]),
+            vec!["high".to_string()],
+            "full pages must stay at high detail"
+        );
+    }
+
+    #[tokio::test]
+    async fn markscheme_window_sends_downscaled_images() {
+        // 4 large image pages → window=3 step=2 gives windows [0,3) and [2,4).
+        let pgs = vec![large_image_page(); 4];
+        let mock = MockLlm::new(vec![
+            ok_chat(
+                r#"{"answers":[{"question_number":1,"answer_markdown":"Answer one."},{"question_number":2,"answer_markdown":"Answer two."}]}"#,
+            ),
+            ok_chat(
+                r#"{"answers":[{"question_number":2,"answer_markdown":"Answer two."},{"question_number":3,"answer_markdown":"Answer three."}]}"#,
+            ),
+        ]);
+        let mut c = config();
+        c.max_output_tokens = 4096;
+        let (drafts, _report) =
+            run_markscheme_pipeline(&mock, &pgs, &c, &NullProgress, &cancel_flag())
+                .await
+                .unwrap();
+        assert_eq!(drafts.len(), 3);
+        // Window 0 sends pages 0-2 (3 images). Each must be ≤768px on the long edge.
+        let window_body = &mock.bodies()[0];
+        let images: Vec<&str> = window_body["messages"][1]["content"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|c| c["type"] == "image_url")
+            .filter_map(|c| c["image_url"]["url"].as_str())
+            .collect();
+        assert_eq!(images.len(), 3);
+        for url in images {
+            let decoded = geometry::decode_page_image(url)
+                .unwrap_or_else(|| panic!("image must decode: {}", &url[..url.len().min(40)]));
+            let (w, h) = decoded.dimensions();
+            assert!(
+                w.max(h) <= geometry::API_IMAGE_MAX_DIM,
+                "mark-scheme page was {}x{} — must be capped at ≤768px",
+                w,
+                h
+            );
+        }
+        // Full pages stay high detail.
+        assert!(body_image_details(window_body).iter().all(|d| d == "high"));
+    }
+
     // ── Diagram audit: trace-table regression (AQA CS June 2024 Q30) ─────
     // Ten near-identical PNGs of an EMPTY student trace table were saved as
     // "diagrams" because the blank guard can't see ruled grids. These tests
@@ -4968,6 +5272,58 @@ mod tests {
             report.anomalies
         );
         assert!(report.crop_rejections >= 1, "every drop counted");
+    }
+
+    #[tokio::test]
+    async fn identical_repair_failure_stops_resending() {
+        // Q2's real failure mode: the model keeps proposing the exact same
+        // degenerate box. The convergence guard must NOT spend a third API
+        // call re-sending the same images for the same rejection — it should
+        // resolve via the budget-spent prune-and-accept path after one repeat.
+        let pgs = vec![grid_page()];
+        let span_pages: Vec<(usize, &PageInput)> = vec![(0, &pgs[0])];
+        let span = doc_map::QuestionSpan {
+            number: 30,
+            start_page: 0,
+            end_page: 0,
+            start_y_frac: None,
+            end_y_frac: None,
+            expected_marks: Some(6),
+            reliable_pages: vec![],
+            ambiguous_pages: vec![],
+        };
+        // A box that is out of the page — deterministically rejected by the
+        // audit as "unusable (degenerate or outside the page)".
+        let bad_box = r#"{"items":[{"question_number":30,"content":"Complete the flow chart below. [DIAGRAM_PLACEHOLDER] **[6 marks]**","marks":6,"topics":["Proof"],"module":"A","diagram_bboxes":[[9.0,9.0,0.1,0.1]],"bbox_page_indexes":[0]}]}"#;
+        let mock = MockLlm::new(vec![ok_chat(bad_box), ok_chat(bad_box)]);
+        let cache = Arc::new(crate::pdf_render::PageRenderCache::new(
+            PAGE_RENDER_CACHE_CAPACITY,
+        ));
+        let semaphore = Arc::new(Semaphore::new(1));
+        let collateral = Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
+        let all_spans = Arc::new(vec![span.clone()]);
+        let (built_opt, report) =
+            extract_span(&mock, &config(), &span, &span_pages, &cache, &Arc::new(PageImageCache::new()), &semaphore, &collateral, &all_spans, &cancel_flag()).await;
+        let built = built_opt.expect("transcription must survive the repeated failure");
+
+        // Guard triggers on the second identical rejection: only 2 of the
+        // configured responses are consumed, the third re-send never happens.
+        assert_eq!(mock.remaining(), 0, "no third re-send for a stuck repair");
+        assert!(!built.content.contains("[DIAGRAM_PLACEHOLDER]"));
+        assert!(built.content.contains("Complete the flow chart below."));
+        assert_eq!(
+            report.repair_reasons.get("diagram_box_issues"),
+            Some(&2),
+            "two repair rounds recorded (initial failure + one repeat)"
+        );
+        assert!(
+            report
+                .anomalies
+                .iter()
+                .any(|a| a.contains("dropped 1 invalid diagram box")),
+            "the drop must be on the record: {:?}",
+            report.anomalies
+        );
     }
 
     #[test]

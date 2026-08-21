@@ -51,6 +51,25 @@ pub enum ResponseFormat {
     JsonSchema { schema: serde_json::Value },
 }
 
+/// Vision image `detail` hint for OpenAI-style providers. `Low` sends a
+/// single 512-px tile; `High` requests 768-px tiling for fine print. Gemini
+/// and Anthropic ignore this field entirely — for those providers the real
+/// cost lever is the image's pixel dimensions, so callers also cap size.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ImageDetail {
+    Low,
+    High,
+}
+
+impl ImageDetail {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ImageDetail::Low => "low",
+            ImageDetail::High => "high",
+        }
+    }
+}
+
 /// One chat completion call. The caller awaits the boxed future — this keeps
 /// the trait object-safe without pulling in an extra crate.
 pub trait LlmClient: Send + Sync {
@@ -64,11 +83,15 @@ pub trait LlmClient: Send + Sync {
 
 /// Build a standard OpenAI-compatible chat request body (json_object mode).
 /// `images` are base64 page renders. Existing data URLs retain their MIME
-/// type; legacy raw-base64 inputs are treated as JPEG.
+/// type; legacy raw-base64 inputs are treated as WebP. `detail` applies to
+/// every image in the call; callers should pass `ImageDetail::Low` only for
+/// tightly-cropped single-question bands (OpenAI tiling savings) and
+/// `ImageDetail::High` for any call that contains a full page.
 pub fn chat_body<S: AsRef<str>>(
     model: &str,
     system: &str,
     images: &[S],
+    detail: ImageDetail,
     text: Option<&str>,
     max_tokens: u32,
     response_format: Option<ResponseFormat>,
@@ -101,14 +124,14 @@ pub fn chat_body<S: AsRef<str>>(
         // Phase 0: OpenAI-style vision APIs honour a "detail" hint. "high"
         // forces 768-px tiles and lets the model see fine detail (small
         // subscripts, axis labels, circuit symbols). Providers that don't
-        // understand this field (Gemini, Anthropic) ignore it safely. At
-        // our new ~200 DPI render the 2048-px long edge maps cleanly onto
-        // two high-detail tiles.
+        // understand this field (Gemini, Anthropic) ignore it safely. API
+        // images are capped at 768 px on the long edge by the render path,
+        // so "high" maps to at most a few tiles and "low" to a single tile.
         content.push(serde_json::json!({
             "type": "image_url",
             "image_url": {
                 "url": image_url,
-                "detail": "high"
+                "detail": detail.as_str()
             }
         }));
     }
@@ -434,38 +457,58 @@ mod tests {
     #[test]
     fn chat_body_preserves_png_data_url() {
         let images = ["data:image/png;base64,AAAA"];
-        let body = chat_body("model", "system", &images, None, 100, None);
+        let body = chat_body("model", "system", &images, ImageDetail::High, None, 100, None);
         assert_eq!(image_url(&body), images[0]);
     }
 
     #[test]
     fn chat_body_preserves_jpeg_data_url() {
         let images = ["data:image/jpeg;base64,BBBB"];
-        let body = chat_body("model", "system", &images, None, 100, None);
+        let body = chat_body("model", "system", &images, ImageDetail::High, None, 100, None);
         assert_eq!(image_url(&body), images[0]);
     }
 
     #[test]
     fn chat_body_preserves_webp_data_url() {
         let images = ["data:image/webp;base64,WWWW"];
-        let body = chat_body("model", "system", &images, None, 100, None);
+        let body = chat_body("model", "system", &images, ImageDetail::High, None, 100, None);
         assert_eq!(image_url(&body), images[0]);
     }
 
     #[test]
     fn chat_body_defaults_raw_base64_to_webp() {
         let images = ["CCCC"];
-        let body = chat_body("model", "system", &images, None, 100, None);
+        let body = chat_body("model", "system", &images, ImageDetail::High, None, 100, None);
         assert_eq!(image_url(&body), "data:image/webp;base64,CCCC");
+    }
+
+    #[test]
+    fn chat_body_emits_low_detail() {
+        let images = ["CCCC"];
+        let body = chat_body("model", "system", &images, ImageDetail::Low, None, 100, None);
+        assert_eq!(
+            body["messages"][1]["content"][0]["image_url"]["detail"],
+            "low"
+        );
+    }
+
+    #[test]
+    fn chat_body_emits_high_detail() {
+        let images = ["CCCC"];
+        let body = chat_body("model", "system", &images, ImageDetail::High, None, 100, None);
+        assert_eq!(
+            body["messages"][1]["content"][0]["image_url"]["detail"],
+            "high"
+        );
     }
 
     #[test]
     fn chat_body_sets_low_reasoning_for_3_7_flash() {
         let images = ["CCCC"];
-        let body = chat_body("google/gemini-3.7-flash", "system", &images, None, 100, None);
+        let body = chat_body("google/gemini-3.7-flash", "system", &images, ImageDetail::High, None, 100, None);
         assert_eq!(body["reasoning"]["effort"], "low");
 
-        let body2 = chat_body("google/gemini-2.5-flash", "system", &images, None, 100, None);
+        let body2 = chat_body("google/gemini-2.5-flash", "system", &images, ImageDetail::High, None, 100, None);
         assert_eq!(body2["reasoning"]["effort"], "none");
     }
 }
