@@ -278,6 +278,21 @@ pub async fn init_db(app_data_dir: PathBuf) -> Result<SqlitePool, sqlx::Error> {
     .execute(&pool)
     .await?;
 
+    // Phase 2: per-stage token breakdown (JSON array of
+    // {stage, promptTokens, completionTokens}). Idempotent — the ALTER
+    // fails with "duplicate column" on databases that already have it.
+    if let Err(e) = sqlx::query(
+        "ALTER TABLE import_cost_logs ADD COLUMN stage_breakdown TEXT",
+    )
+    .execute(&pool)
+    .await
+    {
+        let msg = e.to_string();
+        if !msg.contains("duplicate column") {
+            return Err(e);
+        }
+    }
+
     // Seed taxonomy if completely empty
     let count: (i64,) = sqlx::query_as("SELECT count(*) FROM subjects").fetch_one(&pool).await?;
     if count.0 == 0 {
@@ -586,6 +601,10 @@ pub struct ImportCostRecord {
     pub cost_usd: f64,
     pub duration_ms: i64,
     pub created_at: i64,
+    /// JSON array of per-stage {stage, promptTokens, completionTokens};
+    /// `None` for rows logged before Phase 2.
+    #[sqlx(default)]
+    pub stage_breakdown: Option<String>,
 }
 
 pub async fn record_import_cost(
@@ -598,6 +617,7 @@ pub async fn record_import_cost(
     completion_tokens: i64,
     cost_usd: f64,
     duration_ms: i64,
+    stage_breakdown: Option<&str>,
 ) -> Result<ImportCostRecord, sqlx::Error> {
     let id = uuid::Uuid::new_v4().to_string();
     let total_tokens = prompt_tokens + completion_tokens;
@@ -611,9 +631,9 @@ pub async fn record_import_cost(
         INSERT INTO import_cost_logs (
             id, paper_name, model_name, paper_type,
             questions_count, prompt_tokens, completion_tokens, total_tokens,
-            cost_usd, duration_ms, created_at
+            cost_usd, duration_ms, created_at, stage_breakdown
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         "#,
     )
     .bind(&id)
@@ -627,6 +647,7 @@ pub async fn record_import_cost(
     .bind(cost_usd)
     .bind(duration_ms)
     .bind(now)
+    .bind(stage_breakdown)
     .execute(pool)
     .await?;
 
@@ -642,6 +663,7 @@ pub async fn record_import_cost(
         cost_usd,
         duration_ms,
         created_at: now,
+        stage_breakdown: stage_breakdown.map(str::to_string),
     })
 }
 
@@ -705,7 +727,7 @@ pub async fn get_import_cost_history(
         SELECT
             id, paper_name, model_name, paper_type,
             questions_count, prompt_tokens, completion_tokens, total_tokens,
-            cost_usd, duration_ms, created_at
+            cost_usd, duration_ms, created_at, stage_breakdown
         FROM import_cost_logs
         ORDER BY created_at DESC
         LIMIT 100

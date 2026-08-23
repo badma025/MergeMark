@@ -185,7 +185,7 @@ static PAPER_TOTAL_REGEX: LazyLock<regex::Regex> = LazyLock::new(|| {
 ///     punctuation that looks like a label).
 ///   * part labels (a)/(b)/(i) — those never begin with 1+ digits at line
 ///     start followed by a period/closing paren without a letter.
-static QUESTION_HEADING_REGEX: LazyLock<regex::Regex> = LazyLock::new(|| {
+pub(crate) static QUESTION_HEADING_REGEX: LazyLock<regex::Regex> = LazyLock::new(|| {
     // Tolerates AQA's spaced margin padding (e.g. "0 7" for question 7, "1 0" for 10).
     // The digits may be separated by spaces — but ONLY same-line whitespace is
     // allowed anywhere inside the match. Letting `\s` match \r\n used to glue
@@ -2183,6 +2183,7 @@ mod tests {
 
     #[test]
     fn edexcel_2023_pdf_uses_ordered_text_headings() {
+        let _guard = crate::pdf_render::pdfium_test_lock();
         let Some((pages, map)) = golden_map("../'23 edexcel.pdf") else {
             return;
         };
@@ -2207,6 +2208,7 @@ mod tests {
 
     #[test]
     fn edexcel_fixture_text_and_image_extraction_integrity() {
+        let _guard = crate::pdf_render::pdfium_test_lock();
         let years = ["17", "18", "19", "20", "21", "22", "24"];
         let mut tested = 0usize;
 
@@ -2372,6 +2374,7 @@ mod tests {
     /// PDF is not present (CI).
     #[test]
     fn aqa_physics_papers_place_all_questions() {
+        let _guard = crate::pdf_render::pdfium_test_lock();
         // (year, expected question count). '19 Section B is "Questions 07 to
         // 31" — 31 questions; '17/'18/'23/'24 have 32; '20/'21/'22 have 31.
         let cases: &[(&str, usize)] = &[

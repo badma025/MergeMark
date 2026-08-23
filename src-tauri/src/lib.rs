@@ -17,6 +17,7 @@ mod json_salvage;
 mod llm;
 mod pdf_render;
 mod pipeline;
+pub(crate) mod stroke_census;
 mod taxonomy;
 mod validate;
 pub mod marker_client;

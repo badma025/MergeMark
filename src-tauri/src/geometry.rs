@@ -929,52 +929,6 @@ pub fn text_density_in_box(b: &[f32; 4], text_rects: &[[f32; 4]]) -> f32 {
     (covered / box_area).min(1.0)
 }
 
-fn boxes_overlap_expanded(a: [f32; 4], b: [f32; 4], gap: f32) -> bool {
-    let (ax0, ax1) = (a[0] - gap, a[0] + a[2] + gap);
-    let (bx0, bx1) = (b[0] - gap, b[0] + b[2] + gap);
-    let (ay0, ay1) = (a[1] - gap, a[1] + a[3] + gap);
-    let (by0, by1) = (b[1] - gap, b[1] + b[3] + gap);
-    ax0 < bx1 && bx0 < ax1 && ay0 < by1 && by0 < ay1
-}
-
-fn union_box(a: [f32; 4], b: [f32; 4]) -> [f32; 4] {
-    let x = a[0].min(b[0]);
-    let y = a[1].min(b[1]);
-    let x1 = (a[0] + a[2]).max(b[0] + b[2]);
-    let y1 = (a[1] + a[3]).max(b[1] + b[3]);
-    [x, y, x1 - x, y1 - y]
-}
-
-/// Greedily union boxes whose 1-D projections overlap after expanding each by
-/// `gap_frac` of the page. A circuit or graph is drawn as many small paths;
-/// this merges them into one figure region. Larger boxes seed clusters first
-/// so a dominant figure is not absorbed into a neighbouring speck's box.
-pub fn cluster_boxes(mut boxes: Vec<[f32; 4]>, gap_frac: f32) -> Vec<[f32; 4]> {
-    if boxes.is_empty() {
-        return boxes;
-    }
-    boxes.sort_by(|a, b| {
-        (b[2] * b[3])
-            .partial_cmp(&(a[2] * a[3]))
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
-    let mut clusters: Vec<[f32; 4]> = Vec::with_capacity(boxes.len());
-    for b in boxes {
-        let mut merged = None;
-        for (i, c) in clusters.iter().enumerate() {
-            if boxes_overlap_expanded(b, *c, gap_frac) {
-                merged = Some(i);
-                break;
-            }
-        }
-        match merged {
-            Some(i) => clusters[i] = union_box(clusters[i], b),
-            None => clusters.push(b),
-        }
-    }
-    clusters
-}
-
 /// One-stop predicate for a candidate figure region: rejects specks, rule
 /// lines, header (top 5%) / footer (bottom 8%) bands, and text-dense regions.
 pub fn is_probable_figure_box(
@@ -1046,6 +1000,270 @@ fn expand_rect(
         w: x1.saturating_sub(x0),
         h: y1.saturating_sub(y0),
     }
+}
+
+// ── Point-space geometry for Smart Scissors (stroke census) ────────────────
+//
+// All stroke-census clustering happens in PDF point space (origin
+// bottom-left, y up). A `RectPt` is `[left, right, top, bottom]` with
+// `top > bottom`. Conversion to the app's normalized [x, y, w, h] happens
+// exactly once at emission via `normalize_pdf_box`.
+
+pub type RectPt = [f32; 4];
+
+/// Construct a point-space rect from its four edges (y-up: top > bottom).
+#[inline]
+pub fn rect_pt(left: f32, right: f32, top: f32, bottom: f32) -> RectPt {
+    [left, right, top, bottom]
+}
+
+#[inline]
+pub fn rect_w(r: &RectPt) -> f32 {
+    (r[1] - r[0]).max(0.0)
+}
+
+#[inline]
+pub fn rect_h(r: &RectPt) -> f32 {
+    (r[2] - r[3]).max(0.0)
+}
+
+#[inline]
+pub fn rect_area(r: &RectPt) -> f32 {
+    rect_w(r) * rect_h(r)
+}
+
+#[inline]
+pub fn rect_center(r: &RectPt) -> [f32; 2] {
+    [(r[0] + r[1]) / 2.0, (r[2] + r[3]) / 2.0]
+}
+
+pub fn rect_union(a: &RectPt, b: &RectPt) -> RectPt {
+    [
+        a[0].min(b[0]),
+        a[1].max(b[1]),
+        a[2].max(b[2]),
+        a[3].min(b[3]),
+    ]
+}
+
+/// Axis-aligned separation distance between two rects. Zero when they
+/// overlap or touch. This is the join metric used by region growing.
+pub fn rect_gap(a: &RectPt, b: &RectPt) -> f32 {
+    let dx = (a[0] - b[1]).max(b[0] - a[1]).max(0.0);
+    let dy = (a[3] - b[2]).max(b[3] - a[2]).max(0.0);
+    (dx * dx + dy * dy).sqrt()
+}
+
+/// Overlap length of two 1-D intervals [a0, a1] and [b0, b1].
+#[inline]
+fn interval_overlap(a0: f32, a1: f32, b0: f32, b1: f32) -> f32 {
+    (a1.min(b1) - a0.max(b0)).max(0.0)
+}
+
+/// Fraction of `inner`'s x-span overlapped by `outer`'s x-span (0..1).
+/// Used by line/block assembly: two lines coalesce only if they genuinely
+/// sit side-by-side, not merely near each other.
+pub fn x_span_coverage(inner: &RectPt, outer: &RectPt) -> f32 {
+    let w = rect_w(inner);
+    if w <= 0.0 {
+        return 0.0;
+    }
+    interval_overlap(inner[0], inner[1], outer[0], outer[1]) / w
+}
+
+/// Detect uniform-spacing families among 1-D stroke centers.
+///
+/// Two-level: coordinates are first collapsed into "line positions"
+/// (centers within `tol_pt` belong to the same printed line), then every
+/// window of `min_members` consecutive lines whose gaps have coefficient of
+/// variation ≤ `cv_max` is reported as a family. This mirrors reality:
+/// gridline members sit far apart (their pitch IS the signal), while
+/// near-duplicate centers are fragments of one line. Windows may overlap on
+/// long uniform grids; consumers retype idempotently. Returns index groups.
+pub fn uniform_spacing_families(
+    mut coords: Vec<(f32, usize)>,
+    tol_pt: f32,
+    min_members: usize,
+    cv_max: f32,
+) -> Vec<Vec<usize>> {
+    if coords.len() < min_members {
+        return Vec::new();
+    }
+    coords.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+
+    // Collapse near-identical centers into line positions (running mean).
+    let mut lines: Vec<(f32, Vec<usize>)> = Vec::new();
+    for (coord, idx) in coords {
+        match lines.last_mut() {
+            Some((rep, members)) if coord - *rep <= tol_pt => {
+                let n = members.len() as f32;
+                *rep = (*rep * n + coord) / (n + 1.0);
+                members.push(idx);
+            }
+            _ => lines.push((coord, vec![idx])),
+        }
+    }
+    if lines.len() < min_members {
+        return Vec::new();
+    }
+
+    let mut families = Vec::new();
+    for start in 0..=lines.len() - min_members {
+        let window = &lines[start..start + min_members];
+        let gaps: Vec<f32> = window.windows(2).map(|w| w[1].0 - w[0].0).collect();
+        let n = gaps.len() as f32;
+        let mean = gaps.iter().sum::<f32>() / n;
+        if mean <= 1e-6 {
+            continue;
+        }
+        let var = gaps.iter().map(|g| (g - mean) * (g - mean)).sum::<f32>() / n;
+        if var.sqrt() / mean <= cv_max {
+            families.push(window.iter().flat_map(|(_, m)| m.iter().copied()).collect());
+        }
+    }
+    families
+}
+
+/// True when the straight corridor between the centers of `a` and `b`
+/// passes through any barrier (sampled every `step_pt`, barriers expanded
+/// by `pad_pt`). This is the ONLY geometric predicate region growth uses —
+/// strokes separated by question text can never weld into one figure.
+pub fn corridor_blocked(a: &RectPt, b: &RectPt, barriers: &[RectPt], step_pt: f32, pad_pt: f32) -> bool {
+    if barriers.is_empty() {
+        return false;
+    }
+    let ca = rect_center(a);
+    let cb = rect_center(b);
+    let dx = cb[0] - ca[0];
+    let dy = cb[1] - ca[1];
+    let dist = (dx * dx + dy * dy).sqrt();
+    let steps = ((dist / step_pt.max(1.0)).ceil() as usize).max(1);
+    for k in 0..=steps {
+        let t = k as f32 / steps as f32;
+        let px = ca[0] + dx * t;
+        let py = ca[1] + dy * t;
+        for bar in barriers {
+            if px >= bar[0] - pad_pt
+                && px <= bar[1] + pad_pt
+                && py >= bar[3] - pad_pt
+                && py <= bar[2] + pad_pt
+            {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Expand a point-space rect outward by `pad` on every edge.
+pub fn pad_rect(r: &RectPt, pad: f32) -> RectPt {
+    [r[0] - pad, r[1] + pad, r[2] + pad, r[3] - pad]
+}
+
+/// Minimum fraction of an edge's span a barrier must cover to block that
+/// edge's movement. Corner grazes by unrelated bands never freeze lateral
+/// growth; genuine text walls spanning most of the edge do.
+const EDGE_COVER_MIN: f32 = 0.15;
+
+/// Expand `cur` toward `goal` edge-by-edge. Each moving edge stops at the
+/// first barrier face it would cross; a barrier counts only when it lies in
+/// FRONT of the movement AND spans ≥ `EDGE_COVER_MIN` of the edge. Monotone
+/// and deterministic — label capture can pull a crop toward its labels but
+/// never swallow neighbouring body text.
+pub fn expand_clamped(cur: &RectPt, goal: &RectPt, barriers: &[RectPt], pad_pt: f32) -> RectPt {
+    let covers = |edge_lo: f32, edge_hi: f32, bar_lo: f32, bar_hi: f32| -> bool {
+        let span = (edge_hi - edge_lo).max(1e-3);
+        interval_overlap(edge_lo, edge_hi, bar_lo, bar_hi) / span >= EDGE_COVER_MIN
+    };
+    let mut r = *cur;
+
+    // LEFT: stopping faces are barrier right-faces strictly ahead (< r[0]).
+    if goal[0] < r[0] {
+        let mut limit = goal[0];
+        for bar in barriers {
+            if !covers(r[3], r[2], bar[3], bar[2]) {
+                continue;
+            }
+            let stop = bar[1] + pad_pt;
+            if stop >= r[0] {
+                // Zone reaches across the edge plane — movement is frozen…
+                if bar[0] - pad_pt < r[0] {
+                    limit = r[0];
+                    break;
+                }
+                // …but only when the barrier is ahead of, not behind, the edge.
+                continue;
+            }
+            if stop > limit {
+                limit = stop;
+            }
+        }
+        r[0] = limit.min(r[0]);
+    }
+    // RIGHT
+    if goal[1] > r[1] {
+        let mut limit = goal[1];
+        for bar in barriers {
+            if !covers(r[3], r[2], bar[3], bar[2]) {
+                continue;
+            }
+            let stop = bar[0] - pad_pt;
+            if stop <= r[1] {
+                if bar[1] + pad_pt > r[1] {
+                    limit = r[1];
+                    break;
+                }
+                continue;
+            }
+            if stop < limit {
+                limit = stop;
+            }
+        }
+        r[1] = limit.max(r[1]);
+    }
+    // TOP: moving up, barrier bottom-faces are the stopping faces.
+    if goal[2] > r[2] {
+        let mut limit = goal[2];
+        for bar in barriers {
+            if !covers(r[0], r[1], bar[0], bar[1]) {
+                continue;
+            }
+            let stop = bar[3] - pad_pt;
+            if stop <= r[2] {
+                if bar[2] + pad_pt > r[2] {
+                    limit = r[2];
+                    break;
+                }
+                continue;
+            }
+            if stop < limit {
+                limit = stop;
+            }
+        }
+        r[2] = limit.max(r[2]);
+    }
+    // BOTTOM
+    if goal[3] < r[3] {
+        let mut limit = goal[3];
+        for bar in barriers {
+            if !covers(r[0], r[1], bar[0], bar[1]) {
+                continue;
+            }
+            let stop = bar[2] + pad_pt;
+            if stop >= r[3] {
+                if bar[3] - pad_pt < r[3] {
+                    limit = r[3];
+                    break;
+                }
+                continue;
+            }
+            if stop > limit {
+                limit = stop;
+            }
+        }
+        r[3] = limit.min(r[3]);
+    }
+    r
 }
 
 /// Crop a diagram with optional graph-canvas margins. Graphs need asymmetric
@@ -1910,29 +2128,6 @@ mod tests {
     }
 
     #[test]
-    fn cluster_merges_overlapping_paths_into_one_figure() {
-        // Two overlapping path boxes (a graph drawn from several strokes).
-        let boxes = vec![
-            [0.30, 0.30, 0.20, 0.20],
-            [0.40, 0.40, 0.15, 0.15],
-            [0.60, 0.60, 0.05, 0.05],
-        ];
-        let clustered = cluster_boxes(boxes, 0.02);
-        assert_eq!(clustered.len(), 2, "two near boxes merge, distant one stays separate");
-        let merged = clustered.iter().find(|b| b[2] >= 0.25).expect("merged box");
-        assert!(merged[0] <= 0.30 && merged[1] <= 0.30, "union covers both origins");
-        let far = clustered.iter().find(|b| b[2] < 0.25).unwrap();
-        assert!((far[0] - 0.60).abs() < 1e-4);
-    }
-
-    #[test]
-    fn cluster_merges_boxes_separated_by_small_gap() {
-        let boxes = vec![[0.10, 0.50, 0.10, 0.10], [0.215, 0.50, 0.10, 0.10]];
-        let clustered = cluster_boxes(boxes, 0.02);
-        assert_eq!(clustered.len(), 1, "a 1.5% gap merges when tolerance is 2%");
-    }
-
-    #[test]
     fn rule_line_and_speck_are_rejected() {
         let text: [[f32; 4]; 0] = [];
         let rule = [0.20, 0.70, 0.60, 0.008]; // wide, thin → ruled answer line
@@ -1972,5 +2167,70 @@ mod tests {
         assert_eq!(caption_kind_from_text("Graph of y against x"), Some("graph".into()));
         assert_eq!(caption_kind_from_text("Flow chart of the process"), Some("flowchart".into()));
         assert_eq!(caption_kind_from_text("Figure 4"), None);
+    }
+
+    #[test]
+    fn rect_metrics_and_gap() {
+        let a = rect_pt(0.0, 10.0, 20.0, 0.0);
+        let b = rect_pt(14.0, 24.0, 8.0, 4.0);
+        assert!((rect_w(&a) - 10.0).abs() < 1e-5);
+        assert!((rect_h(&a) - 20.0).abs() < 1e-5);
+        // horizontal separation 4pt (a.right=10 → b.left=14), vertical overlap
+        let g = rect_gap(&a, &b);
+        assert!((g - 4.0).abs() < 1e-4, "gap {g}");
+        // overlapping rects are gap-zero
+        let c = rect_pt(5.0, 12.0, 15.0, 2.0);
+        assert!(rect_gap(&a, &c) < 1e-6);
+    }
+
+    #[test]
+    fn uniform_family_needs_regular_spacing() {
+        // Four gridlines at exact 10pt pitch: every 3-line window is a
+        // regular family (windows may overlap by design); their union must
+        // cover all members.
+        let regular: Vec<(f32, usize)> =
+            [50.0, 60.0, 70.0, 80.0].iter().enumerate().map(|(i, &c)| (c, i)).collect();
+        let fams = uniform_spacing_families(regular.clone(), 3.0, 3, 0.15);
+        assert!(!fams.is_empty(), "regular pitch must form a family");
+        let mut covered: Vec<usize> = fams.iter().flatten().copied().collect();
+        covered.sort_unstable();
+        covered.dedup();
+        assert_eq!(covered, vec![0, 1, 2, 3]);
+
+        // Irregular spacings fail the CV gate in every window.
+        let irregular: Vec<(f32, usize)> =
+            [50.0, 56.0, 74.0, 80.0].iter().enumerate().map(|(i, &c)| (c, i)).collect();
+        let fams = uniform_spacing_families(irregular, 3.0, 3, 0.15);
+        assert!(fams.is_empty(), "irregular gaps must not form a family");
+
+        // Two members can never be a family.
+        let pair: Vec<(f32, usize)> = vec![(50.0, 0), (60.0, 1)];
+        assert!(uniform_spacing_families(pair, 3.0, 3, 0.15).is_empty());
+    }
+
+    #[test]
+    fn corridor_blocked_crosses_text_barrier_only() {
+        let a = rect_pt(0.0, 10.0, 100.0, 90.0);   // figure left
+        let b = rect_pt(200.0, 210.0, 100.0, 90.0); // figure right
+        let text_between = vec![rect_pt(90.0, 130.0, 95.0, 85.0)];
+        assert!(corridor_blocked(&a, &b, &text_between, 6.0, 1.0));
+
+        // No barrier in between → clear.
+        assert!(!corridor_blocked(&a, &b, &[rect_pt(300.0, 310.0, 0.0, -10.0)], 6.0, 1.0));
+        // No barriers at all → trivially clear.
+        assert!(!corridor_blocked(&a, &b, &[], 6.0, 1.0));
+    }
+
+    #[test]
+    fn expand_clamped_stops_at_body_text() {
+        let barriers = vec![rect_pt(120.0, 180.0, 100.0, 90.0)];
+        let cur = rect_pt(40.0, 110.0, 100.0, 60.0);
+        // Goal wants to swallow the barrier entirely; the right edge must
+        // stop before it, while the free top edge still expands.
+        let goal = rect_pt(30.0, 200.0, 140.0, 50.0);
+        let out = expand_clamped(&cur, &goal, &barriers, 2.0);
+        assert!(out[1] <= barriers[0][0] + 1e-4, "right edge {} must stop at barrier left {}", out[1], barriers[0][0]);
+        assert!((out[2] - goal[2]).abs() < 1e-4, "top edge expands freely");
+        assert!((out[0] - goal[0]).abs() < 1e-4, "left edge expands freely");
     }
 }

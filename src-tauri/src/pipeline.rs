@@ -89,6 +89,11 @@ pub struct PipelineConfig {
     /// behaviour); enabled by the production import command when the paper's
     /// text map is sufficient.
     pub text_first: bool,
+    /// Same idea for mark-scheme windows: a window whose pages all carry a
+    /// reliable text layer is transcribed with ZERO image tokens, falling
+    /// back to full-page vision when diagram placeholders appear or the
+    /// attempt fails. Off by default (tests keep the old behaviour).
+    pub ms_text_first: bool,
 }
 
 impl PipelineConfig {
@@ -105,6 +110,7 @@ impl PipelineConfig {
             max_output_tokens: 32768,
             parallelism: DEFAULT_PARALLEL,
             text_first: false,
+            ms_text_first: false,
         }
     }
 }
@@ -169,6 +175,8 @@ pub struct ImportReport {
     pub diagrams_deduped: usize,
     /// Questions transcribed from the text layer alone (zero image tokens).
     pub text_first: usize,
+    /// Mark-scheme windows transcribed from the text layer alone.
+    pub ms_text_first: usize,
     /// Read-from-figure questions answered from deterministic figure crops
     /// (~4k image tokens each instead of ~10k+ per full page).
     pub crop_first: usize,
@@ -181,6 +189,17 @@ pub struct ImportReport {
     pub anomalies: Vec<String>,
     pub timings: Vec<TimingEntry>,
     pub total_elapsed_ms: u64,
+    /// Per-stage billed-token breakdown, persisted into `import_cost_logs`.
+    pub stage_breakdown: Vec<StageCost>,
+}
+
+/// Billed tokens attributed to one pipeline stage (see `StageTag`).
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StageCost {
+    pub stage: String,
+    pub prompt_tokens: u64,
+    pub completion_tokens: u64,
 }
 
 impl ImportReport {
@@ -217,13 +236,70 @@ const DEFAULT_PARALLEL: usize = 4;
 // pages are ~30MB each, so 32 caps worst-case at ~1GB for one import.
 const PAGE_RENDER_CACHE_CAPACITY: usize = 32;
 
+/// Minimum Smart-Scissors confidence for a detected figure to count as
+/// trustworthy "supply" in the text-first gate (plan Phase 2 §D).
+const FIGURE_SUPPLY_MIN_CONFIDENCE: f32 = 0.5;
+
+/// Every API call is tagged with the pipeline stage that issued it, so the
+/// cost ledger can answer "where does the money actually go" instead of
+/// guessing from run totals.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum StageTag {
+    /// Document-map vision fallback (insufficient text layer).
+    StructurePass,
+    /// Per-span transcription from the text layer alone (zero images).
+    TextFirstExtraction,
+    /// One combined text-only call for every safe span sharing a page.
+    BatchTextFirst,
+    /// Question answered from deterministic figure crops only (~4k tokens).
+    CropFirst,
+    /// Full-page vision extraction for one span.
+    VisionSpan,
+    /// Shared-page batch vision call (page hosts several failed spans).
+    FallbackPage,
+    /// Mark-scheme window transcribed from the text layer alone.
+    MsTextFirst,
+    /// Mark-scheme window read as full-page vision.
+    MsWindow,
+}
+
+impl StageTag {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            StageTag::StructurePass => "structure_pass",
+            StageTag::TextFirstExtraction => "text_first_extraction",
+            StageTag::BatchTextFirst => "batch_text_first",
+            StageTag::CropFirst => "crop_first",
+            StageTag::VisionSpan => "vision_span",
+            StageTag::FallbackPage => "fallback_page",
+            StageTag::MsTextFirst => "ms_text_first",
+            StageTag::MsWindow => "ms_window",
+        }
+    }
+
+    /// Output-token ceiling for this stage. Completions bill at the ~8×
+    /// input rate, and schema-mode responses never legitimately approach
+    /// the global 32k ceiling on small units; the truncation guard converts
+    /// any ceiling hit into a bounded repair round.
+    pub fn output_cap(self) -> u32 {
+        match self {
+            StageTag::TextFirstExtraction | StageTag::BatchTextFirst | StageTag::CropFirst => 2048,
+            StageTag::MsTextFirst => 3072,
+            StageTag::VisionSpan | StageTag::FallbackPage | StageTag::MsWindow => 8192,
+            StageTag::StructurePass => 2048,
+        }
+    }
+}
+
 /// Process-wide accumulator for real API token usage across one pipeline run.
-/// Every `chat_with_permit` call adds its response's `usage` block, so the
-/// import cost estimate uses actual billed tokens instead of guesses.
+/// Every `chat_with_permit` call adds its response's `usage` block under its
+/// stage tag, so the import cost estimate uses actual billed tokens AND can
+/// attribute them to the stage that spent them.
 #[derive(Debug, Default)]
 pub struct TokenTotals {
     pub prompt_tokens: std::sync::atomic::AtomicU64,
     pub completion_tokens: std::sync::atomic::AtomicU64,
+    stages: std::sync::Mutex<std::collections::BTreeMap<StageTag, (u64, u64)>>,
 }
 
 impl TokenTotals {
@@ -238,12 +314,27 @@ impl TokenTotals {
             .fetch_add(completion, std::sync::atomic::Ordering::Relaxed);
     }
 
+    pub fn add_stage(&self, stage: StageTag, prompt: u64, completion: u64) {
+        self.add(prompt, completion);
+        if let Ok(mut map) = self.stages.lock() {
+            let entry = map.entry(stage).or_insert((0, 0));
+            entry.0 += prompt;
+            entry.1 += completion;
+        }
+    }
+
     pub fn snapshot(&self) -> (u64, u64) {
         (
             self.prompt_tokens.load(std::sync::atomic::Ordering::Relaxed),
-            self.completion_tokens
-                .load(std::sync::atomic::Ordering::Relaxed),
+            self.completion_tokens.load(std::sync::atomic::Ordering::Relaxed),
         )
+    }
+
+    pub fn snapshot_stages(&self) -> Vec<(StageTag, u64, u64)> {
+        self.stages
+            .lock()
+            .map(|map| map.iter().map(|(s, (p, c))| (*s, *p, *c)).collect())
+            .unwrap_or_default()
     }
 }
 
@@ -253,6 +344,7 @@ async fn chat_with_permit<C: LlmClient>(
     semaphore: &Arc<Semaphore>,
     cancel: &AtomicBool,
     usage: &Arc<TokenTotals>,
+    stage: StageTag,
 ) -> Result<serde_json::Value, crate::llm::LlmError> {
     if cancel.load(Ordering::Relaxed) {
         return Err(crate::llm::LlmError::Network("Import cancelled by user".to_string()));
@@ -277,7 +369,7 @@ async fn chat_with_permit<C: LlmClient>(
             if let Ok(resp) = &res {
                 let u = crate::llm::usage_from_response(resp);
                 if u.prompt_tokens > 0 || u.completion_tokens > 0 {
-                    usage.add(u.prompt_tokens, u.completion_tokens);
+                    usage.add_stage(stage, u.prompt_tokens, u.completion_tokens);
                 }
                 if std::env::var_os("MERGEMARK_LOG_USAGE").is_some() {
                     eprintln!(
@@ -500,10 +592,23 @@ impl ImportReport {
         self.diagrams_saved += o.diagrams_saved;
         self.diagrams_deduped += o.diagrams_deduped;
         self.text_first += o.text_first;
+        self.ms_text_first += o.ms_text_first;
         self.crop_first += o.crop_first;
         self.figures_detected += o.figures_detected;
         self.prompt_tokens += o.prompt_tokens;
         self.completion_tokens += o.completion_tokens;
+        for cost in o.stage_breakdown {
+            if let Some(existing) = self
+                .stage_breakdown
+                .iter_mut()
+                .find(|s| s.stage == cost.stage)
+            {
+                existing.prompt_tokens += cost.prompt_tokens;
+                existing.completion_tokens += cost.completion_tokens;
+            } else {
+                self.stage_breakdown.push(cost);
+            }
+        }
         self.mark_checks.extend(o.mark_checks);
         self.quarantined.extend(o.quarantined);
         self.skipped_pages.extend(o.skipped_pages);
@@ -1562,10 +1667,96 @@ RULES:
         .to_string()
 }
 
+/// Slim prompt for TEXT-ONLY mark-scheme windows: the full transcription
+/// rules minus every image/diagram-boxing rule (no images are attached).
+/// A `[DIAGRAM_PLACEHOLDER]` in the response is the signal that this window
+/// genuinely contains worked figures and must fall back to vision.
+fn markscheme_text_first_system_prompt() -> String {
+    let mut rules = markscheme_system_prompt();
+    // The base prompt teaches image boxing and treats images as authoritative;
+    // both are wrong for a text-only window. Swap those passages out.
+    rules = rules.replace(
+        "Each array item: { \"question_number\": int (WHOLE question only; AQA 03.1 → 3), \"answer_markdown\": string, \"diagram_bboxes\": [[x,y,w,h]...] relative 0.0-1.0, \"diagram_page_indexes\": [ints, same length as bboxes, 0-based image index] }.",
+        "Each array item: { \"question_number\": int (WHOLE question only; AQA 03.1 → 3), \"answer_markdown\": string }.",
+    );
+    rules = rules.replace(
+        "- INLINE IMAGE PLACEMENT: If an image or diagram is present, insert its placeholder [DIAGRAM_PLACEHOLDER] IMMEDIATELY after the sentence or paragraph that references it. Never place diagrams at the end of the question if they were referenced earlier.",
+        "- FIGURES IN TEXT-ONLY MODE: NO IMAGES are attached. If a worked figure/graph/image is genuinely required to convey the answer, insert [DIAGRAM_PLACEHOLDER] at its position — do NOT attempt to describe it.",
+    );
+    rules = rules.replace(
+        "- Diagrams (activity networks, Gantt charts, trees, graphs): capture via diagram_bboxes + diagram_page_indexes and insert [DIAGRAM_PLACEHOLDER] where the diagram belongs. NEVER box text, math working, examiner notes, or empty grids (the CRITICAL DIAGRAM BAN).",
+        "- Diagrams cannot be boxed in this mode: use [DIAGRAM_PLACEHOLDER] where one belongs. Tables of DATA stay as Markdown tables (see TABLE FORMATTING) — they are text, not diagrams.",
+    );
+    rules = rules.replace(
+        "Raw text is provided as a baseline (images are authoritative):",
+        "",
+    );
+    format!("{}\nMODE: TEXT-ONLY. The raw text layer below is authoritative — transcribe from it directly.", rules)
+}
+
+/// Slim JSON schema for TEXT-ONLY MS calls: answers carry no diagram fields.
+#[allow(dead_code)]
+fn markscheme_text_first_json_schema() -> serde_json::Value {
+    serde_json::json!({
+        "type": "json_schema",
+        "json_schema": {
+            "name": "markscheme_text_first",
+            "schema": {
+                "type": "object",
+                "properties": {
+                    "answers": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "question_number": { "type": "integer" },
+                                "answer_markdown": { "type": "string" }
+                            },
+                            "required": ["question_number", "answer_markdown"]
+                        }
+                    }
+                },
+                "required": ["answers"]
+            }
+        }
+    })
+}
+
+/// Conservative reliability gate for TEXT-ONLY mark-scheme windows: every
+/// page must carry real extracted text, the combined text must be
+/// substantial, replacement-character garbage must be rare, and there must
+/// be no figure references (worked figures need vision boxing).
+fn window_text_reliable(pages: &[PageInput]) -> bool {
+    if pages.is_empty() {
+        return false;
+    }
+    let mut total = 0usize;
+    let mut bad = 0usize;
+    for p in pages {
+        let t = &p.text;
+        if t.trim().is_empty() {
+            return false;
+        }
+        total += t.len();
+        bad += t.matches('\u{FFFD}').count();
+    }
+    if total < 400 {
+        return false;
+    }
+    if (bad as f32) / (total as f32) >= 0.02 {
+        return false;
+    }
+    let combined = pages
+        .iter()
+        .map(|p| p.text.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    !text_references_figure(&combined)
+}
+
 // ══════════════════════════════════════════════════════════════════════════
 // Question pipeline
 // ══════════════════════════════════════════════════════════════════════════
-
 pub async fn run_question_pipeline<C: LlmClient, P: Progress>(
     client: &C,
     pages: &[PageInput],
@@ -1696,7 +1887,7 @@ pub async fn run_question_pipeline<C: LlmClient, P: Progress>(
                         750,
                         Some(llm::ResponseFormat::JsonSchema { schema: structure_json_schema() }),
                     );
-                    let result = match chat_with_permit(client, &body, &semaphore, cancel, &usage).await {
+                    let result = match chat_with_permit(client, &body, &semaphore, cancel, &usage, StageTag::StructurePass).await {
                         Ok(resp) => llm::message_content(&resp)
                             .map_err(|e| format!("bad response shape ({})", e)),
                         Err(e) => Err(format!("API failure ({})", e)),
@@ -2254,14 +2445,29 @@ pub async fn run_question_pipeline<C: LlmClient, P: Progress>(
     let (prompt_tok, completion_tok) = usage.snapshot();
     report.prompt_tokens = prompt_tok;
     report.completion_tokens = completion_tok;
+    report.stage_breakdown = usage
+        .snapshot_stages()
+        .into_iter()
+        .map(|(stage, p, c)| StageCost {
+            stage: stage.as_str().to_string(),
+            prompt_tokens: p,
+            completion_tokens: c,
+        })
+        .collect();
 
     eprintln!(
-        "[PATH_SUMMARY] {} questions: {} text-first (0 img), {} crop-first (~4k img), {} full-page vision (figures detected: {})",
+        "[PATH_SUMMARY] {} questions: {} text-first (0 img), {} crop-first (~4k img), {} full-page vision (figures detected: {}); stages: {}",
         report.questions_extracted,
         report.text_first,
         report.crop_first,
         report.questions_extracted.saturating_sub(report.text_first + report.crop_first),
         report.figures_detected,
+        report
+            .stage_breakdown
+            .iter()
+            .map(|s| format!("{}={}p/{}c", s.stage, s.prompt_tokens, s.completion_tokens))
+            .collect::<Vec<_>>()
+            .join(", "),
     );
 
     // Per-stage timing so the import log can prove where wall-time went (and
@@ -2848,14 +3054,14 @@ async fn try_text_first_extraction<C: LlmClient>(
         &[] as &[String],
         llm::ImageDetail::Low,
         Some(&user_text),
-        config.max_output_tokens,
+        config.max_output_tokens.min(StageTag::TextFirstExtraction.output_cap()),
         Some(llm::ResponseFormat::JsonSchema {
             schema: text_first_json_schema(),
         }),
     );
 
     let api_start = Instant::now();
-    let resp = match chat_with_permit(client, &body, request_semaphore, cancel, usage).await {
+    let resp = match chat_with_permit(client, &body, request_semaphore, cancel, usage, StageTag::TextFirstExtraction).await {
         Ok(r) => r,
         Err(e) => {
             eprintln!(
@@ -2992,7 +3198,7 @@ async fn try_text_first_batch_extraction<C: LlmClient>(
         &[] as &[String],
         llm::ImageDetail::Low,
         Some(&user_text),
-        config.max_output_tokens,
+        config.max_output_tokens.min(StageTag::BatchTextFirst.output_cap()),
         Some(llm::ResponseFormat::JsonSchema {
             schema: text_first_json_schema(),
         }),
@@ -3005,7 +3211,7 @@ async fn try_text_first_batch_extraction<C: LlmClient>(
     );
 
     let api_start = Instant::now();
-    let resp = match chat_with_permit(client, &body, request_semaphore, cancel, usage).await {
+    let resp = match chat_with_permit(client, &body, request_semaphore, cancel, usage, StageTag::BatchTextFirst).await {
         Ok(r) => r,
         Err(e) => {
             eprintln!("[TEXT_FIRST_FALLBACK] batch reason=api_error err={}", e);
@@ -3177,12 +3383,12 @@ async fn try_crop_first_extraction<C: LlmClient>(
         &crop_b64s,
         llm::ImageDetail::High,
         Some(&user_text),
-        config.max_output_tokens,
+        config.max_output_tokens.min(StageTag::CropFirst.output_cap()),
         Some(llm::ResponseFormat::JsonSchema {
             schema: extraction_json_schema(),
         }),
     );
-    let resp = match chat_with_permit(client, &body, request_semaphore, cancel, usage).await {
+    let resp = match chat_with_permit(client, &body, request_semaphore, cancel, usage, StageTag::CropFirst).await {
         Ok(r) => r,
         Err(e) => {
             report.anomalies.push(format!(
@@ -3372,7 +3578,14 @@ async fn extract_span<C: LlmClient>(
         Vec::new()
     };
     let candidates = span_figure_candidates(span, span_pages, page_figures, &referenced);
-    let fig_count = candidates.len();
+    // Supply counting only trusts confident detections: a low-confidence
+    // region must never silently satisfy a figure reference — the span then
+    // falls back to full-page vision instead of starving for its figure.
+    // (Low-confidence figures still attach when explicitly referenced.)
+    let fig_count = candidates
+        .iter()
+        .filter(|(_, f)| f.seg_confidence >= FIGURE_SUPPLY_MIN_CONFIDENCE)
+        .count();
     let needs_vision = must_read || (text_refs_figure && fig_count == 0);
 
     if text_first && has_text && !needs_vision {
@@ -3667,14 +3880,14 @@ async fn extract_span<C: LlmClient>(
                 &images,
                 detail,
                 Some(&user_text),
-                config.max_output_tokens,
+                config.max_output_tokens.min(StageTag::VisionSpan.output_cap()),
                 Some(llm::ResponseFormat::JsonSchema {
                     schema: extraction_schema.clone(),
                 }),
             );
 
             let api_start = Instant::now();
-            let resp = match chat_with_permit(client, &body, request_semaphore, cancel, usage).await {
+            let resp = match chat_with_permit(client, &body, request_semaphore, cancel, usage, StageTag::VisionSpan).await {
                 Ok(r) => r,
                 Err(e) => {
                     last_error = e.to_string();
@@ -3764,14 +3977,14 @@ async fn extract_span<C: LlmClient>(
                             "{}\n\nNOTE: This is a retry with fewer pages due to payload size issues. Transcribe Question {} from these pages only.",
                             user_text, span.number
                         )),
-                        config.max_output_tokens,
+                        config.max_output_tokens.min(StageTag::VisionSpan.output_cap()),
                         Some(llm::ResponseFormat::JsonSchema {
                             schema: extraction_schema.clone(),
                         }),
                     );
 
                     let api_start = Instant::now();
-                    let reduced_resp = match chat_with_permit(client, &reduced_body, request_semaphore, cancel, usage).await {
+                    let reduced_resp = match chat_with_permit(client, &reduced_body, request_semaphore, cancel, usage, StageTag::VisionSpan).await {
                         Ok(r) => r,
                         Err(e) => {
                             last_error = e.to_string();
@@ -4816,7 +5029,12 @@ async fn extract_same_page_batch<C: LlmClient>(
         // must still go to vision, exactly as the old per-span loop decided).
         let fig_counts: Vec<usize> = spans
             .iter()
-            .map(|span| span_figure_candidates(span, &span_pages, page_figures, &referenced).len())
+            .map(|span| {
+                span_figure_candidates(span, &span_pages, page_figures, &referenced)
+                    .iter()
+                    .filter(|(_, f)| f.seg_confidence >= FIGURE_SUPPLY_MIN_CONFIDENCE)
+                    .count()
+            })
             .collect();
         let needs_vision =
             must_read || (text_refs_figure && fig_counts.iter().any(|&c| c == 0));
@@ -5023,13 +5241,12 @@ async fn extract_same_page_batch<C: LlmClient>(
             &images,
             llm::ImageDetail::High,
             Some(&user_text),
-            config.max_output_tokens,
+            config.max_output_tokens.min(StageTag::FallbackPage.output_cap()),
             Some(llm::ResponseFormat::JsonSchema {
                 schema: extraction_schema.clone(),
             }),
         );
-
-        let resp = match chat_with_permit(client, &body, request_semaphore, cancel, usage).await {
+        let resp = match chat_with_permit(client, &body, request_semaphore, cancel, usage, StageTag::FallbackPage).await {
             Ok(r) => r,
             Err(e) => {
                 last_error = e.to_string();
@@ -5755,10 +5972,10 @@ RULES:
             &page_images,
             llm::ImageDetail::High,
             Some(&user_text),
-            config.max_output_tokens,
+            config.max_output_tokens.min(StageTag::FallbackPage.output_cap()),
             Some(llm::ResponseFormat::JsonSchema { schema: extraction_json_schema() }),
         );
-        let resp = match chat_with_permit(client, &body, request_semaphore, cancel, usage).await {
+        let resp = match chat_with_permit(client, &body, request_semaphore, cancel, usage, StageTag::FallbackPage).await {
             Ok(r) => r,
             Err(e) => {
                 last_error = e.to_string();
@@ -6043,6 +6260,157 @@ RULES:
 /// One sliding mark-scheme window: images + raw text in, validated answers
 /// out. Windows run in parallel batches, so each owns a local report;
 /// errors come back as Err(last_error) for the caller's quarantine record.
+/// TEXT-ONLY attempt at one mark-scheme window. Returns `Some` when the
+/// text-first transcription succeeded AND contains no diagram placeholders
+/// (nothing needs vision); `None` means the caller must fall through to the
+/// full-page vision path unchanged. Bounded by the same repair budget.
+#[allow(clippy::too_many_arguments)]
+async fn try_ms_text_first_window<C: LlmClient>(
+    client: &C,
+    config: &PipelineConfig,
+    pages: &[PageInput],
+    start: usize,
+    end: usize,
+    _step: usize,
+    request_semaphore: &Arc<Semaphore>,
+    cancel: &AtomicBool,
+    usage: &Arc<TokenTotals>,
+) -> Option<(Result<Vec<AiAnswer>, String>, ImportReport)> {
+    let mut report = ImportReport::default();
+    let mut chunk_text = String::new();
+    for (i, p) in pages.iter().enumerate().take(end).skip(start) {
+        if !p.text.trim().is_empty() {
+            chunk_text.push_str(&format!(
+                "RAW TEXT PAGE {}:\n{}\n\n---\n\n",
+                i + 1,
+                p.text
+            ));
+        }
+    }
+    let context_note = if start == 0 {
+        format!("These are pages 1–{} of the mark scheme.", end)
+    } else {
+        format!(
+            "Page {} is context (already processed). Extract ONLY answers anchored on page{} {}.",
+            start,
+            if end > start + 1 { "s" } else { "" },
+            if end > start + 1 {
+                format!("{}–{}", start + 1, end)
+            } else {
+                format!("{}", start + 1)
+            }
+        )
+    };
+    let user_text = format!(
+        "{}\n\n{}",
+        context_note,
+        chunk_text
+    );
+    let system = markscheme_text_first_system_prompt();
+    let max_out = config.max_output_tokens.min(StageTag::MsTextFirst.output_cap());
+
+    let mut last_error = String::new();
+    let max_attempts = 1 + config.max_repairs;
+    for attempt in 1..=max_attempts {
+        if cancel.load(Ordering::Relaxed) {
+            break;
+        }
+        let text = if attempt == 1 {
+            user_text.clone()
+        } else {
+            format!(
+                "{}\n\nPREVIOUS ATTEMPT FAILED VALIDATION: {}. Regenerate the complete corrected JSON.",
+                user_text, last_error
+            )
+        };
+        let body = llm::chat_body(
+            &config.model,
+            &system,
+            &[] as &[String],
+            llm::ImageDetail::Low,
+            Some(&text),
+            max_out,
+            Some(llm::ResponseFormat::JsonSchema {
+                schema: markscheme_text_first_json_schema(),
+            }),
+        );
+        let api_start = Instant::now();
+        let resp = match chat_with_permit(client, &body, request_semaphore, cancel, usage, StageTag::MsTextFirst).await {
+            Ok(r) => r,
+            Err(e) => {
+                last_error = e.to_string();
+                if cancel.load(Ordering::Relaxed) {
+                    break;
+                }
+                continue;
+            }
+        };
+        report.record_timing(
+            "extraction",
+            "ms_text_first",
+            Some(start + 1),
+            None,
+            api_start.elapsed().as_millis() as u64,
+        );
+        if llm::response_was_truncated(&resp) {
+            last_error = "the previous response hit the max_tokens ceiling and was cut off (finish_reason=length); regenerate the complete corrected JSON".to_string();
+            report.note_repair("ms_text_first_finish_reason_length");
+            continue;
+        }
+        let content = match llm::message_content(&resp) {
+            Ok(c) => c,
+            Err(e) => {
+                last_error = e.to_string();
+                continue;
+            }
+        };
+        match parse_llm_json::<AiAnswerEnvelope>(&content) {
+            ParseOutcome::Clean(AiAnswerEnvelope::Wrapped { answers })
+            | ParseOutcome::Clean(AiAnswerEnvelope::Bare(answers))
+            | ParseOutcome::Salvaged {
+                value: AiAnswerEnvelope::Wrapped { answers },
+                ..
+            }
+            | ParseOutcome::Salvaged {
+                value: AiAnswerEnvelope::Bare(answers),
+                ..
+            } => {
+                let needs_vision = answers.iter().any(|a| {
+                    a.answer_markdown
+                        .as_deref()
+                        .is_some_and(|m| m.contains("[DIAGRAM_PLACEHOLDER]"))
+                });
+                if needs_vision {
+                    eprintln!(
+                        "[MS_TEXT_FIRST] window {}–{} needs figures; falling back to vision",
+                        start + 1,
+                        end
+                    );
+                    return None;
+                }
+                eprintln!(
+                    "[MS_TEXT_FIRST] window {}–{} transcribed from text layer (0 image tokens)",
+                    start + 1,
+                    end
+                );
+                report.ms_text_first += 1;
+                return Some((Ok(answers), report));
+            }
+            ParseOutcome::Malformed { error } => {
+                last_error = format!("invalid JSON: {}", error);
+                report.note_repair("ms_text_first_malformed_json");
+            }
+        }
+    }
+    eprintln!(
+        "[MS_TEXT_FIRST] window {}–{} text attempt failed ({}); falling back to vision",
+        start + 1,
+        end,
+        last_error
+    );
+    None
+}
+
 async fn read_markscheme_window<C: LlmClient>(
     client: &C,
     config: &PipelineConfig,
@@ -6059,18 +6427,40 @@ async fn read_markscheme_window<C: LlmClient>(
     if cancel.load(Ordering::Relaxed) {
         return (Err("Import cancelled by user".to_string()), report);
     }
+
+    // Phase 2 cost lever: a window whose pages all carry a reliable text
+    // layer is transcribed with zero image tokens. Any failure or figure
+    // signal falls through to the full-page vision path below, unchanged.
+    if config.ms_text_first && window_text_reliable(&pages[start..end]) {
+        if let Some(result) = try_ms_text_first_window(
+            client,
+            config,
+            pages,
+            start,
+            end,
+            step,
+            request_semaphore,
+            cancel,
+            usage,
+        )
+        .await
+        {
+            return result;
+        }
+    }
+
     let images: Vec<String> = pages[start..end]
         .iter()
         .filter_map(|p| p.get_b64().cloned())
         .map(|b64| geometry::resize_b64_to_max_dim(&b64, geometry::api_image_max_dim()).unwrap_or(b64))
         .collect();
     let mut chunk_text = String::new();
-    for i in start..end {
-        if !pages[i].text.trim().is_empty() {
+    for (i, p) in pages.iter().enumerate().take(end).skip(start) {
+        if !p.text.trim().is_empty() {
             chunk_text.push_str(&format!(
                 "RAW TEXT PAGE {}:\n{}\n\n---\n\n",
                 i + 1,
-                pages[i].text
+                p.text
             ));
         }
     }
@@ -6116,10 +6506,10 @@ async fn read_markscheme_window<C: LlmClient>(
             &images,
             llm::ImageDetail::High,
             Some(&text),
-            config.max_output_tokens,
+            config.max_output_tokens.min(StageTag::MsWindow.output_cap()),
             Some(llm::ResponseFormat::JsonSchema { schema: extraction_json_schema() }),
         );
-        let resp = match chat_with_permit(client, &body, request_semaphore, cancel, usage).await {
+        let resp = match chat_with_permit(client, &body, request_semaphore, cancel, usage, StageTag::MsWindow).await {
             Ok(r) => r,
             Err(e) => {
                 last_error = e.to_string();
@@ -6396,6 +6786,15 @@ pub async fn run_markscheme_pipeline<C: LlmClient, P: Progress>(
     let (prompt_tok, completion_tok) = usage.snapshot();
     report.prompt_tokens = prompt_tok;
     report.completion_tokens = completion_tok;
+    report.stage_breakdown = usage
+        .snapshot_stages()
+        .into_iter()
+        .map(|(stage, p, c)| StageCost {
+            stage: stage.as_str().to_string(),
+            prompt_tokens: p,
+            completion_tokens: c,
+        })
+        .collect();
     Ok((drafts, report))
 } // Tests — the golden suite. Deterministic: MockLlm replays scripted model
   // behaviour (valid, hallucinating, truncating, junk) so every failure class
@@ -6644,6 +7043,243 @@ mod tests {
                 .unwrap();
         assert_eq!(report.quarantined.len(), 1);
         assert!(report.quarantined[0].scope.contains("mark-scheme"));
+    }
+
+    // ── Phase 2: mark-scheme text-first + stage attribution ───────────────
+
+    /// Mark-scheme pages whose combined text clears the reliability gate
+    /// (>400 chars, no replacement chars, no figure references). Pages carry
+    /// real rasters so the vision-fallback assertions can inspect images.
+    fn rich_text_ms_pages(n: usize) -> Vec<PageInput> {
+        let para = "The answer uses integration by parts to evaluate the region and then applies logarithms to both sides before solving the resulting quadratic expression for the unknown variable. ".repeat(3);
+        let mut g = gray_blank(400, 600);
+        g_hline(&mut g, 300);
+        let b64 = png_b64(&g);
+        (0..n)
+            .map(|_| PageInput {
+                kind: PageInputKind::Image { b64: b64.clone() },
+                text: para.clone(),
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn ms_window_text_first_sends_zero_images() {
+        let pgs = rich_text_ms_pages(3);
+        let mock = MockLlm::new(vec![ok_chat(
+            r#"{"answers":[{"question_number":1,"answer_markdown":"**(a)** Area = 12.5 units. M1 A1"}]}"#,
+        )]);
+        let mut c = config();
+        c.ms_text_first = true;
+        let (drafts, report) =
+            run_markscheme_pipeline(&mock, &pgs, &c, &NullProgress, &cancel_flag())
+                .await
+                .unwrap();
+        assert_eq!(drafts.len(), 1);
+        assert_eq!(report.ms_text_first, 1, "window transcribed from text");
+        assert!(
+            !body_has_image(&mock.bodies()[0]),
+            "text-first MS window must send ZERO images"
+        );
+        assert_eq!(mock.remaining(), 0, "exactly one text-only call");
+        assert_eq!(
+            mock.bodies()[0]["max_tokens"], 3072,
+            "MS text-first output capped at the stage ceiling"
+        );
+    }
+
+    #[tokio::test]
+    async fn ms_window_text_first_placeholder_falls_back_to_vision() {
+        let pgs = rich_text_ms_pages(3);
+        let mock = MockLlm::new(vec![
+            // Text-first attempt signals a worked figure it cannot see.
+            ok_chat(
+                r#"{"answers":[{"question_number":1,"answer_markdown":"[DIAGRAM_PLACEHOLDER] Gradient = 3. M1 A1"}]}"#,
+            ),
+            // Same window re-read with full-page vision.
+            ok_chat(
+                r#"{"answers":[{"question_number":1,"answer_markdown":"Gradient = 3. M1 A1"}]}"#,
+            ),
+        ]);
+        let mut c = config();
+        c.ms_text_first = true;
+        let (drafts, report) =
+            run_markscheme_pipeline(&mock, &pgs, &c, &NullProgress, &cancel_flag())
+                .await
+                .unwrap();
+        assert_eq!(drafts.len(), 1);
+        assert_eq!(report.ms_text_first, 0, "placeholder window is not counted");
+        assert_eq!(mock.bodies().len(), 2, "text attempt, then vision fallback");
+        assert!(
+            body_has_image(&mock.bodies()[1]),
+            "the fallback call must carry the window images"
+        );
+    }
+
+    #[tokio::test]
+    async fn ms_window_unreliable_text_goes_straight_to_vision() {
+        let mut pgs = pages(3); // empty text layers — gate must refuse
+        pgs[0].text = "Sparse".into();
+        let mock = MockLlm::new(vec![ok_chat(
+            r#"{"answers":[{"question_number":1,"answer_markdown":"Answer one. B1"}]}"#,
+        )]);
+        let mut c = config();
+        c.ms_text_first = true;
+        let (drafts, report) =
+            run_markscheme_pipeline(&mock, &pgs, &c, &NullProgress, &cancel_flag())
+                .await
+                .unwrap();
+        assert_eq!(drafts.len(), 1);
+        assert_eq!(report.ms_text_first, 0);
+        assert_eq!(
+            mock.bodies().len(), 1,
+            "single vision call — no text-first attempt was made"
+        );
+    }
+
+    #[tokio::test]
+    async fn low_confidence_figure_does_not_supply_text_first() {
+        // The only detected figure sits below the confidence floor: it must
+        // NOT satisfy the figure reference — the span falls back to vision
+        // instead of silently starving for its exhibit.
+        let pgs = vec![PageInput {
+            kind: PageInputKind::Image {
+                b64: text_image_page().get_b64().unwrap().to_string(),
+            },
+            text: "Figure 1 shows a circuit. State the total resistance.\n\n[2 marks]".into(),
+        }];
+        let span_pages: Vec<(usize, &PageInput)> = vec![(0, &pgs[0])];
+        let span = doc_map::QuestionSpan {
+            number: 30,
+            start_page: 0,
+            end_page: 0,
+            start_y_frac: None,
+            end_y_frac: None,
+            expected_marks: Some(2),
+            reliable_pages: vec![],
+            ambiguous_pages: vec![],
+        };
+        let page_figures = vec![vec![crate::pdf_render::DetectedFigure {
+            bbox: [0.10, 0.10, 0.50, 0.50],
+            caption: Some("Figure 1".into()),
+            kind: Some("circuit".into()),
+            seg_confidence: 0.3,
+        }]];
+        let mock = MockLlm::new(vec![ok_chat(
+            r#"{"items":[{"question_number":30,"content":"The total resistance is $6\\,\\Omega$. **[2 marks]**","marks":2,"topics":["circuits"],"module":"Algebra","is_code":false,"diagram_bboxes":[],"diagram_captions":[],"diagram_kinds":[],"bbox_page_indexes":[],"math_snippet":"6\\Omega","visual_options":null}]}"#,
+        )]);
+        let cache = Arc::new(crate::pdf_render::PageRenderCache::new(
+            PAGE_RENDER_CACHE_CAPACITY,
+        ));
+        let semaphore = Arc::new(Semaphore::new(1));
+        let collateral = Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
+        let all_spans = Arc::new(vec![span.clone()]);
+        let mut cfg = config();
+        cfg.text_first = true;
+        let (built_opt, report) =
+            extract_span(&mock, &cfg, &span, &span_pages, &page_figures, &cache, &Arc::new(PageImageCache::new()), &semaphore, &collateral, &all_spans, true, &cancel_flag(), &usage()).await;
+        let built = built_opt.expect("vision path must build the question");
+        assert!(built.content.contains("6"), "vision answer used");
+        assert_eq!(
+            report.text_first, 0,
+            "low-confidence supply must not enable text-first"
+        );
+        assert_eq!(mock.bodies().len(), 1, "straight to vision");
+        assert!(body_has_image(&mock.bodies()[0]));
+    }
+
+    #[tokio::test]
+    async fn confident_figure_supplies_text_first() {
+        // Same layout, but the detection is confident: the span proceeds
+        // text-first with the deterministic crop attached afterwards.
+        let pgs = vec![PageInput {
+            kind: PageInputKind::Image {
+                b64: text_image_page().get_b64().unwrap().to_string(),
+            },
+            text: "Figure 1 shows a circuit. State the total resistance.\n\n[2 marks]".into(),
+        }];
+        let span_pages: Vec<(usize, &PageInput)> = vec![(0, &pgs[0])];
+        let span = doc_map::QuestionSpan {
+            number: 30,
+            start_page: 0,
+            end_page: 0,
+            start_y_frac: None,
+            end_y_frac: None,
+            expected_marks: Some(2),
+            reliable_pages: vec![],
+            ambiguous_pages: vec![],
+        };
+        let page_figures = vec![vec![crate::pdf_render::DetectedFigure {
+            bbox: [0.10, 0.10, 0.50, 0.50],
+            caption: Some("Figure 1".into()),
+            kind: Some("circuit".into()),
+            seg_confidence: 0.9,
+        }]];
+        let mock = MockLlm::new(vec![ok_chat(
+            r#"{"items":[{"question_number":30,"content":"The total resistance is $6\\,\\Omega$. **[2 marks]**","marks":2,"topics":["circuits"],"module":"Algebra","is_code":false,"diagram_bboxes":[],"diagram_captions":[],"diagram_kinds":[],"bbox_page_indexes":[],"math_snippet":"6\\Omega","visual_options":null}]}"#,
+        )]);
+        let cache = Arc::new(crate::pdf_render::PageRenderCache::new(
+            PAGE_RENDER_CACHE_CAPACITY,
+        ));
+        let semaphore = Arc::new(Semaphore::new(1));
+        let collateral = Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
+        let all_spans = Arc::new(vec![span.clone()]);
+        let mut cfg = config();
+        cfg.text_first = true;
+        let (built_opt, report) =
+            extract_span(&mock, &cfg, &span, &span_pages, &page_figures, &cache, &Arc::new(PageImageCache::new()), &semaphore, &collateral, &all_spans, true, &cancel_flag(), &usage()).await;
+        let built = built_opt.expect("confident supply must keep text-first");
+        assert!(built.content.contains("6"), "text-first answer used");
+        assert_eq!(report.text_first, 1);
+        assert!(
+            !body_has_image(&mock.bodies()[0]),
+            "zero-image transcription despite the figure reference"
+        );
+    }
+
+    #[tokio::test]
+    async fn stage_attribution_records_text_first_tokens() {
+        let pgs = vec![text_image_page()];
+        let span_pages: Vec<(usize, &PageInput)> = vec![(0, &pgs[0])];
+        let span = doc_map::QuestionSpan {
+            number: 30,
+            start_page: 0,
+            end_page: 0,
+            start_y_frac: None,
+            end_y_frac: None,
+            expected_marks: Some(2),
+            reliable_pages: vec![],
+            ambiguous_pages: vec![],
+        };
+        let resp = serde_json::json!({
+            "choices": [{ "message": { "content": r#"{"items":[{"question_number":30,"content":"State the value of $x$ when $2x + 4 = 10$. **[2 marks]**","marks":2,"topics":[],"module":"Algebra","is_code":false,"diagram_bboxes":[],"diagram_captions":[],"diagram_kinds":[],"bbox_page_indexes":[],"math_snippet":"2x + 4 = 10","visual_options":null}]}"# } }],
+            "usage": { "prompt_tokens": 4200, "completion_tokens": 312, "total_tokens": 4512 }
+        });
+        let mock = MockLlm::new(vec![Ok(resp)]);
+        let cache = Arc::new(crate::pdf_render::PageRenderCache::new(
+            PAGE_RENDER_CACHE_CAPACITY,
+        ));
+        let semaphore = Arc::new(Semaphore::new(1));
+        let collateral = Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
+        let all_spans = Arc::new(vec![span.clone()]);
+        let mut cfg = config();
+        cfg.text_first = true;
+        let usage_arc = usage();
+        let (_built_opt, _report) =
+            extract_span(&mock, &cfg, &span, &span_pages, &[], &cache, &Arc::new(PageImageCache::new()), &semaphore, &collateral, &all_spans, true, &cancel_flag(), &usage_arc).await;
+        let stages = usage_arc.snapshot_stages();
+        assert_eq!(stages.len(), 1, "one tagged stage");
+        assert_eq!(
+            stages[0].0,
+            StageTag::TextFirstExtraction,
+            "tokens attributed to the text-first stage"
+        );
+        assert_eq!(stages[0].2, 312, "completion tokens recorded per stage");
+        assert_eq!(
+            mock.bodies()[0]["max_tokens"],
+            StageTag::TextFirstExtraction.output_cap(),
+            "per-stage output cap applied over the global 32k"
+        );
     }
 
     // ── Vision detail policy & resolution cap ─────────────────────────────
@@ -7642,11 +8278,13 @@ mod tests {
                 bbox: [200.0 / 1200.0, 600.0 / 1600.0, 500.0 / 1200.0, 300.0 / 1600.0],
                 caption: Some("Figure 1".to_string()),
                 kind: Some("circuit".to_string()),
+                seg_confidence: 0.9,
             },
             crate::pdf_render::DetectedFigure {
                 bbox: [200.0 / 1200.0, 1000.0 / 1600.0, 500.0 / 1200.0, 300.0 / 1600.0],
                 caption: Some("Figure 2".to_string()),
                 kind: Some("graph".to_string()),
+                seg_confidence: 0.9,
             },
         ]];
         let mock = MockLlm::new(vec![ok_chat(
@@ -7763,6 +8401,7 @@ mod tests {
             bbox,
             caption: Some(caption.to_string()),
             kind: None,
+            seg_confidence: 0.9,
         }
     }
 
@@ -8199,6 +8838,7 @@ mod tests {
     /// Skips silently when the fixture or pdfium is unavailable.
     #[test]
     fn diagnostic_gate_decisions_on_fixture() {
+        let _guard = crate::pdf_render::pdfium_test_lock();
         let manifest = env!("CARGO_MANIFEST_DIR");
         let path = std::path::Path::new(manifest).join("../physics '24.pdf");
         if !path.exists() {

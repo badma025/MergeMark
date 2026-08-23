@@ -1454,6 +1454,12 @@ pub async fn parse_pdf_vision(
     config.text_first = std::env::var("MERGEMARK_TEXT_FIRST")
         .map(|v| v != "0")
         .unwrap_or(true);
+    // Same lever for mark-scheme windows (Phase 2): reliable-text windows
+    // transcribe with zero image tokens; figure signals fall back to vision.
+    config.ms_text_first = config.text_first
+        && std::env::var("MERGEMARK_MS_TEXT_FIRST")
+            .map(|v| v != "0")
+            .unwrap_or(true);
 
     let (route, client) = resolve_llm_client(&state, model_name.clone())
         .await
@@ -1737,6 +1743,7 @@ pub async fn parse_pdf_vision(
         comp_tok as i64,
         real_cost,
         0,
+        Some(&serde_json::to_string(&report.stage_breakdown).unwrap_or_default()),
     )
     .await;
 
@@ -2150,6 +2157,7 @@ pub async fn parse_mark_scheme_vision(
         comp_est as i64,
         cost_usd,
         0,
+        Some(&serde_json::to_string(&report.stage_breakdown).unwrap_or_default()),
     )
     .await;
 

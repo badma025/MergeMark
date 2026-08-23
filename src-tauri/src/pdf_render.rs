@@ -136,7 +136,7 @@ impl PageRenderCache {
     }
 }
 
-fn get_pdfium() -> Result<&'static Pdfium, String> {
+pub(crate) fn get_pdfium() -> Result<&'static Pdfium, String> {
     PDFIUM_INSTANCE.get_or_init(|| {
         let bindings = Pdfium::bind_to_system_library()
             .map_err(|e| format!("Failed to bind to pdfium: {:?}", e))?;
@@ -235,6 +235,11 @@ pub struct DetectedFigure {
     pub caption: Option<String>,
     /// Semantic kind inferred from the caption ("graph", "circuit", …).
     pub kind: Option<String>,
+    /// Smart Scissors deterministic confidence (0..1): seed strength, grid
+    /// presence, label richness, caption presence, ink normality. Recorded
+    /// for Phase-2 consumers (pack quality metadata, Tier-0 gating); no
+    /// pipeline behaviour depends on it yet.
+    pub seg_confidence: f32,
 }
 
 /// Detect figures on every page of a PDF from its vector content stream —
@@ -252,132 +257,76 @@ pub fn detect_pdf_figures(path: &Path) -> Result<Vec<Vec<DetectedFigure>>, Strin
     for page in pages.iter() {
         result.push(detect_page_figures_inner(&page));
     }
+
+    // Golden-fixture authoring aid: MERGEMARK_FIGURE_DEBUG_JSON=<path>
+    // writes every detected box so a human can review/correct the output
+    // into committed goldens. Never set in production.
+    if let Ok(dump_path) = std::env::var("MERGEMARK_FIGURE_DEBUG_JSON") {
+        dump_debug_json(&dump_path, path, &result);
+    }
     Ok(result)
 }
 
-/// Per-page detection: collect Image/Path object bounds, cluster strokes into
-/// figure regions, filter specks/rule-lines/text-dense/header-footer regions,
-/// then attach the nearest "Figure N" caption.
+/// Write the golden-curation debug dump (see `detect_pdf_figures`).
+fn dump_debug_json(out_path: &str, source: &Path, per_page: &[Vec<DetectedFigure>]) {
+    use serde_json::json;
+    let pages: Vec<_> = per_page
+        .iter()
+        .enumerate()
+        .filter(|(_, figs)| !figs.is_empty())
+        .map(|(idx, figs)| {
+            json!({
+                "index": idx,
+                "figures": figs.iter().map(|f| json!({
+                    "bbox": f.bbox,
+                    "caption": f.caption,
+                    "kind": f.kind,
+                    "seg_confidence": (f.seg_confidence * 100.0).round() / 100.0,
+                })).collect::<Vec<_>>(),
+            })
+        })
+        .collect();
+    let doc = json!({
+        "source_pdf": source.file_name().and_then(|s| s.to_str()).unwrap_or("unknown"),
+        "generator": concat!("mergemark/", env!("CARGO_PKG_VERSION"), " stroke_census"),
+        "note": "UNCURATED candidate boxes — human review required before committing as golden",
+        "pages": pages,
+    });
+    match serde_json::to_string_pretty(&doc) {
+        Ok(body) => {
+            if let Err(e) = std::fs::write(out_path, body) {
+                eprintln!("[FIGURE_DEBUG] could not write {}: {}", out_path, e);
+            } else {
+                eprintln!("[FIGURE_DEBUG] candidate boxes written to {}", out_path);
+            }
+        }
+        Err(e) => eprintln!("[FIGURE_DEBUG] serialization failed: {}", e),
+    }
+}
+
+/// Per-page detection: delegated entirely to Smart Scissors
+/// (`stroke_census::detect_page_figures`), which types every content-stream
+/// primitive, builds text barriers, grows regions seed-first, and captures
+/// internal labels — all deterministic, zero AI calls. A page with nothing
+/// figure-like yields an empty `Vec`; an unparseable document yields an
+/// `Err` (callers degrade to the vision path, which keeps the import working
+/// for scanned PDFs).
 fn detect_page_figures_inner(page: &PdfPage) -> Vec<DetectedFigure> {
-    let page_w = page.width().value;
-    let page_h = page.height().value;
-    if page_w <= 0.0 || page_h <= 0.0 {
-        return Vec::new();
-    }
-
-    // 1. Raw object bounds (normalized 0..1). Images and paths are the
-    //    drawing primitives a figure is made of. Per-object errors are
-    //    skipped, never fatal.
-    let objects = page.objects();
-    let mut raw_boxes: Vec<[f32; 4]> = Vec::new();
-    for obj in objects.iter() {
-        let bounds = match &obj {
-            PdfPageObject::Image(o) => o.bounds().ok(),
-            PdfPageObject::Path(o) => o.bounds().ok(),
-            _ => None,
-        };
-        let Some(b) = bounds else { continue };
-        let b = crate::geometry::normalize_pdf_box(
-            b.left().value,
-            b.right().value,
-            b.top().value,
-            b.bottom().value,
-            page_w,
-            page_h,
-        );
-        if b[2] <= 0.0 || b[3] <= 0.0 {
-            continue;
-        }
-        raw_boxes.push(b);
-    }
-    if raw_boxes.is_empty() {
-        return Vec::new();
-    }
-
-    // 2. Text segments: used for text-density filtering and caption
-    //    association ("Figure 1" is a text object in the content stream).
-    let mut text_rects: Vec<[f32; 4]> = Vec::new();
-    let mut caption_candidates: Vec<([f32; 2], String)> = Vec::new();
-    if let Ok(text) = page.text() {
-        for seg in text.segments().iter() {
-            let rect = seg.bounds();
-            let tr = [
-                (rect.left().value / page_w).clamp(0.0, 1.0),
-                (1.0 - rect.top().value / page_h).clamp(0.0, 1.0),
-                (rect.width().value / page_w).clamp(0.0, 1.0),
-                (rect.height().value / page_h).clamp(0.0, 1.0),
-            ];
-            if tr[2] <= 0.0 || tr[3] <= 0.0 {
-                continue;
-            }
-            text_rects.push(tr);
-            let seg_text = seg.text();
-            if matches_caption(&seg_text) {
-                caption_candidates.push((
-                    [tr[0] + tr[2] / 2.0, tr[1] + tr[3] / 2.0],
-                    seg_text,
-                ));
-            }
-        }
-    }
-
-    // 3. Cluster strokes into figure regions, then filter the clusters.
-    //
-    // A tight gap is deliberate: exam pages are covered in ruled answer lines,
-    // headers, and border rules made of hundreds of tiny path segments. A wide
-    // merge tolerance chains them across the whole page into one near-full-page
-    // box (which also steals the nearest caption). Figures are drawn as
-    // connected strokes (axes cross curves, circuit wires touch), so a small
-    // gap still merges them while keeping the page decoration separate. The
-    // decoration clusters are then rejected below by area / thinness / density.
-    let clusters = crate::geometry::cluster_boxes(raw_boxes, 0.006);
-    let mut figures: Vec<DetectedFigure> = Vec::new();
-    for b in clusters {
-        if b[2] * b[3] > MAX_FIGURE_AREA_FRAC {
-            continue;
-        }
-        if !crate::geometry::is_probable_figure_box(&b, &text_rects, 0.003, 0.015, 8.0, 0.4) {
-            continue;
-        }
-        let caption = nearest_caption(b, &caption_candidates);
-        let kind = caption
-            .as_deref()
-            .and_then(crate::geometry::caption_kind_from_text);
-        figures.push(DetectedFigure {
-            bbox: b,
-            caption,
-            kind,
-        });
-    }
-    figures
+    crate::stroke_census::detect_page_figures(page)
 }
 
-/// No legitimate AQA figure fills more than half a page; the full-page border
-/// rectangle (a chain of tiny path segments) is far larger and is decoration.
-const MAX_FIGURE_AREA_FRAC: f32 = 0.5;
-
-/// True when a text segment looks like a "Figure N" / "Fig. N" caption.
-fn matches_caption(text: &str) -> bool {
-    static RE_CAPTION: OnceLock<regex::Regex> = OnceLock::new();
-    RE_CAPTION
-        .get_or_init(|| regex::Regex::new(r"(?i)\bfig(?:ure)?\.?\s*\d+").unwrap())
-        .is_match(text)
-}
-
-/// Pick the caption candidate whose center is nearest this figure's center.
-fn nearest_caption(b: [f32; 4], candidates: &[([f32; 2], String)]) -> Option<String> {
-    let cx = b[0] + b[2] / 2.0;
-    let cy = b[1] + b[3] / 2.0;
-    let mut best: Option<(f32, &str)> = None;
-    for (center, text) in candidates {
-        let dx = center[0] - cx;
-        let dy = center[1] - cy;
-        let dist = dx * dx + dy * dy;
-        if best.map_or(true, |(bd, _)| dist < bd) {
-            best = Some((dist, text));
-        }
-    }
-    best.map(|(_, t)| t.to_string())
+/// Serialize every pdfium touch made by tests. Pdfium's C API is not
+/// thread-safe (see `PageRenderCache::render`) and production is naturally
+/// serialized by `AppState::extraction_in_progress`, but the test suite runs
+/// several pdfium-heavy fixtures concurrently — under load this manifested
+/// as sporadic `FormatError`s and even STATUS_HEAP_CORRUPTION. Tests take
+/// this lock for the duration of their pdfium work.
+#[cfg(test)]
+pub(crate) fn pdfium_test_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::OnceLock<Mutex<()>> = std::sync::OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 /// Extract each page's text layer via pdfium (cheap, no rendering). Used by
@@ -503,6 +452,7 @@ mod tests {
     /// real behaviour on dev machines.
     #[test]
     fn detect_figures_on_real_fixture() {
+        let _guard = pdfium_test_lock();
         let manifest = env!("CARGO_MANIFEST_DIR");
         for name in ["../physics '24.pdf", "../physics '21.pdf"] {
             let path = std::path::Path::new(manifest).join(name);
@@ -617,6 +567,7 @@ mod tests {
     /// image at the default DPI.
     #[test]
     fn render_page_from_document_smoke() {
+        let _guard = pdfium_test_lock();
         let manifest = env!("CARGO_MANIFEST_DIR");
         let path = std::path::Path::new(manifest).join("../physics '24.pdf");
         if !path.exists() {
@@ -646,6 +597,7 @@ mod tests {
     /// default 300 DPI.
     #[test]
     fn dpi_knob_shrinks_renders() {
+        let _guard = pdfium_test_lock();
         let manifest = env!("CARGO_MANIFEST_DIR");
         let path = std::path::Path::new(manifest).join("../physics '24.pdf");
         if !path.exists() {
