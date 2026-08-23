@@ -238,6 +238,33 @@ article,
   max-width: 100%;
 }
 
+/* ─── Image-based MCQ options ─────────────────────────────────────────────── */
+/* Diagrams bound to MCQ options (`- [MCQ:A] ![Option A](...)`) must scale
+   proportionally and stay inside their interactive card, never overflowing
+   the 2x2 grid. Targets nested imgs regardless of custom imageRenderer
+   wrappers (lightbox divs, figures). */
+.mcq-option-media img,
+.mcq-item img {
+  display: block;
+  max-height: 11rem;
+  max-width: 100%;
+  width: auto;
+  height: auto;
+  object-fit: contain;
+  margin-inline: auto;
+}
+
+/* Neutralise the standalone-diagram margins/frames inside the compact cards */
+.mcq-item img {
+  border: none;
+  box-shadow: none;
+}
+.mcq-item .group\/diag,
+.mcq-item figure {
+  margin-top: 0 !important;
+  margin-bottom: 0 !important;
+}
+
 /* ─── Print & PDF Dynamic Pagination Rules ───────────────────────────────── */
 @media print {
   /* Prevent question cards and MCQ options from splitting across pages */
@@ -275,5 +302,11 @@ article,
   body, article, p, span, td, th {
     color: #000000 !important;
     background-color: transparent !important;
+  }
+
+  /* Keep image-based MCQ options compact on printed worksheets */
+  .mcq-item img {
+    max-height: 9rem !important;
+    object-fit: contain !important;
   }
 }

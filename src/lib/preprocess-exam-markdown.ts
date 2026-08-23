@@ -5,8 +5,12 @@
  * 1. Normalizes Markdown tables (injects missing GFM delimiters & blank lines)
  * 2. Strips orphaned trailing $ symbols (e.g. "[2 marks]$", "answer: $x$.$", "$$ $")
  * 3. Balances unclosed LaTeX math environments (\begin{pmatrix} -> \end{pmatrix})
- * 4. Balances inline ($) and block ($$) math delimiters
+ * 4. Balances inline ($) and block ($$) math delimiters — broken inline math is
+ *    closed at the END OF ITS OWN LINE so a stray $ can never swallow the next
+ *    paragraph or an MCQ options grid
  * 5. Fixes spaced LaTeX commands ("\ frac" -> "\frac")
+ * 6. Strips backend placeholder tokens ([DIAGRAM_PLACEHOLDER],
+ *    [VISUAL_MCQ_PLACEHOLDER]) and phantom/empty display math blocks
  */
 
 // LaTeX environments that require balancing and wrapping
@@ -17,6 +21,33 @@ export const MATH_ENVS = [
   'eqnarray', 'eqnarray*', 'multline', 'multline*',
   'split', 'subequations'
 ];
+
+/**
+ * Backend placeholder tokens that must never reach the DOM as literal text.
+ */
+export const PLACEHOLDER_TOKENS = ['[DIAGRAM_PLACEHOLDER]', '[VISUAL_MCQ_PLACEHOLDER]'] as const;
+
+/**
+ * Strip backend placeholder tokens so they can never reach the DOM as literal text.
+ */
+export function stripPlaceholderTokens(text: string): string {
+  let s = text;
+  for (const token of PLACEHOLDER_TOKENS) {
+    s = s.split(token).join('');
+  }
+  return s;
+}
+
+/**
+ * Remove phantom/empty display math blocks ($$ with no content between the
+ * delimiters, including across blank lines) before the markdown parser sees
+ * them — an empty $$ pair renders as a stray KaTeX artifact / blank gap.
+ */
+export function stripEmptyDisplayMath(text: string): string {
+  let s = text.replace(/\$\$[\s]*\$\$/g, '');
+  // Collapse blank runs the removal leaves behind.
+  return s.replace(/\n{3,}/g, '\n\n');
+}
 
 /**
  * Common LaTeX command names frequently broken by OCR / LLMs with a space after the backslash
@@ -46,15 +77,66 @@ export function fixSpacedCommands(text: string): string {
 }
 
 /**
+ * Restore LaTeX commands mangled by unescaped `\t` escapes in stored JSON
+ * payloads: "\text{Ra}" decodes to a literal TAB character followed by
+ * "ext{Ra}" (same class as \theta → TAB + "heta"). Tabs never occur
+ * legitimately in exam content, so a TAB directly preceding the remainder of
+ * a known LaTeX command is deterministically restored to backslash-t.
+ */
+const TAB_MANGLED_LATEX_RE = /\t(?=(?:extbf|extit|extrm|exttt|ext|imes|heta|herefore|au|ilde|an|o|op|riangle|woheadrightarrow|frac|dfrac)(?![A-Za-z]))/g;
+
+export function fixTabMangledLatex(text: string): string {
+  if (!text.includes('\t')) return text;
+  return text.replace(TAB_MANGLED_LATEX_RE, '\\t');
+}
+
+/**
  * Normalizes Markdown tables produced by OCR / LLMs:
- * 1. Ensures blank lines before and after table blocks (required by CommonMark/GFM table parser).
- * 2. Injects missing delimiter rows (|---|---|...) if the LLM omitted the header separator.
- * 3. Trims pipe lines and cleans table boundaries.
+ * 1. Reassembles multi-line cells (split across lines) into valid single-line GFM table rows.
+ * 2. Bridges blank lines between header and delimiter rows or within table bodies.
+ * 3. Deduplicates consecutive delimiter rows (|:---|:---| followed by | --- | --- |).
+ * 4. Ensures delimiter column count matches header column count.
+ * 5. Guarantees clean blank lines before and after table blocks.
  */
 export function normalizeMarkdownTables(text: string): string {
   if (!text || !text.includes('|')) return text;
 
-  const lines = text.split('\n');
+  const rawLines = text.split('\n');
+  const lines: string[] = [];
+
+  // Pass 1: Fuse multiline table rows.
+  // e.g. Line 1: "| | mass of water"
+  //      Line 2: "mass of air |"
+  // -> Fuse to "| | mass of water <br> mass of air |"
+  for (let i = 0; i < rawLines.length; i++) {
+    let line = rawLines[i];
+    const trimmed = line.trim();
+
+    if (trimmed.startsWith('|') && !trimmed.endsWith('|') && trimmed.length > 1) {
+      // Look ahead for continuation lines that finish this row
+      let fused = trimmed;
+      let j = i + 1;
+      while (j < rawLines.length) {
+        const nextTrimmed = rawLines[j].trim();
+        if (nextTrimmed === '') break;
+        if (nextTrimmed.startsWith('|') && nextTrimmed.endsWith('|')) {
+          // New row begins, break
+          break;
+        }
+        fused += (nextTrimmed.endsWith('|') ? ' <br> ' : ' ') + nextTrimmed;
+        if (nextTrimmed.endsWith('|')) {
+          j++;
+          break;
+        }
+        j++;
+      }
+      lines.push(fused);
+      i = j - 1;
+    } else {
+      lines.push(line);
+    }
+  }
+
   const result: string[] = [];
   let inTable = false;
   let tableLines: string[] = [];
@@ -66,16 +148,50 @@ export function normalizeMarkdownTables(text: string): string {
 
   const isDelimiterRow = (l: string) => /^\|(?:\s*:?-+:?\s*\|)+$/.test(l.trim());
 
+  const getColCount = (row: string) => {
+    const cells = row.split('|').map(c => c.trim()).filter((_, idx, arr) => idx > 0 && idx < arr.length - 1);
+    return Math.max(cells.length, 1);
+  };
+
   const flushTable = (tbl: string[]) => {
     if (tbl.length === 0) return;
 
-    let repaired = tbl;
-    // If only 1 line, or second line is not a delimiter row, create and insert one
-    if (tbl.length >= 1 && (tbl.length === 1 || !isDelimiterRow(tbl[1]))) {
-      const headerCols = tbl[0].split('|').filter((_, idx, arr) => idx > 0 && idx < arr.length - 1);
-      const colCount = Math.max(headerCols.length, 1);
+    // Filter out duplicate or redundant delimiter rows
+    const cleanedRows: string[] = [];
+    for (let r = 0; r < tbl.length; r++) {
+      const row = tbl[r].trim();
+      if (isDelimiterRow(row)) {
+        // If previous row in cleanedRows was already a delimiter, skip this one
+        if (cleanedRows.length > 0 && isDelimiterRow(cleanedRows[cleanedRows.length - 1])) {
+          continue;
+        }
+      }
+      cleanedRows.push(row);
+    }
+
+    if (cleanedRows.length === 0) return;
+
+    let repaired: string[] = [];
+
+    // Case A: First row is already a delimiter row (missing header row)
+    if (isDelimiterRow(cleanedRows[0])) {
+      const colCount = getColCount(cleanedRows[0]);
+      const headerRow = '|' + '   |'.repeat(colCount);
+      repaired = [headerRow, cleanedRows[0], ...cleanedRows.slice(1)];
+    }
+    // Case B: Second row is NOT a delimiter row (or only 1 row total)
+    else if (cleanedRows.length === 1 || !isDelimiterRow(cleanedRows[1])) {
+      const colCount = getColCount(cleanedRows[0]);
       const delimiterRow = '|' + ' --- |'.repeat(colCount);
-      repaired = [tbl[0], delimiterRow, ...tbl.slice(1)];
+      repaired = [cleanedRows[0], delimiterRow, ...cleanedRows.slice(1)];
+    } else {
+      // Delimiter row exists at index 1 — ensure its column count matches header
+      const headerCols = getColCount(cleanedRows[0]);
+      const delimCols = getColCount(cleanedRows[1]);
+      if (headerCols !== delimCols) {
+        cleanedRows[1] = '|' + ' --- |'.repeat(headerCols);
+      }
+      repaired = cleanedRows;
     }
 
     // Ensure blank line before table if needed
@@ -89,13 +205,31 @@ export function normalizeMarkdownTables(text: string): string {
 
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i];
-    if (isTableLine(line)) {
+    const trimmed = line.trim();
+
+    if (isTableLine(trimmed)) {
       if (!inTable) {
         inTable = true;
-        tableLines = [line.trim()];
+        tableLines = [trimmed];
       } else {
-        tableLines.push(line.trim());
+        tableLines.push(trimmed);
       }
+    } else if (trimmed === '' && inTable) {
+      // Lookahead: is next non-blank line also a table line?
+      let nextIsTable = false;
+      for (let j = i + 1; j < lines.length; j++) {
+        const look = lines[j].trim();
+        if (look === '') continue;
+        if (isTableLine(look)) nextIsTable = true;
+        break;
+      }
+      if (!nextIsTable) {
+        flushTable(tableLines);
+        inTable = false;
+        tableLines = [];
+        result.push(line);
+      }
+      // If next is table, we bridge across the blank line without flushing
     } else {
       if (inTable) {
         flushTable(tableLines);
@@ -111,6 +245,26 @@ export function normalizeMarkdownTables(text: string): string {
   }
 
   return result.join('\n');
+}
+
+/**
+ * Ensures display math blocks ($$...$$) have blank lines before and after
+ * so CommonMark/ReactMarkdown never squashes display equations into adjacent paragraphs.
+ */
+export function isolateDisplayMathBlocks(text: string): string {
+  if (!text || !text.includes('$$')) return text;
+
+  // 1. Isolate single-line $$...$$ from surrounding text:
+  // e.g. "Text\n$$eq$$" -> "Text\n\n$$eq$$"
+  // e.g. "$$eq$$\nText" -> "$$eq$$\n\nText"
+  let s = text.replace(/([^\n])\n([ \t]*\$\$[^\n]+\$\$)/g, '$1\n\n$2');
+  s = s.replace(/(\$\$[^\n]+\$\$)[ \t]*\n([^\n])/g, '$1\n\n$2');
+
+  // 2. Isolate multi-line $$ ... $$ blocks from surrounding text:
+  s = s.replace(/([^\n])\n([ \t]*\$\$\s*$)/gm, '$1\n\n$2');
+  s = s.replace(/(^\s*\$\$)[ \t]*\n([^\n])/gm, '$1\n\n$2');
+
+  return s;
 }
 
 /**
@@ -221,6 +375,43 @@ export function healMatrixEnvironments(text: string): string {
 }
 
 /**
+ * Close broken inline math at the END OF ITS OWN LINE.
+ *
+ * The old repair appended the closing `$` at the end of the whole document
+ * segment, which silently swallowed every paragraph (and any MCQ options
+ * grid) between the stray `$` and the next delimiter into one math node.
+ * Closing per line guarantees a broken boundary can only ever eat its own
+ * sentence, never the content below it.
+ */
+function closeBrokenInlineMathPerLine(part: string): string {
+  const lines = part.split('\n');
+  let inMath = false;
+  return lines
+    .map((line) => {
+      let s = '';
+      for (let i = 0; i < line.length; i++) {
+        const ch = line[i];
+        if (ch === '\\') {
+          // Consume the escaped char verbatim so \$ stays literal.
+          s += ch + (line[i + 1] ?? '');
+          i++;
+          continue;
+        }
+        if (ch === '$') {
+          inMath = !inMath;
+        }
+        s += ch;
+      }
+      if (inMath) {
+        s += '$';
+        inMath = false;
+      }
+      return s;
+    })
+    .join('\n');
+}
+
+/**
  * Strict final delimiter validator and repair pass
  */
 export function validateAndEnforceDelimiters(text: string): string {
@@ -245,11 +436,9 @@ export function validateAndEnforceDelimiters(text: string): string {
   const healedParts = parts.map((part, index) => {
     // Even indices are OUTSIDE display math ($$)
     if (index % 2 === 0) {
-      const singleDollars = (part.match(/(?<!\\)\$/g) || []).length;
-      if (singleDollars % 2 !== 0) {
-        return part + '$';
-      }
-      return part;
+      // Close any broken inline $ boundary at its OWN line end so it can
+      // never swallow subsequent text or MCQ syntax.
+      return closeBrokenInlineMathPerLine(part);
     } else {
       // Odd indices are INSIDE display math ($$)
       // Strip nested single $ inside display math to prevent KaTeX parse errors
@@ -383,12 +572,87 @@ export function deduplicateRepeatedParagraphs(text: string): string {
 }
 
 /**
+ * Convert interior newlines inside multi-line $$ ... $$ blocks into explicit
+ * LaTeX row separators (\\).
+ *
+ * KaTeX treats a raw newline inside display math as ordinary whitespace, so
+ * sequential equations transcribed on separate lines (nuclear decay chains,
+ * simultaneous pairs) render squashed end-to-end (e.g.
+ * "...Rn + α^{222}...Po"). Each interior newline becomes \\ unless either
+ * side already carries a separator, or the break sits on a bare environment
+ * boundary where a separator would create an empty matrix row.
+ */
+const BARE_ENV_OPEN_RE = /^\\begin\{[A-Za-z*]+\}(?:\[[^\]]*\])?(?:\{[^}]*\})*$/;
+
+function endsWithRowSeparator(trimmed: string): boolean {
+  return /(?:\\\\|\\cr)\s*$/.test(trimmed);
+}
+
+export function ensureDisplayMathLineBreaks(text: string): string {
+  if (!text.includes('$$')) return text;
+  const lines = text.split('\n');
+  const out: string[] = [];
+  let inDisplay = false;
+
+  for (const line of lines) {
+    const trimmed = line.trim();
+    const doubles = (trimmed.match(/(?<!\\)\$\$/g) || []).length;
+    const toggles = doubles % 2 === 1;
+
+    if (!inDisplay) {
+      out.push(line);
+      if (toggles) inDisplay = true;
+      continue;
+    }
+
+    // Inside a display block: this line's interior content is everything
+    // before a trailing $$ that closes the block.
+    const closesHere = toggles && trimmed.endsWith('$$');
+    const curInner = closesHere ? trimmed.slice(0, -2).trim() : trimmed;
+
+    // Previous line's interior content (the block may have opened with
+    // content on the same line, e.g. "$$x = 1").
+    const prevTrim = (out[out.length - 1] ?? '').trim();
+    const prevInner = prevTrim.startsWith('$$') ? prevTrim.slice(2).trim() : prevTrim;
+
+    const needsSeparator =
+      prevInner.length > 0 &&
+      curInner.length > 0 &&
+      !endsWithRowSeparator(prevInner) &&
+      !curInner.startsWith('\\\\') &&
+      !BARE_ENV_OPEN_RE.test(prevInner) &&
+      !curInner.startsWith('\\end{');
+
+    if (needsSeparator) {
+      out.push(closesHere ? `\\\\ ${curInner}$$` : `\\\\ ${trimmed}`);
+    } else {
+      out.push(line);
+    }
+
+    if (toggles) inDisplay = false;
+  }
+
+  return out.join('\n');
+}
+
+/**
  * Main delimiter and table healing function
  */
 export function healLatexDelimiters(raw: string): string {
   if (!raw || !raw.trim()) return '';
 
   let s = raw;
+
+  // -1. Escape-mangled LaTeX from stored payloads must be restored before
+  //     any structural pass sees TAB + "ext" instead of \text.
+  s = fixTabMangledLatex(s);
+
+  // 0. Backend placeholder tokens must never reach the parser or DOM.
+  s = stripPlaceholderTokens(s);
+  // 0b. Phantom/empty display math blocks are stripped before healing so
+  //     they cannot confuse delimiter pairing.
+  s = stripEmptyDisplayMath(s);
+
   s = deduplicateRepeatedParagraphs(s);
   s = normalizeMarkdownTables(s);
   s = fixSpacedCommands(s);
@@ -397,6 +661,15 @@ export function healLatexDelimiters(raw: string): string {
   s = stripOrphanedDollars(s);
   s = balanceMathEnvironments(s);
   s = validateAndEnforceDelimiters(s);
+  // Multi-line display blocks need explicit \\ row separators — KaTeX
+  // ignores raw newlines and would squash sequential equations end-to-end.
+  s = ensureDisplayMathLineBreaks(s);
+  // Isolate display math blocks ($$...$$) from adjacent text paragraphs
+  s = isolateDisplayMathBlocks(s);
+
+  // Healing can itself produce empty $$ pairs (e.g. stripping a stray $ from
+  // "$$ $") — remove them as a final pass.
+  s = stripEmptyDisplayMath(s);
 
   return s;
 }

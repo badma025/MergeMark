@@ -11,7 +11,7 @@
  * 6. Detects and normalizes sequential MCQ options (A, B, C, D)
  */
 
-import { MATH_ENVS, healLatexDelimiters, fixSpacedCommands } from './preprocess-exam-markdown';
+import { MATH_ENVS, healLatexDelimiters, fixSpacedCommands, stripPlaceholderTokens, stripEmptyDisplayMath, fixTabMangledLatex } from './preprocess-exam-markdown';
 import { normalizeMCQOptions } from './preprocess-mcq';
 
 /**
@@ -296,6 +296,17 @@ export function preprocessExamMarkdown(raw: string): string {
   if (!raw || !raw.trim()) return '';
 
   let s = raw;
+
+  // 0. Escape-mangled LaTeX (unescaped "\text" stored as TAB + "ext") is
+  //    restored before any structural pass runs.
+  s = fixTabMangledLatex(s);
+
+  // 0. Backend placeholder tokens ([DIAGRAM_PLACEHOLDER] /
+  //    [VISUAL_MCQ_PLACEHOLDER]) and phantom/empty display math blocks are
+  //    stripped BEFORE any structural pass so they can never reach the
+  //    markdown parser or the DOM.
+  s = stripPlaceholderTokens(s);
+  s = stripEmptyDisplayMath(s);
 
   // 1. Fix obvious LaTeX typos (space after backslash)
   s = fixSpacedCommands(s);

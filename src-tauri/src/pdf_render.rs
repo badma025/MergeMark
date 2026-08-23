@@ -1,5 +1,6 @@
 use std::collections::{HashMap, VecDeque};
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use pdfium_render::prelude::*;
 use crate::pipeline::{PageInput, PageInputKind};
@@ -21,6 +22,19 @@ struct PageRenderCacheState {
 pub struct PageRenderCache {
     capacity: usize,
     state: Mutex<PageRenderCacheState>,
+    /// Lazily-loaded PDF document shared across every page render in this
+    /// cache. Loading once instead of once-per-page removes the repeated
+    /// full-PDF parses that dominated figure-crop wall-time.
+    document: Mutex<Option<(PathBuf, Arc<PdfDocument<'static>>)>>,
+    /// Serializes pdfium renders. Pdfium itself is NOT thread-safe (its
+    /// `thread_safe` feature only adds Send+Sync bounds — it does not lock),
+    /// so concurrent figure-attach jobs must not render simultaneously even
+    /// though the document is shared. Holds only during the actual render, so
+    /// cache-hit lookups never block on an in-flight render.
+    render: Mutex<()>,
+    /// Number of times the PDF was loaded from disk (test instrumentation:
+    /// a multi-page render sequence through one cache must see exactly 1).
+    pub load_count: AtomicUsize,
 }
 
 impl PageRenderCache {
@@ -31,6 +45,9 @@ impl PageRenderCache {
                 pages: HashMap::with_capacity(capacity.max(1)),
                 lru: VecDeque::with_capacity(capacity.max(1)),
             }),
+            document: Mutex::new(None),
+            render: Mutex::new(()),
+            load_count: AtomicUsize::new(0),
         }
     }
 
@@ -41,20 +58,47 @@ impl PageRenderCache {
         path: &Path,
         page_idx: usize,
     ) -> Result<Arc<DynamicImage>, String> {
+        // Fast path: cache hit — touch LRU, return. Brief lock only.
+        {
+            let mut state = self
+                .state
+                .lock()
+                .map_err(|_| "300-DPI page cache lock poisoned".to_string())?;
+            if let Some(image) = state.pages.get(&page_idx).cloned() {
+                if let Some(position) = state.lru.iter().position(|cached| *cached == page_idx) {
+                    state.lru.remove(position);
+                }
+                state.lru.push_back(page_idx);
+                return Ok(image);
+            }
+        }
+
+        // Slow path: render from the shared document. The document is loaded
+        // once; the dedicated render mutex keeps the renders serialized
+        // because pdfium is not thread-safe. The state lock is NOT held, so
+        // concurrent cache-hit lookups never block on an in-flight render.
+        let document = self.get_or_load_document(path)?;
+        let _render_guard = self
+            .render
+            .lock()
+            .map_err(|_| "300-DPI render lock poisoned".to_string())?;
+        let image = Arc::new(render_page_from_document(
+            document.as_ref(),
+            page_idx,
+            figure_render_dpi(),
+        )?);
+        drop(_render_guard);
+
+        // Double-checked insert: a parallel job may have rendered this page
+        // while we were rendering — prefer its entry so the LRU slot is not
+        // wasted on a duplicate.
         let mut state = self
             .state
             .lock()
             .map_err(|_| "300-DPI page cache lock poisoned".to_string())?;
-
         if let Some(image) = state.pages.get(&page_idx).cloned() {
-            if let Some(position) = state.lru.iter().position(|cached| *cached == page_idx) {
-                state.lru.remove(position);
-            }
-            state.lru.push_back(page_idx);
             return Ok(image);
         }
-
-        let image = Arc::new(render_pdf_page_at_300dpi(path, page_idx)?);
         if state.pages.len() >= self.capacity {
             if let Some(evicted) = state.lru.pop_front() {
                 state.pages.remove(&evicted);
@@ -63,6 +107,32 @@ impl PageRenderCache {
         state.pages.insert(page_idx, Arc::clone(&image));
         state.lru.push_back(page_idx);
         Ok(image)
+    }
+
+    /// Load the PDF document once per cache and hand back a shared handle,
+    /// reloading only when a different path is requested (defensive: one
+    /// import uses one cache, so this is at most one load per run).
+    fn get_or_load_document(
+        &self,
+        path: &Path,
+    ) -> Result<Arc<PdfDocument<'static>>, String> {
+        let mut document = self
+            .document
+            .lock()
+            .map_err(|_| "300-DPI document lock poisoned".to_string())?;
+        if let Some((cached_path, doc)) = document.as_ref() {
+            if cached_path.as_path() == path {
+                return Ok(Arc::clone(doc));
+            }
+        }
+        self.load_count.fetch_add(1, Ordering::Relaxed);
+        let pdfium = get_pdfium()?;
+        let doc = pdfium
+            .load_pdf_from_file(path, None)
+            .map_err(|e| format!("Failed to load PDF: {:?}", e))?;
+        let shared = Arc::new(doc);
+        *document = Some((path.to_path_buf(), Arc::clone(&shared)));
+        Ok(shared)
     }
 }
 
@@ -360,26 +430,66 @@ pub fn load_and_optimize_image_file(path: &Path) -> Result<PageInput, String> {
     })
 }
 
+/// Default render DPI for figure-crop pages. Matches the pre-knob hardcoded
+/// 300 DPI (A4 width 2480px) so crops stay pixel-identical unless a user opts
+/// into a lower resolution.
+const DEFAULT_FIGURE_RENDER_DPI: u32 = 300;
+
+/// Render resolution for figure-crop pages. Env override
+/// `MERGEMARK_FIGURE_RENDER_DPI` ∈ [96, 300] trades crop fidelity for ~4×
+/// faster renders (e.g. 150 DPI) without a code change; the default keeps
+/// today's 300-DPI output byte-for-byte identical.
+fn figure_render_dpi() -> u32 {
+    std::env::var("MERGEMARK_FIGURE_RENDER_DPI")
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok())
+        .map(|dpi| dpi.clamp(96, DEFAULT_FIGURE_RENDER_DPI))
+        .unwrap_or(DEFAULT_FIGURE_RENDER_DPI)
+}
+
+/// Target render width for a given DPI. Scaled from the 300-DPI baseline
+/// (2480px = 8.27in × 300), so the default reproduces today's pixels exactly
+/// while lower DPIs shrink the render proportionally.
+fn figure_target_width(dpi: u32) -> i32 {
+    let width =
+        ((2480u32 as f32 * dpi as f32 / DEFAULT_FIGURE_RENDER_DPI as f32).round() as u32).max(1);
+    width.min(i32::MAX as u32) as i32
+}
+
+/// Render one page of an already-loaded document at the given DPI — the body
+/// of the old `render_pdf_page_at_300dpi` minus the per-call document parse.
+pub fn render_page_from_document(
+    doc: &PdfDocument,
+    page_idx: usize,
+    dpi: u32,
+) -> Result<image::DynamicImage, String> {
+    let pages = doc.pages();
+    if page_idx >= pages.len() as usize {
+        return Err(format!("Page index {} out of bounds", page_idx));
+    }
+
+    let page = pages
+        .get((page_idx as u16).into())
+        .map_err(|e| format!("Failed to get page: {:?}", e))?;
+
+    let render_config = PdfRenderConfig::new().set_target_width(figure_target_width(dpi));
+    let bitmap = page
+        .render_with_config(&render_config)
+        .map_err(|e| format!("Failed to render page: {:?}", e))?;
+
+    bitmap
+        .as_image()
+        .map_err(|e| format!("Failed to convert bitmap to image: {:?}", e))
+}
+
+#[allow(dead_code)]
 pub fn render_pdf_page_at_300dpi(path: &Path, page_idx: usize) -> Result<image::DynamicImage, String> {
     let pdfium = get_pdfium()?;
 
     let document = pdfium.load_pdf_from_file(path, None)
         .map_err(|e| format!("Failed to load PDF: {:?}", e))?;
 
-    let pages = document.pages();
-    if page_idx >= pages.len() as usize {
-        return Err(format!("Page index {} out of bounds", page_idx));
-    }
-
-    let page = pages.get((page_idx as u16).into())
-        .map_err(|e| format!("Failed to get page: {:?}", e))?;
-
-    let render_config = PdfRenderConfig::new().set_target_width(2480); // roughly 300 DPI for A4 width (8.27 * 300 = 2481)
-    let bitmap = page.render_with_config(&render_config)
-        .map_err(|e| format!("Failed to render page: {:?}", e))?;
-
-    bitmap.as_image()
-        .map_err(|e| format!("Failed to convert bitmap to image: {:?}", e))
+    render_page_from_document(&document, page_idx, DEFAULT_FIGURE_RENDER_DPI)
 }
 
 #[cfg(test)]
@@ -465,5 +575,105 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Fixture-gated regression for the load-once document cache: one cache
+    /// must parse the PDF exactly once and serve every page render from that
+    /// single document. Skips cleanly when pdfium/fixture are absent.
+    #[test]
+    fn cache_reuses_loaded_document() {
+        let manifest = env!("CARGO_MANIFEST_DIR");
+        let path = std::path::Path::new(manifest).join("../physics '24.pdf");
+        if !path.exists() {
+            eprintln!("[RENDER_TEST] fixture missing: {}", path.display());
+            return;
+        }
+        let cache = PageRenderCache::new(2);
+        let page0 = match cache.get_or_render(&path, 0) {
+            Ok(img) => img,
+            Err(e) => {
+                eprintln!("[RENDER_TEST] pdfium unavailable, skipping: {}", e);
+                return;
+            }
+        };
+        assert!(page0.width() > 0 && page0.height() > 0);
+        let page1 = cache
+            .get_or_render(&path, 1)
+            .expect("second page renders from the shared document");
+        assert!(page1.width() > 0 && page1.height() > 0);
+        // Two distinct pages rendered from a single document parse.
+        assert_eq!(
+            cache.load_count.load(Ordering::Relaxed),
+            1,
+            "document must be loaded exactly once for a multi-page render sequence"
+        );
+        // A cache hit neither re-renders nor re-loads the document.
+        let hit = cache.get_or_render(&path, 0).expect("cached hit");
+        assert_eq!(hit.width(), page0.width());
+        assert_eq!(cache.load_count.load(Ordering::Relaxed), 1);
+    }
+
+    /// Fixture-gated smoke: render_page_from_document returns a non-empty
+    /// image at the default DPI.
+    #[test]
+    fn render_page_from_document_smoke() {
+        let manifest = env!("CARGO_MANIFEST_DIR");
+        let path = std::path::Path::new(manifest).join("../physics '24.pdf");
+        if !path.exists() {
+            eprintln!("[RENDER_TEST] fixture missing: {}", path.display());
+            return;
+        }
+        let pdfium = match get_pdfium() {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("[RENDER_TEST] pdfium unavailable, skipping: {}", e);
+                return;
+            }
+        };
+        let document = match pdfium.load_pdf_from_file(&path, None) {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("[RENDER_TEST] pdfium load failed, skipping: {}", e);
+                return;
+            }
+        };
+        let img = render_page_from_document(&document, 0, DEFAULT_FIGURE_RENDER_DPI)
+            .expect("render page 0 at default DPI");
+        assert!(img.width() > 0 && img.height() > 0);
+    }
+
+    /// Fixture-gated: the DPI knob must shrink the render relative to the
+    /// default 300 DPI.
+    #[test]
+    fn dpi_knob_shrinks_renders() {
+        let manifest = env!("CARGO_MANIFEST_DIR");
+        let path = std::path::Path::new(manifest).join("../physics '24.pdf");
+        if !path.exists() {
+            eprintln!("[RENDER_TEST] fixture missing: {}", path.display());
+            return;
+        }
+        let pdfium = match get_pdfium() {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("[RENDER_TEST] pdfium unavailable, skipping: {}", e);
+                return;
+            }
+        };
+        let document = match pdfium.load_pdf_from_file(&path, None) {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("[RENDER_TEST] pdfium load failed, skipping: {}", e);
+                return;
+            }
+        };
+        let high = render_page_from_document(&document, 0, DEFAULT_FIGURE_RENDER_DPI)
+            .expect("300-DPI render");
+        let low = render_page_from_document(&document, 0, 150).expect("150-DPI render");
+        assert!(
+            high.width() > low.width(),
+            "300-DPI render width {} must exceed 150-DPI width {}",
+            high.width(),
+            low.width()
+        );
     }
 }

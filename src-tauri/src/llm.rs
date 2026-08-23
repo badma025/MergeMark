@@ -174,6 +174,18 @@ pub fn chat_body<S: AsRef<str>>(
     })
 }
 
+/// True when the provider reported the response was cut off at the
+/// `max_tokens` ceiling (`finish_reason == "length"`). A length-truncated
+/// payload ends mid-tag / mid-string — it must be REGENERATED, never
+/// salvaged, so the pipeline treats it like a validation failure and
+/// round-trips the reason into the repair prompt.
+pub fn response_was_truncated(resp: &serde_json::Value) -> bool {
+    resp["choices"][0]["finish_reason"]
+        .as_str()
+        .map(|f| f.eq_ignore_ascii_case("length"))
+        .unwrap_or(false)
+}
+
 /// Pull `choices[0].message.content` out of a chat completion response.
 pub fn message_content(resp: &serde_json::Value) -> Result<String, LlmError> {
     resp["choices"][0]["message"]["content"]
@@ -533,5 +545,23 @@ mod tests {
 
         let body2 = chat_body("google/gemini-2.5-flash", "system", &images, ImageDetail::High, None, 100, None);
         assert_eq!(body2["reasoning"]["effort"], "none");
+    }
+
+    #[test]
+    fn response_truncation_detected_via_finish_reason() {
+        let truncated = serde_json::json!({
+            "choices": [{ "message": { "content": "{\"items\":[" }, "finish_reason": "length" }]
+        });
+        assert!(response_was_truncated(&truncated));
+
+        let complete = serde_json::json!({
+            "choices": [{ "message": { "content": "{}" }, "finish_reason": "stop" }]
+        });
+        assert!(!response_was_truncated(&complete));
+
+        // Missing finish_reason (some providers) must NOT be flagged.
+        let bare = ok_chat("{}");
+        let bare = bare.unwrap();
+        assert!(!response_was_truncated(&bare));
     }
 }

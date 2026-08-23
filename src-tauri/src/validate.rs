@@ -363,9 +363,13 @@ pub fn normalize_decimal_parts(content: &str, question_number: u32) -> String {
 // Markdown collapses single newlines into one flowing paragraph. Exam
 // content (database schemas, algorithms, tables) is LINE-structured: losing
 // the line breaks mashes "Product(ProductID, Description," into a single
-// wrapped blob. Outside code fences, display math, and Markdown tables,
-// every source line becomes its own paragraph — what you see on the paper
-// is what renders on the card.
+// wrapped blob.
+//
+// BUT a soft break must only be promoted to a paragraph break when the next
+// line starts a STRUCTURAL element. Promoting every consecutive prose pair
+// fragments a single printed sentence across multiple <p> tags — the exact
+// "sentence fragmentation" defect. Prose lines now flow into one paragraph;
+// structural boundaries still get their own.
 pub fn harden_line_breaks(content: &str) -> String {
     let mut out = String::with_capacity(content.len() + content.len() / 2);
     let mut in_fence = false;
@@ -385,7 +389,12 @@ pub fn harden_line_breaks(content: &str) -> String {
             out.push_str(trimmed);
             out.push('\n');
         } else {
-            if !blank && prev_nonempty && !prev_table {
+            // Promote to a paragraph break ONLY at a structural boundary:
+            // lists, sub-part labels, display math, headings, MCQ options,
+            // bold tags, or blockquotes. Plain prose keeps its soft break and
+            // renders as ONE paragraph (a wrapped print-line is not a new
+            // sentence).
+            if !blank && prev_nonempty && !prev_table && starts_structural_element(t) {
                 out.push('\n');
             }
             out.push_str(trimmed);
@@ -424,6 +433,31 @@ pub fn harden_line_breaks(content: &str) -> String {
         out.pop();
     }
     re(r"\n{3,}").replace_all(&out, "\n\n").to_string()
+}
+
+/// True when `t` begins a line that deserves its own paragraph even though
+/// the previous line was also non-empty: exam sub-part labels, numbered /
+/// bulleted lists, headings, display math, MCQ options, bold tags,
+/// blockquotes, and answer-grid markers. Everything else is treated as
+/// continuation prose of the previous line's sentence/paragraph.
+fn starts_structural_element(t: &str) -> bool {
+    if t.starts_with("$$") || t.starts_with('\\') {
+        return true; // display math / raw LaTeX command lines
+    }
+    if t.starts_with('#') || t.starts_with('>') || t.starts_with('-') || t.starts_with('*') || t.starts_with('+') {
+        return true; // headings, quotes, list items
+    }
+    if t.starts_with("**") || t.starts_with("[MCQ:") {
+        return true; // bold headers/mark tags and MCQ option cards
+    }
+    // Sub-part labels: "(a)", "(iv)", "1.", "12)", "3 . 1"-style decimals
+    if re(r"^\([a-zA-Z0-9]+\)").is_match(t) {
+        return true;
+    }
+    if re(r"^\d+[.)]").is_match(t) {
+        return true;
+    }
+    false
 }
 
 static RE_TWO_BLOCK_LINE: LazyLock<regex::Regex> = LazyLock::new(|| {
@@ -531,7 +565,278 @@ pub fn heal_polar_equations(content: &str) -> String {
     result.join("\n")
 }
 
+// ── Math delimiter discipline ───────────────────────────────────────────────
+//
+// KaTeX renders garbage (or swallows subsequent question text / MCQ syntax)
+// whenever the model leaves an inline `$` or display `$$` unclosed. Two gates:
+//
+//   * `math_delimiter_balance_errors` — validator whose verdicts are quoted
+//     verbatim into the repair loop, so the model fixes its own pairing;
+//   * `balance_math_delimiters` — terminal deterministic healer applied to
+//     every assembled card: closes broken inline math AT THE END OF ITS OWN
+//     LINE (so a stray `$` can never swallow the rest of the question or an
+//     options grid), strips nested `$` inside `$$` blocks, and closes an
+//     unterminated display block at the end of the content.
+
+/// Collapse runs of `$` to exactly `$$` before scanning (mirrors the TS side).
+/// The replacement is a closure because the regex crate interpolates `$`
+/// sequences in plain replacement strings (`$$` would yield a single `$`).
+fn normalize_dollar_runs(s: &str) -> std::borrow::Cow<'_, str> {
+    RE_TRIPLE_DOLLARS.replace_all(s, |_: &regex::Captures| "$$")
+}
+
+/// Scan one line, returning `(unescaped_single_dollar_parity_odd, display_toggles)`
+/// where `display_toggles` counts `$$` occurrences.
+fn scan_line_delimiters(line: &str) -> (bool, usize) {
+    let bytes = line.as_bytes();
+    let mut singles = 0usize;
+    let mut doubles = 0usize;
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if bytes[i] == b'\\' {
+            i += 2; // skip escaped char verbatim (\$, \\, \frac…)
+            continue;
+        }
+        if bytes[i] == b'$' {
+            if i + 1 < bytes.len() && bytes[i + 1] == b'$' {
+                doubles += 1;
+                i += 2;
+                continue;
+            }
+            singles += 1;
+        }
+        i += 1;
+    }
+    (singles % 2 == 1, doubles)
+}
+
+/// Validator: human-readable violations for unbalanced `$` / `$$` pairing.
+/// Quoted back to the model by the repair loop via `validate_span_items`.
+pub fn math_delimiter_balance_errors(content: &str) -> Vec<String> {
+    let mut errors = Vec::new();
+    let s = normalize_dollar_runs(content);
+    let mut in_display = false;
+    let mut total_doubles = 0usize;
+    for (idx, line) in s.split('\n').enumerate() {
+        let (odd_singles, doubles) = scan_line_delimiters(line);
+        total_doubles += doubles;
+        if doubles % 2 == 1 {
+            in_display = !in_display;
+        }
+        if odd_singles && !in_display {
+            errors.push(format!(
+                "line {} opens an inline math `$` that is never closed on the same line — every $ must be paired on ONE line (e.g. $x^2 + 1$)",
+                idx + 1
+            ));
+        }
+    }
+    if total_doubles % 2 == 1 {
+        errors.push(
+            "display math delimiters are unbalanced: a $$ block is opened but never closed with $$".to_string(),
+        );
+    }
+    errors
+}
+
+/// Terminal deterministic healer (mirror of the frontend
+/// `validateAndEnforceDelimiters`, applied where the model cannot be asked
+/// again): closes broken inline `$` at the end of its own line, strips
+/// nested `$` inside `$$`, and appends a closing `$$` for an unterminated
+/// display block. Never invents content.
+pub fn balance_math_delimiters(content: &str) -> String {
+    let s = normalize_dollar_runs(content);
+    let mut out = String::with_capacity(s.len() + 16);
+    let mut in_display = false;
+
+    for line in s.split('\n') {
+        let mut chars = line.chars().peekable();
+        while let Some(c) = chars.next() {
+            if c == '\\' {
+                out.push(c);
+                if let Some(&next) = chars.peek() {
+                    out.push(next);
+                    chars.next();
+                }
+                continue;
+            }
+            if c == '$' {
+                if chars.peek() == Some(&'$') {
+                    chars.next();
+                    in_display = !in_display;
+                    out.push_str("$$");
+                    continue;
+                }
+                if !in_display {
+                    out.push('$');
+                }
+                // Inside display math a stray single `$` is stripped (KaTeX
+                // parse-error prevention).
+                continue;
+            }
+            out.push(c);
+        }
+        // Close broken inline math at the END OF ITS OWN LINE — never let a
+        // stray `$` swallow the next paragraph, table, or MCQ option grid.
+        let (odd_singles, _) = scan_line_delimiters(line);
+        if odd_singles && !in_display {
+            out.push('$');
+        }
+        out.push('\n');
+    }
+
+    // Drop the synthetic trailing newline, then close an unterminated display
+    // block so KaTeX never sees an open $$ boundary.
+    while out.ends_with('\n') {
+        out.pop();
+    }
+    if in_display {
+        out.push_str("\n$$");
+    }
+    out
+}
+
+// ── Multi-line display-math preservation ────────────────────────────────────
+//
+// KaTeX treats a raw newline inside $$ ... $$ as ordinary whitespace, so
+// sequential equations transcribed on separate lines (nuclear decay chains,
+// simultaneous pairs, multi-step derivations) render SQUASHED end-to-end
+// (e.g. "...Rn + ...α^222^...^Po..." with no separation). Deterministic fix:
+// inside a multi-line display block, convert each interior newline into an
+// explicit LaTeX row separator `\\` — unless either side already carries one
+// (`\\` / `\cr`), or the break sits on a bare environment boundary where a
+// separator would create an empty matrix row.
+
+static RE_BARE_ENV_OPEN: LazyLock<regex::Regex> = LazyLock::new(|| {
+    regex::Regex::new(r"^\\begin\{[A-Za-z*]+\}(?:\[[^\]]*\])?(?:\{[^}]*\})*$").unwrap()
+});
+
+fn line_ends_with_row_separator(trimmed: &str) -> bool {
+    let t = trimmed.trim_end();
+    t.ends_with("\\\\") || t.ends_with("\\cr")
+}
+
+pub fn ensure_display_math_line_breaks(content: &str) -> String {
+    if !content.contains("$$") {
+        return content.to_string();
+    }
+    let s = normalize_dollar_runs(content);
+    let mut result: Vec<String> = Vec::new();
+    let mut in_display = false;
+
+    for line in s.split('\n') {
+        let trimmed = line.trim();
+        let (_, doubles) = scan_line_delimiters(line);
+        let toggles = doubles % 2 == 1;
+
+        if !in_display {
+            result.push(line.to_string());
+            if toggles {
+                in_display = true;
+            }
+            continue;
+        }
+
+        // Inside a display block. The interior content of THIS line is
+        // everything before a trailing `$$` that closes the block.
+        let closes_here = toggles && trimmed.ends_with("$$");
+        let cur_inner = if closes_here {
+            trimmed[..trimmed.len() - 2].trim()
+        } else {
+            trimmed
+        };
+
+        // Interior content of the PREVIOUS emitted line: strip a leading
+        // opening `$$` (the block may have opened with content on the same
+        // line, e.g. "$$x = 1").
+        let prev_trim = result.last().map(|l| l.trim()).unwrap_or("");
+        let prev_inner = prev_trim.strip_prefix("$$").unwrap_or(prev_trim).trim();
+
+        let needs_separator = !prev_inner.is_empty()
+            && !cur_inner.is_empty()
+            && !line_ends_with_row_separator(prev_inner)
+            && !cur_inner.starts_with("\\\\")
+            && !RE_BARE_ENV_OPEN.is_match(prev_inner)
+            && !cur_inner.starts_with("\\end{");
+
+        if needs_separator {
+            if closes_here {
+                result.push(format!("\\\\ {}$$", cur_inner));
+            } else {
+                result.push(format!("\\\\ {}", trimmed));
+            }
+        } else {
+            result.push(line.to_string());
+        }
+
+        if toggles {
+            in_display = false;
+        }
+    }
+
+    result.join("\n")
+}
+
+// ── Escape-mangled LaTeX repair ─────────────────────────────────────────────
+//
+// When the model emits "\text{Ra}" instead of "\\text{Ra}" in its JSON
+// payload, the wire-level escape decodes to a literal TAB character followed
+// by "ext{Ra}" (same class of corruption: "\theta" → TAB + "heta"). Tabs
+// never occur legitimately in exam content, so a TAB directly preceding the
+// remainder of a known LaTeX command can be deterministically restored to
+// backslash-t.
+
+/// Restore LaTeX commands mangled by unescaped `\t` escapes in the JSON
+/// payload (TAB + "ext{...}" → `\text{...}`). Applied to every parsed
+/// content string before validation, so corrupted math never reaches a card.
+///
+/// Implemented as a scanner because a literal `\text` decodes to TAB +
+/// "ext{...}" — i.e. the escape consumes BOTH the backslash and the leading
+/// `t` of the command name, so the repair must re-insert backslash-t, not
+/// just a bare backslash.
+const TAB_MANGLED_REMAINDERS: &[&str] = &[
+    // Longest-first so "extbf" wins over "ext".
+    "extbf", "extit", "extrm", "exttt", "ext", "imes", "heta", "herefore", "riangle", "woheadrightarrow", "ilde", "au", "an", "o", "op", "frac", "dfrac",
+];
+
+pub fn fix_tab_mangled_latex(text: &str) -> String {
+    if !text.contains('\t') {
+        return text.to_string();
+    }
+    let mut out = String::with_capacity(text.len() + 8);
+    let mut i = 0usize;
+    while i < text.len() {
+        if text.as_bytes()[i] == b'\t' {
+            let rest = &text[i + 1..];
+            let is_command_remainder = TAB_MANGLED_REMAINDERS.iter().any(|rem| {
+                if !rest.starts_with(rem) {
+                    return false;
+                }
+                // The remainder must end at a non-letter boundary: a real
+                // word like "an<other>" after a prose TAB must not convert.
+                match rest.as_bytes().get(rem.len()) {
+                    None => true,
+                    Some(&b) => !b.is_ascii_alphabetic(),
+                }
+            });
+            if is_command_remainder {
+                out.push_str("\\t"); // literal backslash + t
+                i += 1;
+                continue;
+            }
+            out.push('\t');
+            i += 1;
+            continue;
+        }
+        let ch = text[i..].chars().next().unwrap_or('\u{fffd}');
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    out
+}
+
 pub fn clean_question_content(content: &str) -> String {
+    // Repair escape-mangled LaTeX FIRST so later passes see real commands.
+    let mut cleaned = fix_tab_mangled_latex(content);
     let patterns: &[&str] = &[
         r"(?i)Question\s+\d+\s+continued",
         r"(?i)\(Total\s+for\s+Question\s+\d+\s+is\s+\d+\s+marks?\)",
@@ -544,7 +849,6 @@ pub fn clean_question_content(content: &str) -> String {
         r"(?im)^\s*Problem\s*\d+\s*$",
         r"(?im)^\s*Answer\s*_*\s*$",
     ];
-    let mut cleaned = content.to_string();
     for p in patterns {
         cleaned = re(p).replace_all(&cleaned, "").into_owned();
     }
@@ -1526,6 +1830,47 @@ mod tests {
     }
 
     #[test]
+    fn delimiter_balance_validator_flags_broken_pairing() {
+        // Unclosed inline $ on one line
+        let errs = math_delimiter_balance_errors("Find $x^2 + 1 and state the range.");
+        assert!(errs.iter().any(|e| e.contains("never closed")), "{errs:?}");
+        // Unclosed $$ block
+        let errs = math_delimiter_balance_errors("$$r = 1 + \\sin 2\\theta");
+        assert!(errs.iter().any(|e| e.contains("unbalanced")), "{errs:?}");
+        // Balanced content passes
+        assert!(math_delimiter_balance_errors("Solve $x^2 = 4$.\n\n$$y = 2x$$").is_empty());
+        // Escaped \$ is literal
+        assert!(math_delimiter_balance_errors("Costs \\$5 for $n$ items.").is_empty());
+    }
+
+    #[test]
+    fn delimiter_balancer_closes_inline_math_at_line_end() {
+        // A stray opening $ must be closed at the END OF ITS OWN LINE so it
+        // cannot swallow the next paragraph or MCQ option grid.
+        let src = "The value $x satisfies:\n\n- [MCQ:A] 10\n- [MCQ:B] 20";
+        let out = balance_math_delimiters(src);
+        assert!(out.starts_with("The value $x satisfies:$"), "{out}");
+        assert!(out.contains("- [MCQ:A] 10"), "{out}");
+    }
+
+    #[test]
+    fn delimiter_balancer_strips_nested_dollars_and_closes_display() {
+        let out = balance_math_delimiters("$$\\int $x$ dx");
+        assert_eq!(out, "$$\\int x dx\n$$");
+        // Triple dollars collapse to display pairs
+        let out = balance_math_delimiters("$$$x^2$$");
+        assert_eq!(out, "$$x^2$$");
+    }
+
+    #[test]
+    fn delimiter_balancer_preserves_multibyte_and_balanced_input() {
+        let src = "The angle $\\theta$ is measured in degrees — not radians.";
+        assert_eq!(balance_math_delimiters(src), src);
+        let src = "Velocity $v = 4\\,\\text{m s}^{-2}$ — measured downward.";
+        assert_eq!(balance_math_delimiters(src), src);
+    }
+
+    #[test]
     fn boilerplate_removed_newlines_collapsed() {
         let dirty = "Do the thing\n\n\n\n\n(Total for Question 3 is 8 marks)";
         let clean = clean_question_content(dirty);
@@ -1578,9 +1923,12 @@ mod tests {
 
     #[test]
     fn hard_breaks_keep_lines_tables_and_code_intact() {
+        // Prose / schema CONTINUATION lines keep their SOFT break: markdown
+        // renders them inside ONE <p>, so a wrapped print-line never becomes
+        // a fake new paragraph (sentence-fragmentation fix).
         let schema = "Product(ProductID, Description,\nQuantityInStock, SupplierID)\nSale(SaleID, CustomerID, SaleDate)";
         let out = harden_line_breaks(schema);
-        assert!(out.contains("Description,\n\nQuantityInStock"), "lines must not reflow: {out}");
+        assert!(out.contains("Description,\nQuantityInStock"), "continuation lines stay soft: {out}");
 
         let table = "| A | B |\n| --- | --- |\n| 1 | 2 |";
         assert_eq!(harden_line_breaks(table), table, "tables keep single newlines");
@@ -1590,6 +1938,70 @@ mod tests {
 
         let para = "One sentence.\n\nNext paragraph.";
         assert_eq!(harden_line_breaks(para), para);
+    }
+
+    #[test]
+    fn hard_breaks_promote_structural_boundaries_only() {
+        // A sub-part label after prose gets its own paragraph…
+        let src = "Figure 1 shows a circuit.\n(a) State the current.";
+        let out = harden_line_breaks(src);
+        assert!(out.contains("circuit.\n\n(a)"), "sub-part promoted: {out}");
+        // …but a mid-sentence wrapped print-line does NOT fragment.
+        let wrapped = "The student measures the\nacceleration of the trolley.";
+        assert_eq!(
+            harden_line_breaks(wrapped),
+            wrapped,
+            "mid-sentence wrap stays one paragraph"
+        );
+        // Display math always stands alone.
+        let math = "Find the gradient.\n$$y = 2x + 1$$";
+        let out = harden_line_breaks(math);
+        assert!(out.contains("gradient.\n\n$$"), "{out}");
+    }
+
+    #[test]
+    fn display_math_lines_become_explicit_row_separators() {
+        // Nuclear decay chain transcribed on separate lines inside ONE block:
+        // KaTeX ignores raw newlines, so each interior newline needs \\.
+        let src = "$$^{226}_{88}\\text{Ra} \\rightarrow ^{222}_{86}\\text{Rn} + ^{4}_{2}\\alpha\n^{222}_{86}\\text{Rn} \\rightarrow ^{218}_{84}\\text{Po} + ^{4}_{2}\\alpha$$";
+        let out = ensure_display_math_line_breaks(src);
+        assert!(
+            out.contains("\\alpha\n\\\\ ^{222}"),
+            "interior newline became \\\\ row separator: {out}"
+        );
+        assert!(out.ends_with("\\alpha$$"), "closing $$ preserved: {out}");
+
+        // Existing separators are respected — never doubled.
+        let aligned = "$$\\begin{aligned}\nx &= 1 \\\\\ny &= 2\n\\end{aligned}$$";
+        assert_eq!(ensure_display_math_line_breaks(aligned), aligned);
+
+        // Single-line blocks are untouched.
+        let single = "$$r = 1 + \\sin 2\\theta$$";
+        assert_eq!(ensure_display_math_line_breaks(single), single);
+
+        // Content outside display math is never modified.
+        let plain = "Solve $x^2 = 4$.\nThen find $y$.";
+        assert_eq!(ensure_display_math_line_breaks(plain), plain);
+    }
+
+    #[test]
+    fn tab_mangled_latex_is_restored() {
+        // "\text" emitted unescaped decodes to TAB + "ext{...}".
+        let src = "The nuclide $\text{Ra}$ decays."; // literal TAB from \t
+        let out = fix_tab_mangled_latex(src);
+        assert_eq!(out, "The nuclide $\\text{Ra}$ decays.", "{out}");
+
+        let theta_src = concat!("the angle $\t", "heta$"); // TAB + "heta"
+        assert_eq!(
+            fix_tab_mangled_latex(theta_src),
+            "the angle $\\theta$",
+        );
+
+        // A legitimate prose TAB far from any command remainder survives.
+        let prose = "col1\tcol2 rest of text";
+        assert_eq!(fix_tab_mangled_latex(prose), prose);
+        // Content without tabs short-circuits unchanged.
+        assert_eq!(fix_tab_mangled_latex("plain $x$"), "plain $x$");
     }
 
     #[test]

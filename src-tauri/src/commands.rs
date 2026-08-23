@@ -1271,6 +1271,30 @@ pub async fn parse_pdf_vision(
         .cancel_flag
         .store(false, std::sync::atomic::Ordering::Relaxed);
 
+    let ext = std::path::Path::new(&file_path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_lowercase();
+    let is_pdf = ext == "pdf";
+
+    // ── Deterministic figure detection (free, on-device) ───────────────────
+    // Started UP-FRONT so it overlaps page assembly — but ONLY when page
+    // assembly does not touch pdfium itself: the frontend path extracts text
+    // with pdf-extract (a separate library) while detection uses pdfium, so
+    // they overlap safely. When assembly renders the PDF with pdfium itself
+    // (the None branch), detection must wait — pdfium is not thread-safe, so
+    // two of its calls must never run concurrently.
+    let has_frontend_pages = pdf_base64_pages.as_ref().map_or(false, |p| !p.is_empty());
+    let detection_future = if is_pdf && has_frontend_pages {
+        let path_clone = file_path.clone();
+        Some(tokio::task::spawn_blocking(move || {
+            crate::pdf_render::detect_pdf_figures(std::path::Path::new(&path_clone))
+        }))
+    } else {
+        None
+    };
+
     let pages: Vec<PageInput> = match pdf_base64_pages.filter(|p| !p.is_empty()) {
         Some(pdf_pages) => {
             let num_pages = pdf_pages.len();
@@ -1293,11 +1317,6 @@ pub async fn parse_pdf_vision(
                 .collect()
         },
         None => {
-            let ext = std::path::Path::new(&file_path)
-                .extension()
-                .and_then(|e| e.to_str())
-                .unwrap_or("")
-                .to_lowercase();
             let is_image = ext == "png" || ext == "jpg" || ext == "jpeg" || ext == "webp";
 
             if ext == "pdf" {
@@ -1512,19 +1531,22 @@ pub async fn parse_pdf_vision(
     }
     drop(pool_check);
 
-    // ── Deterministic figure detection (free, on-device) ───────────────────
-    // A single pass over the PDF content stream locates every figure region
-    // with zero AI calls. The pipeline uses these to attach figure crops to
-    // text-first questions, removing the vision figure pass entirely. Only
-    // runs for real PDFs; detection failures degrade to the vision path (the
-    // pipeline falls back whenever a question references a figure it cannot
-    // supply deterministically).
-    let ext = std::path::Path::new(&file_path)
-        .extension()
-        .and_then(|e| e.to_str())
-        .unwrap_or("")
-        .to_lowercase();
-    let page_figures: Vec<Vec<crate::pdf_render::DetectedFigure>> = if ext == "pdf" {
+    // ── Await figure detection (started concurrently with page assembly) ──
+    // Observable signal for the import logs: if the binary is current, this
+    // ALWAYS prints (even "found 0 figures"). Its absence means the running
+    // binary predates deterministic detection.
+    let page_figures: Vec<Vec<crate::pdf_render::DetectedFigure>> = if let Some(future) = detection_future
+    {
+        future
+            .await
+            .map_err(|e| format!("Thread-pool error: {}", e))?
+            .unwrap_or_else(|e| {
+                eprintln!("[DETECT_FIGURES] deterministic detection failed: {}", e);
+                Vec::new()
+            })
+    } else if is_pdf {
+        // Not overlapped (page assembly used pdfium): run detection now that
+        // the pdfium page rendering above has finished.
         let path_clone = file_path.clone();
         tokio::task::spawn_blocking(move || {
             crate::pdf_render::detect_pdf_figures(std::path::Path::new(&path_clone))
@@ -1538,9 +1560,6 @@ pub async fn parse_pdf_vision(
     } else {
         Vec::new()
     };
-    // Observable signal for the import logs: if the binary is current, this
-    // ALWAYS prints (even "found 0 figures"). Its absence means the running
-    // binary predates deterministic detection.
     let detected_total: usize = page_figures.iter().map(Vec::len).sum();
     eprintln!(
         "[DETECT_FIGURES] found {} figures across {} pages (free, on-device)",

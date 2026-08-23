@@ -212,7 +212,10 @@ pub fn repair_is_non_convergent(
 /// stops us paying API latency serially. 429 backpressure is per-call
 /// (llm.rs), so bursts self-limit.
 const DEFAULT_PARALLEL: usize = 4;
-const PAGE_RENDER_CACHE_CAPACITY: usize = 4;
+// Must comfortably cover the distinct figure pages of a real exam paper
+// (~20) so high-res crops stay resident and are never re-rendered; 300-DPI
+// pages are ~30MB each, so 32 caps worst-case at ~1GB for one import.
+const PAGE_RENDER_CACHE_CAPACITY: usize = 32;
 
 /// Process-wide accumulator for real API token usage across one pipeline run.
 /// Every `chat_with_permit` call adds its response's `usage` block, so the
@@ -617,7 +620,8 @@ fn merge_split_questions(items: Vec<AiQuestion>, question_number: u32) -> AiQues
         merged.is_code = merged.is_code.or(item.is_code);
         merged.math_snippet = merged.math_snippet.or(item.math_snippet);
         if merged.visual_options.is_none()
-            && item.visual_options.as_deref() == Some("composite_visual_options")
+            && (item.visual_options.as_deref() == Some("composite_visual_options")
+                || item.visual_options.as_deref() == Some("image_options"))
         {
             merged.visual_options = item.visual_options;
         }
@@ -656,6 +660,23 @@ fn is_composite_visual_options(item: &AiQuestion) -> bool {
                     .any(|kind| kind == "composite_visual_options")
             })
             .unwrap_or(false)
+}
+
+/// True when the model proposed ISOLATED per-option diagrams for an MCQ
+/// (one bbox per option letter). Exact/prefix matching so the legacy
+/// "composite_visual_options" value never collides with it.
+fn is_image_options(item: &AiQuestion) -> bool {
+    if item.visual_options.as_deref() == Some("image_options") {
+        return true;
+    }
+    item.diagram_kinds
+        .as_ref()
+        .map(|kinds| {
+            kinds
+                .iter()
+                .any(|kind| kind == "visual_option" || kind.starts_with("visual_option_"))
+        })
+        .unwrap_or(false)
 }
 
 fn is_visual_option_marker(line: &str) -> bool {
@@ -737,6 +758,222 @@ fn normalize_composite_visual_options(item: &mut AiQuestion) {
         }
         item.content = Some(collapsed.trim().to_string());
     }
+}
+
+/// First line that belongs to an option diagram rather than the question
+/// stem: any A-E option marker line or any placeholder-bearing line.
+/// Returns the BYTE offset of that line's start.
+fn first_option_line_index(content: &str) -> Option<usize> {
+    let mut offset = 0usize;
+    for line in content.lines() {
+        if is_visual_option_marker(line) || line.contains("[DIAGRAM_PLACEHOLDER]") {
+            return Some(offset);
+        }
+        offset += line.len() + 1;
+    }
+    None
+}
+
+/// Bind ISOLATED per-option MCQ diagrams into the strict markdown list format:
+///
+/// ```text
+/// <stem>
+///
+/// - [MCQ:A] [DIAGRAM_PLACEHOLDER]
+/// - [MCQ:B] [DIAGRAM_PLACEHOLDER]
+/// ...
+/// ```
+///
+/// Each diagram bbox stays SEPARATE (never unioned), so the crop splicer maps
+/// box N → placeholder N and every diagram lands inside its own option card.
+/// Legacy single-composite proposals are still routed through
+/// `normalize_composite_visual_options`.
+fn normalize_visual_mcq_options(item: &mut AiQuestion) {
+    if is_composite_visual_options(item) && !is_image_options(item) {
+        normalize_composite_visual_options(item);
+        return;
+    }
+    if !is_image_options(item) {
+        return;
+    }
+
+    let Some(bboxes) = item.diagram_bboxes.clone() else {
+        return;
+    };
+    if bboxes.len() < 2 {
+        // Fewer than two boxes cannot form an options grid; leave untouched.
+        return;
+    }
+
+    // Deterministic per-option metadata so downstream crop splicing labels
+    // each diagram with its option letter.
+    const LETTERS: [char; 5] = ['A', 'B', 'C', 'D', 'E'];
+    item.diagram_captions = Some(
+        (0..bboxes.len())
+            .map(|i| format!("Option {}", LETTERS[i]))
+            .collect(),
+    );
+    item.diagram_kinds = Some(vec!["visual_option".to_string(); bboxes.len()]);
+    item.visual_options = Some("image_options".to_string());
+
+    let stem = item
+        .content
+        .as_deref()
+        .and_then(|content| {
+            let cut = first_option_line_index(content).unwrap_or(content.len());
+            let stem = content[..cut].trim_end();
+            if stem.is_empty() {
+                None
+            } else {
+                Some(stem.to_string())
+            }
+        });
+
+    let mut rebuilt = String::new();
+    if let Some(stem) = stem {
+        rebuilt.push_str(&stem);
+        rebuilt.push_str("\n\n");
+    }
+    for (i, _) in bboxes.iter().enumerate().take(LETTERS.len()) {
+        rebuilt.push_str(&format!("- [MCQ:{}] [DIAGRAM_PLACEHOLDER]\n", LETTERS[i]));
+    }
+    item.content = Some(rebuilt.trim_end().to_string());
+}
+
+/// Intelligently splice saved diagram markdown links into content placeholders.
+/// Matches placeholders with diagrams based on Figure numbers ("Figure 1", "Figure 2"),
+/// option letters ("Option A", "Option B"), and diagram captions, falling back to sequential order.
+pub fn splice_diagrams_by_caption_and_context(
+    mut content: String,
+    links: &[Option<String>],
+    captions: Option<&[String]>,
+) -> String {
+    let non_empty_links: Vec<(usize, String)> = links
+        .iter()
+        .enumerate()
+        .filter_map(|(i, opt)| opt.as_ref().map(|l| (i, l.clone())))
+        .collect();
+
+    if non_empty_links.is_empty() {
+        return content.replace("[DIAGRAM_PLACEHOLDER]", "");
+    }
+
+    // Split content by "[DIAGRAM_PLACEHOLDER]"
+    let parts: Vec<&str> = content.split("[DIAGRAM_PLACEHOLDER]").collect();
+    let num_placeholders = parts.len().saturating_sub(1);
+
+    if num_placeholders == 0 {
+        // No placeholders in text, append all links at the end
+        for (_, link) in &non_empty_links {
+            content.push_str(link);
+        }
+        return content;
+    }
+
+    let re_fig = regex::Regex::new(r"(?i)\b(?:figure|fig\.?)\s*(\d+)\b").unwrap();
+    let re_opt = regex::Regex::new(r"(?i)\b(?:option|choice)\s*([A-E])\b").unwrap();
+
+    let mut placeholder_fig_nums: Vec<Option<u32>> = Vec::with_capacity(num_placeholders);
+    let mut placeholder_opt_letters: Vec<Option<char>> = Vec::with_capacity(num_placeholders);
+
+    for p in 0..num_placeholders {
+        let preceding = parts[p];
+        let snippet = if preceding.len() > 300 {
+            &preceding[preceding.len() - 300..]
+        } else {
+            preceding
+        };
+
+        let fig_num = re_fig
+            .captures_iter(snippet)
+            .last()
+            .and_then(|cap| cap[1].parse::<u32>().ok());
+        let opt_letter = re_opt
+            .captures_iter(snippet)
+            .last()
+            .and_then(|cap| cap[1].chars().next().map(|c| c.to_ascii_uppercase()));
+
+        placeholder_fig_nums.push(fig_num);
+        placeholder_opt_letters.push(opt_letter);
+    }
+
+    // For each diagram link, extract figure number / option letter from caption
+    let mut diagram_fig_nums: Vec<Option<u32>> = Vec::with_capacity(non_empty_links.len());
+    let mut diagram_opt_letters: Vec<Option<char>> = Vec::with_capacity(non_empty_links.len());
+
+    for (orig_idx, _) in &non_empty_links {
+        let cap_str = captions.and_then(|c| c.get(*orig_idx)).map(|s| s.as_str()).unwrap_or("");
+        let fig_num = re_fig
+            .captures(cap_str)
+            .and_then(|cap| cap[1].parse::<u32>().ok());
+        let opt_letter = re_opt
+            .captures(cap_str)
+            .and_then(|cap| cap[1].chars().next().map(|c| c.to_ascii_uppercase()));
+
+        diagram_fig_nums.push(fig_num);
+        diagram_opt_letters.push(opt_letter);
+    }
+
+    // Matching: map each placeholder index -> diagram link
+    let mut assigned_links: Vec<Option<String>> = vec![None; num_placeholders];
+    let mut used_diagrams: Vec<bool> = vec![false; non_empty_links.len()];
+
+    // Pass 1: Exact Figure Number match
+    for p in 0..num_placeholders {
+        if let Some(req_fig) = placeholder_fig_nums[p] {
+            for d in 0..non_empty_links.len() {
+                if !used_diagrams[d] && diagram_fig_nums[d] == Some(req_fig) {
+                    assigned_links[p] = Some(non_empty_links[d].1.clone());
+                    used_diagrams[d] = true;
+                    break;
+                }
+            }
+        }
+    }
+
+    // Pass 2: Exact Option Letter match
+    for p in 0..num_placeholders {
+        if assigned_links[p].is_none() {
+            if let Some(req_opt) = placeholder_opt_letters[p] {
+                for d in 0..non_empty_links.len() {
+                    if !used_diagrams[d] && diagram_opt_letters[d] == Some(req_opt) {
+                        assigned_links[p] = Some(non_empty_links[d].1.clone());
+                        used_diagrams[d] = true;
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    // Pass 3: Fill remaining placeholders in sequential order of unused diagrams
+    for p in 0..num_placeholders {
+        if assigned_links[p].is_none() {
+            if let Some(d) = (0..non_empty_links.len()).find(|&idx| !used_diagrams[idx]) {
+                assigned_links[p] = Some(non_empty_links[d].1.clone());
+                used_diagrams[d] = true;
+            }
+        }
+    }
+
+    // Reconstruct content with spliced links
+    let mut result = String::with_capacity(content.len() + 256);
+    for p in 0..num_placeholders {
+        result.push_str(parts[p]);
+        if let Some(link) = &assigned_links[p] {
+            result.push_str(link);
+        }
+    }
+    result.push_str(parts[num_placeholders]);
+
+    // Any remaining unused diagram links are appended at the end
+    for (d, (_, link)) in non_empty_links.iter().enumerate() {
+        if !used_diagrams[d] {
+            result.push_str(link);
+        }
+    }
+
+    result
 }
 
 #[derive(Debug, Default, serde::Deserialize)]
@@ -982,7 +1219,10 @@ fn extraction_json_schema() -> serde_json::Value {
                             "type": "object",
                             "properties": {
                                 "question_number": { "type": "integer", "minimum": 1, "maximum": 100 },
-                                "content": { "type": "string" },
+                                "content": {
+                                    "type": "string",
+                                    "description": "Markdown transcription. ALL math must be wrapped in balanced delimiters: every $ opened on a line is closed on the SAME line; every $$ block is closed with $$. No raw LaTeX (\\frac, ^{...}_{...}, \\alpha) may appear outside math delimiters. Never break a sentence across paragraphs. Sequential printed equations stay on SEPARATE $$ blocks (or rows joined with \\\\ inside one block) — never concatenated end-to-end. In JSON, escape EVERY backslash as \\\\ (writing \\text instead of \\\\text decodes to a TAB character followed by 'ext')."
+                                },
                                 "marks": { "type": ["integer", "null"], "minimum": 0 },
                                 "topics": { "type": "array", "items": { "type": "string" } },
                                 "module": { "type": "string" },
@@ -1000,7 +1240,10 @@ fn extraction_json_schema() -> serde_json::Value {
                                 "diagram_kinds": { "type": "array", "items": { "type": "string" } },
                                 "bbox_page_indexes": { "type": "array", "items": { "type": "integer" } },
                                 "math_snippet": { "type": "string" },
-                                "visual_options": { "type": ["string", "null"] }
+                                "visual_options": {
+                                    "type": ["string", "null"],
+                                    "description": "null for text questions; 'image_options' when MCQ answer choices are separate visual diagrams (one box per option letter, in A-D order); 'composite_visual_options' is the legacy single-composite value."
+                                }
                             },
                             "required": ["question_number", "content", "marks", "topics", "module", "is_code", "diagram_bboxes", "diagram_captions", "diagram_kinds", "bbox_page_indexes", "math_snippet", "visual_options"],
                             "additionalProperties": false
@@ -1077,9 +1320,9 @@ Example 3 — Structured table (trace table) — transcribe as Markdown table, N
 Input page (Question 12): "12 Complete the trace table for the algorithm below.\n\n| i | condition | output |\n|---|---|---|\n| 1 | true | 3 |\n| 2 |  |  |\n| 3 |  |  |"
 Output: {"items": [{"question_number": 12, "content": "Complete the trace table for the algorithm below.\n\n| i | condition | output |\n|---|---|---|\n| 1 | true | 3 |\n| 2 |  |  |\n| 3 |  |  |", "marks": 4, "difficulty_rating": null, "topics": ["algorithms", "trace tables"], "module": "Computer Science", "is_code": false, "diagram_bboxes": [], "diagram_captions": [], "diagram_kinds": [], "bbox_page_indexes": [], "math_snippet": "", "visual_options": null}]}
 
-Example 4 — Multiple-choice with visual options (composite)
+Example 4 — Multiple-choice with image-based options (ISOLATED per option, NEVER one composite blob)
 Input page (Question 15): "15 Which graph represents y = sin(x)/x?\nA [graph A]\nB [graph B]\nC [graph C]\nD [graph D]"
-Output: {"items": [{"question_number": 15, "content": "Which graph represents $y = \\frac{\\sin x}{x}$?\n\nA [DIAGRAM_PLACEHOLDER]\nB [DIAGRAM_PLACEHOLDER]\nC [DIAGRAM_PLACEHOLDER]\nD [DIAGRAM_PLACEHOLDER]", "marks": 1, "difficulty_rating": null, "topics": ["trigonometry", "graphs"], "module": "Pure Mathematics", "is_code": false, "diagram_bboxes": [[0.10, 0.25, 0.80, 0.65]], "diagram_captions": ["Options A, B, C, D"], "diagram_kinds": ["composite_visual_options"], "bbox_page_indexes": [0], "math_snippet": "sin(x)/x", "visual_options": "composite_visual_options"}]}
+Output: {"items": [{"question_number": 15, "content": "Which graph represents $y = \\frac{\\sin x}{x}$?\n\n- [MCQ:A] [DIAGRAM_PLACEHOLDER]\n- [MCQ:B] [DIAGRAM_PLACEHOLDER]\n- [MCQ:C] [DIAGRAM_PLACEHOLDER]\n- [MCQ:D] [DIAGRAM_PLACEHOLDER]", "marks": 1, "difficulty_rating": null, "topics": ["trigonometry", "graphs"], "module": "Pure Mathematics", "is_code": false, "diagram_bboxes": [[0.10, 0.25, 0.25, 0.20], [0.55, 0.25, 0.25, 0.20], [0.10, 0.50, 0.25, 0.20], [0.55, 0.50, 0.25, 0.20]], "diagram_captions": ["Option A", "Option B", "Option C", "Option D"], "diagram_kinds": ["visual_option", "visual_option", "visual_option", "visual_option"], "bbox_page_indexes": [0, 0, 0, 0], "math_snippet": "sin(x)/x", "visual_options": "image_options"}]}
 
 Example 5 — Question continues from previous page
 Input page (Question 9 continued): "(c) Find the exact value of the integral. [4 marks]\n\n(Total for Question 9 is 10 marks)\n\n10 (a) ..."
@@ -1092,6 +1335,10 @@ Output: {"items": [{"question_number": 3, "content": "A curve has polar equation
 Example 7 — Cardioid and Multi-Curve Polar Equations (Ensure $r = $ is NEVER dropped)
 Input page: "Question 8 (****)\nThe diagram above shows the curves with polar equations\nr = 1 + sin 2*theta, 0 <= theta <= pi/2\nr = 1.5, 0 <= theta <= pi/2\nFind the area enclosed between the two curves."
 Output: {"items": [{"question_number": 8, "content": "The diagram above shows the curves with polar equations\n\n$$r = 1 + \\sin 2\\theta, \\quad 0 \\le \\theta \\le \\frac{\\pi}{2}$$\n\nand\n\n$$r = 1.5, \\quad 0 \\le \\theta \\le \\frac{\\pi}{2}$$\n\nFind the area enclosed between the two curves.", "marks": null, "difficulty_rating": "****", "topics": ["polar coordinates", "integration"], "module": "Pure Mathematics", "is_code": false, "diagram_bboxes": [], "diagram_captions": [], "diagram_kinds": [], "bbox_page_indexes": [], "math_snippet": "r = 1 + \\sin 2\\theta", "visual_options": null}]}
+
+Example 8 — Nuclear decay equation (prescripts are MATH, never plaintext)
+Input page (Question 5): "5 The nuclide 226 88 Ra decays by alpha emission to radon. [2 marks]"
+Output: {"items": [{"question_number": 5, "content": "The nuclide $^{226}_{88}\\text{Ra}$ decays by alpha emission:\n\n$$^{226}_{88}\\text{Ra} \\rightarrow\\ ^{222}_{86}\\text{Rn} +\\ ^{4}_{2}\\alpha$$\n\n**[2 marks]**", "marks": 2, "difficulty_rating": null, "topics": ["nuclear physics"], "module": "Physics", "is_code": false, "diagram_bboxes": [], "diagram_captions": [], "diagram_kinds": [], "bbox_page_indexes": [], "math_snippet": "^{226}_{88}Ra -> ^{222}_{86}Rn + alpha", "visual_options": null}]}
 
 END OF EXAMPLES — Follow the same JSON structure, escaping rules, and isolation discipline exactly.
 "#;
@@ -1107,14 +1354,27 @@ CONTEXT: The user will specify the target question number, paper name, and modul
 3. ABSOLUTE VARIABLE FIDELITY: Transcribe complete equations verbatim without dropping leading variables, function headers, or curve names. If the source shows "r = ...", "y = ...", "f(x) = ...", "C: r = ...", you MUST include the "r = ", "y = ", etc. inside the math block: `$$r = \\frac{{...}}{{...}}$$`.
 4. DOMAIN & CONSTRAINTS: Include all domain restrictions (e.g. `, \\quad 0 \\le \\theta < 2\\pi`) inside the math delimiters.
 5. NO PLAIN TEXT IN $$: Never wrap standard English sentences or instructions inside `$$ ... $$`.
+6. SENTENCE INTEGRITY: A sentence is ONE paragraph. NEVER insert a hard line break mid-sentence — the PDF's printed line wrapping is NOT sentence structure. Join the wrapped print-lines of one sentence into a single continuous line; use \\n\\n ONLY between sub-parts, display equations, tables, or genuinely separate paragraphs. A sentence fragmented across paragraphs is a transcription error. WRONG: "The diagram shows\\na circuit connected..." RIGHT: "The diagram shows a circuit connected..." on ONE line.
+7. OPERATOR PRESERVATION: Every printed fraction MUST be transcribed as LaTeX (\\frac{{numerator}}{{denominator}} — or a/b inside $...$ for simple inline fractions), and every ratio with its operator (a:b or a\\div b). NEVER silently drop a fraction bar, division slash, ratio colon, ×, ÷, ±, or exponent. If the paper prints a stacked fraction, output \\frac — never flatten it into prose and never omit it. Ratio PHRASES keep their operator too: "electrostatic force / gravitational force" MUST keep its slash (or become $\\frac{{\\text{{electrostatic force}}}}{{\\text{{gravitational force}}}}$) — never render as "electrostatic forcegravitational force".
+8. NUCLEAR / PARTICLE NOTATION: nuclide and decay notation (mass/atomic prescripts, alpha/beta/gamma particles) MUST be LaTeX math, e.g. $^{{226}}_{{88}}\\text{{Ra}} \\rightarrow\\ ^{{222}}_{{86}}\\text{{Rn}} +\\ ^{{4}}_{{2}}\\alpha$. NEVER emit ^{{...}}_{{...}} prescripts or \\alpha/\\beta/\\gamma decay notation as bare plaintext outside math delimiters.
+9. MULTI-LINE EQUATIONS: Sequential or stacked printed equations (nuclear decay chains, simultaneous equation pairs, multi-step derivations) MUST keep their line structure. Put EACH equation in its OWN `$$ ... $$` block separated by a blank line, or join rows INSIDE one block using the LaTeX row separator \\\\ . NEVER concatenate consecutive equations end-to-end on a single line (WRONG: $$\\text{{X}} \\rightarrow \\text{{Y}} \\rightarrow \\text{{Z}}$$ when printed stacked) and NEVER drop the newline between them.
 
 ═══ ADAPTIVE MARK & DIFFICULTY EXTRACTION ═══
-1. STANDARD MARKS: If explicit mark allocations are printed (e.g. `[4 marks]`, `(3 marks)`, `[1 mark]`), sum them as an integer in `"marks"`, and place `**[X marks]**` at the end of each marked sub-part.
+1. STANDARD MARKS: If explicit mark allocations are printed (e.g. `[4 marks]`, `(3 marks)`, `[1 mark]`), sum them as an integer in `"marks"`, and place `**[X marks]**` at the end of each marked sub-part — NEVER inside `$ ... $` or `$$ ... $$` math blocks.
 2. DIFFICULTY RATINGS: If difficulty / star ratings are present instead (e.g. `(*)`, `(**)`, `(***)`, `(***+)`, `(****)`, `(*****)`, `(Specialist)`, `(Synoptic)` as in T. Madas worksheets):
    - Extract the rating string into `"difficulty_rating"` (e.g. `"***+"`).
    - Set `"marks": null`.
    - DO NOT invent, hallucinate, or default marks (e.g. do NOT output `marks: 1`) when no mark scheme allocation is printed.
 3. If neither is present, set `"marks": null` and `"difficulty_rating": null`.
+
+═══ ANSWER LINES, WRITE-IN SPACES & UNITS (CRITICAL) ═══
+1. STRIP FINAL ANSWER LINES: Completely OMIT every answer prompt line, fill-in blank, underline run, dotted leader, and standalone answer box designed for student responses. Examples to DROP entirely: "answer = _______", "average emf = _________ V", "Total = _____", "_________", "………………", and any ruled/dotted response area. These are layout furniture for the candidate, NOT question content — transcribing them corrupts the question.
+2. TRAILING UNIT LABELS: When dropping an answer line, also drop the unit label printed at the END of that line (the trailing "V" in "average emf = _________ V", or trailing "m/s", "J", "N", "°", "%"). Only transcribe units that are part of the explanatory question narrative itself (e.g. "The resistance R is measured in ohms (∼)" or "Give your answer in joules").
+3. MARK SCHEME FOOTERS: Lines like "(Total for Question 5 is 8 marks)" are footers, never content.
+
+═══ MARK ALLOCATION PLACEMENT & LATEX ISOLATION (CRITICAL) ═══
+1. PLACEMENT: Place each mark allocation (e.g. **[3 marks]**, (3)) at the END of the question or sub-part text it belongs to, or on its own new line immediately AFTER the question statement. NEVER merge mark brackets inside LaTeX math blocks ($ ... $ or $$ ... $$) and NEVER inline them with answer prompts or units.
+2. LATEX ISOLATION: Only wrap ACTUAL mathematical expressions, variables, and numerical values in LaTeX delimiters. NEVER combine exam metadata, text labels, units, and marks into a single math string. FORBIDDEN corruption pattern: $averageemf = V **[3marks]**$. CORRECT: the prose stays as prose, the mark tag is **[3 marks]** outside math, and only real math (e.g. $\\varepsilon = 12$) is delimited.
 
 ═══ SUB-PARTS VS MULTIPLE CHOICE (CRITICAL) ═══
 1. SUB-QUESTIONS: Sub-parts labeled `(a)`, `(b)`, `(c)` or `(i)`, `(ii)` are mathematical sub-questions. Format them in lowercase parentheses `(a)`, `(b)` separated by double newlines (`\n\n`). NEVER convert sub-parts into multiple-choice options.
@@ -1135,7 +1395,7 @@ OUTPUT STRUCTURE — EVERY item MUST have:
   * Format sub-parts (a), (b), (c) separated by double newlines (\n\n).
   * Omit headers, footers, "(Total for Question...)", blank page notices, and dotted answer lines at the end of parts.
   * Structured tables (trace tables, data tables): Transcribe as Markdown tables (| col |), NEVER as diagram boxes.
-  * Math: Wrap inline math in $...$, display equations on their own line in $$...$$. Use valid LaTeX (\\frac, \\sin, \\cos, \\theta). Backslashes MUST be escaped in JSON (\\\\frac).
+   * Math: Wrap inline math in $...$, display equations on their own line in $$...$$. Use valid LaTeX (\\frac, \\sin, \\cos, \\theta). Backslashes MUST be escaped in JSON (\\\\frac). An unescaped escape corrupts the text: writing \\text instead of \\\\text decodes to a literal TAB character followed by "ext" — ALWAYS double every backslash (\\\\text, \\\\theta).
   * Code: Markdown backticks (`...`), never LaTeX math mode.
   * Insert [DIAGRAM_PLACEHOLDER] chronologically after referencing text.
 - "marks": Total integer marks, or null if unknown / difficulty-rated.
@@ -1150,7 +1410,12 @@ OUTPUT STRUCTURE — EVERY item MUST have:
 - "diagram_captions": array of strings, one per box.
 - "diagram_kinds": array of semantic strings ("graph", "schema", "flowchart", "circuit", etc.), one per box.
 - "bbox_page_indexes": array of 0-based page image indices matching diagram_bboxes.
-- "visual_options": null for text questions. Set to "composite_visual_options" ONLY if MCQ answer choices are visual diagrams (return ONE composite box spanning options A through D).{few_shot}
+- "visual_options": null for text questions. When MCQ answer choices are IMAGE-BASED diagrams (four graphs / circuits / sketches labelled A-D):
+  * Treat EACH option diagram as a DISTINCT entity. Return FOUR (or as many as options present) SEPARATE diagram_bboxes — ONE tight box per option, listed in A, B, C, D order. NEVER merge all option diagrams into one big composite box or a single image array attached to the stem.
+  * diagram_captions: ["Option A", "Option B", ...]; diagram_kinds: ["visual_option", "visual_option", ...] — one entry per box.
+  * In "content" bind each isolated diagram to its option letter with the strict MCQ list format, one line per option:
+    "- [MCQ:A] [DIAGRAM_PLACEHOLDER]\n- [MCQ:B] [DIAGRAM_PLACEHOLDER]\n- [MCQ:C] [DIAGRAM_PLACEHOLDER]\n- [MCQ:D] [DIAGRAM_PLACEHOLDER]"
+  * Set "visual_options" to exactly "image_options". The placeholder COUNT must equal the box COUNT.{few_shot}
 "#,
         topics_instruction = topics_instruction,
         module = config.module_name,
@@ -1191,11 +1456,23 @@ CONTEXT: The user will specify the target question number(s), paper name, and mo
 3. ABSOLUTE VARIABLE FIDELITY: Transcribe complete equations verbatim without dropping leading variables, function headers, or curve names ("r = ...", "y = ...", "f(x) = ...").
 4. DOMAIN & CONSTRAINTS: Include all domain restrictions (e.g. `, \quad 0 \le \theta < 2\pi`) inside the math delimiters.
 5. NO PLAIN TEXT IN $$: Never wrap standard English sentences or instructions inside `$$ ... $$`.
+6. SENTENCE INTEGRITY: A sentence is ONE paragraph. NEVER insert a hard line break mid-sentence — the text layer's line wrapping is NOT sentence structure. Join the wrapped lines of one sentence into a single continuous line; use \n\n ONLY between sub-parts, display equations, tables, or genuinely separate paragraphs. WRONG: "The diagram shows\na circuit connected...". RIGHT: "The diagram shows a circuit connected..." on ONE line.
+7. OPERATOR PRESERVATION: Every printed fraction MUST be transcribed as LaTeX (\frac{{numerator}}{{denominator}} — or a/b inside $...$ for simple inline fractions), and every ratio with its operator (a:b). NEVER silently drop a fraction bar, division slash, ratio colon, ×, ÷, ±, or exponent. Ratio PHRASES keep their operator too: "electrostatic force / gravitational force" MUST keep its slash (or become $\frac{{\text{{electrostatic force}}}}{{\text{{gravitational force}}}}$) — never render as "electrostatic forcegravitational force".
+8. NUCLEAR / PARTICLE NOTATION: nuclide and decay notation MUST be LaTeX math, e.g. $^{{226}}_{{88}}\text{{Ra}} \rightarrow\ ^{{222}}_{{86}}\text{{Rn}} +\ ^{{4}}_{{2}}\alpha$. NEVER emit prescripts or decay particles as bare plaintext outside math delimiters.
+9. MULTI-LINE EQUATIONS: Sequential or stacked printed equations (nuclear decay chains, simultaneous pairs, multi-step derivations) MUST keep their line structure. Put EACH equation in its OWN `$$ ... $$` block separated by a blank line, or join rows INSIDE one block using the LaTeX row separator \\\\ . NEVER concatenate consecutive equations end-to-end and NEVER drop the newline between them.
 
 ═══ ADAPTIVE MARK & DIFFICULTY EXTRACTION ═══
-1. STANDARD MARKS: If explicit mark allocations are printed (e.g. `[4 marks]`, `(3 marks)`, `[1 mark]`), sum them as an integer in `"marks"`, and place `**[X marks]**` at the end of each marked sub-part.
+1. STANDARD MARKS: If explicit mark allocations are printed (e.g. `[4 marks]`, `(3 marks)`, `[1 mark]`), sum them as an integer in `"marks"`, and place `**[X marks]**` at the end of each marked sub-part — NEVER inside `$ ... $` or `$$ ... $$` math blocks.
 2. DIFFICULTY RATINGS: If difficulty / star ratings are present instead (e.g. `(*)`, `(**)`, `(***)`, `(***+)`, `(****)`, `(*****)`, `(Specialist)`, `(Synoptic)`): extract the rating string into `"difficulty_rating"`, set `"marks": null`, and DO NOT invent marks.
 3. If neither is present, set `"marks": null` and `"difficulty_rating": null`.
+
+═══ ANSWER LINES, WRITE-IN SPACES & UNITS (CRITICAL) ═══
+1. STRIP FINAL ANSWER LINES: Completely OMIT every answer prompt line, fill-in blank, underline run, dotted leader, and standalone answer box designed for student responses (e.g. "answer = _______", "average emf = _________ V", "Total = _____", "_________", "………………"). These are layout furniture, NOT question content.
+2. TRAILING UNIT LABELS: When dropping an answer line, also drop the unit label printed at the END of that line (trailing "V", "m/s", "J", "N", "°", "%"). Only transcribe units that are part of the explanatory question narrative itself.
+
+═══ MARK ALLOCATION PLACEMENT & LATEX ISOLATION (CRITICAL) ═══
+1. PLACEMENT: Place each mark allocation (e.g. **[3 marks]**, (3)) at the END of the question or sub-part text, or on its own new line immediately AFTER it. NEVER merge mark brackets inside LaTeX math blocks ($ ... $ or $$ ... $$).
+2. LATEX ISOLATION: Only wrap ACTUAL mathematical expressions, variables, and numerical values in LaTeX delimiters. NEVER combine exam metadata, text labels, units, and marks into a single math string (FORBIDDEN: $averageemf = V **[3marks]**$).
 
 ═══ SUB-PARTS VS MULTIPLE CHOICE (CRITICAL) ═══
 1. SUB-QUESTIONS: Sub-parts labeled `(a)`, `(b)`, `(c)` or `(i)`, `(ii)` are mathematical sub-questions. Format them in lowercase parentheses `(a)`, `(b)` separated by double newlines (`\n\n`). NEVER convert sub-parts into multiple-choice options.
@@ -1209,7 +1486,7 @@ CONTEXT: The user will specify the target question number(s), paper name, and mo
 
 ═══ OUTPUT STRUCTURE — EVERY item MUST have ═══
 - "question_number": integer matching the requested question number.
-- "content": Full text transcription without summary or leading question number. Format sub-parts separated by double newlines. Structured tables (trace tables, data tables): Markdown tables (| col |), NEVER as diagram boxes. Math: `$...$` / `$$...$$` with valid LaTeX (\\frac, \\sin, \\cos, \\theta); backslashes MUST be escaped in JSON (\\\\frac). Code: Markdown backticks, never LaTeX math mode.
+- "content": Full text transcription without summary or leading question number. Format sub-parts separated by double newlines. Structured tables (trace tables, data tables): Markdown tables (| col |), NEVER as diagram boxes. Math: `$...$` / `$$...$$` with valid LaTeX (\\frac, \\sin, \\cos, \\theta); backslashes MUST be escaped in JSON (\\\\frac) — writing \\text instead of \\\\text decodes to a literal TAB character followed by "ext", so ALWAYS double every backslash. Code: Markdown backticks, never LaTeX math mode.
 - "marks": integer total, or null.
 - "difficulty_rating": string rating or null.
 {topics_instruction}
@@ -1263,19 +1540,24 @@ RULES:
 - ARTIFACT FILTERING: Recognize and completely exclude all non-exam content. Silently ignore margin warnings, printer registration marks, page numbers, and barcodes.
 - INLINE IMAGE PLACEMENT: If an image or diagram is present, insert its placeholder [DIAGRAM_PLACEHOLDER] IMMEDIATELY after the sentence or paragraph that references it. Never place diagrams at the end of the question if they were referenced earlier.
 - TABLE FORMATTING: If a grid or table contains standard text or numbers, you MUST format it as a standard Markdown table using pipes | and dashes -. NEVER use LaTeX array environments or \hline for data tables.
-- EQUATION COHESION: A mathematical equation MUST remain inside a single, cohesive display math block $$ ... $$. Never split an equation into multiple blocks. Operators like =, +, or exponents like ^n and ^{-1} must remain inside the same block as the matrices or variables they belong to.
+- EQUATION COHESION: A mathematical equation MUST remain inside a single, cohesive display math block $$ ... $$. Never split an equation into multiple blocks. Operators like =, +, or exponents like ^n and ^{-1} must remain inside the same block as the matrices or variables they belong to. Sequential printed equations (decay chains, simultaneous pairs) keep their line structure: separate $$ blocks per equation, or rows joined with \\ inside one block — NEVER concatenated end-to-end on one line.
 - CHARACTER PRECISION: Pay close attention to function notation. Do not confuse the italic function symbol $f$ in $f(x)$ or $f(t)$ with the number 1. Pay extreme attention to Greek symbols: do not confuse \theta with the number 1, or \alpha with a. Accurately transcribe all complex number forms, e.g., r(\cos \theta + \text{i}\sin \theta).
 - DELIMITER DISCIPLINE: NEVER place inline math delimiters $ inside a display math $$ block. Display math must start with $$ and end with $$ with NO inner $ signs. Never wrap regular prose or full sentences in $$ display math delimiters.
 - LIST CLEAN-UP: Do not output empty list bullets or empty numbered prefixes.
 - CRITICAL: Never fracture inline math. WRONG: $r(\cos$ \theta $). RIGHT: $r(\cos \theta)$.
 - CRITICAL: Never wrap English sentences in $$. Use $ for variables inside text.
 - STRUCTURAL SPACING: Enforce strict hierarchical spacing with double line breaks (\n\n) separating sub-parts and distinct mark points.
+- SENTENCE INTEGRITY: A sentence is ONE paragraph. NEVER insert a hard line break mid-sentence — the printed line wrapping of the paper is NOT sentence structure. Join wrapped lines of one sentence into a single continuous line; use \n\n only between mark points, equations, and genuinely separate paragraphs.
+- OPERATOR PRESERVATION: Every fraction MUST be transcribed as LaTeX (\frac{a}{b}, or a/b inside $...$) and every ratio with its operator (a:b). NEVER silently drop a fraction bar, division slash, ratio colon, ×, ÷, ±, or exponent.
+- NUCLEAR / PARTICLE NOTATION: nuclide prescripts and alpha/beta/gamma decay particles MUST be LaTeX math, e.g. $^{14}_{6}\text{C} \rightarrow\ ^{14}_{7}\text{N} +\ ^{0}_{-1}\beta$. Never emit them as bare plaintext.
 - MATHEMATICAL ACCURACY: Ensure all mathematical notation, including complex numbers, vectors, matrices, exponents, and trigonometric/logarithmic functions, is accurately translated into valid, standard LaTeX.
 - ROBUST TABLE RENDERING: Data/trace tables: standard Markdown tables compatible with Markdown viewers. Never leak raw \hline or unrendered tabular tags. True matrices/Simplex tableaus: \begin{array} or \begin{pmatrix} in $$...$$.
 - Sub-part letters must continue across pages: do not reset (g) back to (a).
+- ANSWER LINES / WRITE-IN SPACES: completely omit answer prompts, fill-in blanks, underline runs and dotted leaders ("answer = _______", "Total = _____", "_________"), including any trailing unit label attached to them. These are student response areas, not mark-scheme content.
+- MARK TAGS: keep mark labels (M1, A1, B1) and mark totals OUTSIDE LaTeX math delimiters. Never merge marks into a single math string with prose or units.
 - Exclude: examiner notes about mark codes, page headers/footers, AQA margin numbers, blank answer-line numbers, and reprinted question text (the REPRINT BAN).
 - Diagrams (activity networks, Gantt charts, trees, graphs): capture via diagram_bboxes + diagram_page_indexes and insert [DIAGRAM_PLACEHOLDER] where the diagram belongs. NEVER box text, math working, examiner notes, or empty grids (the CRITICAL DIAGRAM BAN).
-- JSON ESCAPING: escape LaTeX backslashes (\\frac not \frac). Invalid JSON is rejected outright and your work is lost.
+- JSON ESCAPING: escape LaTeX backslashes (\\frac not \frac). Writing \text instead of \\text decodes to a literal TAB character followed by "ext" — double EVERY backslash. Invalid JSON is rejected outright and your work is lost.
 - You are a transcriber, not a solver. If there is no question-number column with mark labels on these pages, return an empty array."#
         .to_string()
 }
@@ -1982,6 +2264,26 @@ pub async fn run_question_pipeline<C: LlmClient, P: Progress>(
         report.figures_detected,
     );
 
+    // Per-stage timing so the import log can prove where wall-time went (and
+    // that PDF-render speedups actually landed). Entries are only recorded
+    // when a stage ran; missing stages print 0ms.
+    let timing = |stage: &str, operation: &str| -> u64 {
+        report
+            .timings
+            .iter()
+            .find(|t| t.stage == stage && t.operation == operation)
+            .map(|t| t.milliseconds)
+            .unwrap_or(0)
+    };
+    eprintln!(
+        "[TIMING] document_map={}ms structure={}ms extraction_span_stream={}ms extraction_fallback_stream={}ms total={}ms",
+        timing("document_map", "text_layer_scan"),
+        timing("structure", "api_call_stream"),
+        timing("extraction", "span_stream"),
+        timing("extraction", "fallback_stream"),
+        report.total_elapsed_ms,
+    );
+
     Ok((built, report))
 }
 
@@ -2182,10 +2484,40 @@ fn find_figure_reference_after(content: &str, num: u32, from: usize) -> Option<u
     None
 }
 
+/// Placeholder tokens the model / post-processors may leave in content.
+/// `clean_marker_markdown` renames `[DIAGRAM_PLACEHOLDER]` to
+/// `[VISUAL_MCQ_PLACEHOLDER]` inside visual MCQs, so figure attachment must
+/// treat BOTH as splice points — and neither may ever reach a question card.
+const PLACEHOLDER_TOKENS: [&str; 2] = ["[DIAGRAM_PLACEHOLDER]", "[VISUAL_MCQ_PLACEHOLDER]"];
+
+/// Find the earliest placeholder token at or after `from`, as (start, end).
+fn next_placeholder_after(content: &str, from: usize) -> Option<(usize, usize)> {
+    let mut best: Option<(usize, usize)> = None;
+    for token in PLACEHOLDER_TOKENS {
+        if let Some(rel) = content[from..].find(token) {
+            let abs = from + rel;
+            if best.map_or(true, |(start, _)| abs < start) {
+                best = Some((abs, abs + token.len()));
+            }
+        }
+    }
+    best
+}
+
+/// Remove every placeholder token — a bare `[VISUAL_MCQ_PLACEHOLDER]` or
+/// `[DIAGRAM_PLACEHOLDER]` must never leak into a rendered question card.
+fn strip_placeholder_tokens(content: &str) -> String {
+    let mut s = content.to_string();
+    for token in PLACEHOLDER_TOKENS {
+        s = s.replace(token, "");
+    }
+    s
+}
+
 /// Splice deterministic figure crops into a text-first question's content.
 ///
 /// Order of placement:
-///   1. one crop link per `[DIAGRAM_PLACEHOLDER]` the model emitted,
+///   1. one crop link per placeholder token the model emitted,
 ///   2. otherwise immediately after the matching "Figure N" reference,
 ///   3. remaining figures appended at the end.
 /// Every crop goes through the standard save guard chain (`persist_diagrams`
@@ -2204,6 +2536,9 @@ async fn attach_detected_figures(
     let referenced = figure_reference_numbers(content);
     let eligible = span_figure_candidates(span, span_pages, page_figures, &referenced);
     if eligible.is_empty() {
+        // Nothing to attach — but leftover tokens must still be scrubbed so a
+        // bare placeholder never renders as literal text in the card.
+        *content = strip_placeholder_tokens(content);
         return;
     }
     let mut requests = Vec::with_capacity(eligible.len());
@@ -2259,9 +2594,8 @@ async fn attach_detected_figures(
     let mut insert_offset = 0usize;
     for (link_opt, fig) in persisted.links.into_iter().zip(figs) {
         let Some(link) = link_opt else { continue };
-        if let Some(rel) = content[insert_offset..].find("[DIAGRAM_PLACEHOLDER]") {
-            let abs = insert_offset + rel;
-            content.replace_range(abs..abs + "[DIAGRAM_PLACEHOLDER]".len(), &link);
+        if let Some((abs, end)) = next_placeholder_after(content, insert_offset) {
+            content.replace_range(abs..end, &link);
             insert_offset = abs + link.len();
             continue;
         }
@@ -2276,7 +2610,7 @@ async fn attach_detected_figures(
     }
     // Any placeholder that survived (model over-emitted, or every crop was
     // rejected) is dropped — never leak a bare token into a question card.
-    *content = content.replace("[DIAGRAM_PLACEHOLDER]", "");
+    *content = strip_placeholder_tokens(content);
 }
 
 /// Slim JSON schema for TEXT-ONLY calls: the full extraction schema minus the
@@ -2299,7 +2633,10 @@ fn text_first_json_schema() -> serde_json::Value {
                                 "type": "object",
                                 "properties": {
                                     "question_number": { "type": "integer", "minimum": 1, "maximum": 100 },
-                                    "content": { "type": "string" },
+                                    "content": {
+                                        "type": "string",
+                                        "description": "Markdown transcription. ALL math must be wrapped in balanced delimiters: every $ opened on a line is closed on the SAME line; every $$ block is closed with $$. No raw LaTeX (\\frac, ^{...}_{...}, \\alpha) may appear outside math delimiters. Never break a sentence across paragraphs. Sequential printed equations stay on SEPARATE $$ blocks (or rows joined with \\\\ inside one block) — never concatenated end-to-end. In JSON, escape EVERY backslash as \\\\ (writing \\text instead of \\\\text decodes to a TAB character followed by 'ext')."
+                                    },
                                     "marks": { "type": ["integer", "null"], "minimum": 0 },
                                     "topics": { "type": "array", "items": { "type": "string" } },
                                     "module": { "type": "string" },
@@ -2532,6 +2869,19 @@ async fn try_text_first_extraction<C: LlmClient>(
             return None;
         }
     };
+    // Length-truncated text-first output is unusable — the vision path
+    // regenerates it with the full page attached.
+    if llm::response_was_truncated(&resp) {
+        eprintln!(
+            "[TEXT_FIRST_FALLBACK] question={} reason=finish_reason_length",
+            span.number
+        );
+        report.anomalies.push(format!(
+            "Question {} text-first response hit the token ceiling (finish_reason=length); falling back to vision",
+            span.number
+        ));
+        return None;
+    }
     report.record_timing(
         "extraction",
         "text_first",
@@ -2666,6 +3016,13 @@ async fn try_text_first_batch_extraction<C: LlmClient>(
             return (out, report);
         }
     };
+    if llm::response_was_truncated(&resp) {
+        eprintln!("[TEXT_FIRST_FALLBACK] batch reason=finish_reason_length");
+        report.anomalies.push(
+            "Combined text-first batch hit the token ceiling (finish_reason=length); re-asking individually".to_string(),
+        );
+        return (out, report);
+    }
     report.record_timing(
         "extraction",
         "text_first_batch",
@@ -2722,6 +3079,45 @@ async fn try_text_first_batch_extraction<C: LlmClient>(
 /// win. Resolution is still plenty for axis labels and tick values.
 const CROP_FIRST_MAX_DIM: u32 = 512;
 
+/// Render + crop each candidate figure for a crop-first question. Runs on a
+/// blocking thread (via `spawn_blocking`) so a 300-DPI page render never
+/// stalls an async worker mid-extraction. `ignore_grid` is true: a graph's
+/// gridlines are exhibit content, not an answer grid. Returns the WebP crops;
+/// an empty vec when every candidate failed (caller falls back to full pages).
+fn crop_figure_b64s(
+    pdf_path: Option<PathBuf>,
+    span_page_b64s: std::collections::HashMap<usize, String>,
+    candidates: Vec<(usize, crate::pdf_render::DetectedFigure)>,
+    page_render_cache: Arc<crate::pdf_render::PageRenderCache>,
+) -> Vec<String> {
+    let mut crop_b64s: Vec<String> = Vec::with_capacity(candidates.len());
+    for (pi, fig) in candidates {
+        let img = if let Some(pdf_path) = &pdf_path {
+            page_render_cache.get_or_render(pdf_path, pi).ok()
+        } else {
+            span_page_b64s
+                .get(&pi)
+                .and_then(|b64| geometry::decode_page_image(b64))
+                .map(std::sync::Arc::new)
+        };
+        let Some(img) = img else { continue };
+        let Ok(crop) =
+            geometry::crop_diagram_with_options(img.as_ref(), &fig.bbox, 8, true, false)
+        else {
+            continue;
+        };
+        let Some(b64) = geometry::encode_webp_resized(
+            &image::DynamicImage::ImageRgba8(crop),
+            CROP_FIRST_MAX_DIM,
+        )
+        else {
+            continue;
+        };
+        crop_b64s.push(b64);
+    }
+    crop_b64s
+}
+
 /// Crop-first vision attempt for READ-FROM-FIGURE questions: send only the
 /// detected figure crops (≤512px each) instead of full pages, with the
 /// question wording from the text layer. The model reads the value off the
@@ -2742,33 +3138,26 @@ async fn try_crop_first_extraction<C: LlmClient>(
 ) -> Option<(BuiltQuestion, ImportReport)> {
     let mut report = ImportReport::default();
 
-    // 1. Crop each candidate figure from its page into a small image. `ignore_grid`
-    //    is true: a graph's gridlines are exhibit content, not an answer grid.
-    let mut crop_b64s: Vec<String> = Vec::with_capacity(candidates.len());
-    for (pi, fig) in candidates {
-        let img = if let Some(pdf_path) = &config.pdf_path {
-            page_render_cache.get_or_render(pdf_path, *pi).ok()
-        } else {
-            span_pages
-                .iter()
-                .find(|(sp, _)| sp == pi)
-                .and_then(|(_, p)| p.get_b64())
-                .and_then(|b64| geometry::decode_page_image(&b64))
-                .map(std::sync::Arc::new)
-        };
-        let Some(img) = img else { continue };
-        let Ok(crop) =
-            geometry::crop_diagram_with_options(img.as_ref(), &fig.bbox, 8, true, false)
-        else {
-            continue;
-        };
-        let Some(b64) =
-            geometry::encode_webp_resized(&image::DynamicImage::ImageRgba8(crop), CROP_FIRST_MAX_DIM)
-        else {
-            continue;
-        };
-        crop_b64s.push(b64);
-    }
+    // 1. Crop each candidate figure from its page into a small image. Renders
+    //    run on a blocking thread so 300-DPI page renders don't stall the
+    //    async worker.
+    let crop_b64s = {
+        let pdf_path = config.pdf_path.clone();
+        let span_page_b64s = span_pages
+            .iter()
+            .filter_map(|(idx, p)| p.get_b64().map(|b| (*idx, b.clone())))
+            .collect::<std::collections::HashMap<usize, String>>();
+        let candidates = candidates
+            .iter()
+            .map(|(i, f)| (*i, (**f).clone()))
+            .collect::<Vec<_>>();
+        let page_render_cache = Arc::clone(page_render_cache);
+        tokio::task::spawn_blocking(move || {
+            crop_figure_b64s(pdf_path, span_page_b64s, candidates, page_render_cache)
+        })
+        .await
+        .unwrap_or_default()
+    };
     if crop_b64s.is_empty() {
         return None;
     }
@@ -2803,6 +3192,13 @@ async fn try_crop_first_extraction<C: LlmClient>(
             return None;
         }
     };
+    if llm::response_was_truncated(&resp) {
+        report.anomalies.push(format!(
+            "Question {} crop-first response hit the token ceiling (finish_reason=length); falling back to full-page vision",
+            span.number
+        ));
+        return None;
+    }
     let content = match llm::message_content(&resp) {
         Ok(c) => c,
         Err(e) => {
@@ -2997,18 +3393,18 @@ async fn extract_span<C: LlmClient>(
                 span.number
             );
             tf_report.text_first += 1;
-            if fig_count > 0 {
-                attach_detected_figures(
-                    config,
-                    span,
-                    span_pages,
-                    page_figures,
-                    page_render_cache,
-                    &mut built_q.content,
-                    &mut tf_report,
-                )
-                .await;
-            }
+            // Always attach: with figures it splices crops into placeholders;
+            // without figures it still scrubs leftover placeholder tokens.
+            attach_detected_figures(
+                config,
+                span,
+                span_pages,
+                page_figures,
+                page_render_cache,
+                &mut built_q.content,
+                &mut tf_report,
+            )
+            .await;
             tf_report.pages_processed += (span.start_page..=span.end_page).count().max(1);
             push_mark_check(span, &built_q, &mut tf_report);
             report.absorb(tf_report);
@@ -3288,6 +3684,17 @@ async fn extract_span<C: LlmClient>(
                     continue;
                 }
             };
+            // Payload-truncation resilience: finish_reason=length means the
+            // output was cut off mid-tag at the token ceiling — it must be
+            // REGENERATED, never salvaged, so the payload completes fully.
+            if llm::response_was_truncated(&resp) {
+                last_error = "the previous response hit the max_tokens ceiling and was cut off mid-tag (finish_reason=length); regenerate the COMPLETE JSON within the output limit".to_string();
+                report.note_repair("finish_reason_length");
+                if attempt < max_attempts && !cancel.load(Ordering::Relaxed) {
+                    continue;
+                }
+                break;
+            }
             report.record_timing(
                 "extraction",
                 "api_call",
@@ -3372,6 +3779,11 @@ async fn extract_span<C: LlmClient>(
                             continue;
                         }
                     };
+                    if llm::response_was_truncated(&reduced_resp) {
+                        last_error = "the reduced retry was also cut off at the token ceiling (finish_reason=length)".to_string();
+                        report.note_repair("eof_reduced_truncated");
+                        continue;
+                    }
                     report.record_timing(
                         "extraction",
                         "api_call_reduced",
@@ -3608,7 +4020,7 @@ async fn extract_span<C: LlmClient>(
             }
 
             for item in &mut page_items.items {
-                normalize_composite_visual_options(item);
+                normalize_visual_mcq_options(item);
             }
 
             if page_items.items.is_empty() && contents.is_empty() {
@@ -3747,7 +4159,7 @@ async fn extract_span<C: LlmClient>(
                                                         kind.contains("graph")
                                                             || kind.contains("chart")
                                                             || kind.contains("plot")
-                                                            || kind.contains("composite_visual_options")
+                                                            || kind.contains("composite_visual_options") || kind.contains("visual_option")
                                                     })
                                                     .unwrap_or(false),
                                             });
@@ -3761,16 +4173,13 @@ async fn extract_span<C: LlmClient>(
                                         std::mem::take(&mut saved_diagrams),
                                     ).await {
                                         saved_diagrams = persisted.saved;
-                                        for link in persisted.links.into_iter().flatten() {
-                                            if item_content.contains("[DIAGRAM_PLACEHOLDER]") {
-                                                item_content = item_content.replacen("[DIAGRAM_PLACEHOLDER]", &link, 1);
-                                            } else {
-                                                item_content.push_str(&link);
-                                            }
-                                        }
+                                        item_content = splice_diagrams_by_caption_and_context(
+                                            item_content,
+                                            &persisted.links,
+                                            collateral_item.diagram_captions.as_deref(),
+                                        );
                                     }
                                 }
-                                item_content = item_content.replace("[DIAGRAM_PLACEHOLDER]", "");
 
                                 if let Some(built_q) = assemble_built_question(
                                     target_span,
@@ -4199,7 +4608,7 @@ async fn extract_span<C: LlmClient>(
                                 kind.contains("graph")
                                     || kind.contains("chart")
                                     || kind.contains("plot")
-                                    || kind.contains("composite_visual_options")
+                                    || kind.contains("composite_visual_options") || kind.contains("visual_option")
                             })
                             .unwrap_or(false),
                     });
@@ -4217,13 +4626,11 @@ async fn extract_span<C: LlmClient>(
                     Ok(persisted) => {
                         saved_diagrams = persisted.saved;
                         report.absorb(persisted.report);
-                        for link in persisted.links.into_iter().flatten() {
-                        if item_content.contains("[DIAGRAM_PLACEHOLDER]") {
-                            item_content = item_content.replacen("[DIAGRAM_PLACEHOLDER]", &link, 1);
-                        } else {
-                            item_content.push_str(&link);
-                        }
-                    }
+                        item_content = splice_diagrams_by_caption_and_context(
+                            item_content,
+                            &persisted.links,
+                            item.diagram_captions.as_deref(),
+                        );
                     }
                     Err(error) => {
                         saved_diagrams = saved_before;
@@ -4300,6 +4707,13 @@ fn assemble_built_question(
     // 3. MCQ option flattening, 4. Tabular option destruction, 5. Visual MCQ
     // gibberish, 6. Mark allocation misplacement.
     content = crate::marker_client::clean_marker_markdown(&content);
+    // Terminal KaTeX guard: close broken inline $ at line ends and unterminated
+    // $$ blocks so raw LaTeX can never leak as plaintext or swallow text below it.
+    content = validate::balance_math_delimiters(&content);
+    // Multi-line display blocks need explicit LaTeX row separators: KaTeX
+    // ignores raw newlines and would squash sequential equations (decay
+    // chains, simultaneous pairs) end-to-end.
+    content = validate::ensure_display_math_line_breaks(&content);
 
     if content.trim().is_empty() && span.expected_marks.unwrap_or(0) > 0 {
         // A marked question with no content is a hard failure.
@@ -4456,18 +4870,19 @@ async fn extract_same_page_batch<C: LlmClient>(
                         span.number
                     );
                     tf_report.text_first += 1;
-                    if fig_counts[i] > 0 {
-                        attach_detected_figures(
-                            config,
-                            span,
-                            &span_pages,
-                            page_figures,
-                            page_render_cache,
-                            &mut built_q.content,
-                            &mut tf_report,
-                        )
-                        .await;
-                    }
+                    // Always attach: with figures it splices crops into the
+                    // placeholders; without figures it still scrubs any
+                    // leftover placeholder tokens so none can leak to a card.
+                    attach_detected_figures(
+                        config,
+                        span,
+                        &span_pages,
+                        page_figures,
+                        page_render_cache,
+                        &mut built_q.content,
+                        &mut tf_report,
+                    )
+                    .await;
                     tf_report.pages_processed += 1;
                     push_mark_check(span, &built_q, &mut tf_report);
                     tf_out.push(((*span).clone(), Some(built_q)));
@@ -4489,24 +4904,24 @@ async fn extract_same_page_batch<C: LlmClient>(
             )
             .await
             {
-                eprintln!(
-                    "[TEXT_FIRST] Question {} transcribed from text layer (0 image tokens)",
-                    span.number
-                );
-                r.text_first += 1;
-                if fig_counts[0] > 0 {
-                    attach_detected_figures(
-                        config,
-                        span,
-                        &span_pages,
-                        page_figures,
-                        page_render_cache,
-                        &mut built_q.content,
-                        &mut r,
-                    )
-                    .await;
-                }
-                r.pages_processed += 1;
+            eprintln!(
+                "[TEXT_FIRST] Question {} transcribed from text layer (0 image tokens)",
+                span.number
+            );
+            r.text_first += 1;
+            // Always attach: with figures it splices crops; without figures it
+            // still scrubs leftover placeholder tokens.
+            attach_detected_figures(
+                config,
+                span,
+                &span_pages,
+                page_figures,
+                page_render_cache,
+                &mut built_q.content,
+                &mut r,
+            )
+            .await;
+            r.pages_processed += 1;
                 push_mark_check(span, &built_q, &mut r);
                 tf_report.absorb(r);
                 tf_out.push(((*span).clone(), Some(built_q)));
@@ -4624,6 +5039,11 @@ async fn extract_same_page_batch<C: LlmClient>(
                 continue;
             }
         };
+        if llm::response_was_truncated(&resp) {
+            last_error = "the previous response hit the max_tokens ceiling and was cut off mid-tag (finish_reason=length); regenerate the COMPLETE JSON within the output limit".to_string();
+            report.note_repair("batch_finish_reason_length");
+            continue;
+        }
 
         let content = match llm::message_content(&resp) {
             Ok(c) => c,
@@ -4745,7 +5165,7 @@ async fn extract_same_page_batch<C: LlmClient>(
                                 kind.contains("graph")
                                     || kind.contains("chart")
                                     || kind.contains("plot")
-                                    || kind.contains("composite_visual_options")
+                                    || kind.contains("composite_visual_options") || kind.contains("visual_option")
                             })
                             .unwrap_or(false),
                     });
@@ -4761,13 +5181,11 @@ async fn extract_same_page_batch<C: LlmClient>(
                     Ok(persisted) => {
                         saved_diagrams = persisted.saved;
                         report.absorb(persisted.report);
-                        for link in persisted.links.into_iter().flatten() {
-                            if item_content.contains("[DIAGRAM_PLACEHOLDER]") {
-                                item_content = item_content.replacen("[DIAGRAM_PLACEHOLDER]", &link, 1);
-                            } else {
-                                item_content.push_str(&link);
-                            }
-                        }
+                        item_content = splice_diagrams_by_caption_and_context(
+                            item_content,
+                            &persisted.links,
+                            item.diagram_captions.as_deref(),
+                        );
                     }
                     Err(err) => {
                         saved_diagrams = saved_before;
@@ -4850,6 +5268,12 @@ fn validate_span_items(page: &AiQuestionPage, span: &QuestionSpan) -> Vec<String
                 span.number,
                 span.expected_marks.unwrap_or(0)
             ));
+        }
+        // KaTeX delimiter discipline: unbalanced $/$$ pairing is quoted back
+        // to the model so the repair round fixes its own math boundaries
+        // instead of shipping cards that swallow subsequent text.
+        for e in validate::math_delimiter_balance_errors(content) {
+            errors.push(format!("item {}: {}", idx + 1, e));
         }
         if let Some(bboxes) = &item.diagram_bboxes {
             if let Some(indexes) = &item.bbox_page_indexes {
@@ -4974,7 +5398,7 @@ fn audit_diagram_boxes(
                     kind.contains("graph")
                         || kind.contains("chart")
                         || kind.contains("plot")
-                        || kind.contains("composite_visual_options")
+                        || kind.contains("composite_visual_options") || kind.contains("visual_option")
                 })
                 .unwrap_or(false);
 
@@ -5250,10 +5674,13 @@ RULES:
   {{ "question_number": <whole number printed>, "content": "<full transcription>", "marks": int|null, "difficulty_rating": string|null,
      "topics": array, "module": "{module}", "is_code": bool,
      "diagram_bboxes": [[x,y,w,h]...] relative 0.0-1.0, "bbox_page_indexes": [0,...] }}
-- MATHEMATICAL FIDELITY & STRICT DELIMITERS:
-  * Wrap all inline math in `$ ... $` and display equations in `$$ ... $$`.
-  * Ensure perfect delimiter pairing: every `$` or `$$` opened must be closed with the exact same tag. NEVER omit the opening delimiter (e.g. NEVER emit `\frac{{...}}$`).
-  * Never drop leading variables, function names, or prefixes (e.g. `r = \frac{{...}}`, `y = 2\sin x`, `C: r = ...` MUST include the `r = ` verbatim).
+ - MATHEMATICAL FIDELITY & STRICT DELIMITERS:
+   * Wrap all inline math in `$ ... $` and display equations in `$$ ... $$`.
+   * Ensure perfect delimiter pairing: every `$` or `$$` opened must be closed with the exact same tag. NEVER omit the opening delimiter (e.g. NEVER emit `\frac{{...}}$`).
+   * Never drop leading variables, function names, or prefixes (e.g. `r = \frac{{...}}`, `y = 2\sin x`, `C: r = ...` MUST include the `r = ` verbatim).
+   * OPERATOR PRESERVATION: every fraction as `\frac{{a}}{{b}}` (or a/b in $...$), every ratio with its operator (a:b). NEVER drop a fraction bar, division slash, ×, ÷, ±, or exponent.
+   * NUCLEAR NOTATION: nuclide prescripts and decay particles are MATH: `$^{{226}}_{{88}}\text{{Ra}} \rightarrow\ ^{{222}}_{{86}}\text{{Rn}} +\ ^{{4}}_{{2}}\alpha$` — never bare plaintext.
+   * SENTENCE INTEGRITY: never insert a hard line break mid-sentence; join the page's wrapped print-lines of one sentence into a single paragraph.
 - ADAPTIVE MARKS VS DIFFICULTY:
   * If standard marks are printed (`[4 marks]`), output `"marks": 4` and `"difficulty_rating": null`.
   * If difficulty / star ratings are present (e.g. `(*)`, `(**)`, `(***+)`, `(Specialist)` as in T. Madas worksheets), output `"difficulty_rating": "***+"` and `"marks": null`. DO NOT invent marks.
@@ -5341,6 +5768,11 @@ RULES:
                 continue;
             }
         };
+        if llm::response_was_truncated(&resp) {
+            last_error = "the previous response hit the max_tokens ceiling and was cut off mid-tag (finish_reason=length); regenerate the COMPLETE JSON within the output limit".to_string();
+            report.note_repair("fallback_finish_reason_length");
+            continue;
+        }
         let content = match llm::message_content(&resp) {
             Ok(c) => c,
             Err(e) => {
@@ -5539,13 +5971,11 @@ RULES:
                     Ok(persisted) => {
                         saved_diagrams = persisted.saved;
                         report.absorb(persisted.report);
-                        for link in persisted.links.into_iter().flatten() {
-                        if item_content.contains("[DIAGRAM_PLACEHOLDER]") {
-                            item_content = item_content.replacen("[DIAGRAM_PLACEHOLDER]", &link, 1);
-                        } else {
-                            item_content.push_str(&link);
-                        }
-                    }
+                        item_content = splice_diagrams_by_caption_and_context(
+                            item_content,
+                            &persisted.links,
+                            item.diagram_captions.as_deref(),
+                        );
                     }
                     Err(error) => {
                         saved_diagrams = saved_before;
@@ -5580,6 +6010,10 @@ RULES:
                     // 3. MCQ option flattening, 4. Tabular option destruction, 5. Visual MCQ
                     // 6. Mark allocation misplacement.
                     content = crate::marker_client::clean_marker_markdown(&content);
+                    content = validate::balance_math_delimiters(&content);
+                    // Same multi-line display-math guard as the main assembly
+                    // path: explicit \\ row separators inside $$ blocks.
+                    content = validate::ensure_display_math_line_breaks(&content);
                     content
                 },
                 marks: item
@@ -5695,6 +6129,11 @@ async fn read_markscheme_window<C: LlmClient>(
                 continue;
             }
         };
+        if llm::response_was_truncated(&resp) {
+            last_error = "the previous response hit the max_tokens ceiling and was cut off mid-tag (finish_reason=length); regenerate the complete corrected JSON".to_string();
+            report.note_repair("markscheme_finish_reason_length");
+            continue;
+        }
         let content = match llm::message_content(&resp) {
             Ok(c) => c,
             Err(e) => {
@@ -6587,6 +7026,84 @@ mod tests {
         assert_eq!(item.bbox_page_indexes.as_ref().unwrap().len(), 1);
         assert_eq!(item.content.unwrap(), "Which graph is correct?\n[DIAGRAM_PLACEHOLDER]");
         assert_eq!(item.diagram_kinds.unwrap(), vec!["composite_visual_options"]);
+    }
+
+    #[test]
+    fn image_options_keep_boxes_separate_and_bind_strict_mcq_list() {
+        let mut item = AiQuestion {
+            content: Some(
+                "Which graph represents y = sin(x)/x?\nA [DIAGRAM_PLACEHOLDER]\nB [DIAGRAM_PLACEHOLDER]\nC [DIAGRAM_PLACEHOLDER]\nD [DIAGRAM_PLACEHOLDER]"
+                    .into(),
+            ),
+            visual_options: Some("image_options".into()),
+            diagram_bboxes: Some(vec![
+                vec![0.10, 0.25, 0.25, 0.20],
+                vec![0.55, 0.25, 0.25, 0.20],
+                vec![0.10, 0.55, 0.25, 0.20],
+                vec![0.55, 0.55, 0.25, 0.20],
+            ]),
+            bbox_page_indexes: Some(vec![
+                serde_json::json!(0),
+                serde_json::json!(0),
+                serde_json::json!(0),
+                serde_json::json!(0),
+            ]),
+            ..Default::default()
+        };
+
+        normalize_visual_mcq_options(&mut item);
+
+        // Boxes stay ISOLATED — never unioned into one composite crop.
+        assert_eq!(item.diagram_bboxes.as_ref().unwrap().len(), 4);
+        assert_eq!(item.bbox_page_indexes.as_ref().unwrap().len(), 4);
+        assert_eq!(
+            item.diagram_captions.unwrap(),
+            vec!["Option A", "Option B", "Option C", "Option D"]
+        );
+        assert_eq!(
+            item.diagram_kinds.unwrap(),
+            vec!["visual_option"; 4]
+        );
+        let content = item.content.unwrap();
+        assert!(content.starts_with("Which graph represents y = sin(x)/x?"), "{content}");
+        for (letter, _) in ['A', 'B', 'C', 'D'].iter().enumerate() {
+            let letter = ['A', 'B', 'C', 'D'][letter];
+            assert!(
+                content.contains(&format!("- [MCQ:{letter}] [DIAGRAM_PLACEHOLDER]")),
+                "{content}"
+            );
+        }
+    }
+
+    #[test]
+    fn image_options_rebuild_even_from_freeform_option_lines() {
+        let mut item = AiQuestion {
+            content: Some(
+                "Which circuit is correct?\nA)\n[DIAGRAM_PLACEHOLDER]\nB)\n[DIAGRAM_PLACEHOLDER]\nC)\n[DIAGRAM_PLACEHOLDER]"
+                    .into(),
+            ),
+            visual_options: Some("image_options".into()),
+            diagram_bboxes: Some(vec![
+                vec![0.1, 0.2, 0.2, 0.2],
+                vec![0.5, 0.2, 0.2, 0.2],
+                vec![0.1, 0.6, 0.2, 0.2],
+            ]),
+            bbox_page_indexes: Some(vec![
+                serde_json::json!(0),
+                serde_json::json!(0),
+                serde_json::json!(0),
+            ]),
+            ..Default::default()
+        };
+
+        normalize_visual_mcq_options(&mut item);
+
+        let content = item.content.unwrap();
+        assert!(content.starts_with("Which circuit is correct?"), "{content}");
+        assert!(content.contains("- [MCQ:A] [DIAGRAM_PLACEHOLDER]"), "{content}");
+        assert!(content.contains("- [MCQ:B] [DIAGRAM_PLACEHOLDER]"), "{content}");
+        assert!(content.contains("- [MCQ:C] [DIAGRAM_PLACEHOLDER]"), "{content}");
+        assert!(!content.contains("- [MCQ:D]"), "{content}");
     }
 
     #[tokio::test]
@@ -8148,10 +8665,35 @@ mod tests {
         assert_eq!(built[0].question_number, 1);
         assert_eq!(built[1].question_number, 2);
         assert_eq!(built[1].marks, 3);
-        assert!(built[1].content.contains("Question 2 starts on the lower half of page 2."));
         assert_eq!(report.questions_extracted, 2);
         assert!(report.quarantined.is_empty());
         assert_eq!(mock.remaining(), 0, "Question 2 was retrieved from collateral cache with 0 LLM calls");
+    }
+
+    #[test]
+    fn test_splice_diagrams_by_caption_and_context_out_of_order() {
+        let content = "Figure 1 shows a circuit.\n[DIAGRAM_PLACEHOLDER]\n\n(a) Figure 2 shows the graph of V_C vs t.\n[DIAGRAM_PLACEHOLDER]\n\n(b) Figure 3 shows the decay.\n[DIAGRAM_PLACEHOLDER]\n\n(d) Figure 4 shows capacitors.\n[DIAGRAM_PLACEHOLDER]".to_string();
+
+        let links = vec![
+            Some("\n\n![Diagram](url_fig2.png)\n\n".to_string()),
+            Some("\n\n![Diagram](url_fig1.png)\n\n".to_string()),
+            Some("\n\n![Diagram](url_fig4.png)\n\n".to_string()),
+            Some("\n\n![Diagram](url_fig3.png)\n\n".to_string()),
+        ];
+
+        let captions = vec![
+            "Figure 2: Graph of V_C against t".to_string(),
+            "Figure 1: Charging circuit diagram".to_string(),
+            "Figure 4: Parallel plate capacitors".to_string(),
+            "Figure 3: Voltage decay against time".to_string(),
+        ];
+
+        let spliced = splice_diagrams_by_caption_and_context(content, &links, Some(&captions));
+
+        assert!(spliced.contains("Figure 1 shows a circuit.\n\n\n![Diagram](url_fig1.png)"), "Figure 1 must receive url_fig1");
+        assert!(spliced.contains("Figure 2 shows the graph of V_C vs t.\n\n\n![Diagram](url_fig2.png)"), "Figure 2 must receive url_fig2");
+        assert!(spliced.contains("Figure 3 shows the decay.\n\n\n![Diagram](url_fig3.png)"), "Figure 3 must receive url_fig3");
+        assert!(spliced.contains("Figure 4 shows capacitors.\n\n\n![Diagram](url_fig4.png)"), "Figure 4 must receive url_fig4");
     }
 }
 

@@ -179,6 +179,64 @@ static RE_NAV_TEXT: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?im)^\s*(?:TURN\s+OVER|END\s+OF\s+QUESTIONS?|CONTINUE\s+ON\s+NEXT\s+PAGE|GO\s+TO\s+NEXT\s+PAGE)[\s\p{So}]*$").unwrap()
 });
 
+static RE_IMAGE_ONLY_LINE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?m)^[ \t]*!\[[^\]]*\]\([^)]+\)[ \t]*$").unwrap()
+});
+
+static RE_MCQ_OPTION_LINE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?m)^[ \t]*-[ \t]+(?:\[MCQ:[A-Ea-e]\]|\*\*(?:\([A-E]\)|[A-E][).:])\*\*)").unwrap()
+});
+
+// ═══ Answer-line / marks-in-math / MCQ image-option repair patterns ═══════
+
+/// A full line that is a student write-in space: optionally a short prompt
+/// label ("average emf =", "Total:"), then an underline/dotted/ruled run,
+/// then an optional trailing unit label ("V", "m/s", "J", "%", "°").
+static RE_ANSWER_BLANK_LINE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"(?im)^[ \t]*(?:[A-Za-z][^\n=]{0,48}[=:][ \t]*)?(?:_{3,}|\.{5,}|…+|—{3,}|─{3,})[ \t]*(?:[A-Za-zΩ°%/$]{1,8})?[ \t]*$",
+    )
+    .unwrap()
+});
+
+/// Display-math block ($$ ... $$) polluted with a mark allocation tag.
+static RE_DISPLAY_MATH_WITH_MARKS: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"\$\$([^$\n]*?)((?:\*\*)?\[\s*\d+\s*marks?\s*\](?:\*\*)?|\(\s*\d+\s*marks?\s*\))([^$\n]*?)\$\$",
+    )
+    .unwrap()
+});
+
+/// Inline-math block ($ ... $) polluted with a mark allocation tag
+/// (handles corrupted forms like "$averageemf = V **[3marks]**$").
+static RE_INLINE_MATH_WITH_MARKS: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"\$([^$\n]{0,300}?)((?:\*\*)?\[\s*\d+\s*marks?\s*\](?:\*\*)?)([^$\n]{0,300}?)\$")
+        .unwrap()
+});
+
+/// An MCQ option line whose payload is a single image link:
+/// "A ![x](y)", "A) ![x](y)", "(A) ![x](y)", "- **A)** ![x](y)",
+/// "- [MCQ:A] ![x](y)" — all normalise to the strict "- [MCQ:A] ![x](y)".
+static RE_MCQ_IMAGE_OPTION_LINE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"(?im)^[ \t]*(?:-[ \t]+)?(?:\[MCQ:([A-E])\]|[ \t]*\*{0,2}\(([A-E])\)\*{0,2}|\*{0,2}([A-E])[).:]?\*{0,2})[ \t]+(!\[[^\]]*\]\([^)]+\))[ \t]*$",
+    )
+    .unwrap()
+});
+
+/// A strict "[MCQ:X]" label line with the image stranded on the NEXT line.
+static RE_MCQ_LABEL_THEN_IMAGE_LINE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?im)^[ \t]*-[ \t]+\[MCQ:([A-E])\][ \t]*\n[ \t]*(!\[[^\]]*\]\([^)]+\))[ \t]*$")
+        .unwrap()
+});
+
+/// Any markdown image link. Base64 data URLs are full of `A)`-shaped
+/// letter+bracket tokens, so image payloads must be stashed away before any
+/// option-letter heuristic runs.
+static RE_IMAGE_LINK: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"!\[[^\]]*\]\([^)]+\)").unwrap()
+});
+
 // ══════════════════════════════════════════════════════════════════════════
 // Minimal Post-Processing — Only basic typo fixes that are safe as string ops
 // ══════════════════════════════════════════════════════════════════════════
@@ -271,10 +329,34 @@ fn ensure_subpart_spacing(text: &str) -> String {
     }).to_string()
 }
 
+/// Stash markdown image links behind opaque sentinels so letter-suffix
+/// heuristics (MCQ flattening, bold formatting) never parse inside base64
+/// payloads. Returns the protected text and the stashed originals.
+fn stash_image_links(text: &str) -> (String, Vec<String>) {
+    let mut stash: Vec<String> = Vec::new();
+    let protected = RE_IMAGE_LINK
+        .replace_all(text, |caps: &regex::Captures| {
+            let token = format!("\u{0}IMG{}\u{0}", stash.len());
+            stash.push(caps[0].to_string());
+            token
+        })
+        .to_string();
+    (protected, stash)
+}
+
+fn restore_image_links(text: &str, stash: &[String]) -> String {
+    let mut restored = text.to_string();
+    for (i, original) in stash.iter().enumerate() {
+        restored = restored.replace(&format!("\u{0}IMG{}\u{0}", i), original);
+    }
+    restored
+}
+
 /// Fix MCQ option flattening: ensure each option A) B) C) D) or (A) (B) (C) (D) is on its own line
 fn fix_mcq_option_flattening(text: &str) -> String {
+    let (text, stash) = stash_image_links(text);
     // First pass: handle uppercase A) B) C) D) format
-    let result = RE_INLINE_MCQ.replace_all(text, |caps: &regex::Captures| {
+    let result = RE_INLINE_MCQ.replace_all(&text, |caps: &regex::Captures| {
         let matched = &caps[1];
         let parts: Vec<String> = RE_SPLIT_MCQ.find_iter(matched)
             .map(|m| m.as_str().trim().to_string())
@@ -283,13 +365,15 @@ fn fix_mcq_option_flattening(text: &str) -> String {
     }).to_string();
 
     // Second pass: handle (A) (B) (C) (D) format
-    RE_PAREN_MCQ.replace_all(&result, |caps: &regex::Captures| {
+    let result = RE_PAREN_MCQ.replace_all(&result, |caps: &regex::Captures| {
         let matched = &caps[1];
         let parts: Vec<String> = RE_SPLIT_PAREN_MCQ.find_iter(matched)
             .map(|m| m.as_str().trim().to_string())
             .collect();
         format!("\n\n{}", parts.join("\n\n"))
-    }).to_string()
+    }).to_string();
+
+    restore_image_links(&result, &stash)
 }
 
 /// Fix tabular MCQ options: if options appear in a table, convert to clean list or proper markdown table
@@ -528,14 +612,159 @@ fn remove_navigational_text(text: &str) -> String {
     RE_NAV_TEXT.replace_all(text, "").to_string()
 }
 
+/// Remove student write-in spaces: answer prompt lines, fill-in blanks,
+/// underline/dotted runs and standalone answer boxes (e.g. "average emf =
+/// _________ V", "Total = _____"). Trailing unit labels attached to such
+/// lines are removed with them. Narrative question text is untouched.
+pub fn strip_answer_lines(text: &str) -> String {
+    RE_ANSWER_BLANK_LINE.replace_all(text, "").to_string()
+}
+
+fn normalize_mark_tag(tag: &str) -> String {
+    let digits: String = tag.chars().filter(|c| c.is_ascii_digit()).collect();
+    let n: u32 = digits.parse().unwrap_or(0);
+    format!("**[{n} marks]**")
+}
+
+/// Enforce LaTeX isolation of mark allocations: when a mark tag was merged
+/// INTO a math block (corruption like `$average emf = V **[3 marks]**$`),
+/// strip it out of the delimiters and append a clean `**[N marks]**` after
+/// the block instead.
+pub fn unbind_marks_from_math(text: &str) -> String {
+    let display = RE_DISPLAY_MATH_WITH_MARKS
+        .replace_all(text, |caps: &regex::Captures| {
+            let inner = format!("{} {}", caps[1].trim(), caps[3].trim());
+            let inner = inner.trim();
+            if inner.is_empty() {
+                normalize_mark_tag(&caps[2])
+            } else {
+                format!("$${inner}$$ {}", normalize_mark_tag(&caps[2]))
+            }
+        })
+        .to_string();
+    RE_INLINE_MATH_WITH_MARKS
+        .replace_all(&display, |caps: &regex::Captures| {
+            let inner = format!("{} {}", caps[1].trim(), caps[3].trim());
+            let inner = inner.trim();
+            if inner.is_empty() {
+                normalize_mark_tag(&caps[2])
+            } else {
+                format!("${inner}$ {}", normalize_mark_tag(&caps[2]))
+            }
+        })
+        .to_string()
+}
+
+/// Bind image-based MCQ options into the strict markdown list format
+/// `- [MCQ:A] ![Option A](...)`. Handles inline payloads ("A) ![...]"),
+/// bolded forms ("- **A)** ![...]") and stranded next-line images.
+pub fn bind_mcq_image_options(text: &str) -> String {
+    let joined = RE_MCQ_LABEL_THEN_IMAGE_LINE.replace_all(text, "- [MCQ:$1] $2").to_string();
+    RE_MCQ_IMAGE_OPTION_LINE
+        .replace_all(&joined, |caps: &regex::Captures| {
+            let letter = caps
+                .get(1)
+                .or_else(|| caps.get(2))
+                .or_else(|| caps.get(3))
+                .map(|m| m.as_str())
+                .filter(|s| !s.is_empty())
+                .unwrap_or("A");
+            format!("- [MCQ:{letter}] {}", caps[4].trim())
+        })
+        .to_string()
+}
+
+/// True when the byte offset `idx` in `text` sits directly below an MCQ
+/// option line (strict or bold form). Used so `ensure_diagrams_above_mcq`
+/// never rips an option's own diagram out of the options grid.
+fn preceded_by_mcq_option_line(text: &str, idx: usize) -> bool {
+    let before = &text[..idx];
+    let mut candidate: Option<&str> = None;
+    for line in before.lines().rev() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        candidate = Some(line);
+        break;
+    }
+    match candidate {
+        Some(line) => {
+            let trimmed = line.trim();
+            trimmed.contains("[MCQ:") || RE_MCQ_IMAGE_OPTION_LINE.is_match(trimmed)
+        }
+        None => false,
+    }
+}
+
+/// Enforce the structural invariant: a referenced diagram/image ALWAYS
+/// renders ABOVE the MCQ options grid, never below it. When crop splicing
+/// falls back to end-of-content placement (no placeholder token, unnumbered
+/// caption), the image lands after the options — this deterministically moves
+/// every image-only line that sits after the first MCQ option to just above
+/// that option block.
+pub fn ensure_diagrams_above_mcq(text: &str) -> String {
+    let Some(mcq_match) = RE_MCQ_OPTION_LINE.find(text) else {
+        return text.to_string();
+    };
+    let mcq_start = mcq_match.start();
+
+    let mut moved: Vec<String> = Vec::new();
+    let mut ranges: Vec<(usize, usize)> = Vec::new();
+    for m in RE_IMAGE_ONLY_LINE.find_iter(text) {
+        if m.start() > mcq_start && !preceded_by_mcq_option_line(text, m.start()) {
+            moved.push(m.as_str().to_string());
+            ranges.push((m.start(), m.end()));
+        }
+    }
+    if moved.is_empty() {
+        return text.to_string();
+    }
+
+    // Remove the offending image lines (swallow one adjacent newline so no
+    // blank husk is left behind).
+    let mut cleaned = String::with_capacity(text.len());
+    let mut last = 0usize;
+    for (start, end) in &ranges {
+        let mut s = *start;
+        let mut e = *end;
+        if e < text.len() && text.as_bytes()[e] == b'\n' {
+            e += 1;
+        } else if s > 0 && text.as_bytes()[s - 1] == b'\n' {
+            s -= 1;
+        }
+        cleaned.push_str(&text[last..s]);
+        last = e;
+    }
+    cleaned.push_str(&text[last..]);
+
+    // Re-locate the MCQ block in the cleaned string and insert the images
+    // directly above it.
+    let insert_at = RE_MCQ_OPTION_LINE
+        .find(&cleaned)
+        .map(|m| m.start())
+        .unwrap_or(0);
+    let block = format!("\n\n{}\n\n", moved.join("\n"));
+    format!(
+        "{}{}{}",
+        cleaned[..insert_at].trim_end(),
+        block,
+        cleaned[insert_at..].trim_start_matches('\n')
+    )
+}
+
 /// Main post-processing entry point - comprehensive fixes for 6 error categories
 pub fn clean_marker_markdown(content: &str) -> String {
     if content.trim().is_empty() {
         return String::new();
     }
 
-    let mut cleaned = clean_ligatures(content);
+    let mut cleaned = crate::validate::fix_tab_mangled_latex(content);
+    cleaned = clean_ligatures(&cleaned);
     cleaned = fix_basic_latex_typos(&cleaned);
+
+    // 0a. LATEX ISOLATION: pull mark allocation tags OUT of math blocks so
+    // corrupted strings like "$average emf = V **[3 marks]**$" never survive.
+    cleaned = unbind_marks_from_math(&cleaned);
 
     // 1. ARTIFACT BLEED: Remove exam-board boilerplate and page artifacts
     // PRE-CLEAN: Remove margin warnings, header/footer text, and navigation boilerplate BEFORE card-splitting logic runs
@@ -545,6 +774,11 @@ pub fn clean_marker_markdown(content: &str) -> String {
     cleaned = remove_margin_artifacts(&cleaned);
     cleaned = remove_serial_codes(&cleaned);
     cleaned = remove_navigation_markers(&cleaned);
+
+    // 1b. ANSWER-LINE STRIPPING: remove student write-in spaces (answer
+    // prompts, underline/dotted runs, standalone answer boxes) and the
+    // trailing unit labels attached to them.
+    cleaned = strip_answer_lines(&cleaned);
 
     // 2. NUMBER-AGNOSTIC FAILURE: Convert AQA decimals FIRST (before leading artifact removal),
     // then remove leading question numbers/OCR artifacts, ensure sub-part spacing
@@ -566,6 +800,15 @@ pub fn clean_marker_markdown(content: &str) -> String {
 
     // 7. BOLD OPTION FORMATTING: Format MCQ options as markdown list items with bold keys
     cleaned = format_mcq_options_bold(&cleaned);
+
+    // 7b. IMAGE-OPTION BINDING: image-based MCQ options become the strict
+    // "- [MCQ:A] ![Option A](...)" list format so the frontend grid renders
+    // one diagram per interactive option card.
+    cleaned = bind_mcq_image_options(&cleaned);
+
+    // 8. DIAGRAM HIERARCHY: referenced diagrams always render ABOVE the MCQ
+    // options grid, never below it.
+    cleaned = ensure_diagrams_above_mcq(&cleaned);
 
     // Final cleanup: normalize excessive newlines
     cleaned = normalize_newlines(&cleaned);
@@ -885,6 +1128,124 @@ mod tests {
         assert!(output.contains("Part 1\n\nPart 2"));
         assert!(output.contains("Part 2\n\nPart 3"));
         assert!(!output.contains("\n\n\n"));
+    }
+
+    #[test]
+    fn test_ensure_diagrams_above_mcq_moves_late_images_up() {
+        let input = "Which graph is correct?\n\n- **A)** 10 V\n- **B)** 20 V\n\n![Diagram](img/a.png)";
+        let out = ensure_diagrams_above_mcq(input);
+        let img_pos = out.find("![Diagram]").unwrap();
+        let mcq_pos = out.find("- **A)**").unwrap();
+        assert!(img_pos < mcq_pos, "image must render above the MCQ grid: {out}");
+        assert!(out.contains("- **A)** 10 V"));
+        assert!(out.contains("- **B)** 20 V"));
+    }
+
+    #[test]
+    fn test_ensure_diagrams_above_mcq_leaves_correct_order_untouched() {
+        let input = "Which graph is correct?\n\n![Diagram](img/a.png)\n\n- **A)** 10 V\n- **B)** 20 V";
+        assert_eq!(ensure_diagrams_above_mcq(input), input);
+        // No MCQ grid → untouched
+        let plain = "Find the value.\n\n![Diagram](img/a.png)";
+        assert_eq!(ensure_diagrams_above_mcq(plain), plain);
+    }
+
+    // === ANSWER-LINE STRIPPING TESTS ===
+    #[test]
+    fn test_strip_answer_prompt_lines_with_units() {
+        let input = "Determine the induced emf.\n\naverage emf = _________ V\n\nTotal = _____\n\n[3 marks]";
+        let output = strip_answer_lines(input);
+        assert!(!output.contains("_________"));
+        assert!(!output.contains("_________ V"));
+        assert!(!output.contains("= _"));
+        assert!(output.contains("Determine the induced emf."));
+        assert!(output.contains("[3 marks]"));
+        // Trailing unit "V" must go with its answer line, not survive alone.
+        let lines: Vec<&str> = output.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
+        assert!(!lines.iter().any(|l| *l == "V"), "{output:?}");
+    }
+
+    #[test]
+    fn test_strip_bare_underline_and_dotted_lines() {
+        assert_eq!(strip_answer_lines("Answer:\n____________________").trim(), "Answer:");
+        assert_eq!(strip_answer_lines("Find x.\n………………").trim(), "Find x.");
+    }
+
+    #[test]
+    fn test_strip_answer_lines_preserves_narrative_and_tables() {
+        let text = "The resistance R is measured in ohms.\n\n| Option | Voltage |\n|---|---|\n| A | 200 |";
+        assert_eq!(strip_answer_lines(text), text);
+    }
+
+    // === MARKS-IN-MATH UNBINDING TESTS ===
+    #[test]
+    fn test_unbind_marks_from_inline_math() {
+        let input = "$averageemf = V **[3marks]**$";
+        let out = unbind_marks_from_math(input);
+        assert!(out.contains("**[3 marks]**"), "{out}");
+        assert!(!out.contains("[3marks]"));
+        // The mark tag must sit OUTSIDE the delimiters.
+        let close = out.rfind('$').unwrap();
+        let tag_pos = out.find("**[3 marks]**").unwrap();
+        assert!(tag_pos > close);
+    }
+
+    #[test]
+    fn test_unbind_marks_from_display_math() {
+        let input = "$$E = 12\\ \\text{J} [2 marks]$$";
+        let out = unbind_marks_from_math(input);
+        assert!(out.starts_with("$$E"));
+        assert!(out.ends_with("$$ **[2 marks]**"), "{out}");
+    }
+
+    #[test]
+    fn test_unbind_marks_leaves_clean_math_untouched() {
+        let text = "Find $x$ when $$y = 2x + 1$$. **[3 marks]**";
+        assert_eq!(unbind_marks_from_math(text), text);
+    }
+
+    // === IMAGE-OPTION MCQ BINDING TESTS ===
+    #[test]
+    fn test_bind_image_option_letter_prefix() {
+        let input = "Which graph is correct?\n\nA ![Option A](img/a.png)\nB) ![Option B](img/b.png)\n(C) ![Option C](img/c.png)";
+        let out = bind_mcq_image_options(input);
+        assert!(out.contains("- [MCQ:A] ![Option A](img/a.png)"), "{out}");
+        assert!(out.contains("- [MCQ:B] ![Option B](img/b.png)"), "{out}");
+        assert!(out.contains("- [MCQ:C] ![Option C](img/c.png)"), "{out}");
+    }
+
+    #[test]
+    fn test_bind_image_option_bold_list_form() {
+        let input = "- **A)** ![Diagram 1](img/1.png)\n- **(B)** ![Diagram 2](img/2.png)";
+        let out = bind_mcq_image_options(input);
+        assert!(out.contains("- [MCQ:A] ![Diagram 1](img/1.png)"), "{out}");
+        assert!(out.contains("- [MCQ:B] ![Diagram 2](img/2.png)"), "{out}");
+    }
+
+    #[test]
+    fn test_bind_image_option_stranded_next_line() {
+        let input = "- [MCQ:A]\n![Diagram](img/a.png)";
+        let out = bind_mcq_image_options(input);
+        assert_eq!(out.trim(), "- [MCQ:A] ![Diagram](img/a.png)");
+    }
+
+    #[test]
+    fn test_bind_image_options_via_clean_marker_markdown() {
+        let input = "Which circuit has the highest resistance?\n\nA) ![Opt A](data:image/png;base64,AAAA)\nB) ![Opt B](data:image/png;base64,BBBB)";
+        let out = clean_marker_markdown(input);
+        assert!(out.contains("- [MCQ:A] ![Opt A]("), "{out}");
+        assert!(out.contains("- [MCQ:B] ![Opt B]("), "{out}");
+    }
+
+    #[test]
+    fn test_ensure_diagrams_above_mcq_keeps_option_images_in_grid() {
+        // An image directly under a bound option line belongs to THAT option;
+        // it must never be hoisted above the grid.
+        let input = "Which graph is correct?\n\n- [MCQ:A] 10 V\n![Option B](img/b.png)\n- [MCQ:C] 30 V";
+        let out = ensure_diagrams_above_mcq(input);
+        let img_pos = out.find("![Option B]").unwrap();
+        let mcq_pos = out.find("- [MCQ:A]").unwrap();
+        assert!(img_pos > mcq_pos, "option image must stay inside the grid: {out}");
     }
 
     // === INTEGRATION TESTS ===
