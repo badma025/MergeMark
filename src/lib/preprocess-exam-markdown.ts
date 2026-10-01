@@ -101,7 +101,13 @@ export function fixTabMangledLatex(text: string): string {
 export function normalizeMarkdownTables(text: string): string {
   if (!text || !text.includes('|')) return text;
 
-  const rawLines = text.split('\n');
+  // Un-wrap any table rows or delimiter lines accidentally wrapped in math delimiters ($| ... |$)
+  let cleaned = text
+    .replace(/^[ \t]*\$(\|(?:\s*:?-+:?\s*\|)+)\$?[ \t]*$/gm, '$1')
+    .replace(/^[ \t]*\$?(\|(?:\s*:?-+:?\s*\|)+)\$[ \t]*$/gm, '$1')
+    .replace(/^[ \t]*\$(\|.*\|)\$[ \t]*$/gm, '$1');
+
+  const rawLines = cleaned.split('\n');
   const lines: string[] = [];
 
   // Pass 1: Fuse multiline table rows.
@@ -284,8 +290,10 @@ export function stripOrphanedDollars(text: string): string {
   s = s.replace(/([.?!,;:])\$(?=\s|$)/g, '$1');
 
   // 4. Strip stray double-dollar with an extra single dollar: "$$ $" or "$ $$"
-  s = s.replace(/\$\$\s*\$(?!\$)/g, '$$$$');
-  s = s.replace(/(?<!\$)\$\s*\$\$/g, '$$$$');
+  //    on ONE line. Across a line break these are two spans (an inline
+  //    formula closing a sentence, then a display block) and must survive.
+  s = s.replace(/\$\$[ \t]*\$(?!\$)/g, '$$$$');
+  s = s.replace(/(?<!\$)\$[ \t]*\$\$/g, '$$$$');
 
   // 5. Strip solitary dollar signs on their own line
   s = s.replace(/^[ \t]*\$[ \t]*$/gm, '');
@@ -588,16 +596,204 @@ function endsWithRowSeparator(trimmed: string): boolean {
   return /(?:\\\\|\\cr)\s*$/.test(trimmed);
 }
 
+/**
+ * Shared code map for the delimiter machinery (the Rust `validate::line_code_map`
+ * mirror). Tracks fenced code blocks by MARKER CHAR and RUN LENGTH so a
+ * four-backtick fence is not closed by a three-backtick line and a tilde fence
+ * is not closed by backticks. Inline code spans follow CommonMark backtick-RUN
+ * rules (a span opens with a run of N backticks and closes at the next run of
+ * EXACTLY N backticks), so ``a ` b`` and ``$`` stay opaque.
+ */
+interface LineCode {
+  /** The whole line sits inside a fenced code block. */
+  fenced: boolean;
+  /** [start, end) char ranges of inline code spans (empty inside a fence). */
+  spans: Array<[number, number]>;
+}
+
+function fenceMarker(line: string): { ch: string; run: number } | null {
+  const trimmed = line.replace(/^ {0,3}/, '');
+  if (trimmed.length < 3) return null;
+  const ch = trimmed[0];
+  if (ch !== '`' && ch !== '~') return null;
+  let run = 0;
+  while (run < trimmed.length && trimmed[run] === ch) run++;
+  if (run < 3) return null;
+  // A backtick fence may not carry another backtick in its info string.
+  if (ch === '`' && trimmed.slice(run).includes('`')) return null;
+  return { ch, run };
+}
+
+/** True when `line` CLOSES a fence opened with `ch`/`run`: same marker char, a
+ * run at least as long, and nothing but whitespace after the run. */
+function fenceCloses(line: string, ch: string, run: number): boolean {
+  const marker = fenceMarker(line);
+  if (!marker || marker.ch !== ch || marker.run < run) return false;
+  const trimmed = line.replace(/^ {0,3}/, '');
+  return trimmed.slice(marker.run).trim() === '';
+}
+
+function inlineCodeSpans(line: string): Array<[number, number]> {
+  const spans: Array<[number, number]> = [];
+  let i = 0;
+  while (i < line.length) {
+    if (line[i] !== '`') {
+      i++;
+      continue;
+    }
+    const start = i;
+    let run = 0;
+    while (i < line.length && line[i] === '`') {
+      run++;
+      i++;
+    }
+    let j = i;
+    let closeEnd = -1;
+    while (j < line.length) {
+      if (line[j] === '`') {
+        let m = 0;
+        while (j < line.length && line[j] === '`') {
+          m++;
+          j++;
+        }
+        if (m === run) {
+          closeEnd = j;
+          break;
+        }
+      } else {
+        j++;
+      }
+    }
+    const end = closeEnd === -1 ? line.length : closeEnd;
+    spans.push([start, end]);
+    i = end;
+  }
+  return spans;
+}
+
+export function lineCodeMap(content: string): LineCode[] {
+  const map: LineCode[] = [];
+  let open: { ch: string; run: number } | null = null;
+  for (const line of content.split('\n')) {
+    if (open) {
+      const closes = fenceCloses(line, open.ch, open.run);
+      map.push({ fenced: true, spans: [] });
+      if (closes) open = null;
+      continue;
+    }
+    const marker = fenceMarker(line);
+    if (marker) {
+      open = marker;
+      map.push({ fenced: true, spans: [] });
+      continue;
+    }
+    map.push({ fenced: false, spans: inlineCodeSpans(line) });
+  }
+  return map;
+}
+
+/**
+ * Mask fenced code blocks and inline code spans with opaque sentinels so the
+ * (otherwise code-blind) delimiter passes copy them verbatim. Newline structure
+ * is preserved (one sentinel per code line), so line-anchored repairs still see
+ * the same number of lines. `restore` puts the exact original text back.
+ *
+ * The sentinel uses U+0001 control chars and digits only — it contains none of
+ * the characters the passes match (`$`, backtick, `|`, `\begin{`, punctuation).
+ */
+export function protectCode(content: string): { masked: string; restore: (s: string) => string } {
+  const codeMap = lineCodeMap(content);
+  const store: string[] = [];
+  // Collision-safe sentinel: pick a control marker the source does not already
+  // contain, so an existing U+0001+digits sequence can never restore as another
+  // code span (or as `undefined`).
+  let marker = '';
+  for (let len = 1; len <= 8 && !marker; len++) {
+    for (const c of ['\u0001', '\u0002', '\u0003', '\u0000']) {
+      const candidate = c.repeat(len);
+      if (!content.includes(candidate)) {
+        marker = candidate;
+        break;
+      }
+    }
+  }
+  if (!marker) {
+    throw new Error('protectCode: content already contains every sentinel marker');
+  }
+  const token = (text: string) => {
+    store.push(text);
+    return `${marker}${store.length - 1}${marker}`;
+  };
+  const masked = content
+    .split('\n')
+    .map((line, i) => {
+      const code = codeMap[i] ?? { fenced: false, spans: [] as Array<[number, number]> };
+      if (code.fenced) return token(line);
+      if (code.spans.length === 0) return line;
+      let out = '';
+      let pos = 0;
+      for (const [start, end] of code.spans) {
+        out += line.slice(pos, start) + token(line.slice(start, end));
+        pos = end;
+      }
+      out += line.slice(pos);
+      return out;
+    })
+    .join('\n');
+  const restore = (s: string) =>
+    s.replace(new RegExp(`${marker}(\\d+)${marker}`, 'g'), (_match, n: string) => store[Number(n)]);
+  return { masked, restore };
+}
+
+/** Display `$$` toggles in one line, counting each run of two-or-more dollars
+ * as ONE toggle and ignoring inline code spans. */
+function countDisplayToggles(line: string, spans: Array<[number, number]>): number {
+  let toggles = 0;
+  let pos = 0;
+  const scan = (segment: string) => {
+    let i = 0;
+    while (i < segment.length) {
+      if (segment[i] === '\\') {
+        i += 2;
+        continue;
+      }
+      if (segment[i] === '$') {
+        let run = 0;
+        while (i + run < segment.length && segment[i + run] === '$') run++;
+        if (run >= 2) toggles++;
+        i += run;
+        continue;
+      }
+      i++;
+    }
+  };
+  for (const [start, end] of spans) {
+    if (start > pos) scan(line.slice(pos, start));
+    pos = Math.max(end, pos);
+  }
+  if (pos < line.length) scan(line.slice(pos));
+  return toggles;
+}
+
 export function ensureDisplayMathLineBreaks(text: string): string {
   if (!text.includes('$$')) return text;
   const lines = text.split('\n');
+  const codeMap = lineCodeMap(text);
   const out: string[] = [];
   let inDisplay = false;
 
-  for (const line of lines) {
+  for (let idx = 0; idx < lines.length; idx++) {
+    const line = lines[idx];
+    const code = codeMap[idx];
+    // Fenced blocks and lines that are entirely inline code are opaque: they
+    // neither open, close nor continue display math.
+    const entirelyInlineCode = code.spans.some(([start, end]) => start === 0 && end >= line.length);
+    if (code.fenced || entirelyInlineCode) {
+      out.push(line);
+      continue;
+    }
     const trimmed = line.trim();
-    const doubles = (trimmed.match(/(?<!\\)\$\$/g) || []).length;
-    const toggles = doubles % 2 === 1;
+    const toggles = countDisplayToggles(line, code.spans) % 2 === 1;
 
     if (!inDisplay) {
       out.push(line);
@@ -636,12 +832,68 @@ export function ensureDisplayMathLineBreaks(text: string): string {
 }
 
 /**
+ * Heals fractured math expressions and exponents split across dollar delimiters or OCR:
+ * e.g. "$4.0 \times 10$−6 \text{kg}" -> "$4.0 \times 10^{-6}\ \text{kg}$"
+ * e.g. "$10$−6" -> "$10^{-6}$"
+ * e.g. "−$7.1\times10^{7}" -> "$-7.1\times10^{7}$"
+ * e.g. "$7.1\times10^{7}\text{C} \text{kg}$−1" -> "$7.1\times10^{7}\text{ C kg}^{-1}$"
+ * e.g. "$4.0 \times 10^{-6}$ \text{kg}" -> "$4.0 \times 10^{-6}\ \text{kg}$"
+ */
+export function healFracturedMath(text: string): string {
+  if (!text) return '';
+  let s = text;
+
+  // 1. Minus sign outside opening $: −$7.1 \times 10^7 -> $-7.1 \times 10^7$
+  s = s.replace(/(?:^|[\s(])([−–\-])\s*\$([^\$\n]+)\$/g, '$1-$2$');
+
+  // 2. Exponent and unit outside closing $: `$4.0 \times 10$−6 \text{kg}` or `$4.0 \times 10$-6 kg`
+  s = s.replace(
+    /\$([^\$\n]+?)\$[ \t]*[−–\-^](\d+)[ \t]*(\\text\{[^\}]+\}|[a-zA-Z]+)(?=[ \t.,;:\n]|$)/g,
+    '$$$1^{-\$2}\\ \$3$$'
+  );
+
+  // 3. Simple power outside closing $: `$10$−6` or `$10$-6` or `$10$^6`
+  s = s.replace(
+    /\$([^\$\n]+?)\$[ \t]*[−–\-^](\d+)(?=[ \t.,;:\n]|$)/g,
+    '$$$1^{-\$2}$$'
+  );
+
+  // 4. `\text{...}` directly following closing $: `$4.0 \times 10^{-6}$ \text{kg}` -> `$4.0 \times 10^{-6}\ \text{kg}$`
+  s = s.replace(
+    /\$([^\$\n]+?)\$[ \t]*(\\text\{[^\}]+\})/g,
+    '$$$1\\ \$2$$'
+  );
+
+  // 5. Trailing exponent outside closing $: `$7.1\times10^{7}\text{C} \text{kg}$−1` -> `$7.1\times10^{7}\text{C} \text{kg}^{-1}$`
+  s = s.replace(
+    /\$([^\$\n]+?)\$[ \t]*[−–\-^](\d+)/g,
+    '$$$1^{-\$2}$$'
+  );
+
+  // 6. Strip multi-line AQA margin warnings, watermark PMT and stray box tokens
+  s = s.replace(/(?:^|\r?\n)[ \t]*(?:Do not write[ \t]*\r?\n+[ \t]*outside the[ \t]*\r?\n+[ \t]*box|outside the[ \t]*\r?\n+[ \t]*box|Do not write outside the box|\bdo not write in this area\b|\bdo not write on this page\b)[ \t]*(?=\r?\n|$)/gi, '');
+  s = s.replace(/(?:^|\r?\n)[ \t]*box[ \t]*(?=\r?\n+[ \t]*(?:0\s*)?\d)/gmi, '');
+  s = s.replace(/^[ \t]*(?:box[ \t]+(?:0\s*)?\d+(?:[ \t]*\d+)?(?:[ \t]*\.[ \t]*\d+)?|\([a-z]\)[ \t]*box[ \t]*|box[ \t]+)/gmi, '');
+  s = s.replace(/(?:^|\r?\n)[ \t]*PMT[ \t]*(?=\r?\n|$)/gmi, '');
+
+  return s;
+}
+
+/**
  * Main delimiter and table healing function
  */
 export function healLatexDelimiters(raw: string): string {
   if (!raw || !raw.trim()) return '';
 
   let s = raw;
+
+  // Fenced code blocks and inline code spans are opaque to EVERY pass below —
+  // including tab-mangled repair, placeholder stripping and the empty-display
+  // strip. Mask them first, run the code-blind healers, then restore the exact
+  // source text. Without this a literal `$$$` / `$$ $$` / placeholder-looking
+  // string / TAB-mangled text inside code would be rewritten.
+  const { masked, restore } = protectCode(s);
+  s = masked;
 
   // -1. Escape-mangled LaTeX from stored payloads must be restored before
   //     any structural pass sees TAB + "ext" instead of \text.
@@ -653,6 +905,7 @@ export function healLatexDelimiters(raw: string): string {
   //     they cannot confuse delimiter pairing.
   s = stripEmptyDisplayMath(s);
 
+  s = healFracturedMath(s);
   s = deduplicateRepeatedParagraphs(s);
   s = normalizeMarkdownTables(s);
   s = fixSpacedCommands(s);
@@ -671,5 +924,5 @@ export function healLatexDelimiters(raw: string): string {
   // "$$ $") — remove them as a final pass.
   s = stripEmptyDisplayMath(s);
 
-  return s;
+  return restore(s);
 }

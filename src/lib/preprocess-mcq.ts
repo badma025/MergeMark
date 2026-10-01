@@ -57,14 +57,14 @@ export function promoteDiagramsAboveMcq(markdown: string): string {
       const l = beforeLines[i].trim();
       if (l === '') continue;
       if (
-        l.includes('[MCQ:') ||
-        /^(?:[-*+][ \t]+)?(?:\*\*|\[)?\s*[A-E][\s.:)\]]/i.test(l)
+        /^-\s+\[MCQ:[A-E]\]\s*$/.test(l) ||
+        /^(?:[-*+][ \t]+)?(?:\*\*)?[A-E][.:)]?\s*$/.test(l)
       ) {
         isOptionImage = true;
       }
       break;
     }
-    if (isOptionImage) continue;
+    if (isOptionImage || /^\s*!\[(?:Option|Choice)\s+[A-E]\]/i.test(m[0])) continue;
 
     moved.push(m[0].trim());
     ranges.push({ start: m.index, end: m.index + m[0].length });
@@ -218,9 +218,163 @@ export function convertStandaloneImagesToMcq(text: string): string {
   return text;
 }
 
+/**
+ * Formats bare LaTeX math or units inside an MCQ option body into clean $ ... $ math
+ */
+export function formatMcqOptionBody(rawBody: string): string {
+  let body = rawBody.trim();
+  body = body.replace(/((?:\*\*|\*|\[)?\s*\[?\s*\d+\s*marks?\s*\]?\s*(?:\*\*|\*|\])?)\s*$/i, '').trim();
+
+  if (body.includes('$')) {
+    return body.replace(/\${3,}/g, '$');
+  }
+  // Markdown payloads and prose are never standalone equations.
+  if (body.includes('](') || body.split(/\s+/).length > 3) return body;
+
+  const hasLatex = /(?:\\(?:times|frac|dfrac|cfrac|sqrt|pm|mp|approx|leq|geq|cdot|text|mu|pi|alpha|beta|gamma|delta|Delta|Omega|theta|lambda|sigma|varepsilon|mathrm|mathbf|vmatrix|pmatrix)|10\^\{?[-−–\d]+\}?|\^\{?[-−–\d]+\}?|_[0-9a-zA-Z]+|\b\d+(?:\.\d+)?\s*[×x]\s*10)/i.test(body);
+
+  if (hasLatex) {
+    const unitMatch = body.match(/^(.*?)[ \t]+([A-Za-z]+|\\[a-zA-Z]+(?:\{[^\}]*\})?)$/);
+    if (unitMatch && !body.endsWith('}')) {
+      const mathPart = unitMatch[1].trim();
+      const unitPart = unitMatch[2].trim();
+      if (unitPart.startsWith('\\')) {
+        body = `$${mathPart}\\ ${unitPart}$`;
+      } else {
+        body = `$${mathPart}\\text{ ${unitPart}}$`;
+      }
+    } else {
+      body = `$${body}$`;
+    }
+  }
+
+  return body;
+}
+
+/**
+ * Fuses multi-line MCQ options where unit lines or continuation phrases
+ * have been broken across newlines beneath option letters:
+ * e.g.:
+ * A 4.0\times10^{7}
+ * W
+ * B 1.0\times10^{8}
+ * W
+ * C 6.0\times10^{8}
+ * W
+ * D 3.6\times10^{10}\text{W} **[1 mark]**
+ */
+export function fuseSplitMcqLines(text: string): string {
+  if (!text) return '';
+  text = text.replace(/\r/g, '');
+  // NOTE: a generic "number line then short token line" rule used to turn any
+  // `9\nF` into `\frac{9}{F}`. That is an unsafe guess (product? value+unit?
+  // flattened fraction?), so it is intentionally gone. Reconstructing a real
+  // stacked fraction requires fraction-bar glyph evidence from the backend; the
+  // backend leaves such runs un-tagged and flags them as local recoveries.
+  if (text.includes('[MCQ:')) return text;
+
+  const lines = text.split('\n');
+  let mcqStart = -1;
+  // Search from the end backwards to find the start of the valid contiguous MCQ options block
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const trimmed = lines[i].trim();
+    const m = trimmed.match(/^(?:\*\*|\[)?\s*A(?:[\s.:)\]]+|$)(.*)$/i);
+    if (m) {
+      if (SUBQUESTION_VERB_REGEX.test(m[1].trim())) continue;
+      const remaining = lines.slice(i + 1);
+      let foundB = false;
+      let foundC = false;
+      for (const rl of remaining) {
+        const rt = rl.trim();
+        if (/^(?:\*\*|\[)?\s*B(?:[\s.:)\]]+|$)/.test(rt)) foundB = true;
+        if (foundB && /^(?:\*\*|\[)?\s*C(?:[\s.:)\]]+|$)/.test(rt)) foundC = true;
+      }
+      if (foundB && foundC) {
+        mcqStart = i;
+        break;
+      }
+    }
+  }
+
+  if (mcqStart === -1) return text;
+
+  const stemLines = lines.slice(0, mcqStart);
+  const optLines = lines.slice(mcqStart);
+
+  let currentLetter: string | null = null;
+  let currentContent: string[] = [];
+  const parsedOpts: Array<{ letter: string; body: string }> = [];
+
+  for (const l of optLines) {
+    const trimmed = l.trim();
+    if (trimmed === '') continue;
+    if (/^!\[/.test(trimmed) && currentContent.length > 0 && !/^!\[(?:Option|Choice)\s+[A-E]\]/i.test(trimmed)) {
+      stemLines.push('', l, '');
+      continue;
+    }
+    const optM = trimmed.match(/^(?:\*\*|\[)?\s*([A-E])(?:[\s.:)\]]+|$)(.*)$/);
+    if (optM && ['A', 'B', 'C', 'D', 'E'].includes(optM[1].toUpperCase())) {
+      if (currentLetter) {
+        parsedOpts.push({ letter: currentLetter, body: currentContent.join(' ').trim() });
+      }
+      currentLetter = optM[1].toUpperCase();
+      currentContent = optM[2].trim() ? [optM[2].trim()] : [];
+    } else {
+      if (currentLetter) {
+        currentContent.push(trimmed);
+      } else {
+        stemLines.push(l);
+      }
+    }
+  }
+  if (currentLetter) {
+    parsedOpts.push({ letter: currentLetter, body: currentContent.join(' ').trim() });
+  }
+
+  if (parsedOpts.length < 3) return text;
+
+  // Check if any option contains a subquestion command verb
+  if (parsedOpts.some(o => SUBQUESTION_VERB_REGEX.test(o.body))) {
+    return text;
+  }
+
+  // Strip mark allocation from last option if present
+  let trailingMark: string | null = null;
+  const lastOpt = parsedOpts[parsedOpts.length - 1];
+  const markMatch = lastOpt.body.match(/((?:\*\*|\*|\[)?\s*\[?\s*\d+\s*marks?\s*\]?\s*(?:\*\*|\*|\])?)\s*$/i);
+  if (markMatch) {
+    trailingMark = markMatch[1].trim();
+    lastOpt.body = lastOpt.body.slice(0, markMatch.index).trim();
+  }
+
+  let stem = stemLines.join('\n').trim();
+  // Strip leading stray subquestion letters `(a)`, `(a) `, `(b)` from MCQ stem
+  stem = stem.replace(/^\s*\([a-z0-9]+\)\s*/i, '');
+  // Strip stray margin `box ` at start of stem
+  stem = stem.replace(/^(?:box[ \t]+(?:0\s*)?\d+(?:[ \t]*\d+)?(?:[ \t]*\.[ \t]*\d+)?|\([a-z]\)[ \t]*box[ \t]*|box[ \t]+)/i, '');
+
+  if (trailingMark && !/\[\s*\d+\s*marks?\s*\]/i.test(stem)) {
+    const numMatch = trailingMark.match(/\d+/);
+    if (numMatch) {
+      const n = numMatch[0];
+      stem += ` **[${n} mark${parseInt(n, 10) > 1 ? 's' : ''}]**`;
+    }
+  }
+
+  const formatted = parsedOpts.map(opt => {
+    const body = formatMcqOptionBody(opt.body);
+    return `- [MCQ:${opt.letter}] ${body}`;
+  });
+
+  return `${stem}\n\n${formatted.join('\n')}\n`;
+}
+
 export function normalizeMCQOptions(markdown: string): string {
   if (!markdown) return '';
   let text = markdown;
+
+  // ── Step -2: Fuse multi-line split MCQ options with continuation lines ──
+  text = fuseSplitMcqLines(text);
 
   // ── Step -1: Convert standalone visual options (3-5 trailing images) into MCQ options ──
   text = convertStandaloneImagesToMcq(text);
@@ -286,6 +440,20 @@ export function normalizeMCQOptions(markdown: string): string {
     }
     return `- [MCQ:${letter}] ${content.trim()}`;
   });
+
+  // ── Step 3c: Wrap bare LaTeX math in existing - [MCQ:X] options & strip misplaced marks ──
+  text = text.replace(/^[ \t]*-[ \t]+\[MCQ:([A-E])\][ \t]+(.+)$/gm, (_match, letter, rawBody) => {
+    let body = formatMcqOptionBody(rawBody);
+    // Delimiters are local to an option, including malformed display markers.
+    body = body.replace(/(?<!\\)\${2,}/g, '$');
+    if ((body.match(/(?<!\\)\$/g) || []).length % 2) body += '$';
+    return `- [MCQ:${letter}] ${body}`;
+  });
+
+  // ── Step 3d: Strip leading stray subquestion letters `(a)`, `(b)` from MCQ question stem ──
+  if (text.includes('- [MCQ:')) {
+    text = text.replace(/^\s*\([a-z0-9]+\)\s*/i, '');
+  }
 
   // ── Pattern 3b: Tighten loose MCQ lists by removing blank lines between - [MCQ:X] items ──
   text = text.replace(/(^[ \t]*-[ \t]+\[MCQ:[A-E]\][^\n]+)\n+(?=[ \t]*-[ \t]+\[MCQ:[A-E]\])/gm, '$1\n');

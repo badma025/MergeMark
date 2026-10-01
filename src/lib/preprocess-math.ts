@@ -11,7 +11,7 @@
  * 6. Detects and normalizes sequential MCQ options (A, B, C, D)
  */
 
-import { MATH_ENVS, healLatexDelimiters, fixSpacedCommands, stripPlaceholderTokens, stripEmptyDisplayMath, fixTabMangledLatex } from './preprocess-exam-markdown';
+import { MATH_ENVS, healLatexDelimiters, fixSpacedCommands, stripPlaceholderTokens, stripEmptyDisplayMath, fixTabMangledLatex, protectCode } from './preprocess-exam-markdown';
 import { normalizeMCQOptions } from './preprocess-mcq';
 
 /**
@@ -289,6 +289,23 @@ function wrapOrphanedMath(text: string): string {
 }
 
 /**
+ * Normalizes unicode math debris that survives legacy imports (trap class T4):
+ * - U+2212 MINUS SIGN / en dash -> ASCII hyphen-minus
+ * - "\text{kg} \text{m}-3"      -> "\text{kg} \text{m}^{-3}"
+ * - "x × 10-15" / "10-15 m"     -> "x \times 10^{-15}" / "$10^{-15}$ m"
+ * Runs before any structural pass so later $-balancing sees clean input.
+ */
+export function normalizeUnicodeMath(text: string): string {
+  if (!text) return text;
+  let s = text.replace(/\u2212/g, '-').replace(/\u2013/g, '-');
+  s = s.replace(/\\text\{([A-Za-z]+)\}[ ]?-(\d)/g, '\\text{$1}^{-$2}');
+  s = s.replace(/(?:×|\\times)[ \t]*10-(\d+)/g, (_m, d: string) => `\\times 10^{-${d}}`);
+  // Bare "10-15" outside math: preceding char consumed & re-emitted (no lookbehind in JS).
+  s = s.replace(/(^|[^$\w^{])10-(\d+)(?![\w}])/g, (_m, pre: string, d: string) => `${pre}$10^{-${d}}$`);
+  return s;
+}
+
+/**
  * Master Pre-AST Sanitizer:
  * Executes on raw string content before entering ReactMarkdown.
  */
@@ -297,9 +314,25 @@ export function preprocessExamMarkdown(raw: string): string {
 
   let s = raw;
 
+  // Fenced code blocks and inline code spans are opaque to EVERY pass in this
+  // chain, including tab-mangled repair, MCQ normalization, unicode math
+  // normalization, placeholder stripping and the empty-display strip. Mask
+  // first, run the whole transform stack, then restore the exact source text.
+  const { masked, restore } = protectCode(s);
+  s = masked;
+
   // 0. Escape-mangled LaTeX (unescaped "\text" stored as TAB + "ext") is
   //    restored before any structural pass runs.
   s = fixTabMangledLatex(s);
+
+  // Establish option boundaries before global math healing can interpret a
+  // malformed dollar run as a display block spanning several choices.
+  s = normalizeMCQOptions(s);
+
+  // 0.5 Unicode math debris (U+2212 minus, plain negative exponents) is
+  //     normalized before delimiter healing so `$` balancing operates on
+  //     the intended math spans, not on minus-sign noise.
+  s = normalizeUnicodeMath(s);
 
   // 0. Backend placeholder tokens ([DIAGRAM_PLACEHOLDER] /
   //    [VISUAL_MCQ_PLACEHOLDER]) and phantom/empty display math blocks are
@@ -329,7 +362,7 @@ export function preprocessExamMarkdown(raw: string): string {
   // 7. Clean excessive blank lines (3+ to 2)
   s = s.replace(/\n{3,}/g, '\n\n');
 
-  return s.trim();
+  return restore(s).trim();
 }
 
 /**

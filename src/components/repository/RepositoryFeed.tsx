@@ -285,9 +285,9 @@ export function RepositoryFeed({
 
   // Expand displayCount smoothly after initial paint without blocking the UI
   useEffect(() => {
-    if (!loading && filtered.length > displayCount) {
+    if (!loading && displayCount === INITIAL_DISPLAY_COUNT && filtered.length > INITIAL_DISPLAY_COUNT) {
       const timer = setTimeout(() => {
-        setDisplayCount(60);
+        setDisplayCount((prev) => (prev === INITIAL_DISPLAY_COUNT ? 60 : prev));
       }, 400);
       return () => clearTimeout(timer);
     }
