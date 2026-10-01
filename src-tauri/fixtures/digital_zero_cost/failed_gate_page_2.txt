@@ -1,0 +1,9 @@
+2 A sound wave of frequency 250 Hz travels through air at a speed of 340 m/s. The wave is
+reflected from a wall some distance away and returns to the source, where it is detected with a
+microphone connected to an oscilloscope.
+
+(a) Calculate the wavelength of this sound wave. **[2 marks]**
+
+(b) The reflected sound wave returns to its source. State the name of this effect. **[2 marks]**
+
+(Total for Question 2 is 4 marks)

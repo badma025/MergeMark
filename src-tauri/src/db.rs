@@ -411,7 +411,9 @@ pub async fn set_byok_api_key(
 // output for the same input.
 
 /// Bump this to invalidate all cached extraction results after logic changes.
-pub const EXTRACTION_CACHE_VERSION: u32 = 2;
+/// v3: formatting-rules pipeline (sanitize seam, structural validator,
+/// Tier-0 figure lever) — cached v2 entries hold unformatted cards.
+pub const EXTRACTION_CACHE_VERSION: u32 = 3;
 
 /// Compute a deterministic cache key from file content + parameters.
 /// Uses a fast FNV-1a hash of the file bytes (not cryptographic, just

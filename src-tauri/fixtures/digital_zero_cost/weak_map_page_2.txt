@@ -1,0 +1,8 @@
+2 A loudspeaker produces a sound wave of frequency 170 Hz that travels through air at a speed of
+340 m/s. The wave then passes into water, where the speed of sound is greater than the speed of
+sound in air.
+
+(a) Calculate the wavelength of the sound wave in air. **[2 marks]**
+
+(b) State and explain what happens to the frequency and to the wavelength of the sound wave as it
+passes from the air into the water. **[3 marks]**

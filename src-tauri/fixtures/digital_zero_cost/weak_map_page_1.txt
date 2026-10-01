@@ -1,0 +1,9 @@
+1 A student investigates the resistance of a filament lamp. The lamp is connected in series with a
+variable power supply, an ammeter and a voltmeter. The student records the current through the
+lamp and the potential difference across the lamp for a range of supply settings.
+
+(a) The student measures a current of 0.25 A when the potential difference across the lamp is
+3.0 V. Calculate the resistance of the lamp. **[2 marks]**
+
+(b) The student increases the potential difference and finds that the resistance of the lamp
+increases. Explain, in terms of the ions in the filament, why the resistance increases. **[3 marks]**

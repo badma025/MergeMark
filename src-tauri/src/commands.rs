@@ -18,6 +18,47 @@ static RE_CLASSIFIER_MARKS: LazyLock<regex::Regex> = LazyLock::new(|| regex::Reg
 static RE_CLASSIFIER_QSPLIT: LazyLock<regex::Regex> = LazyLock::new(|| regex::Regex::new(r"(?m)(?:^|\n)(?:Question\s+\d+|Q\.?\s*\d+|\d{1,2}[.)]\s)").unwrap());
 static RE_CLASSIFIER_MATH: LazyLock<regex::Regex> = LazyLock::new(|| regex::Regex::new(r"(?s)\$\$?.+?\$\$?|\\\[.+?\\\]|\\\(.+?\\\)").unwrap());
 
+// Provider vs on-device client for question-paper ingestion.
+
+/// Which client a question-paper import runs with.
+///
+/// Digital documents (any page carrying machine-readable question text) are
+/// ingested entirely on-device: no provider resolution, no credentials, no
+/// upload entitlement. The local variant uses the offline refusing client, so
+/// even a bug in the orchestration layer cannot reach the network.
+enum QuestionClient {
+    Provider(ReqwestLlm),
+    Local(crate::llm::RefusingLlm),
+}
+
+impl crate::llm::LlmClient for QuestionClient {
+    fn chat<'a>(
+        &'a self,
+        body: &'a serde_json::Value,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = Result<serde_json::Value, crate::llm::LlmError>>
+                + Send
+                + 'a,
+        >,
+    > {
+        match self {
+            QuestionClient::Provider(client) => client.chat(body),
+            QuestionClient::Local(client) => client.chat(body),
+        }
+    }
+}
+
+/// Provider requirement for one import, decided from the page text ALONE and
+/// before any credential or quota lookup.
+///
+/// `false` means a digital document: the import must run on-device and must
+/// not resolve a provider, read a key, or spend free-tier uploads. Extracted
+/// so the rule is testable without Tauri state.
+fn import_requires_provider(pages: &[PageInput]) -> bool {
+    !pipeline::is_local_only_document(pages)
+}
+
 
 
 // ── Shared data model ─────────────────────────────────────────────────────────
@@ -1435,6 +1476,13 @@ pub async fn parse_pdf_vision(
     );
     config.allowed_topics = allowed_topics;
     config.diagrams_dir = diagrams_dir;
+    // Load the document's character/run/rule geometry ONCE for this import so
+    // the deterministic layout repairs (stacked fractions, formulas, nuclides)
+    // have real source evidence without reloading the PDF per span.
+    config.layout_evidence = crate::pdf_render::load_import_evidence(
+        std::path::Path::new(&file_path),
+    )
+    .map(std::sync::Arc::new);
     config.max_repairs = 2;
     // Phase 0: questions now get the same output budget as mark schemes.
     // Long physics questions with sub-parts (a)–(f), derivations, graph
@@ -1460,16 +1508,35 @@ pub async fn parse_pdf_vision(
         && std::env::var("MERGEMARK_MS_TEXT_FIRST")
             .map(|v| v != "0")
             .unwrap_or(true);
+    // Tier-0 deterministic extraction: text-reliable, figure-free question
+    // spans are carved out of the text layer by a local Rust transcriber —
+    // zero API calls. Any gate refusal falls back to the LLM unchanged.
+    config.deterministic = std::env::var("MERGEMARK_DETERMINISTIC")
+        .map(|v| v != "0")
+        .unwrap_or(true);
 
-    let (route, client) = resolve_llm_client(&state, model_name.clone())
-        .await
-        .map_err(|e| e.hint.unwrap_or(e.message))?;
+    // Digital question papers are ingested entirely on-device. Decide that from
+    // the pages BEFORE touching the provider/billing layer so an exhausted free
+    // tier or a missing BYOK key can never block a local import, and a local
+    // import never spends an upload entitlement.
+    let local_only = !import_requires_provider(&pages);
+    let (route, client): (Option<crate::billing::BillingRoute>, QuestionClient) = if local_only {
+        eprintln!(
+            "[LOCAL_ONLY] digital question paper: running on-device with the refusing local client (no provider, no credentials, no quota)"
+        );
+        (None, QuestionClient::Local(crate::llm::RefusingLlm::new()))
+    } else {
+        let (route, client) = resolve_llm_client(&state, model_name.clone())
+            .await
+            .map_err(|e| e.hint.unwrap_or(e.message))?;
+        (Some(route), QuestionClient::Provider(client))
+    };
 
     // Use higher parallelism for BYOK (user controls their own rate limits);
     // conservative for the shared Free Tier key. The 429 retry loop in
     // llm.rs handles backpressure automatically if the provider throttles.
-    config.parallelism = match &route {
-        crate::billing::BillingRoute::FreeTier { .. } => {
+    config.parallelism = match route.as_ref() {
+        Some(crate::billing::BillingRoute::FreeTier { .. }) => {
             std::env::var("MERGEMARK_PARALLELISM")
                 .ok()
                 .and_then(|v| v.parse::<usize>().ok())
@@ -1502,6 +1569,10 @@ pub async fn parse_pdf_vision(
             for q in &cached_questions {
                 let topics_json = q.topics.as_deref().unwrap_or("[]");
                 let subtopic = if q.subtopic.is_empty() { "Imported" } else { &q.subtopic };
+                // Same sanitizer gate as the fresh-import path so cached cards
+                // can never reintroduce formatting corruption.
+                let content =
+                    crate::sanitize::sanitize_question_content(&q.content, q.question_number.unwrap_or(0) as u32);
                 let _ = sqlx::query(
                     r#"
                     INSERT INTO questions (id, subject, subtopic, topics, marks, content, math_snippet, is_code, paper_name, question_number, module, needs_review, answer_stale)
@@ -1522,7 +1593,7 @@ pub async fn parse_pdf_vision(
                 .bind(subtopic)
                 .bind(topics_json)
                 .bind(q.marks)
-                .bind(&q.content)
+                .bind(&content)
                 .bind(q.is_code)
                 .bind(&config.paper_name)
                 .bind(q.question_number)
@@ -1532,7 +1603,14 @@ pub async fn parse_pdf_vision(
                 .await;
             }
             drop(pool_check);
-            return Ok(cached_questions);
+            let mut sanitized = cached_questions;
+            for q in &mut sanitized {
+                q.content = crate::sanitize::sanitize_question_content(
+                    &q.content,
+                    q.question_number.unwrap_or(0) as u32,
+                );
+            }
+            return Ok(sanitized);
         }
     }
     drop(pool_check);
@@ -1594,7 +1672,9 @@ pub async fn parse_pdf_vision(
     let pool = state.db.lock().await;
 
     // Increment free uploads if we used the Free Tier
-    if matches!(route, crate::billing::BillingRoute::FreeTier { .. }) {
+    // A local-only (digital) import resolved no route and therefore spends no
+    // upload entitlement: `route` is `None` for those runs.
+    if matches!(route.as_ref(), Some(crate::billing::BillingRoute::FreeTier { .. })) {
         let _ = crate::db::increment_free_uploads(&pool).await;
     }
 
@@ -1603,6 +1683,12 @@ pub async fn parse_pdf_vision(
     let mut tx = pool.begin().await.map_err(|e| e.to_string())?;
 
     for q in built {
+        // ── Deterministic content sanitizer (last line of defense) ─────────
+        // Runs on every card regardless of origin (LLM / Tier-0 / fallback):
+        // strips OCR margin boilerplate, repairs unicode-minus exponents,
+        // balances rogue `$` delimiters, unwraps sentence-level math,
+        // reconstructs scrambled isotope notation, and tightens MCQ lists.
+        let content = crate::sanitize::sanitize_question_content(&q.content, q.question_number);
         let topics_json = if q.topics.is_empty() {
             "[]".to_string()
         } else {
@@ -1649,7 +1735,7 @@ pub async fn parse_pdf_vision(
         .bind(&subtopic)
         .bind(&topics_json)
         .bind(q.marks)
-        .bind(&q.content)
+        .bind(&content)
         .bind(q.is_code)
         .bind(&config.paper_name)
         .bind(q.question_number as i64)
@@ -1671,7 +1757,7 @@ pub async fn parse_pdf_vision(
             subject: config.subject.clone(),
             subtopic,
             marks: q.marks,
-            content: q.content,
+            content,
             math_snippet: String::new(),
             is_code: q.is_code,
             answer_content: None,
@@ -2006,6 +2092,9 @@ pub async fn parse_mark_scheme_vision(
         "MarkScheme".into(),
         Some(std::path::PathBuf::from(&file_path)),
     );
+    config.deterministic = std::env::var("MERGEMARK_DETERMINISTIC")
+        .map(|value| value != "0")
+        .unwrap_or(true);
     config.diagrams_dir = diagrams_dir;
     config.max_repairs = 2;
     config.max_output_tokens = 32768;
@@ -2882,5 +2971,62 @@ pub async fn get_generation_cost(
     };
 
     crate::cost::fetch_openrouter_generation_cost(&generation_id, &key).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn text_page(text: &str) -> PageInput {
+        PageInput {
+            kind: crate::pipeline::PageInputKind::TextOnly,
+            text: text.to_string(),
+        }
+    }
+
+    fn image_page(text: &str) -> PageInput {
+        PageInput {
+            kind: crate::pipeline::PageInputKind::Image {
+                b64: "data:image/webp;base64,AAAA".to_string(),
+            },
+            text: text.to_string(),
+        }
+    }
+
+    /// A digital document must not require a provider: the route is decided
+    /// from page text alone, before any credential or quota lookup, and the
+    /// free-tier debit is skipped because no route is resolved.
+    #[test]
+    fn digital_import_never_requires_a_provider() {
+        let digital = vec![
+            text_page("Answer ALL questions. Instructions to candidates."),
+            text_page("1 Explain why the resistance of a filament lamp increases as the temperature of the filament rises during the experiment. [3 marks]"),
+            text_page("END OF QUESTIONS"),
+        ];
+        assert!(!import_requires_provider(&digital));
+
+        // A short modular paper is still digital: there is no document-size floor.
+        let short = vec![text_page(
+            "1 Prove that the sum of two even numbers is always even. [2 marks]",
+        )];
+        assert!(!import_requires_provider(&short));
+
+        // Blank / back-matter pages cannot hand a digital paper to the cloud.
+        let with_blank = vec![
+            text_page("1 Calculate the mean of 3, 7 and 11. [2 marks]"),
+            text_page(""),
+            image_page(""),
+            text_page("END OF QUESTIONS"),
+        ];
+        assert!(!import_requires_provider(&with_blank));
+    }
+
+    /// Only a genuine scan / image-only input keeps the provider route (and
+    /// therefore the free-tier accounting).
+    #[test]
+    fn scanned_only_import_still_requires_a_provider() {
+        let scanned = vec![image_page(""), image_page("   "), image_page("\u{200a}")];
+        assert!(import_requires_provider(&scanned));
+    }
 }
 

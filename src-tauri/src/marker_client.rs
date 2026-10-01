@@ -44,7 +44,9 @@ static RE_ARTIFACT_BOILERPLATE: LazyLock<Regex> = LazyLock::new(|| {
 });
 
 static RE_AQA_DECIMAL_PART: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?:^|\n)\s*(\d+)(?:[.\s])([1-9])\b").unwrap()
+    // The dotless form is only a zero-padded heading ("05 2"): "23 5" in a
+    // trace table is data, never part (e).
+    Regex::new(r"(?m)^[ \t]*(?:(\d(?:[ \t]?\d)*)(?:[ \t]+box)?[ \t]*)?\.[ \t]*([1-9])\b|^[ \t]*(0\d)[ \t]+([1-9])\b").unwrap()
 });
 
 static RE_SUBPART_LABEL: LazyLock<Regex> = LazyLock::new(|| {
@@ -243,13 +245,7 @@ static RE_IMAGE_LINK: LazyLock<Regex> = LazyLock::new(|| {
 
 /// Ligature cleanup (exact replacements, zero false positives)
 pub fn clean_ligatures(s: &str) -> String {
-    s.replace('\u{fb00}', "ff")    // ﬀ
-     .replace('\u{fb03}', "ffi")   // ﬃ
-     .replace('\u{fb01}', "fi")    // ﬁ
-     .replace('\u{fb02}', "fl")    // ﬂ
-     .replace('\u{fb04}', "ffl")   // ﬄ
-     .replace('\u{fb05}', "st")    // ﬅ
-     .replace('\u{fb06}', "st")    // ﬆ
+    crate::validate::clean_ligatures(s)
 }
 
 /// Fix space after backslash for known LaTeX commands: "\ begin" -> "\begin", "\ sqrt" -> "\sqrt"
@@ -305,10 +301,19 @@ fn remove_leading_number_artifacts(text: &str) -> String {
 
 /// Convert AQA decimal sub-parts: "02.1" -> "(a)", "02.2" -> "(b)", "02 5" -> "(e)"
 /// Only applies when the pattern appears as a sub-part label (start of line or after whitespace)
-fn convert_aqa_decimal_parts(text: &str) -> String {
+pub(crate) fn convert_aqa_decimal_parts(text: &str) -> String {
     RE_AQA_DECIMAL_PART.replace_all(text, |caps: &regex::Captures| {
-        let _whole: u32 = caps[1].parse().unwrap_or(0);
-        let part: u32 = caps[2].parse().unwrap_or(0);
+        // A decimal followed by a unit is a value, not a subpart heading.
+        // Tier-0 may already have converted the unit to a LaTeX text group.
+        static UNIT_AFTER: LazyLock<Regex> = LazyLock::new(|| Regex::new(
+            r"^[ \t]*(?:\\[ \t]+)?(?:\\text\{)?(?:kW|MW|W|kJ|MJ|J|kg|g|km|cm|mm|m|ms|s|h|mV|kV|V|mA|A|kN|N|C|K|Hz|Pa|MeV|eV)\b"
+        ).unwrap());
+        let main = caps.get(1).or_else(|| caps.get(3)).map(|m| m.as_str());
+        let explicit_heading = main.map_or(true, |m| (m.starts_with('0') && m.len() > 1) || m.contains([' ', '\t']) || caps[0].contains("box"));
+        if !explicit_heading && UNIT_AFTER.is_match(&text[caps.get(0).unwrap().end()..]) {
+            return caps[0].to_string();
+        }
+        let part: u32 = caps.get(2).or_else(|| caps.get(4)).unwrap().as_str().parse().unwrap_or(0);
         if part >= 1 && part <= 26 {
             let letter = (b'a' + (part - 1) as u8) as char;
             format!("\n\n({})", letter)
@@ -554,6 +559,21 @@ fn fix_mark_allocation(text: &str) -> String {
             rebuilt.push_str(parts[0].trim());
         }
 
+        if label_data.is_empty() {
+            // Single-part question with a mark tag and NO sub-parts: there is
+            // nowhere to relocate the tag, and rebuilding from the
+            // tag-stripped text used to delete it (leaving bare "****" and a
+            // bogus "lacks terminal punctuation" review flag). Put the tag(s)
+            // back exactly where the model reported them.
+            for mark in &marks {
+                if !rebuilt.is_empty() {
+                    rebuilt.push(' ');
+                }
+                rebuilt.push_str(mark);
+            }
+            return rebuilt;
+        }
+
         for (i, (prefix, label)) in label_data.iter().enumerate() {
             rebuilt.push_str(prefix);
             rebuilt.push_str(label);
@@ -690,7 +710,7 @@ fn preceded_by_mcq_option_line(text: &str, idx: usize) -> bool {
     match candidate {
         Some(line) => {
             let trimmed = line.trim();
-            trimmed.contains("[MCQ:") || RE_MCQ_IMAGE_OPTION_LINE.is_match(trimmed)
+            Regex::new(r"^-\s+\[MCQ:[A-E]\]\s*$").unwrap().is_match(trimmed)
         }
         None => false,
     }
@@ -711,7 +731,8 @@ pub fn ensure_diagrams_above_mcq(text: &str) -> String {
     let mut moved: Vec<String> = Vec::new();
     let mut ranges: Vec<(usize, usize)> = Vec::new();
     for m in RE_IMAGE_ONLY_LINE.find_iter(text) {
-        if m.start() > mcq_start && !preceded_by_mcq_option_line(text, m.start()) {
+        let explicitly_option = Regex::new(r"(?i)^\s*!\[(?:Option|Choice)\s+[A-E]\]").unwrap().is_match(m.as_str());
+        if m.start() > mcq_start && !explicitly_option && !preceded_by_mcq_option_line(text, m.start()) {
             moved.push(m.as_str().to_string());
             ranges.push((m.start(), m.end()));
         }
@@ -1314,5 +1335,59 @@ Page 2"#;
         assert!(output.contains("Voltage"));
         assert!(output.contains("Current"));
         assert!(output.contains("Option"));
+    }
+
+    #[test]
+    fn single_part_single_mark_tag_is_not_deleted() {
+        // Regression: the old relocation rebuild stripped the tag and never
+        // re-appended it, leaving bare "****" and a bogus terminal-punctuation
+        // review flag on a perfectly complete one-part question.
+        let input = "State what happens to the resistance of the lamp as the current through it \
+                     increases. **[4 marks]**";
+        let output = clean_marker_markdown(input);
+        assert!(
+            output.contains("4 marks"),
+            "the mark tag must survive: {output}"
+        );
+        assert!(
+            !output.contains("****"),
+            "bare asterisks must never be left behind: {output}"
+        );
+        assert_eq!(
+            crate::validate::sum_inline_marks(&output),
+            4,
+            "inline marks stay readable: {output}"
+        );
+        assert!(
+            crate::validate::has_terminal_ending(&output),
+            "the card must still read as complete: {output}"
+        );
+    }
+
+    #[test]
+    fn single_part_bare_bracket_tag_is_preserved() {
+        let output = clean_marker_markdown("1. Solve x=2. **[2]**");
+        assert!(output.contains("[2]"), "bare bracket tag preserved: {output}");
+        assert!(!output.contains("****"), "{output}");
+    }
+
+    #[test]
+    fn equal_subpart_tags_are_preserved_next_to_their_parts() {
+        // (a)(b)(c) worth 3 marks each: relocation must keep every tag with
+        // its own part instead of collapsing or dropping them.
+        let input = "(a) Show that the tension is 12 N. **[3 marks]**\n\n\
+                     (b) State the direction of the force. **[3 marks]**\n\n\
+                     (c) Explain the motion after release. **[3 marks]**";
+        let output = clean_marker_markdown(input);
+        assert_eq!(
+            output.matches("3 marks").count(),
+            3,
+            "every sub-part keeps its allocation: {output}"
+        );
+        assert_eq!(crate::validate::sum_inline_marks(&output), 9, "{output}");
+        let a = output.find("(a)").unwrap();
+        let b = output.find("(b)").unwrap();
+        let c = output.find("(c)").unwrap();
+        assert!(a < b && b < c, "{output}");
     }
 }

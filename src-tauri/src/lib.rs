@@ -11,15 +11,19 @@ mod backup;
 mod billing;
 mod commands;
 pub mod cost;
+mod deterministic;
 mod doc_map;
 mod geometry;
 mod json_salvage;
-mod llm;
-mod pdf_render;
-mod pipeline;
+pub mod layout;
+pub mod mark_scheme_deterministic;
+pub mod llm;
+pub mod pdf_render;
+pub mod pipeline;
+pub mod sanitize;
 pub(crate) mod stroke_census;
 mod taxonomy;
-mod validate;
+pub mod validate;
 pub mod marker_client;
 
 pub struct AppState {

@@ -1,0 +1,11 @@
+1 A student investigates how the resistance of a thermistor changes with temperature. The
+thermistor is connected in series with a battery, an ammeter and a variable resistor. The student
+records the current in the thermistor for a range of temperatures of the thermistor.
+
+(a) The current in the thermistor is 0.12 A when the potential difference across it is 6.0 V.
+Calculate the resistance of the thermistor. **[2 marks]**
+
+(b) The temperature of the thermistor increases. Explain, in terms of charge carriers, why the
+resistance of the thermistor decreases. **[3 marks]**
+
+(Total for Question 1 is 4 marks)

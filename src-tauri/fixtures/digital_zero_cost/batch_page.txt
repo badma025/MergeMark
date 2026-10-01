@@ -1,0 +1,14 @@
+1 A student measures the current in a filament lamp for a range of potential differences.
+
+(a) State what happens to the resistance of the lamp as the current through it increases.
+**[2 marks]**
+
+(b) Explain your answer in terms of the ions in the filament of the lamp. **[2 marks]**
+
+(Total for Question 1 is 4 marks)
+
+2 The student then repeats the experiment using a thermistor instead of the filament lamp and
+records the current for a range of temperatures. State and explain how the resistance of the
+thermistor changes as its temperature rises. **[2 marks]**
+
+(Total for Question 2 is 5 marks)

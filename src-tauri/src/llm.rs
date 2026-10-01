@@ -6,6 +6,8 @@
 // call site (previously the question path, mark-scheme path, classifier, and
 // tagger each had their own inconsistent handling).
 
+use std::sync::LazyLock;
+
 #[derive(Debug, Clone)]
 pub enum LlmError {
     /// request never got a usable HTTP response
@@ -281,6 +283,19 @@ fn retry_after(response: &reqwest::Response) -> Option<std::time::Duration> {
         .map(std::time::Duration::from_secs)
 }
 
+/// Extract the provider's own retry delay from a 429 body. Google's
+/// OpenAI-compat endpoint does not send a Retry-After header; instead its
+/// error message carries "Please retry in 55.365077273s." — parse that.
+fn retry_delay_from_body(body_text: &str) -> Option<std::time::Duration> {
+    static RE: LazyLock<regex::Regex> = LazyLock::new(|| {
+        regex::Regex::new(r"(?i)retry\s+in\s+([0-9]+(?:\.[0-9]+)?)\s*s").unwrap()
+    });
+    let m = RE.captures(body_text)?;
+    let secs: f64 = m[1].parse().ok()?;
+    // Add a small safety margin so we never wake up just early.
+    Some(std::time::Duration::from_secs_f64(secs + 2.0))
+}
+
 impl LlmClient for ReqwestLlm {
     fn chat<'a>(
         &'a self,
@@ -293,6 +308,22 @@ impl LlmClient for ReqwestLlm {
                 "{}/chat/completions",
                 self.config.base_url.trim_end_matches('/')
             );
+            // Provider compatibility shim: the `reasoning` field is an
+            // OpenRouter extension. Google's OpenAI-compat endpoint (and
+            // other strict OpenAI-compatible providers) reject it with a
+            // 400 "Unknown name" — strip it everywhere except OpenRouter.
+            let is_openrouter = self
+                .config
+                .base_url
+                .to_lowercase()
+                .contains("openrouter");
+            let body: serde_json::Value = if !is_openrouter && body.get("reasoning").is_some() {
+                let mut b = body.clone();
+                b.as_object_mut().map(|o| o.remove("reasoning"));
+                b
+            } else {
+                body.clone()
+            };
             let mut attempt: u32 = 0;
             loop {
                 let res = self
@@ -300,7 +331,7 @@ impl LlmClient for ReqwestLlm {
                     .post(&url)
                     .header("Authorization", format!("Bearer {}", self.config.api_key))
                     .timeout(self.config.timeout)
-                    .json(body)
+                    .json(&body)
                     .send()
                     .await;
 
@@ -342,12 +373,20 @@ impl LlmClient for ReqwestLlm {
                                 status, body_text
                             );
                             attempt += 1;
-                            if attempt > 3 {
+                            // Free-tier providers (Google AI Studio) enforce
+                            // per-minute quotas that can demand ~60s waits.
+                            // Honour the provider's own delay when the body
+                            // carries one, and give retries more headroom.
+                            let body_delay = retry_delay_from_body(&body_text);
+                            if attempt > 6 {
                                 return Err(LlmError::RateLimited);
                             }
-                            let backoff = provider_delay.unwrap_or_else(|| {
-                                std::time::Duration::from_secs(10 * (1 << (attempt - 1)))
-                            });
+                            let backoff = provider_delay
+                                .or(body_delay)
+                                .unwrap_or_else(|| {
+                                    std::time::Duration::from_secs(10 * (1 << (attempt - 1)))
+                                })
+                                .min(std::time::Duration::from_secs(120));
                             tokio::time::sleep(backoff + retry_jitter()).await;
                             continue;
                         }
@@ -479,6 +518,96 @@ pub fn ok_chat(content: &str) -> Result<serde_json::Value, LlmError> {
     }))
 }
 
+/// Offline certification client: every `chat` call is COUNTED and REFUSED.
+///
+/// It never touches the network and never needs an API key. Any count above
+/// zero proves that the ingestion path *attempted* a model request, which is
+/// exactly what the zero-cost guarantee forbids for born-digital papers. Use
+/// it for the offline e2e mode (`e2e_import --offline`) and for the
+/// zero-cloud regression tests.
+pub struct RefusingLlm {
+    calls: std::sync::atomic::AtomicUsize,
+    image_calls: std::sync::atomic::AtomicUsize,
+    bodies: std::sync::Mutex<Vec<serde_json::Value>>,
+    reason: String,
+}
+
+impl Default for RefusingLlm {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl RefusingLlm {
+    pub fn new() -> Self {
+        Self {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            image_calls: std::sync::atomic::AtomicUsize::new(0),
+            bodies: std::sync::Mutex::new(Vec::new()),
+            reason: "offline: cloud requests are refused".to_string(),
+        }
+    }
+
+    /// Total attempted requests (text-only + vision).
+    pub fn calls(&self) -> usize {
+        self.calls.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Attempted requests that carried at least one image.
+    pub fn image_calls(&self) -> usize {
+        self.image_calls.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Attempted requests that carried no image (text-only calls).
+    pub fn text_calls(&self) -> usize {
+        self.calls().saturating_sub(self.image_calls())
+    }
+
+    /// Every attempted request body, in order, for diagnostics.
+    pub fn bodies(&self) -> Vec<serde_json::Value> {
+        self.bodies.lock().unwrap().clone()
+    }
+}
+
+/// True when a request body attaches at least one image part.
+pub fn body_has_images(body: &serde_json::Value) -> bool {
+    body.get("messages")
+        .and_then(|m| m.as_array())
+        .map(|messages| {
+            messages.iter().any(|message| {
+                message
+                    .get("content")
+                    .and_then(|c| c.as_array())
+                    .map(|parts| {
+                        parts.iter().any(|part| {
+                            part.get("type").and_then(|t| t.as_str()) == Some("image_url")
+                        })
+                    })
+                    .unwrap_or(false)
+            })
+        })
+        .unwrap_or(false)
+}
+
+impl LlmClient for RefusingLlm {
+    fn chat<'a>(
+        &'a self,
+        body: &'a serde_json::Value,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<serde_json::Value, LlmError>> + Send + 'a>,
+    > {
+        self.calls
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if body_has_images(body) {
+            self.image_calls
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        self.bodies.lock().unwrap().push(body.clone());
+        let reason = self.reason.clone();
+        Box::pin(async move { Err(LlmError::Network(reason)) })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -487,6 +616,37 @@ mod tests {
         body["messages"][1]["content"][0]["image_url"]["url"]
             .as_str()
             .unwrap()
+    }
+
+    #[tokio::test]
+    async fn refusing_client_counts_and_refuses_every_request() {
+        let client = RefusingLlm::new();
+        let with_image = chat_body(
+            "model",
+            "system",
+            &["CCCC"],
+            ImageDetail::Low,
+            Some("describe"),
+            10,
+            None,
+        );
+        let text_only = chat_body(
+            "model",
+            "system",
+            &[] as &[String],
+            ImageDetail::Low,
+            Some("describe"),
+            10,
+            None,
+        );
+        assert!(client.chat(&with_image).await.is_err());
+        assert!(client.chat(&text_only).await.is_err());
+        assert_eq!(client.calls(), 2);
+        assert_eq!(client.image_calls(), 1);
+        assert_eq!(client.text_calls(), 1);
+        assert_eq!(client.bodies().len(), 2, "bodies recorded for diagnostics");
+        assert!(body_has_images(&with_image));
+        assert!(!body_has_images(&text_only));
     }
 
     #[test]

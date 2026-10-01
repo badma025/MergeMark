@@ -4,6 +4,7 @@ version = "1.0.0"
 description = "MergeMark — Maths past-paper to topic bank (V1)"
 authors = ["MergeMark Contributors"]
 edition = "2021"
+default-run = "mergemark"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
