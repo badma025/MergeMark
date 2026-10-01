@@ -53,3 +53,7 @@ matrix_cleaner.py
 scratch_*.tex
 scratch_*.pdf
 scratch_*.aux
+
+# Local import runs and exam-paper corpus (not source)
+output/
+past papers for mergemark/
