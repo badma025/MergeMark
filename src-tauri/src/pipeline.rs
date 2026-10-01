@@ -94,6 +94,42 @@ pub struct PipelineConfig {
     /// back to full-page vision when diagram placeholders appear or the
     /// attempt fails. Off by default (tests keep the old behaviour).
     pub ms_text_first: bool,
+    /// Tier-0 deterministic extraction: carve text-reliable, figure-free
+    /// question spans straight out of the PDF text layer with a Rust
+    /// transcriber (zero API calls). The LLM text-first call becomes the
+    /// fallback. Off by default (tests keep the old behaviour); enabled by
+    /// the production import command unless MERGEMARK_DETERMINISTIC=0.
+    pub deterministic: bool,
+    /// Text-layer classification for THIS document, computed by
+    /// `run_question_pipeline` from the pages it was handed (never trusted
+    /// from the caller). `Some(Digital)` switches the run to the zero-cloud
+    /// local path: the deterministic transcriber is forced on, every cloud
+    /// stage is skipped at the orchestration boundary, and `chat_with_permit`
+    /// refuses to dispatch anything anyway.
+    pub(crate) text_layer_class: Option<doc_map::TextLayerClass>,
+    /// Immutable per-import local layout evidence (character/run/rule
+    /// geometry). Built once for the document by the caller and shared by every
+    /// span, so no span reloads the PDF and no stale global path cache exists.
+    pub layout_evidence: Option<std::sync::Arc<crate::pdf_render::ImportEvidence>>,
+    /// Per-import margin-allocation association, computed once after all spans
+    /// are known. Interior mutability so the first span computes it and every
+    /// later span reuses the same confirmed records.
+    pub margin_model: std::sync::Arc<std::sync::OnceLock<crate::pdf_render::MarginModel>>,
+    /// Questions located by the geometric layout map (digital documents whose
+    /// layout evidence was built): question number → the question's exact
+    /// body. Set by `run_question_pipeline`, never by callers; when present,
+    /// the local transcriber uses these boundaries instead of re-detecting
+    /// headings in page text.
+    pub(crate) layout_questions: Option<std::sync::Arc<std::collections::HashMap<u32, crate::layout::QuestionBody>>>,
+    /// For each layout question, its figures in the order of the
+    /// `[DIAGRAM_PLACEHOLDER]` lines its body carries (page, figure).
+    pub(crate) layout_figures: Option<std::sync::Arc<std::collections::HashMap<u32, Vec<LayoutFigure>>>>,
+    /// TEST ONLY: bind a scanned/image-only context so legacy cloud-path tests
+    /// can exercise the provider route with fixtures whose page text exists
+    /// only to drive the structure pass. Never compiled into production
+    /// binaries, so it cannot bypass the digital policy there.
+    #[cfg(test)]
+    pub(crate) force_scanned_context: bool,
 }
 
 impl PipelineConfig {
@@ -111,7 +147,56 @@ impl PipelineConfig {
             parallelism: DEFAULT_PARALLEL,
             text_first: false,
             ms_text_first: false,
+            deterministic: false,
+            text_layer_class: None,
+            layout_evidence: None,
+            margin_model: std::sync::Arc::new(std::sync::OnceLock::new()),
+            layout_questions: None,
+            layout_figures: None,
+            #[cfg(test)]
+            force_scanned_context: false,
         }
+    }
+
+    /// Bind this run to a text-layer classification. The pipeline calls this
+    /// itself from the pages it was handed; callers never set it.
+    pub(crate) fn with_text_layer_class(mut self, class: doc_map::TextLayerClass) -> Self {
+        self.text_layer_class = Some(class);
+        self
+    }
+
+    /// True when this run is bound to a born-digital document. Digital
+    /// documents permit ZERO cloud requests: the local transcriber is forced
+    /// on and every text/vision/repair/classification call is refused,
+    /// whatever the tuning switches say.
+    pub fn is_digital_document(&self) -> bool {
+        self.text_layer_class
+            .as_ref()
+            .is_some_and(|class| class.is_digital())
+    }
+
+    /// Whether a cloud (LLM/vision) request may be dispatched for this run.
+    /// Digital documents answer `false` unconditionally — this is the value
+    /// the request boundary checks.
+    pub fn cloud_allowed(&self) -> bool {
+        !self.is_digital_document()
+    }
+
+    /// Human-readable text-layer classification for reports. `"unknown"`
+    /// means the pipeline has not classified the document (mark-scheme runs
+    /// and direct unit-test entry points keep the permissive default).
+    pub fn text_layer_label(&self) -> &'static str {
+        match self.text_layer_class.as_ref() {
+            Some(class) if class.is_digital() => "digital",
+            Some(_) => "scanned",
+            None => "unknown",
+        }
+    }
+
+    /// True when this import must run entirely on-device and must NOT resolve
+    /// a provider, read credentials, or spend any upload entitlement.
+    pub fn is_local_only_document(&self) -> bool {
+        self.is_digital_document()
     }
 }
 
@@ -157,6 +242,10 @@ pub struct TimingEntry {
 pub struct ImportReport {
     pub paper_name: String,
     pub kind: String,
+    /// Text-layer classification for this document ("digital", "scanned",
+    /// "mixed", or "unknown" before classification). Digital means every cloud
+    /// stage was skipped and zero requests were permitted.
+    pub text_layer: String,
     pub pages_total: usize,
     pub pages_processed: usize,
     pub questions_expected: usize,
@@ -175,6 +264,14 @@ pub struct ImportReport {
     pub diagrams_deduped: usize,
     /// Questions transcribed from the text layer alone (zero image tokens).
     pub text_first: usize,
+    /// Questions carved entirely locally by the Tier-0 deterministic
+    /// transcriber (zero API calls — no prompt, no completion tokens).
+    pub deterministic: usize,
+    /// Questions retained from a local deterministic carve whose strict
+    /// quality gate FAILED: real content, forced into review, zero cloud
+    /// calls. Counted separately from `deterministic` so a recovered card is
+    /// never reported as a strict Tier-0 success.
+    pub recovered: usize,
     /// Mark-scheme windows transcribed from the text layer alone.
     pub ms_text_first: usize,
     /// Read-from-figure questions answered from deterministic figure crops
@@ -261,6 +358,10 @@ pub enum StageTag {
     MsTextFirst,
     /// Mark-scheme window read as full-page vision.
     MsWindow,
+    /// ONE batched text-only call assigning taxonomy topics to Tier-0
+    /// (untagged) questions after extraction completes. Replaces topic
+    /// selection embedded in every extraction call.
+    TopicClassification,
 }
 
 impl StageTag {
@@ -274,6 +375,7 @@ impl StageTag {
             StageTag::FallbackPage => "fallback_page",
             StageTag::MsTextFirst => "ms_text_first",
             StageTag::MsWindow => "ms_window",
+            StageTag::TopicClassification => "topic_classification",
         }
     }
 
@@ -287,6 +389,7 @@ impl StageTag {
             StageTag::MsTextFirst => 3072,
             StageTag::VisionSpan | StageTag::FallbackPage | StageTag::MsWindow => 8192,
             StageTag::StructurePass => 2048,
+            StageTag::TopicClassification => 1024,
         }
     }
 }
@@ -345,7 +448,22 @@ async fn chat_with_permit<C: LlmClient>(
     cancel: &AtomicBool,
     usage: &Arc<TokenTotals>,
     stage: StageTag,
+    allow_cloud: bool,
 ) -> Result<serde_json::Value, crate::llm::LlmError> {
+    // Request-boundary circuit breaker (defense in depth). The orchestration
+    // layer decides which paths run; this is the last gate before anything can
+    // reach the network. A document-bound policy that forbids the cloud makes
+    // every stage refuse here, so no call site can accidentally re-enable
+    // paid traffic for a digital paper.
+    if !allow_cloud {
+        eprintln!(
+            "[CLOUD_REFUSED] stage={} request refused before dispatch (document policy forbids cloud)",
+            stage.as_str()
+        );
+        return Err(crate::llm::LlmError::Network(
+            "cloud disabled for this document: request refused at the request boundary".to_string(),
+        ));
+    }
     if cancel.load(Ordering::Relaxed) {
         return Err(crate::llm::LlmError::Network("Import cancelled by user".to_string()));
     }
@@ -440,11 +558,27 @@ struct PreparedChunk {
     decoded_pages: Vec<Option<Arc<image::DynamicImage>>>,
 }
 
+/// A figure of a layout question: where it is, and whether its box is the
+/// layout's exact figure extent (cropped as given) or a detector proposal.
+#[derive(Debug, Clone)]
+pub(crate) struct LayoutFigure {
+    pub(crate) page: usize,
+    pub(crate) figure: crate::pdf_render::DetectedFigure,
+    pub(crate) exact: bool,
+}
+
 struct DiagramSaveRequest {
     global_page_idx: usize,
     bbox: Vec<f32>,
     ignore_grid: bool,
     graph_like: bool,
+    /// The box is the figure's exact extent (strokes and labels from the
+    /// layout): crop it as given — with this hairline margin (a fraction
+    /// of the page) — without padding or edge-text trimming.
+    exact: Option<f32>,
+    /// Page furniture pictures (`[x, y, w, h]` page fractions, like `bbox`)
+    /// painted out of the crop: a QR code beside the figure is not part of it.
+    mask: Vec<[f32; 4]>,
 }
 
 struct DiagramPersistence {
@@ -465,7 +599,7 @@ async fn persist_diagrams(
         let mut report = ImportReport::default();
         let mut links = Vec::with_capacity(requests.len());
         for request in requests {
-            links.push(save_diagram(
+            links.push(save_diagram_with(
                 request.global_page_idx,
                 page_b64.get(&request.global_page_idx).map(String::as_str),
                 &request.bbox,
@@ -475,6 +609,8 @@ async fn persist_diagrams(
                 &mut report,
                 request.ignore_grid,
                 request.graph_like,
+                request.exact,
+                &request.mask,
             ));
         }
         DiagramPersistence {
@@ -592,6 +728,8 @@ impl ImportReport {
         self.diagrams_saved += o.diagrams_saved;
         self.diagrams_deduped += o.diagrams_deduped;
         self.text_first += o.text_first;
+        self.deterministic += o.deterministic;
+        self.recovered += o.recovered;
         self.ms_text_first += o.ms_text_first;
         self.crop_first += o.crop_first;
         self.figures_detected += o.figures_detected;
@@ -684,7 +822,163 @@ struct AiQuestionPage {
     items: Vec<AiQuestion>,
 }
 
-fn merge_split_questions(items: Vec<AiQuestion>, question_number: u32) -> AiQuestion {
+/// Why a set of model items could not be stitched into ONE question.
+///
+/// Stitching is only ever safe inside a single parent question. Both refusal
+/// reasons are identity failures, and both must fall back rather than merge:
+/// a batch response or a neighbouring question caught in the crop would
+/// otherwise be silently welded onto this card.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum StitchRefusal {
+    /// An item explicitly belongs to a different parent question.
+    ForeignQuestion(u32),
+    /// An item's question number is present but cannot be parsed, so identity
+    /// cannot be validated.
+    UnverifiableIdentity,
+}
+
+impl StitchRefusal {
+    fn describe(&self) -> String {
+        match self {
+            StitchRefusal::ForeignQuestion(n) => {
+                format!("item belongs to Q{} (distinct parent question)", n)
+            }
+            StitchRefusal::UnverifiableIdentity => {
+                "item question number is unreadable".to_string()
+            }
+        }
+    }
+}
+
+/// Byte offset where a trailing mark tag ("**[3 marks]**", "[2]") starts, or
+/// `None` when the content does not end with one. Anchored at the end so a
+/// mid-sentence bracket can never be mistaken for a mark allocation.
+fn trailing_mark_tag_start(content: &str) -> Option<usize> {
+    static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let re = RE.get_or_init(|| {
+        regex::Regex::new(r"(?i)(?:\*{0,2})\s*(?:\[|\()\s*\d{1,2}\s*marks?\s*(?:\]|\))\s*(?:\*{0,2})\s*$")
+            .unwrap()
+    });
+    re.find(content.trim_end()).map(|m| m.start())
+}
+
+/// The trailing mark tag itself, when the content ends with one.
+fn trailing_mark_tag(content: &str) -> Option<String> {
+    let start = trailing_mark_tag_start(content)?;
+    Some(content.trim_end()[start..].trim().to_string())
+}
+
+/// Numeric value of a mark tag ("**[3 marks]**" -> 3).
+fn mark_tag_value(tag: &str) -> Option<i32> {
+    static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let re = RE.get_or_init(|| regex::Regex::new(r"(?i)(\d{1,2})\s*marks?").unwrap());
+    re.captures(tag)
+        .and_then(|c| c.get(1))
+        .and_then(|m| m.as_str().parse::<i32>().ok())
+}
+
+/// Result of stitching one question's compatible sub-part items.
+struct StitchedQuestion {
+    item: AiQuestion,
+    /// Equal per-item marks could not be resolved against a known parent
+    /// total. The marks are kept exactly as reported and the caller must flag
+    /// the card for review instead of guessing.
+    marks_ambiguous: bool,
+    /// A repeated parent total was collapsed into a single mark value/tag.
+    #[cfg_attr(not(test), allow(dead_code))]
+    repeated_total_collapsed: bool,
+}
+
+/// Merge compatible sub-part items for ONE question in source order.
+///
+/// This is the single-question response boundary: a model that answers a
+/// question with sub-parts `(a)(b)(c)` sometimes returns one item per sub-part
+/// instead of one item for the whole question. Those items are compatible and
+/// are stitched here — content in source order, diagrams/captions/topics/marks
+/// preserved, and marks resolved against the printed parent total (a repeated
+/// parent total collapses once; equal per-part allocations are preserved).
+///
+/// Distinct parent question numbers are NEVER stitched: that returns
+/// `Err(StitchRefusal)` and the caller falls back (strict validation or local
+/// recovery) instead of inventing a merged card.
+fn stitch_question_items(
+    items: Vec<AiQuestion>,
+    question_number: u32,
+    expected_parent_marks: Option<u32>,
+) -> Result<StitchedQuestion, StitchRefusal> {
+    // ── Identity gate (before anything is merged) ──────────────────────────
+    for item in &items {
+        match item.question_number.as_ref() {
+            None => {}
+            Some(raw) => match validate::value_to_question_number(raw) {
+                Some(n) if n == question_number => {}
+                Some(n) => return Err(StitchRefusal::ForeignQuestion(n)),
+                None => return Err(StitchRefusal::UnverifiableIdentity),
+            },
+        }
+    }
+
+    // ── Duplicate totals ──────────────────────────────────────────────────
+    // Marks: allocations vs a repeated parent total. Equal marks on distinct
+    // sub-parts are NOT duplicate totals: (a)+(b)+(c) worth 3 each is a
+    // 9-mark question. The only way to tell a repeated parent total from equal
+    // allocations is the printed total, so:
+    //   * expected == v and sum > expected -> the model repeated the parent
+    //     total on every part: keep one.
+    //   * expected == sum                 -> equal allocations confirmed: keep
+    //     every tag and the summed total.
+    //   * anything else                   -> keep everything, flag review.
+    let mark_values: Vec<i32> = items
+        .iter()
+        .filter_map(|item| item.marks.as_ref().and_then(validate::value_to_marks))
+        .collect();
+    let expected = expected_parent_marks.map(|m| m as i32);
+    let (resolved_marks, repeated_total_collapsed, marks_ambiguous): (Option<i32>, bool, bool) =
+        if mark_values.is_empty() {
+            (None, false, false)
+        } else if mark_values.len() > 1 && mark_values.iter().all(|m| *m == mark_values[0]) {
+            let value = mark_values[0];
+            let sum: i32 = mark_values.iter().sum();
+            match expected {
+                Some(parent) if parent == value && sum > parent => (Some(value), true, false),
+                Some(parent) if parent == sum => (Some(sum), false, false),
+                _ => (Some(sum), false, true),
+            }
+        } else {
+            (Some(mark_values.iter().sum()), false, false)
+        };
+
+    // A repeated parent total is collapsed in the CONTENT too, but ONLY when
+    // the inline tag's own value is the parent total: metadata can repeat the
+    // parent total while the content tags are genuine per-part allocations
+    // ((a)(b)(c) each "**[3 marks]**" under a 9-mark question). Stripping those
+    // would drop legitimate allocations, so the tag value must match.
+    let mark_tags: Vec<Option<String>> = items
+        .iter()
+        .map(|item| {
+            item.content
+                .as_deref()
+                .filter(|c| !c.trim().is_empty())
+                .and_then(trailing_mark_tag)
+        })
+        .collect();
+    let all_tagged = mark_tags.len() > 1 && mark_tags.iter().all(|t| t.is_some());
+    let shared_tag = mark_tags.first().cloned().flatten();
+    let tag_is_parent_total = match (
+        expected,
+        shared_tag.as_deref().and_then(mark_tag_value),
+    ) {
+        (Some(parent), Some(tag_value)) => parent == tag_value,
+        _ => false,
+    };
+    let dedupe_trailing_tag = repeated_total_collapsed
+        && all_tagged
+        && tag_is_parent_total
+        && shared_tag
+            .as_ref()
+            .is_some_and(|first| mark_tags.iter().all(|t| t.as_ref() == Some(first)));
+
+    let item_count = items.len();
     let mut merged = AiQuestion {
         question_number: Some(serde_json::json!(question_number)),
         ..Default::default()
@@ -695,12 +989,19 @@ fn merge_split_questions(items: Vec<AiQuestion>, question_number: u32) -> AiQues
     let mut kinds = Vec::new();
     let mut indexes = Vec::new();
     let mut topics = Vec::new();
-    let mut marks = 0i32;
-    let mut has_marks = false;
 
-    for item in items {
+    for (index, item) in items.into_iter().enumerate() {
         if let Some(value) = item.content.filter(|value| !value.trim().is_empty()) {
-            content.push(value);
+            // Drop the repeated trailing mark tag from every part but the last
+            // so the joined content carries the question total exactly once.
+            let value = if dedupe_trailing_tag && index + 1 != item_count {
+                strip_trailing_mark_tag(&value)
+            } else {
+                value
+            };
+            if !value.trim().is_empty() {
+                content.push(value);
+            }
         }
         if let Some(value) = item.diagram_bboxes {
             bboxes.extend(value);
@@ -717,10 +1018,6 @@ fn merge_split_questions(items: Vec<AiQuestion>, question_number: u32) -> AiQues
         if let Some(value) = item.topics {
             topics.extend(value_to_topics(&value));
         }
-        if let Some(value) = item.marks.as_ref().and_then(validate::value_to_marks) {
-            marks += value;
-            has_marks = true;
-        }
         merged.module = merged.module.or(item.module);
         merged.is_code = merged.is_code.or(item.is_code);
         merged.math_snippet = merged.math_snippet.or(item.math_snippet);
@@ -733,8 +1030,8 @@ fn merge_split_questions(items: Vec<AiQuestion>, question_number: u32) -> AiQues
     }
 
     merged.content = Some(content.join("\n\n"));
-    if has_marks {
-        merged.marks = Some(serde_json::json!(marks));
+    if let Some(total) = resolved_marks {
+        merged.marks = Some(serde_json::json!(total));
     }
     if !topics.is_empty() {
         merged.topics = Some(serde_json::json!(topics));
@@ -751,7 +1048,19 @@ fn merge_split_questions(items: Vec<AiQuestion>, question_number: u32) -> AiQues
     if !indexes.is_empty() {
         merged.bbox_page_indexes = Some(indexes);
     }
-    merged
+    Ok(StitchedQuestion {
+        item: merged,
+        marks_ambiguous,
+        repeated_total_collapsed,
+    })
+}
+
+/// Remove a trailing mark tag from `content`, keeping everything above it.
+fn strip_trailing_mark_tag(content: &str) -> String {
+    match trailing_mark_tag_start(content) {
+        Some(start) => content[..start].trim_end().to_string(),
+        None => content.to_string(),
+    }
 }
 
 fn is_composite_visual_options(item: &AiQuestion) -> bool {
@@ -1201,6 +1510,23 @@ fn looks_like_new_question(prev_content: &str, new_content: &str) -> bool {
     false
 }
 
+/// The question number a piece of content OPENS with, when it starts with its
+/// own heading ("7. ...", "**5.** ...", "Q3) ...").
+///
+/// `None` for sub-part labels ("(b) ..."), prose, and numbers that are not a
+/// heading ("2x + 4 = 10", "250 Hz"). Used to refuse stitching two separate
+/// question stems that a model mislabeled with the same parent number.
+fn leading_question_number(content: &str) -> Option<u32> {
+    static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let re = RE.get_or_init(|| {
+        regex::Regex::new(r"(?i)^\s*\*{0,2}\s*(?:q(?:uestion)?\.?\s*)?(\d{1,2})\s*[\.\)\]]")
+            .unwrap()
+    });
+    re.captures(content)
+        .and_then(|c| c.get(1))
+        .and_then(|m| m.as_str().parse::<u32>().ok())
+}
+
 
 
 // ══════════════════════════════════════════════════════════════════════════
@@ -1445,6 +1771,14 @@ Example 8 — Nuclear decay equation (prescripts are MATH, never plaintext)
 Input page (Question 5): "5 The nuclide 226 88 Ra decays by alpha emission to radon. [2 marks]"
 Output: {"items": [{"question_number": 5, "content": "The nuclide $^{226}_{88}\\text{Ra}$ decays by alpha emission:\n\n$$^{226}_{88}\\text{Ra} \\rightarrow\\ ^{222}_{86}\\text{Rn} +\\ ^{4}_{2}\\alpha$$\n\n**[2 marks]**", "marks": 2, "difficulty_rating": null, "topics": ["nuclear physics"], "module": "Physics", "is_code": false, "diagram_bboxes": [], "diagram_captions": [], "diagram_kinds": [], "bbox_page_indexes": [], "math_snippet": "^{226}_{88}Ra -> ^{222}_{86}Rn + alpha", "visual_options": null}]}
 
+Example 9 — Scrambled nuclear equation (the text layer flattens prescripts/subscripts across lines; YOU must rebuild the physics)
+Input page (Question 31): "31 Uranium-238 absorbs a neutron.\n238 92 U n X \\rightarrow\nX Y beta + anti-neutrino \\rightarrow\nY Z beta + anti-neutrino \\rightarrow\nHow many neutrons does Z have?\nA 144 B 145 C 149 D 237"
+Output: {"items": [{"question_number": 31, "content": "Uranium-238 absorbs a neutron in the first stage in a series of nuclear reactions that end in nucleus Z.\n\n$$^{238}_{92}\\text{U} +\\ ^{1}_{0}\\text{n} \\rightarrow\\ ^{239}_{92}\\text{X}$$\n\n$$^{239}_{92}\\text{X} \\rightarrow\\ ^{239}_{93}\\text{Y} + \\beta^- + \\bar{\\nu}_e$$\n\n$$^{239}_{93}\\text{Y} \\rightarrow\\ ^{239}_{94}\\text{Z} + \\beta^- + \\bar{\\nu}_e$$\n\nHow many neutrons does Z have?\n\n- [MCQ:A] 144\n- [MCQ:B] 145\n- [MCQ:C] 149\n- [MCQ:D] 237 **[1 mark]**", "marks": 1, "difficulty_rating": null, "topics": ["nuclear physics"], "module": "Physics", "is_code": false, "diagram_bboxes": [], "diagram_captions": [], "diagram_kinds": [], "bbox_page_indexes": [], "math_snippet": "", "visual_options": null}]}
+
+Example 10 — Stacked fraction options (a fraction printed over two text lines is ONE option; rebuild with \\frac)
+Input page (Question 12): "12 Charon is a moon of Pluto. The distance between their centres is d. X is the point where the field is zero. What is the distance of X from the centre of Pluto?\nA 2\n9 d\nB 2\n3 d\nC 3\n4 d\nD 8\n9 d"
+Output: {"items": [{"question_number": 12, "content": "Charon is a moon of Pluto that has a mass equal to that of Pluto.\nThe distance between the centre of Pluto and the centre of Charon is $d$.\n$X$ is the point at which the resultant gravitational field due to Pluto and Charon is zero.\nWhat is the distance of $X$ from the centre of Pluto?\n\n- [MCQ:A] $\\frac{2}{9}d$\n- [MCQ:B] $\\frac{2}{3}d$\n- [MCQ:C] $\\frac{3}{4}d$\n- [MCQ:D] $\\frac{8}{9}d$ **[1 mark]**", "marks": 1, "difficulty_rating": null, "topics": ["gravitational fields"], "module": "Physics", "is_code": false, "diagram_bboxes": [], "diagram_captions": [], "diagram_kinds": [], "bbox_page_indexes": [], "math_snippet": "", "visual_options": null}]}
+
 END OF EXAMPLES — Follow the same JSON structure, escaping rules, and isolation discipline exactly.
 "#;
 
@@ -1483,7 +1817,8 @@ CONTEXT: The user will specify the target question number, paper name, and modul
 
 ═══ SUB-PARTS VS MULTIPLE CHOICE (CRITICAL) ═══
 1. SUB-QUESTIONS: Sub-parts labeled `(a)`, `(b)`, `(c)` or `(i)`, `(ii)` are mathematical sub-questions. Format them in lowercase parentheses `(a)`, `(b)` separated by double newlines (`\n\n`). NEVER convert sub-parts into multiple-choice options.
-2. MULTIPLE CHOICE: Only format as multiple choice (`A ...\nB ...`) if the question is an actual multiple-choice test question with 4 alternative answers to choose from.
+2. PART ORDER & INTRO LINES: Sub-parts MUST appear in printed order — (a), then (b), then (c)… — each label EXACTLY once. An unlabelled introduction paragraph printed BEFORE (a) (scene-setting, apparatus description, "The figure shows…") belongs to the stem: transcribe it FIRST with NO part label at all. NEVER attach a part label to the introduction, never reorder parts, never duplicate a label.
+3. MULTIPLE CHOICE: Only format as multiple choice if the question has 4 alternative answers. MCQ option lines MUST be tagged exactly `- [MCQ:A] …`, `- [MCQ:B] …`, `- [MCQ:C] …`, `- [MCQ:D] …` as four CONSECUTIVE lines with NO blank lines between them, ending with ` **[1 mark]**` after option D. A stacked fraction printed across two text lines is ONE option — rebuild it as `\frac`.
 
 ═══ QUESTION ISOLATION RULES (HIGHEST PRIORITY) ═══
 Transcribe the target question and NOTHING ELSE. Sub-parts belonging to other questions must NEVER appear.
@@ -1581,7 +1916,8 @@ CONTEXT: The user will specify the target question number(s), paper name, and mo
 
 ═══ SUB-PARTS VS MULTIPLE CHOICE (CRITICAL) ═══
 1. SUB-QUESTIONS: Sub-parts labeled `(a)`, `(b)`, `(c)` or `(i)`, `(ii)` are mathematical sub-questions. Format them in lowercase parentheses `(a)`, `(b)` separated by double newlines (`\n\n`). NEVER convert sub-parts into multiple-choice options.
-2. MULTIPLE CHOICE: Only format as multiple choice (`A ...\nB ...`) if the question is an actual multiple-choice test question with 4 alternative answers to choose from.
+2. PART ORDER & INTRO LINES: Sub-parts MUST appear in printed order — each label EXACTLY once; an unlabelled introduction printed before (a) is stem text and carries NO label.
+3. MULTIPLE CHOICE: MCQ option lines MUST be tagged exactly `- [MCQ:A] …` … `- [MCQ:D] …` as four CONSECUTIVE lines with NO blank lines between them, ending with ` **[1 mark]**` after option D. A stacked fraction printed across two text lines is ONE option — rebuild it as `\frac`.
 
 ═══ QUESTION ISOLATION RULES (HIGHEST PRIORITY) ═══
 1. Transcribe the target question and NOTHING ELSE. A sub-part belongs to the question printed in its label, or the nearest whole-number heading above it. If not the target question, DROP it.
@@ -1755,8 +2091,75 @@ fn window_text_reliable(pages: &[PageInput]) -> bool {
 }
 
 // ══════════════════════════════════════════════════════════════════════════
-// Question pipeline
+// Deferred topic classification
 // ══════════════════════════════════════════════════════════════════════════
+
+/// Normalize prose and LaTeX into whole words for local taxonomy matching.
+fn topic_words(text: &str) -> String {
+    text.to_lowercase().split(|c: char| !c.is_alphanumeric())
+        .filter(|word| !word.is_empty()).collect::<Vec<_>>().join(" ")
+}
+
+fn topic_phrase(text: &str, phrase: &str) -> bool {
+    format!(" {text} ").contains(&format!(" {} ", topic_words(phrase)))
+}
+
+/// Classify in memory, preserving exact allow-list spellings and existing tags.
+/// Unknown terminology stays untagged; classification never dispatches an LLM.
+async fn classify_topics_deferred<C: LlmClient>(
+    _client: &C,
+    config: &PipelineConfig,
+    built: &mut [BuiltQuestion],
+    _request_semaphore: &Arc<Semaphore>,
+    cancel: &AtomicBool,
+    _usage: &Arc<TokenTotals>,
+) -> usize {
+    let taxonomy: &[(&[&str], &[&str])] = &[
+        (&["Thermal physics", "Thermal"], &["ideal gas", "c rms", "specific heat", "latent heat", "molar", "temperature", "thermal", "internal energy", "molecules", "molecular"]),
+        (&["Capacitors", "Capacitance"], &["capacitor", "capacitors", "capacitance", "dielectric", "parallel plate"]),
+        (&["Electric fields"], &["electric field", "electric potential", "coulomb", "point charge", "charges", "charged sphere"]),
+        (&["Gravitational fields", "Gravitation"], &["gravitational", "satellite", "satellites", "orbit", "orbital", "escape velocity", "planet"]),
+        (&["Magnetic fields", "Electromagnetism"], &["magnetic", "induced emf", "solenoid", "tesla", "flux linkage"]),
+        (&["Nuclear physics", "Nuclear", "Particles and radiation"], &["alpha", "beta", "decay", "half life", "fission", "fusion", "nuclide", "uranium", "nuclear", "nucleon", "neutrons", "protons", "nucleus", "nuclei", "isotope", "mass lost", "mass defect", "binding energy"]),
+        (&["Waves", "Oscillations"], &["oscilloscope", "frequency", "phase difference", "waveform", "wavelength", "oscillation", "oscillations", "harmonic", "diffraction", "interference"]),
+        (&["Mechanics"], &["velocity", "acceleration", "force", "momentum", "kinetic energy", "displacement", "spring", "projectile"]),
+        (&["Electricity", "Electric circuits"], &["current", "resistance", "resistor", "circuit", "voltage", "filament lamp"]),
+        (&["Required Practical", "Practical skills"], &["data logger", "uncertainty", "stopwatch", "measurement", "experiment"]),
+    ];
+    let allowed: Vec<_> = config.allowed_topics.iter().map(|topic| (topic, topic_words(topic))).collect();
+    let mut assigned = 0;
+    for q in built.iter_mut() {
+        if cancel.load(Ordering::Relaxed) { break; }
+        if !q.topics.is_empty() || q.content.trim().is_empty() { continue; }
+        let text = topic_words(&q.content);
+        for (topic, words) in &allowed {
+            if words.is_empty() { continue; }
+            let matched = topic_phrase(&text, words) || taxonomy.iter().any(|(names, keywords)| {
+                names.iter().any(|name| topic_words(name) == *words)
+                    && keywords.iter().any(|keyword| topic_phrase(&text, keyword))
+            });
+            if matched && !q.topics.contains(topic) {
+                q.topics.push((*topic).clone());
+                if q.topics.len() == 3 { break; }
+            }
+        }
+        if !q.topics.is_empty() { assigned += 1; }
+    }
+    assigned
+}
+
+/// Decide, from the pages alone, whether question ingestion for this document
+/// runs entirely on-device.
+///
+/// Production callers use this BEFORE resolving a provider, reading
+/// credentials, or accounting an upload entitlement: a document carrying any
+/// extracted text needs none of them. The pipeline enforces
+/// the same policy internally, so this is an early decision, not the guard.
+pub fn is_local_only_document(pages: &[PageInput]) -> bool {
+    doc_map::classify_text_layer(&pages.iter().map(|p| p.text.clone()).collect::<Vec<_>>())
+        .is_digital()
+}
+
 pub async fn run_question_pipeline<C: LlmClient, P: Progress>(
     client: &C,
     pages: &[PageInput],
@@ -1766,12 +2169,128 @@ pub async fn run_question_pipeline<C: LlmClient, P: Progress>(
     cancel: &AtomicBool,
 ) -> Result<(Vec<BuiltQuestion>, ImportReport), String> {
     let overall_start = Instant::now();
+    // Classify the document from its text layer BEFORE any request, and bind
+    // that verdict to this run's config. The classification is computed here
+    // from the pages actually handed to the pipeline - a caller cannot set it,
+    // and a weak question map never downgrades a digital paper to "scanned".
+    //
+    // The free PDF text layer is preferred because it avoids one vision
+    // request per page, so it is materialised once here and reused below.
+    let page_texts: Vec<String> = pages.iter().map(|p| p.text.clone()).collect();
+    let text_layer_class = doc_map::classify_text_layer(&page_texts);
+    #[allow(unused_mut)]
+    let mut effective_config = config.clone().with_text_layer_class(text_layer_class.clone());
+    // TEST ONLY: legacy cloud-path tests model a scanned/image-only input
+    // whose cloud extraction must stay reachable. The field does not exist in
+    // production builds, so this can never bypass the digital policy there.
+    #[cfg(test)]
+    if config.force_scanned_context {
+        effective_config.text_layer_class =
+            Some(doc_map::TextLayerClass::scanned_only(pages.len()));
+    }
+    let digital = effective_config.is_digital_document();
     let mut report = ImportReport {
-        paper_name: config.paper_name.clone(),
+        paper_name: effective_config.paper_name.clone(),
         kind: "questions".to_string(),
+        text_layer: effective_config.text_layer_label().to_string(),
         pages_total: pages.len(),
         figures_detected: page_figures.iter().map(Vec::len).sum(),
         ..Default::default()
+    };
+    if digital {
+        if text_layer_class.unresolved_pages().is_empty() {
+            report.anomalies.push(
+                "digital document: extracted text on every page - cloud extraction disabled (zero requests permitted); local deterministic extraction only".to_string(),
+            );
+        } else {
+            report.anomalies.push(format!(
+                "digital document: {}/{} pages carry extracted text - cloud extraction disabled (zero requests permitted); pages {:?} have no text layer and are reported locally",
+                text_layer_class.text_pages,
+                text_layer_class.total_pages,
+                text_layer_class
+                    .unresolved_pages()
+                    .iter()
+                    .map(|p| p + 1)
+                    .collect::<Vec<_>>()
+            ));
+        }
+    }
+    // Geometry-first layout (digital documents with layout evidence): page
+    // text in reading order with reconstructed mathematics, and a question
+    // map with exact line boundaries. The classification above already ran
+    // on the ORIGINAL text layer, so a sparse layout can never turn a
+    // digital document into a cloud one.
+    let mut layout_spans: Option<Vec<QuestionSpan>> = None;
+    let layout_pages_input: Option<Vec<PageInput>> = match config.layout_evidence.as_ref() {
+        Some(ev) if digital && !ev.layout.is_empty() && ev.layout.len() == pages.len() => {
+            let lmap = crate::layout::build_layout_map(&ev.layout);
+            report.anomalies.extend(lmap.anomalies.iter().cloned());
+            if lmap.questions.is_empty() {
+                report.anomalies.push("layout map found no questions; using the text-layer map".to_string());
+                None
+            } else {
+                let mut bodies = std::collections::HashMap::new();
+                let mut question_figures = std::collections::HashMap::new();
+                let mut spans = Vec::with_capacity(lmap.questions.len());
+                for q in &lmap.questions {
+                    // Figures are spliced where they are printed.
+                    let figures = layout_question_figures(&ev.layout, q, page_figures);
+                    let rects: Vec<(usize, [f32; 4])> = figures.iter().map(|(f, r)| (f.page, *r)).collect();
+                    let body = crate::layout::question_body_with_figures(&ev.layout, q, &rects);
+                    question_figures.insert(q.number, figures.into_iter().map(|(f, _)| f).collect::<Vec<_>>());
+                    let h0 = ev.layout[q.start_page].height.max(1.0);
+                    let h1 = ev.layout[q.end_page].height.max(1.0);
+                    spans.push(QuestionSpan {
+                        number: q.number,
+                        start_page: q.start_page,
+                        end_page: q.end_page,
+                        start_y_frac: Some((q.start_y / h0).clamp(0.0, 1.0)).filter(|y| *y > 0.05),
+                        end_y_frac: q.end_y.map(|y| (y / h1).clamp(0.0, 1.0)),
+                        expected_marks: body.footer_marks,
+                        reliable_pages: (q.start_page..=q.end_page).collect(),
+                        ambiguous_pages: Vec::new(),
+                    });
+                    bodies.insert(q.number, body);
+                }
+                effective_config.layout_questions = Some(Arc::new(bodies));
+                effective_config.layout_figures = Some(Arc::new(question_figures));
+                layout_spans = Some(spans);
+                Some(
+                    pages
+                        .iter()
+                        .zip(ev.layout.iter())
+                        .map(|(p, lp)| PageInput { kind: p.kind.clone(), text: lp.text() })
+                        .collect(),
+                )
+            }
+        }
+        _ => None,
+    };
+    let config = &effective_config;
+    // A ruled table is transcribed from the layout as a Markdown table; a
+    // detected "figure" that is that table would duplicate it as an image.
+    let table_free_figures: Option<Vec<Vec<crate::pdf_render::DetectedFigure>>> = match config.layout_evidence.as_ref() {
+        Some(ev) if layout_pages_input.is_some() => Some(
+            page_figures
+                .iter()
+                .enumerate()
+                .map(|(pi, figs)| {
+                    let Some(lp) = ev.layout.get(pi) else { return figs.clone() };
+                    figs.iter()
+                        .filter(|f| !figure_is_layout_table(f, lp))
+                        .cloned()
+                        .collect()
+                })
+                .collect(),
+        ),
+        _ => None,
+    };
+    let page_figures: &[Vec<crate::pdf_render::DetectedFigure>] = table_free_figures.as_deref().unwrap_or(page_figures);
+    let pages: &[PageInput] = layout_pages_input.as_deref().unwrap_or(pages);
+    let page_texts: Vec<String> = if layout_pages_input.is_some() {
+        pages.iter().map(|p| p.text.clone()).collect()
+    } else {
+        page_texts
     };
     let page_render_cache = Arc::new(crate::pdf_render::PageRenderCache::new(
         PAGE_RENDER_CACHE_CAPACITY,
@@ -1779,9 +2298,6 @@ pub async fn run_question_pipeline<C: LlmClient, P: Progress>(
     let request_semaphore = Arc::new(Semaphore::new(config.parallelism.max(1)));
     let page_image_cache = Arc::new(PageImageCache::new());
     let usage = Arc::new(TokenTotals::new());
-
-    // Prefer the free PDF text layer: it avoids one vision request per page.
-    let page_texts: Vec<String> = pages.iter().map(|p| p.text.clone()).collect();
 
     // Time the text-layer document map building
     let text_map_start = Instant::now();
@@ -1814,7 +2330,7 @@ pub async fn run_question_pipeline<C: LlmClient, P: Progress>(
     // between structure-pass API calls and extraction API calls.
     let mut structures: Vec<ValidatedPageStructure> = Vec::with_capacity(pages.len());
     let mut structure_timing_ms: u64 = 0;
-    if !text_map_available {
+    if !text_map_available && !digital {
         progress.stage("Scanning document structure…");
         let structure_start = Instant::now();
         let system_structure = structure_system_prompt();
@@ -1887,7 +2403,7 @@ pub async fn run_question_pipeline<C: LlmClient, P: Progress>(
                         750,
                         Some(llm::ResponseFormat::JsonSchema { schema: structure_json_schema() }),
                     );
-                    let result = match chat_with_permit(client, &body, &semaphore, cancel, &usage, StageTag::StructurePass).await {
+                    let result = match chat_with_permit(client, &body, &semaphore, cancel, &usage, StageTag::StructurePass, config.cloud_allowed()).await {
                         Ok(resp) => llm::message_content(&resp)
                             .map_err(|e| format!("bad response shape ({})", e)),
                         Err(e) => Err(format!("API failure ({})", e)),
@@ -1999,7 +2515,13 @@ pub async fn run_question_pipeline<C: LlmClient, P: Progress>(
     let doc_map_start = Instant::now();
 
     // Use hybrid map building: reliable text pages + vision for ambiguous pages
-    let mut map = doc_map::build_hybrid_map_with_scan(&page_texts, &structures, pages.len(), &scan);
+    let mut map = if let Some(spans) = layout_spans.take() {
+        doc_map::DocumentMap { spans, ..Default::default() }
+    } else if digital {
+        doc_map::build_text_only_map(&page_texts, pages.len(), &scan)
+    } else {
+        doc_map::build_hybrid_map_with_scan(&page_texts, &structures, pages.len(), &scan)
+    };
 
     // Record which pages used vision fallback
     report.timings.push(TimingEntry {
@@ -2048,7 +2570,7 @@ pub async fn run_question_pipeline<C: LlmClient, P: Progress>(
     // for, so extraction runs with Phase 1's y-band safety net instead of
     // blindly welding pages. Only when the structure pass also failed do
     // we fall back to per-page extraction.
-    if map.spans.is_empty() {
+    if map.spans.is_empty() && !digital {
         let structure_qs: usize = structures.iter().map(|s| s.questions.len()).sum();
         if structure_qs >= 2 {
             if let Some(structure_map) =
@@ -2062,7 +2584,22 @@ pub async fn run_question_pipeline<C: LlmClient, P: Progress>(
         }
     }
 
-    if map.spans.is_empty() {
+    // A digital document whose text layer produced no spans at all has no
+    // local path left, and the cloud is switched off. Report the local failure
+    // explicitly; never fall into the per-page vision loop.
+    if map.spans.is_empty() && digital {
+        report.anomalies.push(
+            "digital document: text layer produced no question spans and cloud extraction is disabled - nothing extracted locally".to_string(),
+        );
+        report.quarantined.push(QuarantineEvent {
+            scope: "document".to_string(),
+            page: None,
+            question_number: None,
+            reason: "digital document: no locally derivable question spans".to_string(),
+        });
+    }
+
+    if map.spans.is_empty() && !digital {
         // No reliable map → per-page legacy mode with all validators still
         // on (numbers proposed by AI, but forced plausible + monotonic).
         // Pages run in PARALLEL batches; the question-order invariant is
@@ -2437,6 +2974,34 @@ pub async fn run_question_pipeline<C: LlmClient, P: Progress>(
         }
     }
 
+    // ── Deferred topic classification (on-device) ─────────
+    // Tier-0 cards arrive without topics; match syllabus keywords locally.
+    if !config.allowed_topics.is_empty() {
+        let topics_start = Instant::now();
+        let assigned = classify_topics_deferred(
+            client,
+            config,
+            &mut built,
+            &request_semaphore,
+            cancel,
+            &usage,
+        )
+        .await;
+        if assigned > 0 {
+            report.record_timing(
+                "topics",
+                "deferred_classification",
+                None,
+                None,
+                topics_start.elapsed().as_millis() as u64,
+            );
+            eprintln!(
+                "[TOPICS] {} question(s) classified locally (0 tokens)",
+                assigned
+            );
+        }
+    }
+
     report.questions_extracted = built.len();
     report.extracted_total_marks = built.iter().map(|q| q.marks.max(0) as u32).sum();
     // Removed printed paper total checksum warning as requested
@@ -2456,11 +3021,12 @@ pub async fn run_question_pipeline<C: LlmClient, P: Progress>(
         .collect();
 
     eprintln!(
-        "[PATH_SUMMARY] {} questions: {} text-first (0 img), {} crop-first (~4k img), {} full-page vision (figures detected: {}); stages: {}",
+        "[PATH_SUMMARY] {} questions: {} tier0 (0 tokens), {} text-first (0 img), {} crop-first (~4k img), {} full-page vision (figures detected: {}); stages: {}",
         report.questions_extracted,
+        report.deterministic,
         report.text_first,
         report.crop_first,
-        report.questions_extracted.saturating_sub(report.text_first + report.crop_first),
+        report.questions_extracted.saturating_sub(report.deterministic + report.recovered + report.text_first + report.crop_first),
         report.figures_detected,
         report
             .stage_breakdown
@@ -2494,6 +3060,22 @@ pub async fn run_question_pipeline<C: LlmClient, P: Progress>(
 }
 
 /// Marks checksum for one span → report.
+/// A Tier-0 carve is a strict success only when nothing after it (figure
+/// attachment, terminal ending, marks bookkeeping) flagged the card; a
+/// flagged card is a local recovery with its reasons on the record.
+fn settle_tier0_outcome(span: &QuestionSpan, q: &BuiltQuestion, report: &mut ImportReport) {
+    if !q.needs_review {
+        report.deterministic += 1;
+        return;
+    }
+    report.recovered += 1;
+    let reasons = if q.notes.is_empty() { "flagged for review".to_string() } else { q.notes.join("; ") };
+    report.anomalies.push(format!(
+        "Question {}: local recovery (Tier-0 card flagged: {}); content retained for review, zero cloud calls",
+        span.number, reasons
+    ));
+}
+
 fn push_mark_check(span: &QuestionSpan, q: &BuiltQuestion, report: &mut ImportReport) {
     if let Some(expected) = span.expected_marks {
         report.mark_checks.push(MarkCheck {
@@ -2530,7 +3112,7 @@ fn text_references_figure(text: &str) -> bool {
 
 /// Extract the numbers of explicit "Figure N" / "Fig. N" references in the
 /// span's text layer.
-fn figure_reference_numbers(text: &str) -> Vec<u32> {
+pub(crate) fn figure_reference_numbers(text: &str) -> Vec<u32> {
     use std::sync::OnceLock;
     static RE_FIG_NUM: OnceLock<regex::Regex> = OnceLock::new();
     RE_FIG_NUM
@@ -2545,12 +3127,9 @@ fn figure_reference_numbers(text: &str) -> Vec<u32> {
 }
 
 /// Heuristic: does the question's wording demand the ANSWER be READ from a
-/// figure? These are exactly the questions a text-only transcription cannot
-/// satisfy — the text alone never contains the value, so the figure must be
-/// SHOWN to the model (crop-first, or the full page as a fallback). Kept
-/// deliberately narrow so it does not force every figure question back onto
-/// the expensive full-page path.
-fn figure_read_required(text: &str) -> bool {
+/// figure? This identifies a required visual resource, not a need to solve
+/// the question. A supplied crop lets ingestion transcribe the instruction.
+pub(crate) fn figure_read_required(text: &str) -> bool {
     use std::sync::OnceLock;
     static RE_READ: OnceLock<regex::Regex> = OnceLock::new();
     RE_READ
@@ -2632,6 +3211,10 @@ fn span_figure_candidates<'a>(
     // 1. Band-eligible figures on the span's own pages (covers unlabelled
     //    exhibits like "the circuit shown below").
     for (pi, fig) in span_band_figures(span, span_pages, page_figures) {
+        if !referenced.is_empty() && fig_number_from_caption(fig.caption.as_deref())
+            .is_some_and(|number| !referenced.contains(&number)) {
+            continue;
+        }
         add_unique_figure(&mut out, pi, fig);
     }
 
@@ -2651,6 +3234,24 @@ fn span_figure_candidates<'a>(
                 }
             }
         }
+    }
+    // Match placement order to first references, not PDF object order.
+    let rank = |fig: &crate::pdf_render::DetectedFigure| fig_number_from_caption(fig.caption.as_deref())
+        .and_then(|number| referenced.iter().position(|n| *n == number)).unwrap_or(usize::MAX);
+    out.sort_by(|(pa, a), (pb, b)| rank(a).cmp(&rank(b)).then(pa.cmp(pb))
+        .then(a.bbox[1].total_cmp(&b.bbox[1])));
+    // PDF object order is unrelated to printed A-D order. Group unnumbered
+    // figures into rows, then order each row left-to-right before binding.
+    let mut start = 0;
+    while start < out.len() {
+        if rank(out[start].1) != usize::MAX { start += 1; continue; }
+        let (page, first) = out[start];
+        let tolerance = (first.bbox[3] * 0.25).min(0.06);
+        let mut end = start + 1;
+        while end < out.len() && rank(out[end].1) == usize::MAX && out[end].0 == page
+            && out[end].1.bbox[1] - first.bbox[1] <= tolerance { end += 1; }
+        out[start..end].sort_by(|(_, a), (_, b)| a.bbox[0].total_cmp(&b.bbox[0]));
+        start = end;
     }
     out
 }
@@ -2730,7 +3331,151 @@ fn strip_placeholder_tokens(content: &str) -> String {
 /// → `save_diagram`), so the detector proposes but the existing Rust guards
 /// still dispose: sanitizer, header/footer margins, answer-space, blank guard,
 /// grid rejection, signature dedup.
+pub(crate) fn available_span_figures(
+    span: &QuestionSpan,
+    span_pages: &[(usize, &PageInput)],
+    page_figures: &[Vec<crate::pdf_render::DetectedFigure>],
+    referenced: &[u32],
+) -> usize {
+    span_figure_candidates(span, span_pages, page_figures, referenced)
+        .iter()
+        .filter(|(_, figure)| figure.seg_confidence >= FIGURE_SUPPLY_MIN_CONFIDENCE)
+        .count()
+}
+
 async fn attach_detected_figures(
+    config: &PipelineConfig,
+    span: &QuestionSpan,
+    span_pages: &[(usize, &PageInput)],
+    page_figures: &[Vec<crate::pdf_render::DetectedFigure>],
+    page_render_cache: &Arc<crate::pdf_render::PageRenderCache>,
+    question: &mut BuiltQuestion,
+    report: &mut ImportReport,
+) {
+    let references = figure_reference_numbers(&question.content);
+    let distinct: std::collections::BTreeSet<_> = references.iter().copied().collect();
+    // Layout questions know from source geometry which diagrams are drawn
+    // in the question's area: every one of them must be attached, and a
+    // caption beside an empty drawing space is a diagram nobody found. A
+    // "Figure N" printed as text (a program, relations, a table) needs no
+    // image; wording alone ("the equation of a curve") cannot require one.
+    let layout_owned = config.layout_figures.as_ref().and_then(|m| m.get(&span.number)).map(Vec::len);
+    let undetected = config.layout_questions.as_ref().and_then(|m| m.get(&span.number)).map_or(0, |b| b.undetected_figures);
+    let required = match (layout_owned, layout_figures_in_span(config, span)) {
+        (Some(n), _) => n,
+        (None, Some(n)) => distinct.len().max(n.min(1)),
+        (None, None) => distinct.len().max(usize::from(text_references_figure(&question.content))),
+    };
+    let attached = attach_detected_figure_content(config, span, span_pages, page_figures,
+        page_render_cache, &mut question.content, report).await;
+    let unknown = attached.iter().filter(|n| n.is_none()).count();
+    let missing = distinct.iter().filter(|n| !attached.contains(&Some(**n))).count();
+    let failed = if layout_owned.is_some() { attached.len() < required || undetected > 0 } else { attached.len() < required || missing > unknown };
+    if failed {
+        question.needs_review = true;
+        let reason = format!("Question {}: required figure could not be attached; review the source PDF", span.number);
+        question.notes.push(reason.clone());
+        report.anomalies.push(reason);
+    }
+}
+
+/// Corroborating stem evidence for an image-option MCQ. Detached crops with
+/// printed A/B/C labels are NOT enough on their own: multi-part questions and
+/// labelled geometry figures also carry letters. A whole-question MCQ options
+/// grid is a single-part question that asks the reader to choose.
+fn stem_supports_mcq_options(content: &str) -> bool {
+    static RE_PART_LABEL: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let part = RE_PART_LABEL.get_or_init(|| regex::Regex::new(r"(?m)^\s*\([a-h]\)").unwrap());
+    if part.is_match(content) {
+        return false;
+    }
+    static RE_CHOOSE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let choose = RE_CHOOSE.get_or_init(|| {
+        regex::Regex::new(r"(?i)\b(which|choose|select|identify)\b").unwrap()
+    });
+    if !choose.is_match(content) {
+        return false;
+    }
+    // Use the first paragraph as the stem (the mark tag may already sit on a
+    // later line) and require the question mark there. Anchoring on the very
+    // end of the whole content wrongly rejected Q26, whose mark tag is appended
+    // before the crops are attached.
+    let stem = content.split("\n\n").next().unwrap_or(content);
+    let stem = split_trailing_mark_tag(stem)
+        .map(|(head, _)| head)
+        .unwrap_or_else(|| stem.to_string());
+    choose.is_match(&stem) && stem.contains('?')
+}
+
+/// Split a trailing mark tag (`**[1 mark]**`, `[2 marks]`) off a stem so it can
+/// be re-attached after the reconstructed MCQ options. Returns `None` when the
+/// stem does not end on a mark tag.
+fn split_trailing_mark_tag(stem: &str) -> Option<(String, String)> {
+    static RE_MARK: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let re = RE_MARK.get_or_init(|| {
+        regex::Regex::new(r"(?s)^(.*?)\s*(\*\*\[\d+\s*marks?\]\*\*|\[\d+\s*marks?\])\s*$").unwrap()
+    });
+    let caps = re.captures(stem)?;
+    Some((
+        caps.get(1).map(|m| m.as_str().to_string()).unwrap_or_default(),
+        caps.get(2).unwrap().as_str().to_string(),
+    ))
+}
+
+/// Bind detached per-option figure links to their printed option letters.
+///
+/// Each `label` is the option letter captured from positional text evidence
+/// inside/above the crop (`None` when the glyph was not in the text layer).
+/// Because a missing option letter does not mean a missing diagram, the one
+/// anonymous crop is resolved ONLY when the captured letters are exactly the
+/// contiguous run `A..N` minus exactly one letter — i.e. when the assignment
+/// is forced. Any other shape (two anonymous crops, duplicate letters, a
+/// non-contiguous run) returns `None` and the caller leaves the card unbound.
+fn bind_detached_option_pairs(
+    links: &[Option<String>],
+    labels: &[Option<char>],
+) -> Option<Vec<(char, String)>> {
+    if links.len() != labels.len() || links.len() < 3 {
+        return None;
+    }
+    let labelled: std::collections::BTreeSet<char> = labels.iter().flatten().copied().collect();
+    let expected: Vec<char> = (0..labels.len())
+        .map(|i| (b'A' + i as u8) as char)
+        .collect();
+    let missing: Vec<char> = expected
+        .iter()
+        .copied()
+        .filter(|c| !labelled.contains(c))
+        .collect();
+    let anonymous = labels.iter().filter(|l| l.is_none()).count();
+    let shape_ok = if anonymous == 0 {
+        labelled.len() == labels.len() && missing.is_empty()
+    } else {
+        anonymous == 1 && missing.len() == 1
+    };
+    if !shape_ok || !labelled.iter().all(|c| expected.contains(c)) {
+        return None;
+    }
+    let forced = missing.first().copied();
+    let mut pairs: Vec<(char, String)> = Vec::with_capacity(labels.len());
+    let mut forced_used = false;
+    for (link_opt, label) in links.iter().zip(labels.iter()) {
+        let link = link_opt.as_ref()?;
+        let letter = match label {
+            Some(c) => *c,
+            None if !forced_used => {
+                forced_used = true;
+                forced?
+            }
+            None => return None,
+        };
+        pairs.push((letter, link.clone()));
+    }
+    let distinct: std::collections::BTreeSet<char> = pairs.iter().map(|(c, _)| *c).collect();
+    (distinct.len() == pairs.len()).then_some(pairs)
+}
+
+async fn attach_detected_figure_content(
     config: &PipelineConfig,
     span: &QuestionSpan,
     span_pages: &[(usize, &PageInput)],
@@ -2738,19 +3483,25 @@ async fn attach_detected_figures(
     page_render_cache: &Arc<crate::pdf_render::PageRenderCache>,
     content: &mut String,
     report: &mut ImportReport,
-) {
+) -> Vec<Option<u32>> {
     let referenced = figure_reference_numbers(content);
-    let eligible = span_figure_candidates(span, span_pages, page_figures, &referenced);
+    // A layout question's figures were chosen with its body: one per
+    // placeholder, in order.
+    let layout_figures = config.layout_figures.as_ref().and_then(|m| m.get(&span.number));
+    let eligible: Vec<(usize, &crate::pdf_render::DetectedFigure, bool)> = match layout_figures {
+        Some(figs) => figs.iter().map(|f| (f.page, &f.figure, f.exact)).collect(),
+        None => span_figure_candidates(span, span_pages, page_figures, &referenced).into_iter().map(|(p, f)| (p, f, false)).collect(),
+    };
     if eligible.is_empty() {
         // Nothing to attach — but leftover tokens must still be scrubbed so a
         // bare placeholder never renders as literal text in the card.
         *content = strip_placeholder_tokens(content);
-        return;
+        return Vec::new();
     }
     let mut requests = Vec::with_capacity(eligible.len());
     let mut page_b64 = std::collections::HashMap::new();
     let mut figs: Vec<&crate::pdf_render::DetectedFigure> = Vec::with_capacity(eligible.len());
-    for (global_pi, fig) in eligible {
+    for (global_pi, fig, exact) in eligible {
         let graph_like = fig
             .kind
             .as_deref()
@@ -2768,11 +3519,31 @@ async fn attach_detected_figures(
                 }
             }
         }
+        // A picture set inside a sentence is cropped to its own bounds: the
+        // punctuation printed after it belongs to the text.
+        let inline = fig.kind.as_deref() == Some(INLINE_FIGURE_KIND);
+        let mask = config
+            .layout_evidence
+            .as_ref()
+            .and_then(|ev| ev.layout.get(global_pi))
+            .map(|lp| {
+                let (w, h) = (lp.width.max(1.0), lp.height.max(1.0));
+                // Only a small picture (a code, a logo) is painted out: a
+                // page background or margin strip lies under the content.
+                lp.furniture_images
+                    .iter()
+                    .filter(|r| (r[2] - r[0]).max(r[3] - r[1]) <= 90.0)
+                    .map(|r| [r[0] / w, r[1] / h, (r[2] - r[0]) / w, (r[3] - r[1]) / h])
+                    .collect()
+            })
+            .unwrap_or_default();
         requests.push(DiagramSaveRequest {
             global_page_idx: global_pi,
             bbox: fig.bbox.to_vec(),
             ignore_grid,
             graph_like,
+            exact: exact.then_some(if inline { 0.0 } else { 0.004 }),
+            mask,
         });
         figs.push(fig);
     }
@@ -2792,14 +3563,71 @@ async fn attach_detected_figures(
                 "Question {} deterministic diagram persistence failed: {}",
                 span.number, error
             ));
-            return;
+            *content = strip_placeholder_tokens(content);
+            return Vec::new();
         }
     };
     report.absorb(persisted.report);
 
+    let links: Vec<Option<String>> = persisted.links;
+    if layout_figures.is_some() {
+        return splice_layout_figures(content, &links, &figs);
+    }
+    // Detached per-option diagram MCQ: a stem with NO placeholder, and every
+    // attached crop carrying a distinct printed option letter (A..E) captured
+    // from positional text evidence. Bind each crop to its own printed letter;
+    // never guess an order when a label is missing or duplicated.
+    let option_pairs: Option<Vec<(char, String)>> = if !content.contains("[DIAGRAM_PLACEHOLDER]")
+        && stem_supports_mcq_options(content)
+    {
+        let labels: Vec<Option<char>> = figs
+            .iter()
+            .map(|fig| {
+                fig.option_label
+                    .as_deref()
+                    .and_then(|l| l.trim().chars().next())
+                    .filter(|c| matches!(c, 'A'..='E'))
+            })
+            .collect();
+        bind_detached_option_pairs(&links, &labels)
+    } else {
+        None
+    };
+    if let Some(mut pairs) = option_pairs {
+        pairs.sort_by_key(|(c, _)| *c);
+        // The stem may carry a trailing mark tag (placed by the deterministic
+        // normalizer before crops were attached). Move it to the last option so
+        // the MCQ renders as `stem` then the options ending with the marks.
+        let stem_full = strip_placeholder_tokens(content).trim_end().to_string();
+        let (mut rebuilt, mark_tag) = match split_trailing_mark_tag(&stem_full) {
+            Some((head, tag)) => (head.trim_end().to_string(), Some(tag)),
+            None => (stem_full, None),
+        };
+        rebuilt.push_str("\n\n");
+        for (i, (letter, link)) in pairs.iter().enumerate() {
+            if i > 0 {
+                rebuilt.push('\n');
+            }
+            rebuilt.push_str(&format!("- [MCQ:{}] {}", letter, link.trim()));
+            if i + 1 == pairs.len() {
+                if let Some(tag) = mark_tag.as_deref() {
+                    rebuilt.push(' ');
+                    rebuilt.push_str(tag);
+                }
+            }
+        }
+        *content = rebuilt;
+        return figs
+            .iter()
+            .map(|f| fig_number_from_caption(f.caption.as_deref()))
+            .collect();
+    }
+
     let mut insert_offset = 0usize;
-    for (link_opt, fig) in persisted.links.into_iter().zip(figs) {
+    let mut attached = Vec::new();
+    for (link_opt, fig) in links.into_iter().zip(figs) {
         let Some(link) = link_opt else { continue };
+        attached.push(fig_number_from_caption(fig.caption.as_deref()));
         if let Some((abs, end)) = next_placeholder_after(content, insert_offset) {
             content.replace_range(abs..end, &link);
             insert_offset = abs + link.len();
@@ -2817,6 +3645,92 @@ async fn attach_detected_figures(
     // Any placeholder that survived (model over-emitted, or every crop was
     // rejected) is dropped — never leak a bare token into a question card.
     *content = strip_placeholder_tokens(content);
+    attached
+}
+
+/// Splice a layout question's crops into its body: crop `i` replaces the
+/// `i`-th placeholder (a rejected crop removes its placeholder). When the
+/// question asks for a choice and its labelled crops are the options A, B,
+/// C… in full, those become the tagged option list after the stem (their
+/// printed letters — figure labels and answer bubbles — are not stem text)
+/// while unlabelled figures stay where they are printed.
+fn splice_layout_figures(
+    content: &mut String,
+    links: &[Option<String>],
+    figs: &[&crate::pdf_render::DetectedFigure],
+) -> Vec<Option<u32>> {
+    let labels: Vec<Option<char>> = figs
+        .iter()
+        .map(|f| f.option_label.as_deref().and_then(|l| l.trim().chars().next()).filter(|c| matches!(c, 'A'..='E')))
+        .collect();
+    let mut letters: Vec<char> = labels.iter().flatten().copied().collect();
+    letters.sort_unstable();
+    let options_complete = letters.len() >= 3
+        && letters.iter().enumerate().all(|(i, &c)| c == (b'A' + i as u8) as char)
+        && labels.iter().zip(links).all(|(l, k)| l.is_none() || k.is_some());
+    // A single-part question that asks for a choice ("Which pair of graphs
+    // …?"), wherever its question sentence falls among its figures.
+    let stem = strip_placeholder_tokens(content);
+    static PART_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| regex::Regex::new(r"(?m)^\s*\([a-h]\)").unwrap());
+    static CHOICE_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| regex::Regex::new(r"(?i)\b(?:which|choose|select|identify)\b[^?]*\?").unwrap());
+    let as_options = options_complete && !PART_RE.is_match(&stem) && CHOICE_RE.is_match(&stem);
+    let mut attached = Vec::new();
+    let mut cursor = 0usize;
+    for (i, fig) in figs.iter().enumerate() {
+        let link = links.get(i).cloned().flatten();
+        let option = as_options && labels[i].is_some();
+        if link.is_some() && !option {
+            attached.push(fig_number_from_caption(fig.caption.as_deref()));
+        }
+        let replacement = if option { String::new() } else { link.clone().unwrap_or_default() };
+        match next_placeholder_after(content, cursor) {
+            Some((abs, end)) => {
+                content.replace_range(abs..end, &replacement);
+                cursor = abs + replacement.len();
+            }
+            None => content.push_str(&replacement),
+        }
+    }
+    *content = strip_placeholder_tokens(content);
+    if !as_options {
+        return attached;
+    }
+    // Lines made only of the option letters are their printed labels (or
+    // the answer bubbles, already tagged as letter-only options).
+    let letter_line = |l: &str| {
+        let t = l.trim();
+        let t = t.strip_prefix("- [MCQ:").and_then(|r| r.get(2..)).map(str::trim).filter(|_| t.starts_with("- [MCQ:")).unwrap_or(t);
+        t.is_empty() && l.trim().starts_with("- [MCQ:")
+            || !t.is_empty() && t.split_whitespace().all(|w| w.chars().count() == 1 && w.chars().all(|c| letters.contains(&c)))
+    };
+    let stem: String = content.lines().filter(|l| !letter_line(l)).collect::<Vec<_>>().join("\n");
+    let stem = stem.trim_end().to_string();
+    let (mut rebuilt, mark_tag) = match split_trailing_mark_tag(&stem) {
+        Some((head, tag)) => (head.trim_end().to_string(), Some(tag)),
+        None => (stem, None),
+    };
+    let mut pairs: Vec<(char, String)> = labels
+        .iter()
+        .zip(links)
+        .filter_map(|(l, k)| Some(((*l)?, k.clone()?)))
+        .collect();
+    pairs.sort_by_key(|(c, _)| *c);
+    // The mark allocation stands between the stem and the options, as on
+    // every multiple-choice card (a tag trailing an option is not shown).
+    rebuilt.push_str("\n\n");
+    if let Some(tag) = mark_tag.as_deref() {
+        rebuilt.push_str(tag);
+        rebuilt.push('\n');
+    }
+    for (i, (letter, link)) in pairs.iter().enumerate() {
+        if i > 0 {
+            rebuilt.push('\n');
+        }
+        rebuilt.push_str(&format!("- [MCQ:{}] {}", letter, link.trim()));
+    }
+    *content = rebuilt;
+    attached.extend(pairs.iter().map(|_| None));
+    attached
 }
 
 /// Slim JSON schema for TEXT-ONLY calls: the full extraction schema minus the
@@ -2910,6 +3824,30 @@ fn build_question_from_parsed_page(
         );
         return None;
     }
+    // Single-question response boundary: a model that answers sub-parts
+    // (a)(b)(c) as separate items gets them stitched into ONE card here, in
+    // source order and without duplicate totals. Identity is validated first —
+    // a foreign parent question refuses the stitch and we fall back rather
+    // than weld two questions together.
+    let mut stitch_marks_ambiguous = false;
+    let target_items = if target_items.len() > 1 {
+        match stitch_question_items(target_items, span.number, span.expected_marks) {
+            Ok(stitched) => {
+                stitch_marks_ambiguous = stitched.marks_ambiguous;
+                vec![stitched.item]
+            }
+            Err(refusal) => {
+                eprintln!(
+                    "[TEXT_FIRST_FALLBACK] question={} reason=stitch_refused({})",
+                    span.number,
+                    refusal.describe()
+                );
+                return None;
+            }
+        }
+    } else {
+        target_items
+    };
     // A figure is needed → vision will box it. With deterministic detection
     // enabled the caller can supply figures (`available_figures > 0`); the
     // model's placeholders are then accepted and filled in from the crops.
@@ -2992,15 +3930,112 @@ fn build_question_from_parsed_page(
             ai_marks = Some(ai_marks.map_or(m, |existing: i32| existing + m));
         }
     }
-    assemble_built_question(
+    let built = assemble_built_question(
         span,
         config,
         contents,
         topics_acc,
         is_code_acc,
-        false,
-        Vec::new(),
+        stitch_marks_ambiguous,
+        if stitch_marks_ambiguous {
+            vec![
+                "stitched sub-parts carried equal marks with no printed total to confirm them against; marks summed, please review"
+                    .to_string(),
+            ]
+        } else {
+            Vec::new()
+        },
         ai_marks,
+    )?;
+    // Post-merge structural gate: sub-part sequences can only be judged on
+    // the JOINED content — per-item validation above cannot see a missing
+    // first part or a duplicated label across split items. A merged card
+    // that still fails structure escalates to the vision repair loop.
+    let structural = validate::card_structure_errors(&built.content, span.number);
+    if !structural.is_empty() {
+        eprintln!(
+            "[TEXT_FIRST_FALLBACK] question={} reason=structure({})",
+            span.number,
+            structural.join("; ")
+        );
+        return None;
+    }
+    Some(built)
+}
+
+/// Tier-0 seam: the deterministic transcriber hands over a converted
+/// transcription and it flows through the SAME acceptance gates as every LLM
+/// response (`build_question_from_parsed_page`), so Tier 0 inherits every
+/// future validator improvement for free.
+pub(crate) fn build_question_from_seam(
+    content: String,
+    marks: Option<u32>,
+    span: &QuestionSpan,
+    config: &PipelineConfig,
+    available_figures: usize,
+) -> Option<BuiltQuestion> {
+    if is_layout_question(config, span) {
+        let built = assemble_layout_question(span, config, content, false, Vec::new())?;
+        let structural = validate::card_structure_errors(&built.content, span.number);
+        if !structural.is_empty() {
+            eprintln!("[TIER0_LAYOUT] question={} reason=structure({})", span.number, structural.join("; "));
+            return None;
+        }
+        return Some(built);
+    }
+    let item = AiQuestion {
+        question_number: Some(serde_json::json!(span.number)),
+        content: Some(content),
+        marks: marks.map(|m| serde_json::json!(m)),
+        ..Default::default()
+    };
+    build_question_from_parsed_page(
+        AiQuestionPage { items: vec![item] },
+        span,
+        config,
+        available_figures,
+    )
+}
+
+/// Lenient assembly for a locally recovered card.
+///
+/// The strict seam rejects any card that still carries a structural defect.
+/// A born-digital document has no cloud to escalate to, so the honest move is
+/// to keep the real carved content and FLAG it: `needs_review` is forced true,
+/// the failed gate is recorded in the card notes, and the caller surfaces the
+/// same reason as a report anomaly. Nothing is invented here - the content is
+/// whatever the deterministic carve produced, or this returns `None`.
+pub(crate) fn build_recovered_question(
+    content: String,
+    marks_hint: Option<i32>,
+    span: &QuestionSpan,
+    config: &PipelineConfig,
+    failed_gate: &str,
+) -> Option<BuiltQuestion> {
+    if is_layout_question(config, span) {
+        return assemble_layout_question(
+            span,
+            config,
+            content,
+            true,
+            vec![format!(
+                "local recovery: quality gate '{}' failed; content retained for review (digital document, zero cloud calls)",
+                failed_gate
+            )],
+        );
+    }
+    assemble_built_question(
+        span,
+        config,
+        vec![content],
+        Vec::new(),
+        false,
+        true,
+        vec![format!(
+            "local recovery: quality gate '{}' failed; content retained for review (digital document, zero cloud calls)",
+            failed_gate
+        )],
+        marks_hint,
     )
 }
 
@@ -3061,7 +4096,7 @@ async fn try_text_first_extraction<C: LlmClient>(
     );
 
     let api_start = Instant::now();
-    let resp = match chat_with_permit(client, &body, request_semaphore, cancel, usage, StageTag::TextFirstExtraction).await {
+    let resp = match chat_with_permit(client, &body, request_semaphore, cancel, usage, StageTag::TextFirstExtraction, config.cloud_allowed()).await {
         Ok(r) => r,
         Err(e) => {
             eprintln!(
@@ -3211,7 +4246,7 @@ async fn try_text_first_batch_extraction<C: LlmClient>(
     );
 
     let api_start = Instant::now();
-    let resp = match chat_with_permit(client, &body, request_semaphore, cancel, usage, StageTag::BatchTextFirst).await {
+    let resp = match chat_with_permit(client, &body, request_semaphore, cancel, usage, StageTag::BatchTextFirst, config.cloud_allowed()).await {
         Ok(r) => r,
         Err(e) => {
             eprintln!("[TEXT_FIRST_FALLBACK] batch reason=api_error err={}", e);
@@ -3388,7 +4423,7 @@ async fn try_crop_first_extraction<C: LlmClient>(
             schema: extraction_json_schema(),
         }),
     );
-    let resp = match chat_with_permit(client, &body, request_semaphore, cancel, usage, StageTag::CropFirst).await {
+    let resp = match chat_with_permit(client, &body, request_semaphore, cancel, usage, StageTag::CropFirst, config.cloud_allowed()).await {
         Ok(r) => r,
         Err(e) => {
             report.anomalies.push(format!(
@@ -3449,6 +4484,8 @@ async fn try_crop_first_extraction<C: LlmClient>(
     if target_items.len() != 1 {
         return None;
     }
+    let mut target_items = target_items;
+    reconcile_bbox_indexes(&mut target_items);
     let filtered_page = AiQuestionPage {
         items: target_items.clone(),
     };
@@ -3498,6 +4535,17 @@ async fn try_crop_first_extraction<C: LlmClient>(
         Vec::new(),
         ai_marks,
     )?;
+    // Post-merge structural gate (crop-first variant): same escalation rule
+    // as the text-first seam — a structurally broken card must never ship.
+    let structural = validate::card_structure_errors(&built.content, span.number);
+    if !structural.is_empty() {
+        report.anomalies.push(format!(
+            "Question {} crop-first structure failed ({}); falling back",
+            span.number,
+            structural.join("; ")
+        ));
+        return None;
+    }
     Some((built, report))
 }
 
@@ -3556,13 +4604,9 @@ async fn extract_span<C: LlmClient>(
     // AFTER the question text (adjacent-page + whole-paper caption match), so
     // most figure questions never touch the vision path at all.
     //
-    // Two cases still need vision:
-    //   1. Read-from-figure questions ("use the graph to determine…") — the
-    //      answer literally lives in the figure, so the model must SEE it.
-    //      They get the cheap crop-first path below (detected figure crops)
-    //      instead of full pages.
-    //   2. A figure reference with nothing detected anywhere (scanned /
-    //      unusual encodings) — full-page vision as before.
+    // A figure reference with no confident detection still needs recovery.
+    // Graph-reading instructions alone do not require vision: preserve the
+    // instruction and attach its graph, leaving the student to answer it.
     let combined_text: String = span_pages
         .iter()
         .map(|(_, p)| p.text.trim())
@@ -3582,11 +4626,118 @@ async fn extract_span<C: LlmClient>(
     // region must never silently satisfy a figure reference — the span then
     // falls back to full-page vision instead of starving for its figure.
     // (Low-confidence figures still attach when explicitly referenced.)
-    let fig_count = candidates
-        .iter()
-        .filter(|(_, f)| f.seg_confidence >= FIGURE_SUPPLY_MIN_CONFIDENCE)
-        .count();
-    let needs_vision = must_read || (text_refs_figure && fig_count == 0);
+    let fig_count = available_span_figures(span, span_pages, page_figures, &referenced);
+    let needs_vision = text_refs_figure && fig_count == 0;
+
+    // Document policy. A born-digital paper is strictly local: the
+    // deterministic transcriber is forced on whatever the tuning switches say,
+    // and text-first (an LLM call), crop-first, vision, and repair are all
+    // dead. `chat_with_permit` refuses anything that still tries.
+    let digital = config.is_digital_document();
+    let text_first = text_first && !digital;
+    let deterministic_enabled = config.deterministic || digital;
+
+    // ── Tier-0 deterministic extraction ──────────────────────────────────
+    // Zero-cost import cascade: text-reliable, figure-free spans are carved
+    // out of the text layer by the local Rust transcriber — ZERO API calls.
+    // Any gate refusal escalates to the LLM text-first call below unchanged.
+    if has_text && deterministic_enabled {
+        let paper_last_page = all_spans
+            .iter()
+            .map(|s| s.end_page)
+            .max()
+            .unwrap_or(span.end_page);
+        let margin_model = config
+            .margin_model
+            .get_or_init(|| crate::deterministic::build_margin_model(config, all_spans));
+        if let Some((mut built_q, mut t0_report)) = crate::deterministic::try_deterministic_extraction(
+            config,
+            span,
+            span_pages,
+            fig_count,
+            paper_last_page,
+            cancel,
+            Some(margin_model),
+        ) {
+            // Same tail as text-first: attach figures (scrubs leftover
+            // placeholders), bookkeeping, mark check, absorb.
+            attach_detected_figures(
+                config,
+                span,
+                span_pages,
+                page_figures,
+                page_render_cache,
+                &mut built_q,
+                &mut t0_report,
+            )
+            .await;
+            settle_tier0_outcome(span, &built_q, &mut t0_report);
+            t0_report.pages_processed += (span.start_page..=span.end_page).count().max(1);
+            push_mark_check(span, &built_q, &mut t0_report);
+            report.absorb(t0_report);
+            return (Some(built_q), report);
+        }
+        // Digital document with a failed strict carve: no cloud to escalate
+        // to. Keep the best locally carved candidate, flagged for review with
+        // the failed gate on the record; if the carve could not isolate the
+        // question at all, fail locally instead of pretending.
+        if digital {
+            if let Some((mut built_q, mut rec_report, gate)) =
+                crate::deterministic::try_local_recovery(
+                    config,
+                    span,
+                    span_pages,
+                    fig_count,
+                    paper_last_page,
+                    cancel,
+                    Some(margin_model),
+                )
+            {
+                rec_report.recovered += 1;
+                rec_report.anomalies.push(format!(
+                    "Question {}: local recovery (digital document, failed gate: {}); content retained for review, zero cloud calls",
+                    span.number, gate
+                ));
+                attach_detected_figures(
+                    config,
+                    span,
+                    span_pages,
+                    page_figures,
+                    page_render_cache,
+                    &mut built_q,
+                    &mut rec_report,
+                )
+                .await;
+                rec_report.pages_processed += (span.start_page..=span.end_page).count().max(1);
+                push_mark_check(span, &built_q, &mut rec_report);
+                report.absorb(rec_report);
+                return (Some(built_q), report);
+            }
+        }
+    }
+
+    // A digital span that reaches here is a real local failure: either its
+    // pages carry no usable text, or the carve could not isolate the question.
+    // Report it plainly; never dispatch.
+    if digital {
+        let reason = if has_text {
+            "digital document: no viable local candidate and cloud extraction is disabled"
+        } else {
+            "digital document: span pages carry no usable text and cloud extraction is disabled"
+        };
+        eprintln!("[LOCAL_FAILURE] question={} reason={}", span.number, reason);
+        report
+            .anomalies
+            .push(format!("Question {}: {}", span.number, reason));
+        report.quarantined.push(QuarantineEvent {
+            scope: "question".to_string(),
+            page: Some(span.start_page + 1),
+            question_number: Some(span.number),
+            reason: reason.to_string(),
+        });
+        report.pages_processed += (span.start_page..=span.end_page).count().max(1);
+        return (None, report);
+    }
 
     if text_first && has_text && !needs_vision {
         if let Some((mut built_q, mut tf_report)) = try_text_first_extraction(
@@ -3614,7 +4765,7 @@ async fn extract_span<C: LlmClient>(
                 span_pages,
                 page_figures,
                 page_render_cache,
-                &mut built_q.content,
+                &mut built_q,
                 &mut tf_report,
             )
             .await;
@@ -3660,7 +4811,7 @@ async fn extract_span<C: LlmClient>(
                 span_pages,
                 page_figures,
                 page_render_cache,
-                &mut built_q.content,
+                &mut built_q,
                 &mut crop_report,
             )
             .await;
@@ -3887,7 +5038,7 @@ async fn extract_span<C: LlmClient>(
             );
 
             let api_start = Instant::now();
-            let resp = match chat_with_permit(client, &body, request_semaphore, cancel, usage, StageTag::VisionSpan).await {
+            let resp = match chat_with_permit(client, &body, request_semaphore, cancel, usage, StageTag::VisionSpan, config.cloud_allowed()).await {
                 Ok(r) => r,
                 Err(e) => {
                     last_error = e.to_string();
@@ -3984,7 +5135,7 @@ async fn extract_span<C: LlmClient>(
                     );
 
                     let api_start = Instant::now();
-                    let reduced_resp = match chat_with_permit(client, &reduced_body, request_semaphore, cancel, usage, StageTag::VisionSpan).await {
+                    let reduced_resp = match chat_with_permit(client, &reduced_body, request_semaphore, cancel, usage, StageTag::VisionSpan, config.cloud_allowed()).await {
                         Ok(r) => r,
                         Err(e) => {
                             last_error = e.to_string();
@@ -4221,15 +5372,37 @@ async fn extract_span<C: LlmClient>(
                 page_bands = split_page_bands.clone();
                 page_crop_offsets = split_crop_offsets.clone();
                 decoded_pages = split_decoded_pages.clone();
-                page_items.items = vec![merge_split_questions(
-                    std::mem::take(&mut split_raw_items),
-                    span.number,
-                )];
-                let unified = &page_items.items[0];
-                eprintln!(
-                    "[DIAGNOSTIC][UNIFIED_OBJECT] question={} structure={:#?}",
-                    span.number, unified
-                );
+                let raw_items = std::mem::take(&mut split_raw_items);
+                match stitch_question_items(raw_items.clone(), span.number, span.expected_marks) {
+                    Ok(stitched) => {
+                        if stitched.marks_ambiguous {
+                            needs_review = true;
+                            notes.push(
+                                "stitched sub-parts carried equal marks with no printed total to confirm them against; marks summed, please review"
+                                    .to_string(),
+                            );
+                        }
+                        page_items.items = vec![stitched.item];
+                        let unified = &page_items.items[0];
+                        eprintln!(
+                            "[DIAGNOSTIC][UNIFIED_OBJECT] question={} structure={:#?}",
+                            span.number, unified
+                        );
+                    }
+                    Err(refusal) => {
+                        // Distinct parent identities inside one span's
+                        // response: never weld them. Leave the fragments in
+                        // place so the strict per-item validator rejects the
+                        // span honestly instead of shipping a merged card.
+                        eprintln!(
+                            "[STITCH_REFUSED] question={} reason={}",
+                            span.number,
+                            refusal.describe()
+                        );
+                        page_items.items = raw_items;
+                        unified_split = false;
+                    }
+                }
             }
 
             for item in &mut page_items.items {
@@ -4375,6 +5548,8 @@ async fn extract_span<C: LlmClient>(
                                                             || kind.contains("composite_visual_options") || kind.contains("visual_option")
                                                     })
                                                     .unwrap_or(false),
+                                                    exact: None,
+                                                    mask: Vec::new(),
                                             });
                                         }
                                     }
@@ -4461,6 +5636,66 @@ async fn extract_span<C: LlmClient>(
             // After filtering, enforce single-item output. If multiple items
             // matched the target (e.g., LLM split Q8 into sub-parts), we must
             // tell it to combine them into ONE single item.
+            //
+            // Before that: an ordinary single-span response that answers
+            // (a)(b)(c) as separate items for THIS question is a compatible
+            // stitch, not a schema error. Stitch it here so the parts are kept
+            // instead of being discarded or costing a repair round. Items for
+            // other questions were filtered out above, so this can never weld
+            // two parent questions together.
+            if page_items.items.len() > 1 {
+                // Preserve the historical mislabeled-parent safeguard BEFORE
+                // accepting a stitch. Two items where the second looks like a
+                // new question (its own "7." / "**5.**" heading, or a part-label
+                // reset) must go down the existing repair path instead of being
+                // silently welded; any item that opens with its own different
+                // question number is refused for the same reason.
+                let looks_like_separate_questions = page_items
+                    .items
+                    .windows(2)
+                    .any(|pair| {
+                        let prev = pair[0].content.as_deref().unwrap_or("");
+                        let next = pair[1].content.as_deref().unwrap_or("");
+                        (page_items.items.len() == 2 && looks_like_new_question(prev, next))
+                            || leading_question_number(next)
+                                .is_some_and(|n| n != span.number)
+                    });
+                if looks_like_separate_questions {
+                    eprintln!(
+                        "[STITCH_REFUSED] question={} reason=separate_question_stems",
+                        span.number
+                    );
+                } else {
+                    match stitch_question_items(
+                        page_items.items.clone(),
+                        span.number,
+                        span.expected_marks,
+                    ) {
+                        Ok(stitched) => {
+                            eprintln!(
+                                "[STITCHED] question={} items={} -> 1 (0 repair rounds)",
+                                span.number,
+                                page_items.items.len()
+                            );
+                            if stitched.marks_ambiguous {
+                                needs_review = true;
+                                notes.push(
+                                    "stitched sub-parts carried equal marks with no printed total to confirm them against; marks summed, please review"
+                                        .to_string(),
+                                );
+                            }
+                            page_items.items = vec![stitched.item];
+                        }
+                        Err(refusal) => {
+                            eprintln!(
+                                "[STITCH_REFUSED] question={} reason={}",
+                                span.number,
+                                refusal.describe()
+                            );
+                        }
+                    }
+                }
+            }
             if page_items.items.len() > 1 {
                 // More than one item with the target number: check if second item
                 // looks like a genuine continuation (same number, advancing sub-parts)
@@ -4557,6 +5792,7 @@ async fn extract_span<C: LlmClient>(
             }
 
             // ── Deterministic validation of the page items ────────────────
+            reconcile_bbox_indexes(&mut page_items.items);
             let validation_errors = validate_span_items(&page_items, span);
             if !validation_errors.is_empty() {
                 for error in &validation_errors {
@@ -4824,6 +6060,8 @@ async fn extract_span<C: LlmClient>(
                                     || kind.contains("composite_visual_options") || kind.contains("visual_option")
                             })
                             .unwrap_or(false),
+                            exact: None,
+                            mask: Vec::new(),
                     });
                 }
                 let saved_before = saved_diagrams.clone();
@@ -4897,6 +6135,21 @@ async fn extract_span<C: LlmClient>(
         notes,
         ai_marks,
     );
+    // Final structural gate on the vision path: a card whose sub-part
+    // sequence / MCQ syntax / math hygiene is broken must never ship as a
+    // clean card. It falls through to quarantine + fallback so the
+    // needs_review flag surfaces it instead of silently corrupting the repo.
+    if let Some(q) = &built_q {
+        let errs = validate::card_structure_errors(&q.content, span.number);
+        if !errs.is_empty() {
+            report.anomalies.push(format!(
+                "quarantined: Question {} failed structural validation ({})",
+                span.number,
+                errs.join("; ")
+            ));
+            return (None, report);
+        }
+    }
     (built_q, report)
 }
 
@@ -4920,6 +6173,13 @@ fn assemble_built_question(
     // 3. MCQ option flattening, 4. Tabular option destruction, 5. Visual MCQ
     // gibberish, 6. Mark allocation misplacement.
     content = crate::marker_client::clean_marker_markdown(&content);
+    // Deterministic formatting-rules pass (the 6 trap classes: isotope
+    // reconstruction, delimiter balance, sentence-math unwrapping, unicode
+    // minus/exponents, MCQ list syntax, OCR boilerplate). Runs HERE — inside
+    // the acceptance seam — so every extraction path (vision, text-first,
+    // Tier-0, batch) produces clean cards and the structural validator below
+    // never fires on issues the sanitizer already fixed for free.
+    content = crate::sanitize::sanitize_question_content(&content, span.number);
     // Terminal KaTeX guard: close broken inline $ at line ends and unterminated
     // $$ blocks so raw LaTeX can never leak as plaintext or swallow text below it.
     content = validate::balance_math_delimiters(&content);
@@ -4945,6 +6205,11 @@ fn assemble_built_question(
 
     // Marks: printed footer is authoritative; inline tags next; AI estimate last.
     let inline = validate::sum_inline_marks(&content);
+    #[cfg(test)]
+    eprintln!(
+        "[SCRATCH] q={} expected={:?} inline={} ai={:?}",
+        span.number, span.expected_marks, inline, ai_marks
+    );
     let (marks, mark_note) = match (span.expected_marks, inline) {
         (Some(e), 0) => (e as i32, None),
         (Some(e), n) if n == e => (e as i32, None),
@@ -4984,6 +6249,318 @@ fn assemble_built_question(
     })
 }
 
+/// A detected figure whose box lies mostly inside a ruled table the layout
+/// transcribed (the table is text, not an image).
+fn figure_is_layout_table(fig: &crate::pdf_render::DetectedFigure, lp: &crate::layout::LayoutPage) -> bool {
+    let (w, h) = (lp.width.max(1.0), lp.height.max(1.0));
+    let [fx, fy, fw, fh] = fig.bbox;
+    let (fx0, fy0, fx1, fy1) = (fx * w, fy * h, (fx + fw) * w, (fy + fh) * h);
+    let area = ((fx1 - fx0) * (fy1 - fy0)).max(1.0);
+    lp.tables.iter().any(|t| {
+        let ix = (fx1.min(t[2]) - fx0.max(t[0])).max(0.0);
+        let iy = (fy1.min(t[3]) - fy0.max(t[1])).max(0.0);
+        ix * iy >= 0.6 * area
+    })
+}
+
+/// The kind recorded for a picture set inside a line of text.
+const INLINE_FIGURE_KIND: &str = "inline";
+
+/// A layout question's figures in reading order, as (page, figure, crop
+/// rectangle in points): the detector's figures in the question's area (a
+/// figure that is a transcribed table excluded), and every diagram region
+/// the layout drew that the detector missed or split into unlabelled
+/// pieces, cropped with its labels. Nothing outside the question's own
+/// area — between its heading and the next question's — is taken.
+fn layout_question_figures(
+    layout: &[crate::layout::LayoutPage],
+    q: &crate::layout::LayoutQuestion,
+    page_figures: &[Vec<crate::pdf_render::DetectedFigure>],
+) -> Vec<(LayoutFigure, [f32; 4])> {
+    fn area(r: &[f32; 4]) -> f32 {
+        ((r[2] - r[0]).max(0.0) * (r[3] - r[1]).max(0.0)).max(1.0)
+    }
+    fn overlap(a: &[f32; 4], b: &[f32; 4]) -> f32 {
+        (a[2].min(b[2]) - a[0].max(b[0])).max(0.0) * (a[3].min(b[3]) - a[1].max(b[1])).max(0.0)
+    }
+    let mut out: Vec<(LayoutFigure, [f32; 4])> = Vec::new();
+    for p in q.start_page..=q.end_page {
+        let Some(lp) = layout.get(p) else { continue };
+        let (w, h) = (lp.width.max(1.0), lp.height.max(1.0));
+        let mine = |r: &[f32; 4]| crate::layout::question_figure_window(layout, q, p, (r[1] + r[3]) * 0.5);
+        let detected: Vec<(&crate::pdf_render::DetectedFigure, [f32; 4])> = page_figures
+            .get(p)
+            .map(|v| v.as_slice())
+            .unwrap_or(&[])
+            .iter()
+            .filter(|f| !figure_is_layout_table(f, lp))
+            .map(|f| (f, [f.bbox[0] * w, f.bbox[1] * h, (f.bbox[0] + f.bbox[2]) * w, (f.bbox[1] + f.bbox[3]) * h]))
+            .filter(|(_, r)| mine(r))
+            .collect();
+        let mut keep = vec![true; detected.len()];
+        // A detector box over what the layout already transcribed as text
+        // (a table, a row of bits, labelled boxes, the sentence above) is a
+        // partial picture of that text, not a figure.
+        for (i, (_, d)) in detected.iter().enumerate() {
+            let covered: f32 = lp.lines.iter().map(|l| overlap(d, &[l.x0, l.y0, l.x1, l.y1])).sum::<f32>()
+                + lp.tables.iter().map(|t| overlap(d, t)).sum::<f32>();
+            let over_text = lp.tables.iter().chain(&lp.text_grids).any(|t| overlap(d, t) >= 0.2 * area(d));
+            // Nothing is drawn in it but text and ruled grids.
+            let undrawn = !lp.drawings.iter().any(|b| overlap(d, b) > 0.0);
+            if covered >= 0.45 * area(d) || over_text || undrawn {
+                keep[i] = false;
+            }
+        }
+        let mut extra: Vec<(LayoutFigure, [f32; 4])> = Vec::new();
+        // Option letters name a set of drawings; a lone letter captured
+        // inside one figure (its curve "C") is a label, not an option.
+        let option_set = detected.iter().filter_map(|(f, _)| f.option_label.as_deref()).collect::<std::collections::BTreeSet<_>>().len();
+        for region in lp.figures.iter().filter(|r| mine(r)) {
+            let pieces: Vec<usize> = (0..detected.len())
+                .filter(|&i| overlap(&detected[i].1, region) >= 0.5 * area(&detected[i].1).min(area(region)))
+                .collect();
+            if option_set >= 3 && pieces.iter().any(|&i| detected[i].0.option_label.is_some()) {
+                continue; // the detector's labelled option crops stand
+            }
+            // The layout's figure extent (strokes and labels) is exact. A
+            // detector box over the same figure, or several splitting it,
+            // lends its caption; pieces reaching beyond the strokes widen it.
+            let agrees = pieces.len() == 1 && {
+                let d = &detected[pieces[0]].1;
+                let inter = overlap(d, region);
+                inter / (area(d) + area(region) - inter) >= 0.5
+            };
+            let mut rect = crate::layout::figure_crop_rect(lp, *region);
+            let mut caption = None;
+            let mut kind = None;
+            for &i in &pieces {
+                keep[i] = false;
+                let d = &detected[i].1;
+                if !agrees {
+                    rect = [rect[0].min(d[0]), rect[1].min(d[1]), rect[2].max(d[2]), rect[3].max(d[3])];
+                }
+                caption = caption.or_else(|| detected[i].0.caption.clone());
+                kind = kind.or_else(|| detected[i].0.kind.clone());
+            }
+            let figure = crate::pdf_render::DetectedFigure {
+                bbox: [rect[0] / w, rect[1] / h, (rect[2] - rect[0]) / w, (rect[3] - rect[1]) / h],
+                caption,
+                kind,
+                seg_confidence: FIGURE_SUPPLY_MIN_CONFIDENCE,
+                option_label: None,
+            };
+            extra.push((LayoutFigure { page: p, figure, exact: true }, rect));
+        }
+        // Pictures inside lines of text (formulas printed as images) are
+        // figures of their own, spliced where they stand; a detector box
+        // over one is the same picture.
+        for im in lp.inline_images.iter().filter(|r| mine(r)) {
+            for (i, (_, d)) in detected.iter().enumerate() {
+                if overlap(d, im) >= 0.5 * area(im).min(area(d)) {
+                    keep[i] = false;
+                }
+            }
+            let figure = crate::pdf_render::DetectedFigure {
+                bbox: [im[0] / w, im[1] / h, (im[2] - im[0]) / w, (im[3] - im[1]) / h],
+                caption: None,
+                kind: Some(INLINE_FIGURE_KIND.to_string()),
+                seg_confidence: FIGURE_SUPPLY_MIN_CONFIDENCE,
+                option_label: None,
+            };
+            extra.push((LayoutFigure { page: p, figure, exact: true }, *im));
+        }
+        let mut page_out: Vec<(LayoutFigure, [f32; 4])> = detected
+            .iter()
+            .zip(keep)
+            .filter(|(_, k)| *k)
+            .map(|((f, r), _)| (LayoutFigure { page: p, figure: (*f).clone(), exact: false }, *r))
+            .chain(extra)
+            .collect();
+        // Option letters printed over a row of figures ("A    B" above two
+        // diagrams) name them left to right, one letter per figure.
+        for line in &lp.lines {
+            let letters: Vec<char> = line.text.split_whitespace().map(|w| w.chars().collect::<Vec<_>>()).filter_map(|w| (w.len() == 1).then(|| w[0])).collect();
+            if letters.is_empty()
+                || letters.len() != line.text.split_whitespace().count()
+                || !letters.iter().all(|c| matches!(c, 'A'..='E'))
+            {
+                continue;
+            }
+            let mut below: Vec<usize> = (0..page_out.len())
+                .filter(|&i| {
+                    let r = page_out[i].1;
+                    r[1] >= line.y1 - 2.0 && r[1] <= line.y1 + 4.0 * line.size.max(6.0) && r[2] >= line.x0 - 10.0 && r[0] <= line.x1 + 10.0
+                })
+                .collect();
+            if below.len() != letters.len() {
+                continue;
+            }
+            below.sort_by(|&a, &b| page_out[a].1[0].total_cmp(&page_out[b].1[0]));
+            for (&i, &c) in below.iter().zip(&letters) {
+                if page_out[i].0.figure.option_label.is_none() {
+                    page_out[i].0.figure.option_label = Some(c.to_string());
+                }
+            }
+        }
+        // A crop never takes in the question's own text lines (a detector box
+        // reaching over the sentence above): it stops short of any body line
+        // lying across it.
+        for (f, r) in page_out.iter_mut() {
+            if f.figure.kind.as_deref() == Some(INLINE_FIGURE_KIND) {
+                continue;
+            }
+            let mut c = *r;
+            for l in &lp.lines {
+                let ox = (c[2].min(l.x1) - c[0].max(l.x0)).max(0.0);
+                let oy = (c[3].min(l.y1) - c[1].max(l.y0)).max(0.0);
+                if ox <= 0.0 || oy <= 0.0 || ox < 0.5 * (l.x1 - l.x0).min(c[2] - c[0]) {
+                    continue;
+                }
+                // (Clear of the crop's own margin.)
+                if (l.y0 + l.y1) * 0.5 < (c[1] + c[3]) * 0.5 {
+                    c[1] = c[1].max(l.y1 + 3.5);
+                } else {
+                    c[3] = c[3].min(l.y0 - 3.5);
+                }
+            }
+            if c[3] - c[1] >= 20.0 && (c[1] != r[1] || c[3] != r[3]) {
+                *r = c;
+                f.figure.bbox = [c[0] / w, c[1] / h, (c[2] - c[0]) / w, (c[3] - c[1]) / h];
+            }
+        }
+        // Parts of one drawing found apart (the branches of a tree diagram):
+        // uncaptioned, unlabelled pieces side by side with nothing but their
+        // own labels between them are one figure.
+        loop {
+            let mut merged = false;
+            'pairs: for i in 0..page_out.len() {
+                for j in i + 1..page_out.len() {
+                    let (a, b) = (&page_out[i], &page_out[j]);
+                    let plain = |f: &LayoutFigure| {
+                        f.exact && f.figure.caption.is_none() && f.figure.option_label.is_none() && f.figure.kind.as_deref() != Some(INLINE_FIGURE_KIND)
+                    };
+                    if !plain(&a.0) || !plain(&b.0) {
+                        continue;
+                    }
+                    let (ra, rb) = (a.1, b.1);
+                    let v_overlap = ra[3].min(rb[3]) - ra[1].max(rb[1]);
+                    let h_gap = (rb[0] - ra[2]).max(ra[0] - rb[2]);
+                    if v_overlap <= 0.0 || h_gap > 100.0 {
+                        continue;
+                    }
+                    let u = [ra[0].min(rb[0]), ra[1].min(rb[1]), ra[2].max(rb[2]), ra[3].max(rb[3])];
+                    let text_between = lp.lines.iter().any(|l| {
+                        let (cx, cy) = ((l.x0 + l.x1) * 0.5, (l.y0 + l.y1) * 0.5);
+                        cx > u[0] && cx < u[2] && cy > u[1] && cy < u[3]
+                    });
+                    if text_between {
+                        continue;
+                    }
+                    page_out[i].1 = u;
+                    page_out[i].0.figure.bbox = [u[0] / w, u[1] / h, (u[2] - u[0]) / w, (u[3] - u[1]) / h];
+                    page_out.remove(j);
+                    merged = true;
+                    break 'pairs;
+                }
+            }
+            if !merged {
+                break;
+            }
+        }
+        // Reading order: rows top to bottom, each row left to right.
+        page_out.sort_by(|a, b| a.1[1].total_cmp(&b.1[1]));
+        let mut start = 0;
+        while start < page_out.len() {
+            let top = page_out[start].1[1];
+            let tolerance = ((page_out[start].1[3] - top) * 0.25).min(0.06 * h);
+            let mut end = start + 1;
+            while end < page_out.len() && page_out[end].1[1] - top <= tolerance {
+                end += 1;
+            }
+            page_out[start..end].sort_by(|a, b| a.1[0].total_cmp(&b.1[0]));
+            start = end;
+        }
+        out.extend(page_out);
+    }
+    out
+}
+
+/// Diagram regions the layout found inside a layout question's own area.
+fn layout_figures_in_span(config: &PipelineConfig, span: &QuestionSpan) -> Option<usize> {
+    if !is_layout_question(config, span) {
+        return None;
+    }
+    let ev = config.layout_evidence.as_ref()?;
+    let mut n = 0;
+    for p in span.start_page..=span.end_page {
+        let Some(lp) = ev.layout.get(p) else { continue };
+        let h = lp.height.max(1.0);
+        let lo = if p == span.start_page { span.start_y_frac.unwrap_or(0.0) * h } else { 0.0 };
+        let hi = if p == span.end_page { span.end_y_frac.map(|y| y * h).unwrap_or(h) } else { h };
+        n += lp.figures.iter().filter(|r| {
+            let cy = (r[1] + r[3]) * 0.5;
+            cy >= lo - 5.0 && cy <= hi + 5.0
+        }).count();
+    }
+    Some(n)
+}
+
+/// True when this span's body came from the geometric layout map.
+pub(crate) fn is_layout_question(config: &PipelineConfig, span: &QuestionSpan) -> bool {
+    config.layout_questions.as_ref().is_some_and(|m| m.contains_key(&span.number))
+}
+
+/// Acceptance assembly for a layout-derived card. The body already carries
+/// source-reconstructed mathematics and exact boundaries, so none of the
+/// repair heuristics written for LLM/marker output run here — only the
+/// generic sanitizer (MCQ list syntax, diagram order, delimiter balance) and
+/// the marks/terminal-ending bookkeeping shared with every card.
+fn assemble_layout_question(
+    span: &QuestionSpan,
+    config: &PipelineConfig,
+    content: String,
+    mut needs_review: bool,
+    mut notes: Vec<String>,
+) -> Option<BuiltQuestion> {
+    let mut content = crate::sanitize::sanitize_question_content(&content, span.number);
+    content = validate::balance_math_delimiters(&content);
+    content = validate::ensure_display_math_line_breaks(&content);
+    if content.trim().is_empty() {
+        return None;
+    }
+    let ends_with_reference = config.layout_questions.as_ref().and_then(|m| m.get(&span.number)).is_some_and(|b| b.ends_with_reference);
+    if !validate::has_terminal_ending(&content) && !ends_with_reference {
+        needs_review = true;
+        notes.push("content lacks terminal punctuation (possible truncation)".to_string());
+    }
+    let inline = validate::sum_inline_marks(&content) + validate::sum_style_marks(&content);
+    let marks = match (span.expected_marks, inline) {
+        (Some(e), 0) => e as i32,
+        (Some(e), n) if n == e => e as i32,
+        (Some(e), n) => {
+            needs_review = true;
+            notes.push(format!("inline marks sum ({}) differs from printed footer ({}) — trusting footer", n, e));
+            e as i32
+        }
+        (None, n) if n > 0 => n as i32,
+        (None, _) => {
+            needs_review = true;
+            notes.push("no printed marks found for this question".to_string());
+            0
+        }
+    };
+    Some(BuiltQuestion {
+        question_number: span.number,
+        content,
+        marks,
+        topics: Vec::new(),
+        module: config.module_name.clone(),
+        is_code: false,
+        needs_review,
+        notes,
+    })
+}
+
 /// Extract multiple questions that reside entirely on the same single page in one consolidated call.
 /// Slashes input tokens and vision API calls by 70-80% on multi-question / MCQ pages.
 /// If any question is missing or fails validation, it falls back to extract_span for only that question.
@@ -5015,11 +6592,11 @@ async fn extract_same_page_batch<C: LlmClient>(
     // via the caption-aware candidate lookup), skip the vision call entirely.
     // If ANY question in the batch needs vision, the whole batch falls back
     // to the single shared-page vision call below (unchanged behaviour).
-    if text_first && !page.text.trim().is_empty() {
+    let digital = config.is_digital_document();
+    if (text_first || digital) && !page.text.trim().is_empty() {
         let span_pages = [(page_idx, page)];
         let combined_text = page.text.trim().to_string();
         let text_refs_figure = text_references_figure(&combined_text);
-        let must_read = figure_read_required(&combined_text);
         let referenced = figure_reference_numbers(&combined_text);
         let mut tf_out: Vec<(QuestionSpan, Option<BuiltQuestion>)> = Vec::with_capacity(spans.len());
         let mut tf_report = ImportReport::default();
@@ -5030,15 +6607,149 @@ async fn extract_same_page_batch<C: LlmClient>(
         let fig_counts: Vec<usize> = spans
             .iter()
             .map(|span| {
-                span_figure_candidates(span, &span_pages, page_figures, &referenced)
-                    .iter()
-                    .filter(|(_, f)| f.seg_confidence >= FIGURE_SUPPLY_MIN_CONFIDENCE)
-                    .count()
+                available_span_figures(span, &span_pages, page_figures, &referenced)
             })
             .collect();
         let needs_vision =
-            must_read || (text_refs_figure && fig_counts.iter().any(|&c| c == 0));
+            text_refs_figure && fig_counts.iter().any(|&c| c == 0);
 
+        {
+            // ── Tier-0 deterministic batch ───────────────────────────────
+            // Carve EVERY target span locally; all green ⇒ the page costs
+            // ZERO API calls. Any refusal ⇒ discard partials and fall
+            // through to the combined LLM call unchanged (fallback-for-all).
+            if config.deterministic || digital {
+                let paper_last_page = all_spans
+                    .iter()
+                    .map(|s| s.end_page)
+                    .max()
+                    .unwrap_or(page_idx);
+                if let Some(batch_built) = crate::deterministic::try_deterministic_batch(
+                    config,
+                    spans,
+                    page_idx,
+                    page,
+                    &fig_counts,
+                    paper_last_page,
+                    cancel,
+                ) {
+                    for (i, span) in spans.iter().enumerate() {
+                        let mut built_q = batch_built[i].clone();
+                        attach_detected_figures(
+                            config,
+                            span,
+                            &span_pages,
+                            page_figures,
+                            page_render_cache,
+                            &mut built_q,
+                            &mut tf_report,
+                        )
+                        .await;
+                        settle_tier0_outcome(span, &built_q, &mut tf_report);
+                        tf_report.pages_processed += 1;
+                        push_mark_check(span, &built_q, &mut tf_report);
+                        tf_out.push(((*span).clone(), Some(built_q)));
+                    }
+                    return (tf_out, tf_report);
+                }
+            }
+        }
+        // Digital document with a failed strict batch: every span on this page
+        // must resolve locally. Recover what can be recovered, flag it, and
+        // report the rest as local failures - never the combined LLM call or
+        // the shared-page vision call below.
+        if digital {
+            let paper_last_page = all_spans
+                .iter()
+                .map(|s| s.end_page)
+                .max()
+                .unwrap_or(page_idx);
+            for (i, span) in spans.iter().enumerate() {
+                let figures = fig_counts.get(i).copied().unwrap_or(0);
+                let margin_model = config
+                    .margin_model
+                    .get_or_init(|| crate::deterministic::build_margin_model(config, all_spans));
+                // 1. Re-try this span ALONE with the strict Tier-0 gates. The
+                // batch above is all-or-nothing, so a single stubborn span
+                // must not demote its clean siblings to "recovered".
+                if let Some((mut built_q, mut strict_report)) =
+                    crate::deterministic::try_deterministic_extraction(
+                        config,
+                        span,
+                        &span_pages,
+                        figures,
+                        paper_last_page,
+                        cancel,
+                        Some(margin_model),
+                    )
+                {
+                    attach_detected_figures(
+                        config,
+                        span,
+                        &span_pages,
+                        page_figures,
+                        page_render_cache,
+                        &mut built_q,
+                        &mut strict_report,
+                    )
+                    .await;
+                    settle_tier0_outcome(span, &built_q, &mut strict_report);
+                    strict_report.pages_processed += 1;
+                    push_mark_check(span, &built_q, &mut strict_report);
+                    tf_report.absorb(strict_report);
+                    tf_out.push(((*span).clone(), Some(built_q)));
+                    continue;
+                }
+                // 2. Only a genuinely failed span is retained as a flagged
+                // local recovery.
+                if let Some((mut built_q, mut rec_report, gate)) =
+                    crate::deterministic::try_local_recovery(
+                        config,
+                        span,
+                        &span_pages,
+                        figures,
+                        paper_last_page,
+                        cancel,
+                        Some(margin_model),
+                    )
+                {
+                    rec_report.recovered += 1;
+                    rec_report.anomalies.push(format!(
+                        "Question {}: local recovery (digital document, failed gate: {}); content retained for review, zero cloud calls",
+                        span.number, gate
+                    ));
+                    attach_detected_figures(
+                        config,
+                        span,
+                        &span_pages,
+                        page_figures,
+                        page_render_cache,
+                        &mut built_q,
+                        &mut rec_report,
+                    )
+                    .await;
+                    rec_report.pages_processed += 1;
+                    push_mark_check(span, &built_q, &mut rec_report);
+                    tf_report.absorb(rec_report);
+                    tf_out.push(((*span).clone(), Some(built_q)));
+                } else {
+                    let reason = "digital document: no viable local candidate and cloud extraction is disabled";
+                    eprintln!("[LOCAL_FAILURE] question={} reason={}", span.number, reason);
+                    tf_report
+                        .anomalies
+                        .push(format!("Question {}: {}", span.number, reason));
+                    tf_report.quarantined.push(QuarantineEvent {
+                        scope: "question".to_string(),
+                        page: Some(page_idx + 1),
+                        question_number: Some(span.number),
+                        reason: reason.to_string(),
+                    });
+                    tf_report.pages_processed += 1;
+                    tf_out.push(((*span).clone(), None));
+                }
+            }
+            return (tf_out, tf_report);
+        }
         if !needs_vision {
             if spans.len() >= 2 {
                 // ONE combined call transcribes every question on the page,
@@ -5097,7 +6808,7 @@ async fn extract_same_page_batch<C: LlmClient>(
                         &span_pages,
                         page_figures,
                         page_render_cache,
-                        &mut built_q.content,
+                        &mut built_q,
                         &mut tf_report,
                     )
                     .await;
@@ -5135,7 +6846,7 @@ async fn extract_same_page_batch<C: LlmClient>(
                 &span_pages,
                 page_figures,
                 page_render_cache,
-                &mut built_q.content,
+                &mut built_q,
                 &mut r,
             )
             .await;
@@ -5149,6 +6860,30 @@ async fn extract_same_page_batch<C: LlmClient>(
     }
 
     let max_attempts = 1 + config.max_repairs;
+
+    // Digital document whose shared page carries no usable text at all: there
+    // is nothing to carve and no cloud to ask. Report each span as a local
+    // failure instead of falling into the vision batch.
+    if digital {
+        let reason =
+            "digital document: page carries no usable text and cloud extraction is disabled";
+        let mut out = Vec::with_capacity(spans.len());
+        for span in spans {
+            eprintln!("[LOCAL_FAILURE] question={} reason={}", span.number, reason);
+            report
+                .anomalies
+                .push(format!("Question {}: {}", span.number, reason));
+            report.quarantined.push(QuarantineEvent {
+                scope: "question".to_string(),
+                page: Some(page_idx + 1),
+                question_number: Some(span.number),
+                reason: reason.to_string(),
+            });
+            report.pages_processed += 1;
+            out.push(((*span).clone(), None));
+        }
+        return (out, report);
+    }
 
     // Prepare full page image (no vertical clipping so all MCQs and visual options are fully visible)
     let prep_input = if let Some(b64) = page.get_b64() {
@@ -5246,7 +6981,7 @@ async fn extract_same_page_batch<C: LlmClient>(
                 schema: extraction_schema.clone(),
             }),
         );
-        let resp = match chat_with_permit(client, &body, request_semaphore, cancel, usage, StageTag::FallbackPage).await {
+        let resp = match chat_with_permit(client, &body, request_semaphore, cancel, usage, StageTag::FallbackPage, config.cloud_allowed()).await {
             Ok(r) => r,
             Err(e) => {
                 last_error = e.to_string();
@@ -5385,6 +7120,8 @@ async fn extract_same_page_batch<C: LlmClient>(
                                     || kind.contains("composite_visual_options") || kind.contains("visual_option")
                             })
                             .unwrap_or(false),
+                            exact: None,
+                            mask: Vec::new(),
                     });
                 }
                 let saved_before = saved_diagrams.clone();
@@ -5426,7 +7163,19 @@ async fn extract_same_page_batch<C: LlmClient>(
                 ai_marks,
             );
 
-            if let Some(built_q) = built_opt {
+            let mut built_q = built_opt;
+            if let Some(q) = &built_q {
+                let errs = validate::card_structure_errors(&q.content, span.number);
+                if !errs.is_empty() {
+                    eprintln!(
+                        "[BATCH_STRUCTURE_FALLBACK] question={} reason=({})",
+                        span.number,
+                        errs.join("; ")
+                    );
+                    built_q = None; // fall through to per-span extract_span below
+                }
+            }
+            if let Some(built_q) = built_q {
                 out.push(((*span).clone(), Some(built_q)));
                 continue;
             }
@@ -5457,6 +7206,28 @@ async fn extract_same_page_batch<C: LlmClient>(
 
 /// Deterministic per-item validation for a span. Returns human-readable
 /// violations (quoted verbatim back to the model in the repair prompt).
+/// Deterministic salvage for the most common model slip: diagram_bboxes and
+/// bbox_page_indexes arriving with different lengths. The fix is mechanical
+/// (pad with the span's first page / truncate the tail), so it must never
+/// burn a paid repair round or quarantine a question.
+fn reconcile_bbox_indexes(items: &mut [AiQuestion]) {
+    for item in items.iter_mut() {
+        let Some(bboxes) = &item.diagram_bboxes else { continue };
+        let n = bboxes.len();
+        match &mut item.bbox_page_indexes {
+            Some(idx) => {
+                idx.truncate(n);
+                while idx.len() < n {
+                    idx.push(serde_json::json!(0));
+                }
+            }
+            None => {
+                item.bbox_page_indexes = Some(vec![serde_json::json!(0); n]);
+            }
+        }
+    }
+}
+
 fn validate_span_items(page: &AiQuestionPage, span: &QuestionSpan) -> Vec<String> {
     let mut errors = Vec::new();
     for (idx, item) in page.items.iter().enumerate() {
@@ -5490,6 +7261,13 @@ fn validate_span_items(page: &AiQuestionPage, span: &QuestionSpan) -> Vec<String
         // to the model so the repair round fixes its own math boundaries
         // instead of shipping cards that swallow subsequent text.
         for e in validate::math_delimiter_balance_errors(content) {
+            errors.push(format!("item {}: {}", idx + 1, e));
+        }
+        // Structural formatting rules (the 6 trap classes). Evaluated on the
+        // SANITIZED content: the sanitizer's free fixes must never burn a
+        // paid repair round — only genuine transcription defects should.
+        let sanitized_item = crate::sanitize::sanitize_question_content(content, span.number);
+        for e in validate::card_structure_errors(&sanitized_item, span.number) {
             errors.push(format!("item {}: {}", idx + 1, e));
         }
         if let Some(bboxes) = &item.diagram_bboxes {
@@ -5651,6 +7429,11 @@ fn audit_diagram_boxes(
                     ));
                     continue;
                 }
+                Err(geometry::CropReject::Blank) => {
+                    bad.push((ii, bi));
+                    issues.push(format!("{label}: the box is blank — redraw it around the printed figure, or delete the box AND its [DIAGRAM_PLACEHOLDER]"));
+                    continue;
+                }
             };
 
             // Check if the cropped region looks like answer space
@@ -5769,6 +7552,8 @@ fn split_compound_figures_if_needed(
     }
 }
 
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
 fn save_diagram(
     global_page_idx: usize,
     page_b64: Option<&str>,
@@ -5779,6 +7564,23 @@ fn save_diagram(
     report: &mut ImportReport,
     ignore_grid: bool,
     graph_like: bool,
+) -> Option<String> {
+    save_diagram_with(global_page_idx, page_b64, bbox, config, page_render_cache, saved, report, ignore_grid, graph_like, None, &[])
+}
+
+#[allow(clippy::too_many_arguments)]
+fn save_diagram_with(
+    global_page_idx: usize,
+    page_b64: Option<&str>,
+    bbox: &[f32],
+    config: &PipelineConfig,
+    page_render_cache: &crate::pdf_render::PageRenderCache,
+    saved: &mut Vec<([u8; 64], String)>,
+    report: &mut ImportReport,
+    ignore_grid: bool,
+    graph_like: bool,
+    exact: Option<f32>,
+    mask: &[[f32; 4]],
 ) -> Option<String> {
     if bbox.len() != 4 {
         report.crop_rejections += 1;
@@ -5797,13 +7599,30 @@ fn save_diagram(
             std::sync::Arc::new(geometry::decode_page_image(b64)?)
         }
     };
-    let cropped = match geometry::crop_diagram_with_options(
-        img.as_ref(),
-        bbox,
-        40,
-        ignore_grid,
-        graph_like,
-    ) {
+    // Furniture over the box (a QR code at the corner of a wide figure) is
+    // painted out of a copy of the page before cropping.
+    let meets = |m: &[f32; 4]| m[0] < bbox[0] + bbox[2] && m[0] + m[2] > bbox[0] && m[1] < bbox[1] + bbox[3] && m[1] + m[3] > bbox[1];
+    let img = if mask.iter().any(meets) {
+        let mut page = img.as_ref().to_rgba8();
+        let (pw, ph) = (page.width() as f32, page.height() as f32);
+        for m in mask.iter().filter(|m| meets(m)) {
+            let (x0, y0) = (((m[0] * pw).floor() - 1.0).max(0.0) as u32, ((m[1] * ph).floor() - 1.0).max(0.0) as u32);
+            let (x1, y1) = (((m[0] + m[2]) * pw).ceil().min(pw - 1.0) as u32 + 1, ((m[1] + m[3]) * ph).ceil().min(ph - 1.0) as u32 + 1);
+            for y in y0..y1.min(page.height()) {
+                for x in x0..x1.min(page.width()) {
+                    page.put_pixel(x, y, image::Rgba([255, 255, 255, 255]));
+                }
+            }
+        }
+        std::sync::Arc::new(image::DynamicImage::ImageRgba8(page))
+    } else {
+        img
+    };
+    let cropped = match if let Some(pad) = exact {
+        geometry::crop_exact(img.as_ref(), bbox, ignore_grid, pad)
+    } else {
+        geometry::crop_diagram_with_options(img.as_ref(), bbox, 40, ignore_grid, graph_like)
+    } {
         Ok(c) => c,
         Err(reason) => {
             report.crop_rejections += 1;
@@ -5815,13 +7634,6 @@ fn save_diagram(
         }
     };
     let sig = geometry::tile_signature(&cropped);
-    if let Some((_, link)) = saved
-        .iter()
-        .find(|(s, _)| geometry::signature_distance(s, &sig) < 4)
-    {
-        report.diagrams_deduped += 1;
-        return Some(link.clone());
-    }
     let dir = config.diagrams_dir.as_ref()?;
     let _ = std::fs::create_dir_all(dir);
     let path = dir.join(format!("{}.png", uuid::Uuid::new_v4()));
@@ -5842,6 +7654,15 @@ fn save_diagram(
         cropped
     };
 
+    // A coarse 8x8 signature cannot distinguish different plotted curves
+    // on the same grid. Confirm pixels before reusing a saved figure.
+    for (_, link) in saved.iter().filter(|(s, _)| geometry::signature_distance(s, &sig) < 4) {
+        let existing_path = link.trim().strip_prefix("![Diagram](").and_then(|s| s.strip_suffix(')'));
+        if existing_path.and_then(|p| image::open(p).ok()).is_some_and(|img| img.to_rgba8() == final_crop) {
+            report.diagrams_deduped += 1;
+            return Some(link.clone());
+        }
+    }
     if final_crop.save(&path).is_err() {
         report.crop_rejections += 1;
         return None;
@@ -5975,7 +7796,7 @@ RULES:
             config.max_output_tokens.min(StageTag::FallbackPage.output_cap()),
             Some(llm::ResponseFormat::JsonSchema { schema: extraction_json_schema() }),
         );
-        let resp = match chat_with_permit(client, &body, request_semaphore, cancel, usage, StageTag::FallbackPage).await {
+        let resp = match chat_with_permit(client, &body, request_semaphore, cancel, usage, StageTag::FallbackPage, config.cloud_allowed()).await {
             Ok(r) => r,
             Err(e) => {
                 last_error = e.to_string();
@@ -6167,6 +7988,8 @@ RULES:
                         bbox: bbox.clone(),
                         ignore_grid,
                         graph_like: false,
+                        exact: None,
+                        mask: Vec::new(),
                     });
                 }
                 let mut page_b64 = std::collections::HashMap::new();
@@ -6335,7 +8158,7 @@ async fn try_ms_text_first_window<C: LlmClient>(
             }),
         );
         let api_start = Instant::now();
-        let resp = match chat_with_permit(client, &body, request_semaphore, cancel, usage, StageTag::MsTextFirst).await {
+        let resp = match chat_with_permit(client, &body, request_semaphore, cancel, usage, StageTag::MsTextFirst, config.cloud_allowed()).await {
             Ok(r) => r,
             Err(e) => {
                 last_error = e.to_string();
@@ -6509,7 +8332,7 @@ async fn read_markscheme_window<C: LlmClient>(
             config.max_output_tokens.min(StageTag::MsWindow.output_cap()),
             Some(llm::ResponseFormat::JsonSchema { schema: extraction_json_schema() }),
         );
-        let resp = match chat_with_permit(client, &body, request_semaphore, cancel, usage, StageTag::MsWindow).await {
+        let resp = match chat_with_permit(client, &body, request_semaphore, cancel, usage, StageTag::MsWindow, config.cloud_allowed()).await {
             Ok(r) => r,
             Err(e) => {
                 last_error = e.to_string();
@@ -6572,6 +8395,46 @@ pub async fn run_markscheme_pipeline<C: LlmClient, P: Progress>(
         pages_total: pages.len(),
         ..Default::default()
     };
+    cancelled(cancel)?;
+    if config.deterministic {
+        if let Some(path) = config.pdf_path.as_ref().filter(|p| p.extension().is_some_and(|e| e.eq_ignore_ascii_case("pdf"))) {
+            progress.stage("Reading mark-scheme tables locally…");
+            let path = path.clone();
+            let stop = Arc::new(AtomicBool::new(false));
+            let worker_stop = Arc::clone(&stop);
+            let mut worker = tokio::task::spawn_blocking(move || {
+                let pages = crate::mark_scheme_deterministic::collect_page_evidence(&path, &worker_stop)?;
+                crate::mark_scheme_deterministic::extract(&pages, &worker_stop)
+            });
+            let result = loop {
+                tokio::select! {
+                    result = &mut worker => break result.map_err(|e| e.to_string()).and_then(|r| r),
+                    _ = tokio::time::sleep(std::time::Duration::from_millis(50)) => {
+                        if cancel.load(Ordering::Relaxed) {
+                            stop.store(true, Ordering::Relaxed);
+                            return Err("Import cancelled by user".into());
+                        }
+                    }
+                }
+            };
+            cancelled(cancel)?;
+            match result {
+                Ok(extraction) if extraction.page_count == pages.len() => {
+                    let drafts = extraction.into_drafts();
+                    report.deterministic = drafts.len();
+                    report.questions_extracted = drafts.len();
+                    report.questions_expected = drafts.len();
+                    report.pages_processed = pages.len();
+                    report.total_elapsed_ms = overall_start.elapsed().as_millis() as u64;
+                    report.record_timing("extraction", "ms_tier0", None, None, report.total_elapsed_ms);
+                    return Ok((drafts, report));
+                }
+                Ok(_) => eprintln!("[MS_TIER0_FALLBACK] PDF/page-input count mismatch"),
+                Err(reason) => eprintln!("[MS_TIER0_FALLBACK] {reason}"),
+            }
+            report.record_timing("extraction", "ms_tier0_refused", None, None, overall_start.elapsed().as_millis() as u64);
+        }
+    }
     let page_render_cache = Arc::new(crate::pdf_render::PageRenderCache::new(
         PAGE_RENDER_CACHE_CAPACITY,
     ));
@@ -6722,6 +8585,8 @@ pub async fn run_markscheme_pipeline<C: LlmClient, P: Progress>(
                         bbox: bbox.clone(),
                         ignore_grid,
                         graph_like: false,
+                        exact: None,
+                        mask: Vec::new(),
                     });
                     }
                     let saved_before = saved_diagrams.clone();
@@ -6833,6 +8698,22 @@ mod tests {
         AtomicBool::new(false)
     }
 
+    /// Legacy cloud-path fixtures carry page text only so the structure pass
+    /// and map behave as before. They model an image-only input, so they bind
+    /// an explicit scanned context: production always derives the class from
+    /// the pages, and the flag does not exist outside test builds.
+    /// Run the question pipeline with an explicit cloud context.
+    async fn run_cloud_pipeline<C: crate::llm::LlmClient>(
+        client: &C,
+        pages: &[PageInput],
+        figures: &[Vec<crate::pdf_render::DetectedFigure>],
+        cfg: &PipelineConfig,
+    ) -> Result<(Vec<BuiltQuestion>, ImportReport), String> {
+        let mut cfg = cfg.clone();
+        cfg.force_scanned_context = true;
+        run_question_pipeline(client, pages, figures, &cfg, &NullProgress, &cancel_flag()).await
+    }
+
     fn usage() -> Arc<TokenTotals> {
         Arc::new(TokenTotals::new())
     }
@@ -6873,7 +8754,7 @@ mod tests {
         ]);
         let pgs = paper_pages();
         let (built, report) =
-            run_question_pipeline(&mock, &pgs, &[], &config(), &NullProgress, &cancel_flag())
+            run_cloud_pipeline(&mock, &pgs, &[], &config())
                 .await
                 .unwrap();
         println!("BUILT: {:#?}", built);
@@ -6907,7 +8788,7 @@ mod tests {
         ]);
         let pgs = paper_pages();
         let (built, report) =
-            run_question_pipeline(&mock, &pgs, &[], &config(), &NullProgress, &cancel_flag())
+            run_cloud_pipeline(&mock, &pgs, &[], &config())
                 .await
                 .unwrap();
         assert_eq!(built.len(), 2);
@@ -6937,7 +8818,7 @@ mod tests {
         ]);
         let pgs = paper_pages();
         let (built, report) =
-            run_question_pipeline(&mock, &pgs, &[], &config(), &NullProgress, &cancel_flag())
+            run_cloud_pipeline(&mock, &pgs, &[], &config())
                 .await
                 .unwrap();
         assert_eq!(built.len(), 2); // Q1 fallback + Q2
@@ -6966,7 +8847,7 @@ mod tests {
         ]);
         let pgs = paper_pages();
         let (built, report) =
-            run_question_pipeline(&mock, &pgs, &[], &config(), &NullProgress, &cancel_flag())
+            run_cloud_pipeline(&mock, &pgs, &[], &config())
                 .await
                 .unwrap();
         assert_eq!(built.len(), 2);
@@ -6993,11 +8874,51 @@ mod tests {
         ]);
         let pgs = paper_pages();
         let (built, report) =
-            run_question_pipeline(&mock, &pgs, &[], &config(), &NullProgress, &cancel_flag())
+            run_cloud_pipeline(&mock, &pgs, &[], &config())
                 .await
                 .unwrap();
         assert_eq!(built.len(), 2);
         assert!(report.salvage_events >= 1);
+    }
+
+    #[tokio::test]
+    async fn mark_scheme_tier0_uses_pdf_evidence_and_skips_cloud() {
+        let _lock = crate::pdf_render::pdfium_test_lock();
+        let path = std::env::temp_dir().join(format!("mm_ms_pipeline_{}.pdf", uuid::Uuid::new_v4()));
+        crate::mark_scheme_deterministic::tests::write_pdf_fixture(&path, false);
+        let mut cfg = config();
+        cfg.pdf_path = Some(path.clone());
+        cfg.deterministic = true;
+        let mock = MockLlm::new(vec![]);
+        let pages = vec![PageInput { kind: PageInputKind::TextOnly, text: "Page evidence is read from the PDF".into() }];
+        let (drafts, report) = run_markscheme_pipeline(&mock, &pages, &cfg, &NullProgress, &cancel_flag()).await.unwrap();
+        assert_eq!(drafts.len(), 1);
+        assert!(drafts[0].markdown.contains("The force increases."));
+        assert!(drafts[0].markdown.contains("Accept greater force."));
+        assert_eq!(report.deterministic, 1);
+        assert_eq!(report.pages_processed, 1);
+        assert_eq!(mock.bodies().len(), 0);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn mark_scheme_tier0_refusal_falls_back_without_partial_answers() {
+        let _lock = crate::pdf_render::pdfium_test_lock();
+        let path = std::env::temp_dir().join(format!("mm_ms_fallback_{}.pdf", uuid::Uuid::new_v4()));
+        crate::mark_scheme_deterministic::tests::write_pdf_fixture(&path, true);
+        let mut cfg = config();
+        cfg.pdf_path = Some(path.clone());
+        cfg.deterministic = true;
+        cfg.ms_text_first = true;
+        let mock = MockLlm::new(vec![ok_chat(r#"{"answers":[{"question_number":1,"answer_markdown":"Complete answer including continuation. M1 A1"}]}"#)]);
+        let text = "Question Answers Additional comments Mark AO\n01.1 The force increases as extension increases. Accept equivalent wording. Marking point M1. Accuracy A1. Total 2 marks.";
+        let pages = vec![PageInput { kind: PageInputKind::TextOnly, text: text.repeat(4) }; 2];
+        let (drafts, report) = run_markscheme_pipeline(&mock, &pages, &cfg, &NullProgress, &cancel_flag()).await.unwrap();
+        assert_eq!(drafts.len(), 1);
+        assert!(drafts[0].markdown.contains("Complete answer including continuation"));
+        assert_eq!(report.deterministic, 0);
+        assert_eq!(mock.bodies().len(), 1);
+        std::fs::remove_file(path).unwrap();
     }
 
     #[tokio::test]
@@ -7164,6 +9085,7 @@ mod tests {
             caption: Some("Figure 1".into()),
             kind: Some("circuit".into()),
             seg_confidence: 0.3,
+            option_label: None,
         }]];
         let mock = MockLlm::new(vec![ok_chat(
             r#"{"items":[{"question_number":30,"content":"The total resistance is $6\\,\\Omega$. **[2 marks]**","marks":2,"topics":["circuits"],"module":"Algebra","is_code":false,"diagram_bboxes":[],"diagram_captions":[],"diagram_kinds":[],"bbox_page_indexes":[],"math_snippet":"6\\Omega","visual_options":null}]}"#,
@@ -7214,6 +9136,7 @@ mod tests {
             caption: Some("Figure 1".into()),
             kind: Some("circuit".into()),
             seg_confidence: 0.9,
+            option_label: None,
         }]];
         let mock = MockLlm::new(vec![ok_chat(
             r#"{"items":[{"question_number":30,"content":"The total resistance is $6\\,\\Omega$. **[2 marks]**","marks":2,"topics":["circuits"],"module":"Algebra","is_code":false,"diagram_bboxes":[],"diagram_captions":[],"diagram_kinds":[],"bbox_page_indexes":[],"math_snippet":"6\\Omega","visual_options":null}]}"#,
@@ -8279,12 +10202,14 @@ mod tests {
                 caption: Some("Figure 1".to_string()),
                 kind: Some("circuit".to_string()),
                 seg_confidence: 0.9,
+                option_label: None,
             },
             crate::pdf_render::DetectedFigure {
                 bbox: [200.0 / 1200.0, 1000.0 / 1600.0, 500.0 / 1200.0, 300.0 / 1600.0],
                 caption: Some("Figure 2".to_string()),
                 kind: Some("graph".to_string()),
                 seg_confidence: 0.9,
+                option_label: None,
             },
         ]];
         let mock = MockLlm::new(vec![ok_chat(
@@ -8396,12 +10321,57 @@ mod tests {
         );
     }
 
+    #[test]
+    fn detached_option_figures_bind_only_when_the_letter_is_forced() {
+        let link = |n: &str| Some(format!("![Diagram](d/{n}.png)"));
+        // Physics '24 Q26 shape: three printed letters, one anonymous crop at
+        // top-left. Because the run A..D is missing exactly A, the anonymous
+        // crop is forced to A and every crop is bound.
+        let links = [link("d"), link("a"), link("b"), link("c")];
+        let labels = [Some('D'), None, Some('B'), Some('C')];
+        let pairs = bind_detached_option_pairs(&links, &labels).expect("forced assignment");
+        let mut sorted = pairs.clone();
+        sorted.sort_by_key(|(c, _)| *c);
+        assert_eq!(sorted.iter().map(|(c, _)| *c).collect::<Vec<_>>(), vec!['A', 'B', 'C', 'D']);
+        assert_eq!(pairs[1].0, 'A', "the anonymous top-left crop becomes A");
+
+        // Two anonymous crops: the assignment is ambiguous, so nothing binds.
+        let labels2 = [Some('D'), None, None, Some('C')];
+        assert!(bind_detached_option_pairs(&links, &labels2).is_none());
+        // Duplicate printed letter: reject rather than collapse an option.
+        let labels3 = [Some('D'), None, Some('D'), Some('C')];
+        assert!(bind_detached_option_pairs(&links, &labels3).is_none());
+        // Non-contiguous / mismatched run: reject.
+        let labels4 = [Some('D'), None, Some('B'), Some('E')];
+        assert!(bind_detached_option_pairs(&links, &labels4).is_none());
+        // Fewer than three crops cannot be an option grid.
+        assert!(bind_detached_option_pairs(&links[..2], &labels[..2]).is_none());
+        // Every crop labelled is fine too (no forced slot needed).
+        let full = [Some('A'), Some('B'), Some('C'), Some('D')];
+        assert!(bind_detached_option_pairs(&links, &full).is_some());
+
+        // Stem corroboration: labelled crops alone are not enough. A multi-part
+        // question or a plain descriptive figure must not become an MCQ.
+        assert!(stem_supports_mcq_options(
+            "Which diagram shows a distribution of charge where the potential is zero?"
+        ));
+        assert!(!stem_supports_mcq_options("(a) Which graph is correct?"));
+        assert!(!stem_supports_mcq_options("The figure shows three labelled parts."));
+        assert!(!stem_supports_mcq_options("Which graph is correct"));
+        // The mark tag is appended before crops attach: it must not defeat the
+        // question-mark / choose-word check (physics '24 Q26 shape).
+        assert!(stem_supports_mcq_options(
+            "Which diagram shows a distribution of charge where the potential at P is zero?\n\n**[1 mark]**"
+        ));
+    }
+
     fn fig_on_page(caption: &str, bbox: [f32; 4]) -> crate::pdf_render::DetectedFigure {
         crate::pdf_render::DetectedFigure {
             bbox,
             caption: Some(caption.to_string()),
             kind: None,
             seg_confidence: 0.9,
+            option_label: None,
         }
     }
 
@@ -8561,6 +10531,26 @@ mod tests {
         );
     }
 
+    #[test]
+    fn unnumbered_mcq_figures_follow_printed_reading_order() {
+        let pages = vec![text_image_page()];
+        let span_pages = vec![(0, &pages[0])];
+        let span = doc_map::QuestionSpan {
+            number: 26, start_page: 0, end_page: 0,
+            start_y_frac: None, end_y_frac: None, expected_marks: Some(1),
+            reliable_pages: vec![], ambiguous_pages: vec![],
+        };
+        let figures = vec![vec![
+            fig_on_page("", [0.55, 0.60, 0.30, 0.20]),
+            fig_on_page("", [0.10, 0.22, 0.30, 0.20]),
+            fig_on_page("", [0.10, 0.60, 0.30, 0.20]),
+            fig_on_page("", [0.55, 0.20, 0.30, 0.20]),
+        ]];
+        let ordered = span_figure_candidates(&span, &span_pages, &figures, &[]);
+        let positions: Vec<_> = ordered.iter().map(|(_, f)| (f.bbox[0], f.bbox[1])).collect();
+        assert_eq!(positions, vec![(0.10, 0.22), (0.55, 0.20), (0.10, 0.60), (0.55, 0.60)]);
+    }
+
     #[tokio::test]
     async fn same_page_batch_uses_text_first_when_all_questions_safe() {
         // Shared-page batches were the last full-page-vision cost: one page
@@ -8571,7 +10561,7 @@ mod tests {
             kind: PageInputKind::Image {
                 b64: text_image_page().get_b64().unwrap().to_string(),
             },
-            text: "8. Figure 5 shows a graph. State the gradient.\n\n[2 marks]\n\n9. State the value of $x$.\n\n[1 mark]"
+            text: "8. Figure 5 shows a graph. Use the graph to determine the gradient.\n\n[2 marks]\n\n9. State the value of $x$.\n\n[1 mark]"
                 .into(),
         }];
         let spans = vec![
@@ -8601,7 +10591,7 @@ mod tests {
         // ONE combined text-first call returns both questions' items.
         let mock = MockLlm::new(vec![ok_chat(
             r#"{"items":[
-                {"question_number":8,"content":"Figure 5 shows a graph. The gradient is $3$. **[2 marks]**","marks":2,"topics":[],"module":"Algebra","is_code":false,"diagram_bboxes":[],"diagram_captions":[],"diagram_kinds":[],"bbox_page_indexes":[],"math_snippet":"3","visual_options":null},
+                {"question_number":8,"content":"Figure 5 shows a graph. Use the graph to determine the gradient. **[2 marks]**","marks":2,"topics":[],"module":"Algebra","is_code":false,"diagram_bboxes":[],"diagram_captions":[],"diagram_kinds":[],"bbox_page_indexes":[],"math_snippet":"","visual_options":null},
                 {"question_number":9,"content":"The value of $x$ is $7$. **[1 mark]**","marks":1,"topics":[],"module":"Algebra","is_code":false,"diagram_bboxes":[],"diagram_captions":[],"diagram_kinds":[],"bbox_page_indexes":[],"math_snippet":"7","visual_options":null}
             ]}"#,
         )]);
@@ -8894,8 +10884,8 @@ mod tests {
                 let span_pages: Vec<(usize, &PageInput)> =
                     (span.start_page..=span.end_page).map(|p| (p, &dummy)).collect();
                 let fig_count =
-                    span_figure_candidates(span, &span_pages, &page_figures, &referenced).len();
-                let needs_vision = must_read || (text_refs_figure && fig_count == 0);
+                    available_span_figures(span, &span_pages, &page_figures, &referenced);
+                let needs_vision = text_refs_figure && fig_count == 0;
                 let (kind, idx) = if !has_text {
                     ("no_text", 3)
                 } else if !needs_vision {
@@ -8928,15 +10918,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn crop_first_reads_figure_crop_not_full_page() {
-        // Read-from-figure question + detected figure → the vision call must
-        // send ONLY the ≤512px figure crop (not the full page), and the crop
-        // is attached to the card afterwards.
+    async fn graph_reading_is_transcribed_locally_with_attached_graph() {
+        // Preserve the instruction and graph; ingestion does not solve it.
         let pgs = vec![PageInput {
             kind: PageInputKind::Image {
                 b64: text_image_page().get_b64().unwrap().to_string(),
             },
-            text: "Use the graph to determine the value of $x$. Figure 3 shows the graph.\n\n[2 marks]"
+            text: "30. Figure 3 shows the graph. Use the graph to determine the acceleration of the trolley during the first ten seconds of its journey. [2 marks]\n(Total for Question 30 is 2 marks)"
                 .into(),
         }];
         let span_pages: Vec<(usize, &PageInput)> = vec![(0, &pgs[0])];
@@ -8952,12 +10940,11 @@ mod tests {
         };
         let page_figures =
             vec![vec![fig_on_page("Figure 3", [0.08, 0.45, 0.50, 0.30])]];
-        let mock = MockLlm::new(vec![ok_chat(
-            r#"{"items":[{"question_number":30,"content":"From the graph, $x = 4.2$. **[2 marks]**","marks":2,"topics":["graphs"],"module":"Algebra","is_code":false,"diagram_bboxes":[],"diagram_captions":[],"diagram_kinds":[],"bbox_page_indexes":[],"math_snippet":"x = 4.2","visual_options":null}]}"#,
-        )]);
+        let mock = MockLlm::new(vec![]);
         let dir = std::env::temp_dir().join(format!("mm_cropfirst_{}", uuid::Uuid::new_v4()));
         let mut cfg = config();
         cfg.text_first = true;
+        cfg.deterministic = true;
         cfg.diagrams_dir = Some(dir.clone());
         let cache = Arc::new(crate::pdf_render::PageRenderCache::new(
             PAGE_RENDER_CACHE_CAPACITY,
@@ -8981,40 +10968,33 @@ mod tests {
             &usage(),
         )
         .await;
-        let built = built_opt.expect("crop-first must build the question");
-        assert!(built.content.contains("4.2"), "value read from the crop");
-        assert_eq!(report.text_first, 0, "not a text-first success");
-        assert_eq!(mock.bodies().len(), 1, "exactly one crop-first call");
-        // The image attached to the call is the ≤512px crop, not the full page.
-        let bodies = mock.bodies();
-        let urls: Vec<&str> = bodies[0]["messages"][1]["content"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .filter(|c| c["type"] == "image_url")
-            .filter_map(|c| c["image_url"]["url"].as_str())
-            .collect();
-        assert_eq!(urls.len(), 1, "crop-first body carries exactly one image");
-        let decoded = geometry::decode_page_image(urls[0]).expect("crop must decode");
-        let (w, h) = decoded.dimensions();
-        assert!(
-            w.max(h) <= 512,
-            "crop-first image was {}x{} — must be a ≤512px figure crop, not a page",
-            w,
-            h
-        );
+        let built = built_opt.expect("Tier-0 must build the question");
+        assert!(built.content.contains("determine the acceleration"));
+        assert_eq!(report.deterministic, 1);
+        assert_eq!(mock.bodies().len(), 0, "zero model calls");
+        assert!(!built.needs_review, "{:?}", built.notes);
         assert_eq!(
             built.content.matches("![Diagram](").count(),
             1,
             "the crop is attached to the card: {}",
             built.content
         );
+        // A detection that cannot be persisted is not a verified attachment.
+        cfg.diagrams_dir = None;
+        let (review, _) = extract_span(&mock, &cfg, &span, &span_pages, &page_figures,
+            &cache, &Arc::new(PageImageCache::new()), &semaphore, &collateral,
+            &all_spans, true, &cancel_flag(), &usage()).await;
+        let review = review.unwrap();
+        assert!(review.needs_review);
+        assert!(review.notes.iter().any(|n| n.contains("could not be attached")));
+        assert!(!review.content.contains("PLACEHOLDER"));
+        assert!(mock.bodies().is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
-    async fn crop_first_falls_back_to_full_page_when_parse_fails() {
-        // A broken crop-first response must fall through to the unchanged
+    async fn graph_text_first_falls_back_to_full_page_when_parse_fails() {
+        // A broken text-first response must fall through to the unchanged
         // full-page vision path so the question is never lost.
         let pgs = vec![PageInput {
             kind: PageInputKind::Image {
@@ -9071,7 +11051,7 @@ mod tests {
         assert_eq!(
             mock.bodies().len(),
             2,
-            "crop-first attempt then full-page fallback"
+            "text-first attempt then full-page fallback"
         );
         assert!(
             body_has_image(&mock.bodies()[1]),
@@ -9104,7 +11084,7 @@ mod tests {
         let l2 = save_diagram(
             0,
             chart.get_b64().map(String::as_str),
-            &[0.03, 0.06, 0.88, 0.80],
+            &[0.02, 0.05, 0.90, 0.82],
             &cfg,
             &cache,
             &mut saved,
@@ -9134,6 +11114,15 @@ mod tests {
         assert!(g.is_none(), "answer grid rejected at save");
         assert!(report.crop_rejections >= 1);
         assert_eq!(report.diagrams_saved, 1, "still exactly one PNG written");
+
+        // Similar grids with a changed label/curve must not alias each other.
+        let mut different = chart_img();
+        for x in 280..290 { for y in 220..230 { different.put_pixel(x, y, image::Luma([0])); } }
+        let changed_b64 = png_b64(&different);
+        let distinct = save_diagram(1, Some(&changed_b64), &[0.02, 0.05, 0.90, 0.82],
+            &cfg, &cache, &mut saved, &mut report, false, false).unwrap();
+        assert_ne!(distinct, l1, "different figure must get its own image");
+        assert_eq!(report.diagrams_saved, 2);
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -9211,7 +11200,7 @@ mod tests {
             },
         ];
         let (built, report) =
-            run_question_pipeline(&mock, &pgs, &[], &config(), &NullProgress, &cancel_flag())
+            run_cloud_pipeline(&mock, &pgs, &[], &config())
                 .await
                 .unwrap();
 
@@ -9253,7 +11242,7 @@ mod tests {
             },
         ];
         let (built, report) =
-            run_question_pipeline(&mock, &pgs, &[], &config(), &NullProgress, &cancel_flag())
+            run_cloud_pipeline(&mock, &pgs, &[], &config())
                 .await
                 .unwrap();
 
@@ -9268,9 +11257,10 @@ mod tests {
     #[tokio::test]
     async fn collateral_question_reused_from_shared_page() {
         let mock = MockLlm::new(vec![
-            // structure pass: Q1 on pages 1-2 (multi-page), Q2 on page 2 (single-page)
-            structure_reply("QUESTION", "[1]", "[5]"),
-            structure_reply("QUESTION", "[1, 2]", "[5, 3]"),
+            // structure pass: Q1 on pages 1-2 (multi-page), Q2 on page 2 (single-page).
+            // A footer is [question_number, marks]; page 1 shows none.
+            structure_reply("QUESTION", "[1]", "null"),
+            structure_reply("QUESTION", "[1, 2]", "[2, 3]"),
             // Q1 extraction call (spans pages 1 and 2): returns both Q1 and downstream Q2 as collateral
             ok_chat(
                 r#"{"items":[
@@ -9287,15 +11277,17 @@ mod tests {
             },
             PageInput {
                 kind: PageInputKind::TextOnly,
-                text: "1 Question 1 begins on page 1...".into(),
+                // Scanned question pages: no text layer.
+                text: String::new(),
             },
             PageInput {
                 kind: PageInputKind::TextOnly,
-                text: "1 Question 1 ends here. (Total for Question 1 is 5 marks)\n2 Question 2 starts here. (Total for Question 2 is 3 marks)".into(),
+                text: String::new(),
             },
         ];
         let mut cfg = config();
         cfg.parallelism = 1;
+        cfg.force_scanned_context = true;
         let (built, report) =
             run_question_pipeline(&mock, &pgs, &[], &cfg, &NullProgress, &cancel_flag())
                 .await
@@ -9335,6 +11327,1255 @@ mod tests {
         assert!(spliced.contains("Figure 3 shows the decay.\n\n\n![Diagram](url_fig3.png)"), "Figure 3 must receive url_fig3");
         assert!(spliced.contains("Figure 4 shows capacitors.\n\n\n![Diagram](url_fig4.png)"), "Figure 4 must receive url_fig4");
     }
+
+    // --- Tier-0 deterministic extraction (zero-cost import cascade) ------
+
+    #[tokio::test]
+    async fn tier0_resolves_span_without_api_calls() {
+        let pgs = [PageInput {
+            kind: PageInputKind::Image {
+                b64: text_image_page().get_b64().unwrap().to_string(),
+            },
+            text: "5. Define specific heat capacity and explain why water has an unusually high value compared with most common substances used as coolants. [4 marks]\n(Total for Question 5 is 4 marks)".into(),
+        }];
+        let span_pages: Vec<(usize, &PageInput)> = vec![(0, &pgs[0])];
+        let span = doc_map::QuestionSpan {
+            number: 5,
+            start_page: 0,
+            end_page: 0,
+            start_y_frac: None,
+            end_y_frac: None,
+            expected_marks: Some(4),
+            reliable_pages: vec![],
+            ambiguous_pages: vec![],
+        };
+        // Empty queue: ANY API call would panic the mock.
+        let mock = MockLlm::new(vec![]);
+        let cache = Arc::new(crate::pdf_render::PageRenderCache::new(PAGE_RENDER_CACHE_CAPACITY));
+        let semaphore = Arc::new(Semaphore::new(1));
+        let collateral = Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
+        let all_spans = Arc::new(vec![span.clone()]);
+        let mut cfg = config();
+        cfg.text_first = true;
+        cfg.deterministic = true;
+        // Production conditions: commands.rs ALWAYS populates allowed_topics
+        // from the module taxonomy. Tier 0 must still carve locally.
+        cfg.allowed_topics = vec!["Materials".into(), "Electricity".into()];
+        let (built_opt, report) =
+            extract_span(&mock, &cfg, &span, &span_pages, &[], &cache, &Arc::new(PageImageCache::new()), &semaphore, &collateral, &all_spans, true, &cancel_flag(), &usage()).await;
+        let built = built_opt.expect("Tier-0 must carve this span locally");
+        assert_eq!(built.marks, 4);
+        assert!(built.content.contains("specific heat capacity"));
+        assert_eq!(report.deterministic, 1);
+        assert_eq!(report.text_first, 0);
+        assert_eq!(mock.bodies().len(), 0, "ZERO API calls for a Tier-0 span");
+    }
+
+    #[tokio::test]
+    async fn tier0_escalates_to_llm_on_garbage() {
+        let pgs = [PageInput {
+            kind: PageInputKind::Image {
+                b64: text_image_page().get_b64().unwrap().to_string(),
+            },
+            text: "6. Calculate the resultant force on the trolley and state its direction of motion clearly. [2 marks]\n(Total for Question 6 is 3 marks)".into(),
+        }];
+        let span_pages: Vec<(usize, &PageInput)> = vec![(0, &pgs[0])];
+        let span = doc_map::QuestionSpan {
+            number: 6,
+            start_page: 0,
+            end_page: 0,
+            start_y_frac: None,
+            end_y_frac: None,
+            expected_marks: Some(3),
+            reliable_pages: vec![],
+            ambiguous_pages: vec![],
+        };
+        let mock = MockLlm::new(vec![ok_chat(
+            r#"{"items":[{"question_number":6,"content":"The resultant force is $120$ N acting opposite to the direction of motion of the trolley. **[3 marks]**","marks":3,"topics":[],"module":"Algebra","is_code":false,"diagram_bboxes":[],"diagram_captions":[],"diagram_kinds":[],"bbox_page_indexes":[],"math_snippet":"120","visual_options":null}]}"#,
+        )]);
+        let cache = Arc::new(crate::pdf_render::PageRenderCache::new(PAGE_RENDER_CACHE_CAPACITY));
+        let semaphore = Arc::new(Semaphore::new(1));
+        let collateral = Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
+        let all_spans = Arc::new(vec![span.clone()]);
+        let mut cfg = config();
+        cfg.allowed_topics = vec!["Forces".into()];
+        cfg.text_first = true;
+        cfg.deterministic = true;
+        let (built_opt, report) =
+            extract_span(&mock, &cfg, &span, &span_pages, &[], &cache, &Arc::new(PageImageCache::new()), &semaphore, &collateral, &all_spans, true, &cancel_flag(), &usage()).await;
+        let built = built_opt.expect("LLM fallback must build the question");
+        assert!(built.content.contains("resultant force"));
+        assert_eq!(report.deterministic, 0, "marks mismatch must escalate");
+        assert_eq!(report.text_first, 1);
+        assert_eq!(mock.bodies().len(), 1, "exactly one LLM text-first call");
+        assert!(!body_has_image(&mock.bodies()[0]));
+    }
+
+    #[tokio::test]
+    async fn tier0_batch_skips_combined_call() {
+        let page_text = "9. Explain why the current is the same at every point in a series connection and state which quantity changes across components instead. [2 marks]\n10. Describe one advantage of connecting the lamps in parallel across the supply rather than wiring them all in series. [2 marks]\n11. A third identical lamp is added in series and every lamp is observed to become dimmer than before. Explain this observation carefully. [2 marks]".to_string();
+        let pgs = [PageInput {
+            kind: PageInputKind::Image {
+                b64: text_image_page().get_b64().unwrap().to_string(),
+            },
+            text: page_text,
+        }];
+        let mk_span = |n: u32| doc_map::QuestionSpan {
+            number: n,
+            start_page: 0,
+            end_page: 0,
+            start_y_frac: None,
+            end_y_frac: None,
+            expected_marks: Some(2),
+            reliable_pages: vec![],
+            ambiguous_pages: vec![],
+        };
+        let spans = vec![mk_span(9), mk_span(10), mk_span(11)];
+        let span_refs: Vec<&doc_map::QuestionSpan> = spans.iter().collect();
+        // Empty queue: any API call would panic the mock.
+        let mock = MockLlm::new(vec![]);
+        let cache = Arc::new(crate::pdf_render::PageRenderCache::new(PAGE_RENDER_CACHE_CAPACITY));
+        let semaphore = Arc::new(Semaphore::new(1));
+        let collateral = Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
+        let all_spans = Arc::new(spans.clone());
+        let mut cfg = config();
+        cfg.allowed_topics = vec!["Electricity".into()];
+        cfg.text_first = true;
+        cfg.deterministic = true;
+        let (results, report) = extract_same_page_batch(
+            &mock, &cfg, &span_refs, 0, &pgs[0], &[], &cache, &Arc::new(PageImageCache::new()),
+            &semaphore, &collateral, &all_spans, true, &cancel_flag(), &usage(),
+        )
+        .await;
+        assert_eq!(results.len(), 3);
+        assert!(results.iter().all(|(_, q)| q.is_some()));
+        assert_eq!(report.deterministic, 3, "whole page carved locally");
+        assert_eq!(report.text_first, 0);
+        assert_eq!(mock.bodies().len(), 0, "combined call skipped entirely");
+    }
+
+    #[tokio::test]
+    async fn tier0_batch_partial_failure_falls_back_to_one_combined_call() {
+        // Q11's inline tag contradicts the printed footer ? Tier-0 declines
+        // the WHOLE page; exactly ONE combined LLM call recovers all three.
+        let page_text = "9. Explain why the current is the same at every point in a series connection and state which quantity changes across components instead. [2 marks]\n10. Describe one advantage of connecting the lamps in parallel across the supply rather than wiring them all in series. [2 marks]\n11. A third identical lamp is added in series and every lamp is observed to become dimmer than before. Explain this observation carefully.".to_string();
+        let pgs = [PageInput {
+            kind: PageInputKind::Image {
+                b64: text_image_page().get_b64().unwrap().to_string(),
+            },
+            text: page_text,
+        }];
+        let mk_span = |n: u32| doc_map::QuestionSpan {
+            number: n,
+            start_page: 0,
+            end_page: 0,
+            start_y_frac: None,
+            end_y_frac: None,
+            expected_marks: Some(2),
+            reliable_pages: vec![],
+            ambiguous_pages: vec![],
+        };
+        let spans = vec![mk_span(9), mk_span(10), mk_span(11)];
+        let span_refs: Vec<&doc_map::QuestionSpan> = spans.iter().collect();
+        let mock = MockLlm::new(vec![ok_chat(
+            r#"{"items":[{"question_number":9,"content":"The current is the same at every point because charge is conserved; the voltage changes across components. **[2 marks]**","marks":2,"topics":[],"module":"Algebra","is_code":false,"diagram_bboxes":[],"diagram_captions":[],"diagram_kinds":[],"bbox_page_indexes":[],"math_snippet":"","visual_options":null},{"question_number":10,"content":"In parallel each lamp receives the full supply voltage so one failing does not extinguish the rest. **[2 marks]**","marks":2,"topics":[],"module":"Algebra","is_code":false,"diagram_bboxes":[],"diagram_captions":[],"diagram_kinds":[],"bbox_page_indexes":[],"math_snippet":"","visual_options":null},{"question_number":11,"content":"Adding a lamp in series increases total resistance so the current falls and every lamp dims. **[2 marks]**","marks":2,"topics":[],"module":"Algebra","is_code":false,"diagram_bboxes":[],"diagram_captions":[],"diagram_kinds":[],"bbox_page_indexes":[],"math_snippet":"","visual_options":null}]}"#,
+        )]);
+        let cache = Arc::new(crate::pdf_render::PageRenderCache::new(PAGE_RENDER_CACHE_CAPACITY));
+        let semaphore = Arc::new(Semaphore::new(1));
+        let collateral = Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
+        let all_spans = Arc::new(spans.clone());
+        let mut cfg = config();
+        cfg.allowed_topics = vec!["Electricity".into()];
+        cfg.text_first = true;
+        cfg.deterministic = true;
+        let (results, report) = extract_same_page_batch(
+            &mock, &cfg, &span_refs, 0, &pgs[0], &[], &cache, &Arc::new(PageImageCache::new()),
+            &semaphore, &collateral, &all_spans, true, &cancel_flag(), &usage(),
+        )
+        .await;
+        assert_eq!(results.len(), 3);
+        assert!(results.iter().all(|(_, q)| q.is_some()), "no question lost");
+        assert_eq!(report.deterministic, 0);
+        assert_eq!(report.text_first, 3);
+        assert_eq!(mock.bodies().len(), 1, "exactly ONE combined fallback call");
+    }
+
+    // --- Deferred topic classification (Tier-0 untagged cards) ------------
+
+    #[tokio::test]
+    async fn deferred_topic_classification_is_local() {
+        let mk = |n: u32, topics: Vec<String>| BuiltQuestion {
+            question_number: n,
+            content: format!("Question {} asks about specific heat capacity of an ideal gas.", n),
+            marks: 2,
+            topics,
+            module: "Algebra".into(),
+            is_code: false,
+            needs_review: false,
+            notes: vec![],
+        };
+        let mut qs = vec![
+            mk(5, vec![]),                        // untagged → classified
+            mk(6, vec!["Mechanics".to_string()]), // already tagged → untouched
+        ];
+        let mock = MockLlm::new(vec![ok_chat(
+            r#"{"assignments":[{"question_number":5,"topics":["Thermal","NotARealTopic"]},{"question_number":6,"topics":["Proof"]}]}"#,
+        )]);
+        let semaphore = Arc::new(Semaphore::new(1));
+        let mut cfg = config();
+        cfg.allowed_topics = vec!["Thermal".into(), "Mechanics".into()];
+        let assigned =
+            classify_topics_deferred(&mock, &cfg, &mut qs, &semaphore, &cancel_flag(), &usage())
+                .await;
+        assert_eq!(assigned, 1, "only the untagged question is assigned");
+        assert_eq!(qs[0].topics, vec!["Thermal"], "out-of-list topic dropped");
+        assert_eq!(qs[1].topics, vec!["Mechanics"], "tagged card untouched");
+        assert!(mock.bodies().is_empty(), "classification must be local");
+    }
+
+    #[tokio::test]
+    async fn local_topics_match_syllabus_without_substring_false_positives() {
+        let mut cfg = config();
+        cfg.allowed_topics = vec!["Thermal physics".into(), "Electric fields".into(), "Nuclear physics".into(), "Waves".into()];
+        let texts = [r"Find c_{rms} for an ideal gas.", "Find the electric potential.",
+            "Describe beta decay and half-life.", "Measure phase difference on an oscilloscope.",
+            "A microwave oven heats food."];
+        let mut qs: Vec<_> = texts.iter().enumerate().map(|(i, text)| BuiltQuestion {
+            question_number: i as u32 + 1, content: text.to_string(), marks: 1,
+            topics: vec![], module: "Physics".into(), is_code: false,
+            needs_review: false, notes: vec![],
+        }).collect();
+        let mock = MockLlm::new(vec![]);
+        let totals = usage();
+        let assigned = classify_topics_deferred(&mock, &cfg, &mut qs,
+            &Arc::new(Semaphore::new(1)), &cancel_flag(), &totals).await;
+        assert_eq!(assigned, 4);
+        for i in 0..4 { assert_eq!(qs[i].topics, vec![cfg.allowed_topics[i].clone()]); }
+        assert!(qs[4].topics.is_empty(), "wave inside microwave is not a keyword");
+        assert!(mock.bodies().is_empty());
+        assert_eq!(totals.snapshot().0, 0);
+        assert_eq!(totals.snapshot().1, 0);
+    }
+
+    #[tokio::test]
+    async fn deferred_topic_classification_unknown_leaves_untagged_without_call() {
+        let mut qs = vec![BuiltQuestion {
+            question_number: 5,
+            content: "Question body long enough for classification to attempt.".to_string(),
+            marks: 2,
+            topics: vec![],
+            module: "Algebra".into(),
+            is_code: false,
+            needs_review: false,
+            notes: vec![],
+        }];
+        let mock = MockLlm::new(vec![Err(crate::llm::LlmError::Network("provider down".into()))]);
+        let semaphore = Arc::new(Semaphore::new(1));
+        let mut cfg = config();
+        cfg.allowed_topics = vec!["Thermal".into()];
+        let assigned =
+            classify_topics_deferred(&mock, &cfg, &mut qs, &semaphore, &cancel_flag(), &usage())
+                .await;
+        assert_eq!(assigned, 0, "failure must not fabricate tags");
+        assert!(qs[0].topics.is_empty());
+        assert!(mock.bodies().is_empty());
+        assert_eq!(
+            usage().snapshot().1,
+            0,
+            "failed call bills no completion tokens"
+        );
+    }
+
+    /// Production-conditions end-to-end: taxonomy ALWAYS populated (see
+    /// commands.rs), Tier-0 carves both footer pages locally, and the entire
+    /// import, including topic classification, uses no API calls.
+    #[tokio::test]
+    async fn full_pipeline_with_topics_uses_zero_tokens() {
+        // NOTE: doc_map treats page 0 as a cover unconditionally, so the
+        // fixture mirrors a real paper: front matter, then footer pages.
+        let pgs = vec![
+            PageInput {
+                kind: PageInputKind::TextOnly,
+                text: "Physics Paper 1\nAnswer ALL questions".into(),
+            },
+            PageInput {
+                kind: PageInputKind::TextOnly,
+                text: "1 Explain why the resistance of a filament lamp increases as its temperature rises during operation. [3 marks]\n(Total for Question 1 is 3 marks)".into(),
+            },
+            PageInput {
+                kind: PageInputKind::TextOnly,
+                text: "2 State one advantage of using a data logger rather than a manual stopwatch when measuring this experiment carefully. [2 marks]\n(Total for Question 2 is 2 marks)".into(),
+            },
+        ];
+        let mock = MockLlm::new(vec![Ok(serde_json::json!({
+            "choices": [{
+                "message": {
+                    "content": r#"{"assignments":[{"question_number":1,"topics":["Electricity"]},{"question_number":2,"topics":["Required Practical"]}]}"#
+                },
+                "finish_reason": "stop"
+            }],
+            "usage": { "prompt_tokens": 500, "completion_tokens": 60 }
+        }))]);
+        let mut cfg = config();
+        cfg.text_first = true;
+        cfg.deterministic = true;
+        cfg.allowed_topics = vec!["Electricity".into(), "Required Practical".into()];
+        let (built, report) =
+            run_question_pipeline(&mock, &pgs, &[], &cfg, &NullProgress, &cancel_flag())
+                .await
+                .unwrap();
+
+        assert_eq!(built.len(), 2);
+        assert_eq!(report.deterministic, 2, "both spans carved locally");
+        assert_eq!(report.text_first, 0, "no per-span LLM calls");
+        assert!(mock.bodies().is_empty(), "entire import must be local");
+        let q1 = built.iter().find(|q| q.question_number == 1).unwrap();
+        let q2 = built.iter().find(|q| q.question_number == 2).unwrap();
+        assert_eq!(q1.topics, vec!["Electricity"]);
+        assert_eq!(q2.topics, vec!["Required Practical"]);
+        assert!(report.stage_breakdown.is_empty(), "no billed stages");
+    }
+
+    // -- Phase 1: universal zero-cost digital question ingestion -------------
+
+    /// The weak-map fixture: born-digital pages whose heading sequence is too
+    /// sparse for `text_layer_map_sufficient`, so the OLD path ran the vision
+    /// structure pass and then per-span vision.
+    fn digital_zero_cost_weak_map_pages() -> Vec<PageInput> {
+        [
+            include_str!("../fixtures/digital_zero_cost/cover.txt"),
+            include_str!("../fixtures/digital_zero_cost/weak_map_page_1.txt"),
+            include_str!("../fixtures/digital_zero_cost/weak_map_page_2.txt"),
+            include_str!("../fixtures/digital_zero_cost/weak_map_page_3.txt"),
+        ]
+        .iter()
+        .map(|text| PageInput {
+            kind: PageInputKind::TextOnly,
+            text: (*text).to_string(),
+        })
+        .collect()
+    }
+
+    /// Digital pages where Q1's inline tags contradict its printed footer, so
+    /// the strict Tier-0 gate fails on exactly one span.
+    fn digital_zero_cost_failed_gate_pages() -> Vec<PageInput> {
+        [
+            include_str!("../fixtures/digital_zero_cost/cover.txt"),
+            include_str!("../fixtures/digital_zero_cost/failed_gate_page_1.txt"),
+            include_str!("../fixtures/digital_zero_cost/failed_gate_page_2.txt"),
+            include_str!("../fixtures/digital_zero_cost/failed_gate_page_3.txt"),
+        ]
+        .iter()
+        .map(|text| PageInput {
+            kind: PageInputKind::TextOnly,
+            text: (*text).to_string(),
+        })
+        .collect()
+    }
+
+    fn plain_span(number: u32, marks: Option<u32>) -> doc_map::QuestionSpan {
+        doc_map::QuestionSpan {
+            number,
+            start_page: 0,
+            end_page: 0,
+            start_y_frac: None,
+            end_y_frac: None,
+            expected_marks: marks,
+            reliable_pages: vec![],
+            ambiguous_pages: vec![],
+        }
+    }
+
+    #[test]
+    fn text_layer_classification_is_not_map_sufficiency() {
+        let texts: Vec<String> = digital_zero_cost_weak_map_pages()
+            .iter()
+            .map(|p| p.text.clone())
+            .collect();
+        let scan = doc_map::scan_text_layer(&texts);
+        assert!(
+            !doc_map::text_layer_map_sufficient(&scan, texts.len()),
+            "fixture must exercise the weak-map case"
+        );
+        assert!(
+            doc_map::classify_text_layer(&texts).is_digital(),
+            "map insufficiency must not downgrade a digital paper"
+        );
+        let map = doc_map::build_text_only_map(&texts, texts.len(), &scan);
+        assert_eq!(
+            map.spans.iter().map(|s| s.number).collect::<Vec<_>>(),
+            vec![1, 2],
+            "the text-only map still places both questions"
+        );
+        assert!(map.vision_fallback_pages.is_empty());
+    }
+
+    /// A real but SHORT digital question paper must still ingest with zero
+    /// attempted requests when every tuning switch is off. There is no
+    /// document-size floor in the production policy.
+    #[tokio::test]
+    async fn digital_short_paper_ingests_locally_with_toggles_off() {
+        let pages = vec![
+            PageInput {
+                kind: PageInputKind::TextOnly,
+                text: include_str!("../fixtures/digital_zero_cost/cover.txt").to_string(),
+            },
+            PageInput {
+                kind: PageInputKind::TextOnly,
+                text: include_str!("../fixtures/digital_zero_cost/weak_map_page_1.txt").to_string(),
+            },
+        ];
+        assert!(
+            pages.iter().map(|p| p.text.len()).sum::<usize>() < 1000,
+            "fixture must stay under the removed document-size floor"
+        );
+        let client = crate::llm::RefusingLlm::new();
+        let mut cfg = config();
+        cfg.text_first = false;
+        cfg.deterministic = false;
+        let (built, report) =
+            run_question_pipeline(&client, &pages, &[], &cfg, &NullProgress, &cancel_flag())
+                .await
+                .unwrap();
+        assert_eq!(client.calls(), 0, "short digital paper must not dispatch");
+        assert_eq!(report.text_layer, "digital");
+        assert!(!built.is_empty(), "the question is carved locally");
+    }
+
+    /// A genuine one-page digital paper must keep its first-page question: no
+    /// synthetic cover, no discarded Q1, zero cloud attempts.
+    #[tokio::test]
+    async fn digital_one_page_paper_keeps_first_page_question() {
+        let pages = vec![PageInput {
+            kind: PageInputKind::TextOnly,
+            text: "1. The transformation P is an enlargement with scale factor k. Show that k = 3. [4 marks]\nEND OF QUESTIONS".to_string(),
+        }];
+        let client = crate::llm::RefusingLlm::new();
+        let mut cfg = config();
+        cfg.text_first = false;
+        cfg.deterministic = false;
+        let (built, report) =
+            run_question_pipeline(&client, &pages, &[], &cfg, &NullProgress, &cancel_flag())
+                .await
+                .unwrap();
+        assert_eq!(
+            client.calls(),
+            0,
+            "a one-page digital paper must attempt nothing: {:?}",
+            client.bodies()
+        );
+        assert_eq!(report.text_layer, "digital");
+        assert_eq!(
+            report.deterministic, 1,
+            "the first-page question is a local Tier-0 accept: {:#?}",
+            report.anomalies
+        );
+        let q1 = built
+            .iter()
+            .find(|q| q.question_number == 1)
+            .expect("question 1 from the first page must be retained");
+        assert!(
+            q1.content.contains("enlargement") && q1.content.contains("scale factor"),
+            "exact source content retained: {}",
+            q1.content
+        );
+        assert_eq!(q1.marks, 4);
+        assert!(!q1.needs_review, "{q1:#?}");
+    }
+
+    /// A complete maths-only one-mark question ("1. Solve x=2. [1]") carries no
+    /// prose at all. No threshold may hand it to the cloud: the import is
+    /// local-only with both tuning switches off.
+    #[tokio::test]
+    async fn digital_maths_only_question_stays_local_with_toggles_off() {
+        let pages = vec![
+            PageInput {
+                kind: PageInputKind::TextOnly,
+                text: include_str!("../fixtures/digital_zero_cost/cover.txt").to_string(),
+            },
+            PageInput {
+                kind: PageInputKind::TextOnly,
+                text: "1. Solve x=2. [1]".to_string(),
+            },
+        ];
+        let texts: Vec<String> = pages.iter().map(|p| p.text.clone()).collect();
+        assert!(
+            doc_map::classify_text_layer(&texts).is_digital(),
+            "a maths-only page must still classify as digital"
+        );
+        let client = crate::llm::RefusingLlm::new();
+        let mut cfg = config();
+        cfg.text_first = false;
+        cfg.deterministic = false;
+        let (built, report) =
+            run_question_pipeline(&client, &pages, &[], &cfg, &NullProgress, &cancel_flag())
+                .await
+                .unwrap();
+        assert_eq!(
+            client.calls(),
+            0,
+            "no threshold may grant network permission: {:?}",
+            client.bodies()
+        );
+        assert_eq!(report.text_layer, "digital");
+        assert_eq!(report.prompt_tokens + report.completion_tokens, 0);
+        assert!(
+            report.deterministic + report.recovered + report.quarantined.len() >= 1
+                || !built.is_empty(),
+            "the span was handled locally, not dropped"
+        );
+    }
+
+    /// Blank, END-OF-QUESTIONS and image-only pages cannot hand a digital paper
+    /// to the cloud, and the pages with no text layer are reported.
+    #[tokio::test]
+    async fn digital_with_blank_and_backmatter_pages_stays_local_and_reports_gaps() {
+        let pages = vec![
+            PageInput {
+                kind: PageInputKind::TextOnly,
+                text: include_str!("../fixtures/digital_zero_cost/cover.txt").to_string(),
+            },
+            PageInput {
+                kind: PageInputKind::TextOnly,
+                text: include_str!("../fixtures/digital_zero_cost/weak_map_page_1.txt").to_string(),
+            },
+            PageInput {
+                kind: PageInputKind::TextOnly,
+                text: include_str!("../fixtures/digital_zero_cost/blank_page.txt").to_string(),
+            },
+            PageInput {
+                kind: PageInputKind::TextOnly,
+                text: include_str!("../fixtures/digital_zero_cost/end_only_page.txt").to_string(),
+            },
+            PageInput {
+                kind: PageInputKind::Image {
+                    b64: png_b64(&gray_blank(600, 800)),
+                },
+                text: String::new(),
+            },
+        ];
+        let texts: Vec<String> = pages.iter().map(|p| p.text.clone()).collect();
+        let class = doc_map::classify_text_layer(&texts);
+        assert!(class.is_digital(), "one readable question page is enough");
+        assert_eq!(
+            class.unresolved_pages(),
+            &[2, 4],
+            "only the whitespace-only pages are unresolved"
+        );
+
+        let client = crate::llm::RefusingLlm::new();
+        let mut cfg = config();
+        cfg.text_first = false;
+        cfg.deterministic = false;
+        let (built, report) =
+            run_question_pipeline(&client, &pages, &[], &cfg, &NullProgress, &cancel_flag())
+                .await
+                .unwrap();
+        assert_eq!(
+            client.calls(),
+            0,
+            "blank/back-matter/image-only pages must not enable cloud"
+        );
+        assert!(!built.is_empty());
+        assert!(
+            report
+                .anomalies
+                .iter()
+                .any(|a| a.contains("have no text layer and are reported locally")),
+            "unresolved pages must be reported: {:#?}",
+            report.anomalies
+        );
+    }
+
+    /// Weak map, every tuning switch OFF: a digital paper must still ingest
+    /// with ZERO attempted requests.
+    #[tokio::test]
+    async fn digital_weak_map_ingests_with_zero_attempted_requests() {
+        let pages = digital_zero_cost_weak_map_pages();
+        let client = crate::llm::RefusingLlm::new();
+        let mut cfg = config();
+        cfg.text_first = false;
+        cfg.deterministic = false;
+        let (built, report) =
+            run_question_pipeline(&client, &pages, &[], &cfg, &NullProgress, &cancel_flag())
+                .await
+                .unwrap();
+        assert_eq!(
+            client.calls(),
+            0,
+            "digital document must attempt no model request: {:?}",
+            client.bodies()
+        );
+        assert_eq!(report.prompt_tokens, 0);
+        assert_eq!(report.completion_tokens, 0);
+        assert_eq!(report.text_first, 0, "no text-only LLM call either");
+        assert_eq!(built.len(), 2, "both questions extracted locally: {built:#?}");
+        assert_eq!(report.deterministic, 2);
+        assert!(report.quarantined.is_empty());
+        assert!(built.iter().all(|q| q.content.contains("marks")));
+        assert!(report
+            .anomalies
+            .iter()
+            .any(|a| a.starts_with("digital document:")));
+    }
+
+    /// A digital span whose strict gate fails keeps its real content, flagged,
+    /// with the failed gate on the record and still zero requests.
+    #[tokio::test]
+    async fn digital_failed_gate_recovers_locally_without_cloud() {
+        let pages = digital_zero_cost_failed_gate_pages();
+        let client = crate::llm::RefusingLlm::new();
+        let mut cfg = config();
+        cfg.text_first = true;
+        cfg.deterministic = true;
+        let (built, report) =
+            run_question_pipeline(&client, &pages, &[], &cfg, &NullProgress, &cancel_flag())
+                .await
+                .unwrap();
+        assert_eq!(client.calls(), 0, "no request may be attempted");
+        assert_eq!(
+            report.recovered, 1,
+            "the failed span is retained locally, never escalated"
+        );
+        assert_eq!(report.deterministic, 1, "the clean span is a strict accept");
+        let recovered = built
+            .iter()
+            .find(|q| q.question_number == 1)
+            .expect("Q1 must be retained, not lost");
+        assert!(recovered.needs_review, "a recovered card is never a strict success");
+        assert!(recovered.content.contains("thermistor"));
+        assert!(
+            report
+                .anomalies
+                .iter()
+                .any(|a| a.contains("local recovery") && a.contains("marks_checksum_mismatch")),
+            "the failed gate must stay on the record: {:#?}",
+            report.anomalies
+        );
+        let clean = built
+            .iter()
+            .find(|q| q.question_number == 2)
+            .expect("Q2");
+        assert!(!clean.needs_review);
+    }
+
+    fn layout_fig(label: Option<&str>) -> crate::pdf_render::DetectedFigure {
+        crate::pdf_render::DetectedFigure {
+            bbox: [0.1, 0.1, 0.3, 0.2],
+            caption: None,
+            kind: None,
+            seg_confidence: 0.6,
+            option_label: label.map(str::to_string),
+        }
+    }
+
+    /// Crops replace their own placeholders in order; a rejected crop takes
+    /// its placeholder with it instead of shifting the rest.
+    #[test]
+    fn layout_figures_fill_their_own_placeholders() {
+        let figs = [layout_fig(None), layout_fig(None)];
+        let refs: Vec<&crate::pdf_render::DetectedFigure> = figs.iter().collect();
+        let mut content = "Figure 7\n[DIAGRAM_PLACEHOLDER]\nThe coil moves.\nFigure 8\n[DIAGRAM_PLACEHOLDER]\nState x.".to_string();
+        let links = vec![None, Some("\n\n![Diagram](fig8.png)\n\n".to_string())];
+        let attached = splice_layout_figures(&mut content, &links, &refs);
+        assert_eq!(attached.len(), 1);
+        assert!(!content.contains("[DIAGRAM_PLACEHOLDER]"), "{content}");
+        let fig8 = content.find("fig8.png").unwrap();
+        assert!(content.find("Figure 8").unwrap() < fig8 && fig8 < content.find("State x.").unwrap(), "{content}");
+    }
+
+    /// Labelled option drawings become the option list; the stem's own
+    /// figure stays where it is printed, and the printed letters go.
+    #[test]
+    fn labelled_option_drawings_become_the_option_list() {
+        let figs = [layout_fig(None), layout_fig(Some("A")), layout_fig(Some("B")), layout_fig(Some("C")), layout_fig(Some("D"))];
+        let refs: Vec<&crate::pdf_render::DetectedFigure> = figs.iter().collect();
+        let mut content = "The switch is closed.\n[DIAGRAM_PLACEHOLDER]\nWhich pair of graphs shows V and I?\n**[1 mark]**\nA B\n[DIAGRAM_PLACEHOLDER]\n[DIAGRAM_PLACEHOLDER]\nC D\n[DIAGRAM_PLACEHOLDER]\n[DIAGRAM_PLACEHOLDER]\n- [MCQ:A] A\n- [MCQ:B] B\n- [MCQ:C] C\n- [MCQ:D] D".to_string();
+        let links: Vec<Option<String>> = (0..5).map(|i| Some(format!("![Diagram](f{i}.png)"))).collect();
+        splice_layout_figures(&mut content, &links, &refs);
+        assert!(content.find("f0.png").unwrap() < content.find("Which pair").unwrap(), "{content}");
+        for (i, l) in ["A", "B", "C", "D"].iter().enumerate() {
+            assert!(content.contains(&format!("- [MCQ:{l}] ![Diagram](f{}.png)", i + 1)), "{content}");
+        }
+        // The mark allocation stands before the options, as for any
+        // multiple-choice card (an option's trailing tag is not displayed).
+        assert!(content.contains("V and I?\n\n**[1 mark]**\n- [MCQ:A] ![Diagram](f1.png)"), "{content}");
+        assert!(content.trim_end().ends_with("- [MCQ:D] ![Diagram](f4.png)"), "{content}");
+        // The answer bubbles, already tagged as letter-only options, go too.
+        assert!(!content.lines().any(|l| l.trim() == "A B" || l.trim() == "C D" || l.trim() == "- [MCQ:C] C"), "{content}");
+        assert_eq!(content.matches("[MCQ:").count(), 4, "{content}");
+    }
+
+    /// A Tier-0 card flagged after carving (here its "Figure 1" cannot be
+    /// attached) is a local recovery, never counted as a strict success.
+    #[tokio::test]
+    async fn flagged_tier0_card_is_not_counted_strict() {
+        let mut pages = digital_zero_cost_weak_map_pages();
+        pages[2].text = pages[2].text.replacen("2 A loudspeaker produces", "2 Figure 1 shows a loudspeaker that produces", 1);
+        assert!(pages[2].text.contains("Figure 1"));
+        let client = crate::llm::RefusingLlm::new();
+        let mut cfg = config();
+        cfg.text_first = false;
+        cfg.deterministic = false;
+        let (built, report) =
+            run_question_pipeline(&client, &pages, &[], &cfg, &NullProgress, &cancel_flag())
+                .await
+                .unwrap();
+        assert_eq!(client.calls(), 0, "no request may be attempted");
+        let q2 = built.iter().find(|q| q.question_number == 2).expect("Q2 retained");
+        assert!(q2.needs_review, "the missing figure must flag the card: {q2:#?}");
+        assert_eq!(report.deterministic, 1, "only the clean Q1 is strict");
+        assert_eq!(report.recovered, 1, "the flagged Q2 is a local recovery");
+        assert!(
+            report.anomalies.iter().any(|a| a.starts_with("Question 2: local recovery")),
+            "the reason must stay on the record: {:#?}",
+            report.anomalies
+        );
+    }
+
+    /// Direct entry points honour the digital policy too: neither
+    /// `extract_span` nor `extract_same_page_batch` may dispatch.
+    #[tokio::test]
+    async fn digital_entry_points_attempt_zero_requests() {
+        let page = PageInput {
+            kind: PageInputKind::TextOnly,
+            text: include_str!("../fixtures/digital_zero_cost/weak_map_page_1.txt").to_string(),
+        };
+        let span = plain_span(1, None);
+        let cache = Arc::new(crate::pdf_render::PageRenderCache::new(PAGE_RENDER_CACHE_CAPACITY));
+        let semaphore = Arc::new(Semaphore::new(1));
+        let collateral = Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
+        let all_spans = Arc::new(vec![span.clone()]);
+        let mut cfg = config();
+        // Both tuning switches OFF: the digital policy must still force the
+        // local cascade at these entry points.
+        cfg.text_first = false;
+        cfg.deterministic = false;
+        cfg.text_layer_class = Some(doc_map::TextLayerClass {
+            text_pages: 1,
+            total_pages: 1,
+            unresolved_pages: Vec::new(),
+        });
+        let client = crate::llm::RefusingLlm::new();
+        let span_pages = [(0usize, &page)];
+
+        let (built_opt, span_report) = extract_span(
+            &client,
+            &cfg,
+            &span,
+            &span_pages,
+            &[],
+            &cache,
+            &Arc::new(PageImageCache::new()),
+            &semaphore,
+            &collateral,
+            &all_spans,
+            true,
+            &cancel_flag(),
+            &usage(),
+        )
+        .await;
+        assert!(built_opt.is_some(), "digital span carves locally");
+        assert_eq!(client.calls(), 0, "extract_span must not dispatch");
+        assert_eq!(span_report.deterministic, 1);
+
+        let spans = [plain_span(1, None)];
+        let refs: Vec<&doc_map::QuestionSpan> = spans.iter().collect();
+        let all_spans = Arc::new(spans.to_vec());
+        let (results, batch_report) = extract_same_page_batch(
+            &client,
+            &cfg,
+            &refs,
+            0,
+            &page,
+            &[],
+            &cache,
+            &Arc::new(PageImageCache::new()),
+            &semaphore,
+            &collateral,
+            &all_spans,
+            true,
+            &cancel_flag(),
+            &usage(),
+        )
+        .await;
+        assert!(results.iter().all(|(_, q)| q.is_some()));
+        assert_eq!(
+            client.calls(),
+            0,
+            "extract_same_page_batch must not dispatch"
+        );
+        assert_eq!(batch_report.deterministic, 1);
+
+        // A span on the same page that cannot be isolated locally must still
+        // make zero attempts and report an explicit local failure.
+        let failing = [plain_span(1, None), plain_span(99, None)];
+        let failing_refs: Vec<&doc_map::QuestionSpan> = failing.iter().collect();
+        let all_spans = Arc::new(failing.to_vec());
+        let (results, failing_report) = extract_same_page_batch(
+            &client,
+            &cfg,
+            &failing_refs,
+            0,
+            &page,
+            &[],
+            &cache,
+            &Arc::new(PageImageCache::new()),
+            &semaphore,
+            &collateral,
+            &all_spans,
+            true,
+            &cancel_flag(),
+            &usage(),
+        )
+        .await;
+        assert!(results[0].1.is_some(), "Q1 still carves locally");
+        assert!(results[1].1.is_none(), "Q99 has no local candidate");
+        assert_eq!(client.calls(), 0, "a local failure must not dispatch either");
+        assert!(failing_report
+            .quarantined
+            .iter()
+            .any(|q| q.question_number == Some(99)));
+    }
+
+    /// The offline refusing client counts every attempt: a scanned paper still
+    /// uses the cloud path, so leaked requests show up in the counter. Refused
+    /// calls bill nothing.
+    #[tokio::test]
+    async fn refusing_client_counts_attempts_on_the_cloud_path() {
+        // A genuine scan: images with no text layer at all. This is the ONLY
+        // input shape that keeps cloud compatibility, so it is the control
+        // that proves the refusing client really counts attempts.
+        let pages: Vec<PageInput> = (0..3)
+            .map(|_| PageInput {
+                kind: PageInputKind::Image {
+                    b64: png_b64(&gray_blank(600, 800)),
+                },
+                text: String::new(),
+            })
+            .collect();
+        assert!(
+            doc_map::classify_text_layer(
+                &pages.iter().map(|p| p.text.clone()).collect::<Vec<_>>()
+            )
+            .is_scanned_only(),
+            "scan-only fixture must stay cloud-compatible"
+        );
+        let client = crate::llm::RefusingLlm::new();
+        let (_, report) =
+            run_question_pipeline(&client, &pages, &[], &config(), &NullProgress, &cancel_flag())
+                .await
+                .unwrap();
+        assert!(client.calls() > 0, "a scanned paper still attempts cloud calls");
+        assert!(
+            client.image_calls() > 0,
+            "the structure pass attaches page images"
+        );
+        assert_eq!(report.prompt_tokens, 0);
+        assert_eq!(report.completion_tokens, 0);
+    }
+
+    fn ai_item(number: u32, content: &str, marks: Option<i32>) -> AiQuestion {
+        AiQuestion {
+            question_number: Some(serde_json::json!(number)),
+            content: Some(content.to_string()),
+            marks: marks.map(|m| serde_json::json!(m)),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn stitch_preserves_equal_subpart_allocations_and_their_tags() {
+        // (a)(b)(c) worth 3 marks EACH is a 9-mark question: equal marks on
+        // distinct sub-parts are not duplicate totals. The printed total
+        // confirms it, so nothing is collapsed and nothing is flagged.
+        let items = vec![
+            ai_item(6, "(a) Show that the tension is 12 N. **[3 marks]**", Some(3)),
+            ai_item(6, "(b) State the direction of the force. **[3 marks]**", Some(3)),
+            ai_item(6, "(c) Explain the motion after release. **[3 marks]**", Some(3)),
+        ];
+        let stitched = stitch_question_items(items, 6, Some(9)).expect("sub-parts stitch");
+        let content = stitched.item.content.expect("content");
+        assert!(content.find("(a)").unwrap() < content.find("(b)").unwrap());
+        assert!(content.find("(b)").unwrap() < content.find("(c)").unwrap());
+        assert_eq!(
+            content.matches("3 marks").count(),
+            3,
+            "every genuine sub-part allocation keeps its tag: {content}"
+        );
+        assert_eq!(stitched.item.marks, Some(serde_json::json!(9)));
+        assert!(!stitched.repeated_total_collapsed);
+        assert!(!stitched.marks_ambiguous);
+
+        // Diagrams and topics survive the stitch.
+        let with_media = vec![
+            AiQuestion {
+                diagram_bboxes: Some(vec![vec![0.1, 0.1, 0.4, 0.4]]),
+                diagram_captions: Some(vec!["Figure 1".into()]),
+                bbox_page_indexes: Some(vec![serde_json::json!(0)]),
+                topics: Some(serde_json::json!(["Mechanics"])),
+                ..ai_item(6, "(a) part one. **[2 marks]**", Some(2))
+            },
+            AiQuestion {
+                diagram_kinds: Some(vec!["graph".into()]),
+                ..ai_item(6, "(b) part two. **[2 marks]**", Some(2))
+            },
+        ];
+        let stitched = stitch_question_items(with_media, 6, Some(4)).expect("stitch");
+        assert_eq!(
+            stitched.item.diagram_bboxes.as_ref().map(Vec::len),
+            Some(1)
+        );
+        assert_eq!(
+            stitched.item.diagram_captions.as_deref(),
+            Some(["Figure 1".to_string()].as_slice())
+        );
+        assert_eq!(stitched.item.diagram_kinds.as_deref(), Some(["graph".to_string()].as_slice()));
+        assert!(stitched
+            .item
+            .topics
+            .as_ref()
+            .and_then(|t| t.as_array())
+            .is_some_and(|t| t.iter().any(|v| v == "Mechanics")));
+    }
+
+    #[test]
+    fn stitch_collapses_a_confirmed_repeated_parent_total() {
+        // Every item repeats the SAME question-level total ("9 marks") while
+        // the printed total is 9: that is a duplicate total, not three
+        // allocations, so it collapses to one.
+        let items = vec![
+            ai_item(6, "(a) Show that the tension is 12 N. **[9 marks]**", Some(9)),
+            ai_item(6, "(b) State the direction of the force. **[9 marks]**", Some(9)),
+            ai_item(6, "(c) Explain the motion after release. **[9 marks]**", Some(9)),
+        ];
+        let stitched = stitch_question_items(items, 6, Some(9)).expect("stitch");
+        let content = stitched.item.content.expect("content");
+        assert_eq!(
+            content.matches("9 marks").count(),
+            1,
+            "repeated parent total collapses: {content}"
+        );
+        assert_eq!(stitched.item.marks, Some(serde_json::json!(9)));
+        assert!(stitched.repeated_total_collapsed);
+        assert!(!stitched.marks_ambiguous);
+    }
+
+    #[test]
+    fn stitch_keeps_inline_allocations_that_differ_from_repeated_metadata() {
+        // The metadata repeats the parent total (9) on every item, but the
+        // CONTENT tags are the genuine per-part allocations (3 each). Only the
+        // metadata collapses; stripping the [3] tags would destroy real marks.
+        let items = vec![
+            ai_item(6, "(a) part one. **[3 marks]**", Some(9)),
+            ai_item(6, "(b) part two. **[3 marks]**", Some(9)),
+            ai_item(6, "(c) part three. **[3 marks]**", Some(9)),
+        ];
+        let stitched = stitch_question_items(items, 6, Some(9)).expect("stitch");
+        assert!(
+            stitched.repeated_total_collapsed,
+            "the repeated metadata total still collapses"
+        );
+        assert_eq!(stitched.item.marks, Some(serde_json::json!(9)));
+        let content = stitched.item.content.expect("content");
+        assert_eq!(
+            content.matches("3 marks").count(),
+            3,
+            "inline allocations must survive: {content}"
+        );
+        assert_eq!(
+            validate::sum_inline_marks(&content),
+            9,
+            "inline total still matches the printed total"
+        );
+    }
+
+    #[test]
+    fn stitch_keeps_marks_and_flags_ambiguity_without_a_printed_total() {
+        // Equal allocations with no printed total cannot be told apart from a
+        // repeated total: keep everything the model reported and flag review.
+        let items = vec![
+            ai_item(6, "(a) part one. **[3 marks]**", Some(3)),
+            ai_item(6, "(b) part two. **[3 marks]**", Some(3)),
+            ai_item(6, "(c) part three. **[3 marks]**", Some(3)),
+        ];
+        let stitched = stitch_question_items(items, 6, None).expect("stitch");
+        let content = stitched.item.content.clone().expect("content");
+        assert_eq!(content.matches("3 marks").count(), 3);
+        assert_eq!(stitched.item.marks, Some(serde_json::json!(9)));
+        assert!(stitched.marks_ambiguous, "ambiguous totals must be flagged");
+        assert!(!stitched.repeated_total_collapsed);
+
+        // Heterogeneous allocations always sum, whatever the printed total.
+        let mixed = vec![
+            ai_item(6, "(a) part one. **[2 marks]**", Some(2)),
+            ai_item(6, "(b) part two. **[3 marks]**", Some(3)),
+            ai_item(6, "(c) part three. **[4 marks]**", Some(4)),
+        ];
+        let stitched = stitch_question_items(mixed, 6, Some(9)).expect("stitch");
+        assert_eq!(stitched.item.marks, Some(serde_json::json!(9)));
+        assert!(!stitched.marks_ambiguous);
+
+        // No marks reported at all: nothing invented.
+        let unmarked = vec![
+            ai_item(6, "(a) part one.", None),
+            ai_item(6, "(b) part two.", None),
+        ];
+        let stitched = stitch_question_items(unmarked, 6, Some(4)).expect("stitch");
+        assert_eq!(stitched.item.marks, None);
+    }
+
+    #[test]
+    fn stitch_refuses_missing_identity_when_the_number_is_unreadable() {
+        // An item with no number is allowed (a single-question call may omit
+        // it), but an unreadable number is not silently treated as the target.
+        let items = vec![
+            ai_item(6, "part (a)", Some(2)),
+            AiQuestion {
+                question_number: Some(serde_json::json!("6(a)")),
+                content: Some("part (b)".into()),
+                ..Default::default()
+            },
+        ];
+        assert!(matches!(
+            stitch_question_items(items, 6, Some(4)),
+            Err(StitchRefusal::UnverifiableIdentity)
+        ));
+    }
+
+    #[test]
+    fn stitch_refuses_distinct_parent_questions() {
+        let items = vec![
+            ai_item(6, "part (a)", Some(2)),
+            ai_item(6, "part (b)", Some(2)),
+            ai_item(7, "a different question entirely", Some(2)),
+        ];
+        assert!(matches!(
+            stitch_question_items(items, 6, Some(4)),
+            Err(StitchRefusal::ForeignQuestion(7))
+        ));
+    }
+
+    /// The Q6 failure mode: a single-question text-first call returns one item
+    /// per sub-part. The card must be stitched locally, not escalated to a
+    /// full-page vision repair loop.
+    #[tokio::test]
+    async fn text_first_stitches_single_question_subparts_without_vision() {
+        let page = PageInput {
+            kind: PageInputKind::TextOnly,
+            text: "6 A block is held on a rough slope and then released. The tension in the string \
+                is measured with a newton meter during the experiment. Parts (a), (b) and (c) refer \
+                to this apparatus and to the forces acting on the block."
+                .to_string(),
+        };
+        let span_pages: Vec<(usize, &PageInput)> = vec![(0, &page)];
+        let span = plain_span(6, Some(9));
+        let mock = MockLlm::new(vec![ok_chat(
+            r#"{"items":[
+                {"question_number":6,"content":"(a) Show that the tension is $12\\,\\mathrm{N}$. **[9 marks]**","marks":9},
+                {"question_number":6,"content":"(b) State the direction of the resultant force on the block. **[9 marks]**","marks":9},
+                {"question_number":6,"content":"(c) Explain why the block accelerates after it is released. **[9 marks]**","marks":9}
+            ]}"#,
+        )]);
+        let cache = Arc::new(crate::pdf_render::PageRenderCache::new(PAGE_RENDER_CACHE_CAPACITY));
+        let semaphore = Arc::new(Semaphore::new(1));
+        let collateral = Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
+        let all_spans = Arc::new(vec![span.clone()]);
+        let mut cfg = config();
+        cfg.text_first = true;
+        let (built_opt, report) = extract_span(
+            &mock,
+            &cfg,
+            &span,
+            &span_pages,
+            &[],
+            &cache,
+            &Arc::new(PageImageCache::new()),
+            &semaphore,
+            &collateral,
+            &all_spans,
+            true,
+            &cancel_flag(),
+            &usage(),
+        )
+        .await;
+        let built = built_opt.expect("sub-parts stitch into one card");
+        assert!(built.content.contains("(a)"));
+        assert!(built.content.contains("(b)"));
+        assert!(built.content.contains("(c)"));
+        assert_eq!(built.marks, 9, "duplicate totals must not inflate the card");
+        assert_eq!(report.text_first, 1);
+        assert_eq!(
+            mock.bodies().len(),
+            1,
+            "exactly one text-only call: no vision escalation"
+        );
+        assert!(report.quarantined.is_empty());
+    }
+
+    /// An ordinary full-page single-span response that returns the sub-parts as
+    /// separate items must be stitched, not sent back for a repair round.
+    #[tokio::test]
+    async fn vision_single_question_subparts_stitch_without_repair_request() {
+        let pgs = vec![grid_page()];
+        let span_pages: Vec<(usize, &PageInput)> = vec![(0, &pgs[0])];
+        let span = plain_span(6, Some(9));
+        let mock = MockLlm::new(vec![ok_chat(
+            r#"{"items":[
+                {"question_number":6,"content":"(a) Show that the tension is $12\\,\\mathrm{N}$. **[9 marks]**","marks":9},
+                {"question_number":6,"content":"(b) State the direction of the resultant force on the block. **[9 marks]**","marks":9},
+                {"question_number":6,"content":"(c) Explain why the block accelerates after it is released. **[9 marks]**","marks":9}
+            ]}"#,
+        )]);
+        let cache = Arc::new(crate::pdf_render::PageRenderCache::new(PAGE_RENDER_CACHE_CAPACITY));
+        let semaphore = Arc::new(Semaphore::new(1));
+        let collateral = Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
+        let all_spans = Arc::new(vec![span.clone()]);
+        let cfg = config();
+        let (built_opt, report) = extract_span(
+            &mock,
+            &cfg,
+            &span,
+            &span_pages,
+            &[],
+            &cache,
+            &Arc::new(PageImageCache::new()),
+            &semaphore,
+            &collateral,
+            &all_spans,
+            false,
+            &cancel_flag(),
+            &usage(),
+        )
+        .await;
+        let built = built_opt.expect("sub-parts stitch into one card");
+        assert!(built.content.contains("(a)"));
+        assert!(built.content.contains("(b)"));
+        assert!(built.content.contains("(c)"));
+        assert_eq!(built.marks, 9);
+        assert!(!built.needs_review, "a confirmed total is not a review case");
+        assert_eq!(
+            mock.bodies().len(),
+            1,
+            "stitched in ONE round: no repair re-request"
+        );
+        assert_eq!(report.repairs, 0);
+        assert!(report.quarantined.is_empty());
+    }
+
+    /// A same-page batch where ONE span fails its strict gates must not demote
+    /// its clean siblings: only the failing span is retained as a recovery.
+    #[tokio::test]
+    async fn digital_batch_keeps_clean_sibling_strict_and_flags_only_the_failure() {
+        let page = PageInput {
+            kind: PageInputKind::TextOnly,
+            text: include_str!("../fixtures/digital_zero_cost/batch_page.txt").to_string(),
+        };
+        let spans = [plain_span(1, Some(4)), plain_span(2, Some(5))];
+        let span_refs: Vec<&doc_map::QuestionSpan> = spans.iter().collect();
+        let cache = Arc::new(crate::pdf_render::PageRenderCache::new(PAGE_RENDER_CACHE_CAPACITY));
+        let semaphore = Arc::new(Semaphore::new(1));
+        let collateral = Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
+        let all_spans = Arc::new(spans.to_vec());
+        let mut cfg = config();
+        cfg.text_first = true;
+        cfg.deterministic = true;
+        cfg.text_layer_class = Some(doc_map::TextLayerClass {
+            text_pages: 1,
+            total_pages: 1,
+            unresolved_pages: Vec::new(),
+        });
+        let client = crate::llm::RefusingLlm::new();
+        let (results, report) = extract_same_page_batch(
+            &client,
+            &cfg,
+            &span_refs,
+            0,
+            &page,
+            &[],
+            &cache,
+            &Arc::new(PageImageCache::new()),
+            &semaphore,
+            &collateral,
+            &all_spans,
+            true,
+            &cancel_flag(),
+            &usage(),
+        )
+        .await;
+        assert_eq!(client.calls(), 0, "a digital batch makes no requests");
+        let clean = results[0].1.as_ref().expect("Q1 retained");
+        assert!(
+            !clean.needs_review,
+            "the clean sibling is a strict Tier-0 accept, not a recovery"
+        );
+        let failed = results[1].1.as_ref().expect("Q2 retained");
+        assert!(failed.needs_review, "the failing span is flagged");
+        assert_eq!(
+            report.deterministic, 1,
+            "exactly one strict accept (the clean sibling)"
+        );
+        assert_eq!(
+            report.recovered, 1,
+            "only the genuinely failed span is a recovery"
+        );
+    }
+
+    /// Two clearly separate question stems mislabeled with the SAME parent
+    /// number must never be silently welded: the historical
+    /// `looks_like_new_question` safeguard runs before the stitch and sends the
+    /// span down the repair path instead.
+    #[tokio::test]
+    async fn separate_question_stems_mislabeled_as_one_parent_are_never_merged() {
+        let pgs = vec![grid_page()];
+        let span_pages: Vec<(usize, &PageInput)> = vec![(0, &pgs[0])];
+        let span = plain_span(6, Some(2));
+        let mock = MockLlm::new(vec![
+            // Both items claim to be Question 6, but the second opens with its
+            // own "7." heading: it is a different question.
+            ok_chat(
+                r#"{"items":[
+                    {"question_number":6,"content":"Prove that the sum of two even numbers is even. **[2 marks]**","marks":2},
+                    {"question_number":6,"content":"7. Give two reasons why the current is the same at every point in a series circuit. **[2 marks]**","marks":2}
+                ]}"#,
+            ),
+            // Repair round: only the target question comes back.
+            ok_chat(
+                r#"{"items":[{"question_number":6,"content":"Prove that the sum of two even numbers is even, and explain why the result holds for every pair of integers. **[2 marks]**","marks":2}]}"#,
+            ),
+        ]);
+        let cache = Arc::new(crate::pdf_render::PageRenderCache::new(PAGE_RENDER_CACHE_CAPACITY));
+        let semaphore = Arc::new(Semaphore::new(1));
+        let collateral = Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
+        let all_spans = Arc::new(vec![span.clone()]);
+        let cfg = config();
+        let (built_opt, report) = extract_span(
+            &mock,
+            &cfg,
+            &span,
+            &span_pages,
+            &[],
+            &cache,
+            &Arc::new(PageImageCache::new()),
+            &semaphore,
+            &collateral,
+            &all_spans,
+            false,
+            &cancel_flag(),
+            &usage(),
+        )
+        .await;
+        let built = built_opt.expect("the target question is still recovered");
+        assert!(
+            !built.content.contains("Give two reasons"),
+            "the mislabeled second stem must never be merged in: {}",
+            built.content
+        );
+        assert_eq!(
+            mock.bodies().len(),
+            2,
+            "the safeguard re-asks instead of silently merging"
+        );
+        assert!(report.repairs >= 1, "the safeguard is on the record");
+    }
 }
-
-

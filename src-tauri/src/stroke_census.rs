@@ -71,7 +71,7 @@ const STACK_PAD_PT: f32 = 4.0;
 const HEADER_FRAC: f32 = 0.05;
 /// Footer band (bottom fraction) excluded from figures.
 const FOOTER_FRAC: f32 = 0.08;
-/// No legitimate board figure fills more than half a page.
+/// Default ceiling for regions without a trusted standalone caption.
 const MAX_FIGURE_AREA_FRAC: f32 = 0.5;
 /// Aspect-ratio ceiling carried over from `is_probable_figure_box`.
 const MAX_ASPECT: f32 = 8.0;
@@ -88,6 +88,10 @@ const DECORATION_EXTENSION_MAX: f32 = 2.0;
 /// Captions within this vertical reach of the bbox are bound to it (and
 /// pulled into the crop); anything farther belongs to another element.
 const CAPTION_SNAP_PT: f32 = 26.0;
+
+/// Vertical window above a region within which a printed MCQ option letter
+/// ("A".."E") is treated as that region's option label.
+const OPTION_LABEL_SNAP_PT: f32 = 34.0;
 /// Horizontal slack for the caption snap window.
 const CAPTION_SNAP_SIDE_PT: f32 = 10.0;
 /// Offset tag marking block indices inside `Region.labels` (which otherwise
@@ -355,7 +359,7 @@ fn heading_block(text: &str) -> bool {
 pub(crate) fn matches_caption(text: &str) -> bool {
     static RE_CAPTION: OnceLock<regex::Regex> = OnceLock::new();
     RE_CAPTION
-        .get_or_init(|| regex::Regex::new(r"(?i)\bfig(?:ure)?\.?\s*\d+").unwrap())
+        .get_or_init(|| regex::Regex::new(r"(?i)^\s*fig(?:ure)?\.?\s*\d+[.:]?\s*$").unwrap())
         .is_match(text)
 }
 
@@ -634,6 +638,45 @@ fn caption_in_snap_window(c: &[f32; 2], bbox: &RectPt) -> bool {
         && c[1] <= bbox[2] + CAPTION_SNAP_PT
 }
 
+/// Positional capture of the printed MCQ option letter for a figure region.
+///
+/// Boards print per-option diagrams under a bare letter ("A" / "B" / "C" / "D",
+/// or a `A B` / `C D` grid). The letter is a single-character `LabelCandidate`
+/// text block sitting inside the region hull or just above its top edge with
+/// real horizontal overlap. Returning the letter lets the caller bind the crop
+/// to its printed option; if no letter qualifies, the region stays unlabelled
+/// and the caller must not guess.
+fn capture_option_label(region: &Region, blocks: &[TextBlock]) -> Option<String> {
+    let bbox = region.bbox;
+    let mut best: Option<(f32, String)> = None;
+    for block in blocks {
+        if block.class != BlockClass::LabelCandidate {
+            continue;
+        }
+        let text = block.text.trim();
+        if text.len() != 1 {
+            continue;
+        }
+        let ch = text.chars().next().unwrap();
+        if !matches!(ch, 'A'..='E') {
+            continue;
+        }
+        let c = rect_center(&block.rect);
+        let inside = c[0] >= bbox[0] && c[0] <= bbox[1] && c[1] >= bbox[3] && c[1] <= bbox[2];
+        let above = c[1] >= bbox[2]
+            && c[1] <= bbox[2] + OPTION_LABEL_SNAP_PT
+            && x_span_coverage(&block.rect, &bbox) > 0.2;
+        if !inside && !above {
+            continue;
+        }
+        let d = (c[0] - (bbox[0] + bbox[1]) / 2.0).powi(2) + (c[1] - bbox[2]).powi(2);
+        if best.as_ref().is_none_or(|(bd, _)| d < *bd) {
+            best = Some((d, text.to_string()));
+        }
+    }
+    best.map(|(_, text)| text)
+}
+
 /// Deterministic confidence score: seed strength, grid presence, label
 /// richness, caption presence, and ink-density normality. Clamped to 0..1.
 fn score_region(region: &Region, _page_area_pt: f32) -> f32 {
@@ -716,10 +759,23 @@ struct Collected {
     form_seeds: usize,
 }
 
+/// The visible page's lower-left corner in user space. Object coordinates
+/// are user space while the page renders from its crop box (Edexcel papers
+/// put it at (28.35, 28.35) inside a larger media box), so every collected
+/// rectangle is shifted to crop-box coordinates.
+fn crop_origin(page: &PdfPage) -> (f32, f32) {
+    let boundaries = page.boundaries();
+    match boundaries.crop().or_else(|_| boundaries.media()) {
+        Ok(b) => (b.bounds.left().value, b.bounds.bottom().value),
+        Err(_) => (0.0, 0.0),
+    }
+}
+
 /// Walk every renderable object on the page, measure paths, and produce
 /// typed primitives in rendered-point space.
 fn collect_prims(page: &PdfPage, raw_w: f32, raw_h: f32, rotation: &PdfPageRenderRotation) -> Collected {
     let page_area_pt = (raw_w * raw_h).max(1.0);
+    let (ox, oy) = crop_origin(page);
     let mut prims: Vec<TypedPrim> = Vec::new();
     let mut form_seeds = 0usize;
 
@@ -729,10 +785,10 @@ fn collect_prims(page: &PdfPage, raw_w: f32, raw_h: f32, rotation: &PdfPageRende
                 let Some(b) = o.bounds().ok() else { continue };
                 push_prim(
                     &mut prims,
-                    b.left().value,
-                    b.right().value,
-                    b.top().value,
-                    b.bottom().value,
+                    b.left().value - ox,
+                    b.right().value - ox,
+                    b.top().value - oy,
+                    b.bottom().value - oy,
                     Prim::Bitmap,
                     0.0,
                     raw_w,
@@ -751,10 +807,10 @@ fn collect_prims(page: &PdfPage, raw_w: f32, raw_h: f32, rotation: &PdfPageRende
                 form_seeds += 1;
                 push_prim(
                     &mut prims,
-                    b.left().value,
-                    b.right().value,
-                    b.top().value,
-                    b.bottom().value,
+                    b.left().value - ox,
+                    b.right().value - ox,
+                    b.top().value - oy,
+                    b.bottom().value - oy,
                     Prim::Bitmap,
                     0.0,
                     raw_w,
@@ -765,7 +821,7 @@ fn collect_prims(page: &PdfPage, raw_w: f32, raw_h: f32, rotation: &PdfPageRende
             PdfPageObject::Path(o) => {
                 let Some(b) = o.bounds().ok() else { continue };
                 let mut t = StrokeTelemetry {
-                    bbox: rect_pt(b.left().value, b.right().value, b.top().value, b.bottom().value),
+                    bbox: rect_pt(b.left().value - ox, b.right().value - ox, b.top().value - oy, b.bottom().value - oy),
                     line_count: 0,
                     bezier_count: 0,
                     ink_len_pt: 0.0,
@@ -861,6 +917,7 @@ pub(crate) fn collect_text_segments(
     rotation: &PdfPageRenderRotation,
 ) -> Vec<(RectPt, String)> {
     let mut segs: Vec<(RectPt, String)> = Vec::new();
+    let (ox, oy) = crop_origin(page);
     if let Ok(text) = page.text() {
         for seg in text.segments().iter() {
             let b = seg.bounds();
@@ -868,7 +925,7 @@ pub(crate) fn collect_text_segments(
             if txt.trim().is_empty() {
                 continue;
             }
-            let raw = rect_pt(b.left().value, b.right().value, b.top().value, b.bottom().value);
+            let raw = rect_pt(b.left().value - ox, b.right().value - ox, b.top().value - oy, b.bottom().value - oy);
             let (mapped, _, _) = rotate_rect_for_render(&raw, raw_w, raw_h, rotation);
             if rect_w(&mapped) <= 0.0 || rect_h(&mapped) <= 0.0 {
                 continue;
@@ -879,10 +936,49 @@ pub(crate) fn collect_text_segments(
     segs
 }
 
+/// Local layout evidence for one page: the text runs and the long horizontal
+/// rules (fraction bars, underlines, table rules) in rendered-point space.
+/// Used by `pdf_render::pdf_layout_evidence` to expose position/font evidence
+/// to the assembler without reloading the document per span.
+pub(crate) fn collect_page_layout(
+    page: &PdfPage,
+    raw_w: f32,
+    raw_h: f32,
+    rotation: &PdfPageRenderRotation,
+) -> (Vec<(RectPt, String)>, Vec<RectPt>) {
+    let runs = collect_text_segments(page, raw_w, raw_h, rotation);
+    let rules = collect_prims(page, raw_w, raw_h, rotation)
+        .prims
+        .into_iter()
+        .filter(|p| p.prim == Prim::Rule)
+        .map(|p| p.bbox)
+        .collect();
+    (runs, rules)
+}
+
 // ── Per-page entrypoint ─────────────────────────────────────────────────────
 
 /// Detect figures on one page deterministically. Returns app-normalized
 /// `DetectedFigure`s ready for span binding and cropping.
+fn numeric_option_table_band(lines: &[(RectPt, String)]) -> Option<RectPt> {
+    let mut rows = Vec::new();
+    for letter in ["A", "B", "C", "D"] {
+        let (label, _) = lines.iter().find(|(_, text)| text.trim() == letter)?;
+        let cells: Vec<_> = lines.iter().filter(|(rect, text)| {
+            rect[0] > label[1]
+                && (rect_center(rect)[1] - rect_center(label)[1]).abs() < rect_h(label).max(8.0)
+                && text.trim().chars().next().is_some_and(|c| c.is_ascii_digit())
+                && text.split_whitespace().count() <= 2
+        }).collect();
+        // A column of ordinary numeric MCQ answers has one value per row.
+        // Only a multi-column A-D data table is excluded from figure crops.
+        if cells.len() < 2 { return None; }
+        let row = cells.iter().fold(*label, |bounds, (rect, _)| rect_union(&bounds, rect));
+        rows.push(row);
+    }
+    Some(rows[1..].iter().fold(rows[0], |bounds, row| rect_union(&bounds, row)))
+}
+
 pub(crate) fn detect_page_figures(page: &PdfPage) -> Vec<crate::pdf_render::DetectedFigure> {
     let raw_w = page.width().value;
     let raw_h = page.height().value;
@@ -902,6 +998,7 @@ pub(crate) fn detect_page_figures(page: &PdfPage) -> Vec<crate::pdf_render::Dete
     //    comes from body prose).
     let segs = collect_text_segments(page, raw_w, raw_h, &rotation);
     let lines = assemble_lines(segs);
+    let option_table = numeric_option_table_band(&lines);
     let blocks: Vec<TextBlock> = lines_to_blocks(&lines)
         .iter()
         .map(|(r, t)| classify_block(r, t))
@@ -948,6 +1045,13 @@ pub(crate) fn detect_page_figures(page: &PdfPage) -> Vec<crate::pdf_render::Dete
     let mut regions = grow_regions(&prims, &barriers, &stacked_rules);
 
     // 5. Labels.
+    if let Some(table) = option_table {
+        regions.retain(|region| {
+            let center = rect_center(&region.bbox);
+            !(center[0] >= table[0] - 12.0 && center[0] <= table[1] + 12.0
+                && center[1] <= table[2] + 12.0 && center[1] >= table[3] - 12.0)
+        });
+    }
     for region in regions.iter_mut() {
         capture_labels(region, &blocks, &barriers);
     }
@@ -983,7 +1087,14 @@ pub(crate) fn detect_page_figures(page: &PdfPage) -> Vec<crate::pdf_render::Dete
     for region in regions.iter_mut() {
         let w = rect_w(&region.bbox);
         let h = rect_h(&region.bbox);
-        if w <= 0.0 || h <= 0.0 || (w * h) / page_area_pt > MAX_FIGURE_AREA_FRAC {
+        // A labelled composite (apparatus plus graph) can exceed half a page.
+        // Require a strong seed and caption; retain all prose/margin gates.
+        let max_area = if region.strongest >= 2 && region.caption.is_some() {
+            0.65
+        } else {
+            MAX_FIGURE_AREA_FRAC
+        };
+        if w <= 0.0 || h <= 0.0 || (w * h) / page_area_pt > max_area {
             continue;
         }
         if w.max(h) / w.min(h).max(1e-6) > MAX_ASPECT {
@@ -1016,12 +1127,14 @@ pub(crate) fn detect_page_figures(page: &PdfPage) -> Vec<crate::pdf_render::Dete
             .as_deref()
             .and_then(crate::geometry::caption_kind_from_text);
         let confidence = score_region(region, page_area_pt);
+        let option_label = capture_option_label(region, &blocks);
 
         figures.push(crate::pdf_render::DetectedFigure {
             bbox: norm_bbox,
             caption,
             kind,
             seg_confidence: confidence,
+            option_label,
         });
     }
     figures
@@ -1031,7 +1144,68 @@ pub(crate) fn detect_page_figures(page: &PdfPage) -> Vec<crate::pdf_render::Dete
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn physics24_large_captioned_composite_is_detected() {
+        let _guard = crate::pdf_render::pdfium_test_lock();
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../physics '24.pdf");
+        if !path.exists() { return; }
+        let pdfium = crate::pdf_render::get_pdfium().unwrap();
+        let document = pdfium.load_pdf_from_file(&path, None).unwrap();
+        let page = document.pages().get(15).unwrap();
+        let figures = detect_page_figures(&page);
+        assert!(figures.iter().any(|f| f.caption.as_deref() == Some("Figure 9")
+            && f.bbox[1] < 0.18 && f.bbox[1] + f.bbox[3] > 0.77),
+            "apparatus and graph must remain together: {figures:?}");
+    }
+
+    #[test]
+    fn physics24_diagram_mcq_regions_capture_option_letters() {
+        // Physics '24 Q26 prints four charge diagrams under a `A B` / `C D`
+        // grid. The deterministic detector must capture each printed option
+        // letter from positional text evidence, so the assembler can bind each
+        // crop to its own option rather than guessing an order.
+        let _guard = crate::pdf_render::pdfium_test_lock();
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../physics '24.pdf");
+        if !path.exists() { return; }
+        let pdfium = crate::pdf_render::get_pdfium().unwrap();
+        let document = pdfium.load_pdf_from_file(&path, None).unwrap();
+        let page = document.pages().get(31).unwrap();
+        let figures = detect_page_figures(&page);
+        let labels: Vec<String> = figures
+            .iter()
+            .filter_map(|f| f.option_label.clone())
+            .collect();
+        eprintln!("[OPTION_LABELS] {labels:?}");
+        // The four charge diagrams sit in a 2x2 grid; the printed option
+        // letters are captured from positional text evidence. The top-left
+        // glyph is not present in the text layer for this paper, so three
+        // regions carry a letter and exactly one stays anonymous — the
+        // assembler resolves the forced missing letter downstream.
+        let distinct: std::collections::BTreeSet<&String> = labels.iter().collect();
+        assert!(
+            labels.len() >= 3 && distinct.len() == labels.len(),
+            "expected at least three distinct printed option letters, got {labels:?} from {figures:?}"
+        );
+        assert!(labels.iter().all(|l| matches!(l.as_str(), "A" | "B" | "C" | "D" | "E")));
+    }
+
     use super::*;
+
+    #[test]
+    fn numeric_mcq_table_requires_two_columns() {
+        let mut lines = Vec::new();
+        for (i, label) in ["A", "B", "C", "D"].iter().enumerate() {
+            let y = 200.0 - i as f32 * 30.0;
+            lines.push((rect_pt(10.0, 20.0, y, y - 10.0), label.to_string()));
+            lines.push((rect_pt(40.0, 60.0, y, y - 10.0), "50".into()));
+        }
+        assert!(numeric_option_table_band(&lines).is_none());
+        for i in 0..4 {
+            let y = 200.0 - i as f32 * 30.0;
+            lines.push((rect_pt(90.0, 120.0, y, y - 10.0), "0.30π".into()));
+        }
+        assert!(numeric_option_table_band(&lines).is_some());
+    }
 
     fn rule(l: f32, r: f32, t: f32, b: f32) -> TypedPrim {
         TypedPrim::new(rect_pt(l, r, t, b), Prim::Rule, (r - l).max(t - b))
@@ -1275,6 +1449,9 @@ mod tests {
 
         let caption = classify_block(&rect_pt(0.0, 80.0, 100.0, 92.0), "Figure 3");
         assert_eq!(caption.class, BlockClass::Caption);
+        let reference = classify_block(&rect_pt(0.0, 300.0, 100.0, 88.0),
+            "The graph in Figure 9 shows how the electric potential varies with distance.");
+        assert_eq!(reference.class, BlockClass::Body, "a reference is prose, not a crop label");
 
         let footer = classify_block(&rect_pt(0.0, 160.0, 30.0, 22.0),
             "(Total for Question 3 is 11 marks)");

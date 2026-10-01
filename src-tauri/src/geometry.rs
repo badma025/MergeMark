@@ -815,6 +815,8 @@ pub enum CropReject {
     BadBox,
     /// ruled empty student answer grid (trace table, working grid)
     AnswerGrid,
+    /// nothing printed in the box (an exact crop must show its figure)
+    Blank,
 }
 
 /// Crop a proposed diagram bbox out of a decoded page image.
@@ -1269,6 +1271,35 @@ pub fn expand_clamped(cur: &RectPt, goal: &RectPt, barriers: &[RectPt], pad_pt: 
 /// Crop a diagram with optional graph-canvas margins. Graphs need asymmetric
 /// room outside the plotted rectangle for vertical axis titles/units on the
 /// left and tick labels/axis titles below the x-axis.
+/// Crop a figure whose box is already its exact extent (drawn strokes and
+/// their labels, from the page layout): a hairline margin, and none of the
+/// padding, edge-text trimming or margin heuristics meant for proposed
+/// boxes — those cut away labels set at a figure's edge. Answer grids are
+/// still refused unless the question asks to read one.
+pub fn crop_exact(img: &image::DynamicImage, bbox: &[f32], ignore_grid: bool, pad_frac: f32) -> Result<image::RgbaImage, CropReject> {
+    use image::GenericImageView;
+    let (img_w, img_h) = img.dimensions();
+    let rect = sanitize_bbox(bbox, img_w, img_h).ok_or(CropReject::BadBox)?;
+    let pad = (img_w.min(img_h) as f32 * pad_frac.max(0.0)).round() as u32;
+    let expanded = expand_rect(rect, pad, pad, pad, pad, img_w, img_h);
+    if expanded.w < MIN_EDGE_PX || expanded.h < MIN_EDGE_PX {
+        return Err(CropReject::BadBox);
+    }
+    let mut owned = img.clone();
+    let cropped = image::imageops::crop(&mut owned, expanded.x, expanded.y, expanded.w, expanded.h).to_image();
+    let gray = image::DynamicImage::ImageRgba8(cropped.clone()).to_luma8();
+    // A figure's box shows its strokes: an (almost) inkless crop is no
+    // picture of it.
+    let ink = gray.pixels().filter(|p| p.0[0] < 160).count();
+    if ink < 20.max((gray.width() * gray.height()) as usize / 2000) {
+        return Err(CropReject::Blank);
+    }
+    if !ignore_grid && looks_like_answer_grid(&gray) {
+        return Err(CropReject::AnswerGrid);
+    }
+    Ok(cropped)
+}
+
 pub fn crop_diagram_with_options(
     img: &image::DynamicImage,
     bbox: &[f32],
@@ -1728,6 +1759,17 @@ mod tests {
     fn assert_close(a: u32, b: u32, tol: u32) {
         let d = (a as i64 - b as i64).abs();
         assert!(d <= tol as i64, "{a} not within {tol} of {b}");
+    }
+
+    #[test]
+    fn an_exact_crop_with_no_ink_is_rejected() {
+        let white = image::DynamicImage::ImageRgb8(image::RgbImage::from_pixel(400, 400, image::Rgb([255, 255, 255])));
+        assert!(matches!(crop_exact(&white, &[0.2, 0.2, 0.5, 0.5], true, 0.004), Err(CropReject::Blank)));
+        let mut drawn = image::RgbImage::from_pixel(400, 400, image::Rgb([255, 255, 255]));
+        for x in 100..300 {
+            drawn.put_pixel(x, 200, image::Rgb([0, 0, 0]));
+        }
+        assert!(crop_exact(&image::DynamicImage::ImageRgb8(drawn), &[0.2, 0.2, 0.5, 0.5], true, 0.004).is_ok());
     }
 
     #[test]
