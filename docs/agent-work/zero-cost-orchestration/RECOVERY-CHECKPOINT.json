@@ -1,0 +1,17 @@
+{
+  "status": "stopped_for_r1_progress_review_partial",
+  "worker": "/root/zero_cost_builder",
+  "bundle": "R1 parent mapping integrity",
+  "budget_minutes": 90,
+  "started_at_utc": "2026-09-28T16:01:06Z",
+  "review_due_utc": "2026-09-28T17:31:06Z",
+  "review_recorded_at_utc": "2026-09-28T17:15:39Z",
+  "elapsed_minutes_at_review": 75,
+  "result": "PARTIAL_NOT_ACCEPTED",
+  "progress_report": "docs/agent-work/zero-cost-orchestration/R1-PROGRESS-CHECKPOINT.md",
+  "next_bundle_not_dispatched": "R1b carving seam and truthful quality flags",
+  "clock_rule": "Set both timestamps before resuming implementation; stop and report by deadline even if incomplete. No automatic extension.",
+  "preserved_snapshot": "output/zero-cost-orchestration/paused-20260928-1425utc",
+  "last_complete_corpus": "output/zero-cost-orchestration/c-calibration/run-20260928c1b",
+  "interrupted_run_not_certification": "output/zero-cost-orchestration/c-calibration/run-20260928c1c"
+}

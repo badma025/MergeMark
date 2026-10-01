@@ -1,0 +1,15 @@
+# Corpus C1 — trustworthy accounting and source boundaries/gates
+
+Use the completed all-corpus baseline as diagnostic evidence, not acceptance. Current provisional historical137/242 strict; test46/66. There are18 historical and4 specified test PDFs, not20 historical. Same writer owns harness/scripts, deterministic/docmap/sanitizer/pipeline and affected tests/report. Preserve dirty source.
+
+## Finish this coherent bundle
+
+1. Correct harness metadata end-to-end. `e2e_import` still assigns Physics-only `config.allowed_topics` around146 despite new subject/module flags. Supply appropriate topics or existing safe subject-neutral behavior, and inspect covers of January2025 andNov2024 to establish actual subject/board/module rather than assuming Physics. Validate CLI missing-value handling.
+2. Make calibration fail honestly: script must honor Root, save child exits, reject nonzero/absent/malformed/stale artifacts and any attempted cloud/image request/nonzero tokens/cost. Never synthesize zero counters on missing results. Use unique run output directories or existing tested offline verifier freshness logic. Emit machine-readable manifest with file identity/hash and source expected question IDs independently checked from PDF headings/end/cover, alongside mapped/extracted IDs. Report discrepancies and missing counts in denominator. Do not use questionsExpected from parser as independent source truth. All22 namedfiles present, but source denominator still needs verification.
+3. Fix evidenced general boundary/part/mark defects across corpus. Start CS2022/23/24 (subpart_gap/boxed numbered parts/code), Nov2024 marks_checksum_mismatch, Jan2025/AQAFM boundaries, and MadasQ8/Q9 no-viable-carve. Inspect original source first; recover actual labels, text and mark tags without suppressing gates. Preserve code and tables. Source-confirm total marks and question identities; continued pages and final END boundaries matter. Share general logic across boards, no filenames/question-number branches.
+4. Superscript detector currently falsely flags CS heading04.2 and10.1 (see c-calibration/cs224.log); repair detection using true locally raised glyph attachment, not page maxfont or small numeric runs alone. Preserve actual missing-Q5-exponent warning unless source expression repaired. Do not globally disable this gate. Include heading/small-body negatives and source equation positive.
+5. Inspect source/card output and run frontend code-opacity/render checks on affected CS/marks/boundary examples. Run meaningful targeted tests and fresh affected offline imports. Update all-corpus summary using only valid runs and explicit source denominators. Record remaining symbol/font/matrix and rendering gaps for C2.
+
+## Completion
+
+Return when the accounting contract and actual boundary/gate repairs are implemented and verified. A repeated baseline alone does not finish this bundle. Report requirement->code/tests/artifacts, source comparisons, new per-paper results and remaining concrete failures. No full Cargo until final integration; no cloud/deps/prodDB/staging/commit/push/deploy. Omit sandbox_permissions.
