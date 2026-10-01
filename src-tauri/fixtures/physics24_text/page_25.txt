@@ -1,0 +1,17 @@
+25
+*25*
+Turn over ►
+IB/M/Jun24/7408/2
+Do not write 
+outside the 
+1 4 box Two signals that have the same frequency are displayed simultaneously on 
+an oscilloscope. 
+The display is shown with the time-base set to 5 ms div−1.
+Which row shows the frequency of both signals and the phase difference between them?
+[1 mark]
+Frequency of both signals / Hz Phase difference / rad
+A 50 0.30π
+B 50 0.15π
+C 25 0.30π
+D 25 0.15π
+PMT

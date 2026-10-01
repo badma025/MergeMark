@@ -1,0 +1,17 @@
+4 
+*04*
+IB/M/Jun24/7408/2
+Do not write 
+outside the 
+0 2 box Figure 1 shows a circuit used to charge capacitor C. 
+The battery has negligible internal resistance.
+Figure 1
+The capacitance of C is known.
+0 2 . 1 The switch is closed at time t = 0 and the potential difference VC across C is recorded 
+at different times t. 
+Figure 2 shows the variation of VC with t. 
+Figure 2
+Explain how a gradient of the graph in Figure 2 can be used to determine the initial 
+current I0 in the circuit.
+[2 marks]
+PMT

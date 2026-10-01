@@ -1,0 +1,25 @@
+30
+*30*
+IB/M/Jun24/7408/2
+Do not write 
+outside the 
+2 3 box The diagram shows the gravitational field for a binary star system consisting of two stars 
+X and Y of equal mass.
+Equipotential lines are shown as solid lines.
+Gravitational field lines are shown as dashed lines.
+Which statement is correct?
+[1 mark]
+A More work is done moving from Q to S to R than moving directly from Q to R. 
+B No work is done moving from Q to R. 
+C The gravitational field strength is the same at R and S. 
+D The work done moving from Q to R and moving from Q to S is the same.
+2 4 Which is equal to ε0? 
+[1 mark]
+A the relative permittivity of a vacuum
+B the charge stored on a capacitor consisting of two parallel plates of area 1 m2
+separated by 1 m when the potential difference between the plates is 1 V
+C the work done when moving a 2 C charge from infinity to a distance of π m from 
+the centre of a metal sphere that carries 2 C of charge
+D the charge on a metal sphere which experiences a force of 1 N when its centre 
+is placed 1 m from the centre of a metal sphere that carries 1 C of charge
+PMT

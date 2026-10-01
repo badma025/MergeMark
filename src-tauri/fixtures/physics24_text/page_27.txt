@@ -1,0 +1,26 @@
+27
+*27*
+Turn over ►
+IB/M/Jun24/7408/2
+Do not write 
+outside the 
+box 1 7 The following reaction occurs when a proton and a carbon-13 ( ) 13C 6 nucleus fuse.
+ 13 1 14 Cp N 61 7 + →
+ mass of 13C 6 nucleus = 13.00007 u 
+ mass of 14 N 7 nucleus = 13.99925 u 
+ mass of proton = 1.00728 u
+What is the quantity of energy released?
+[1 mark]
+A 0.5 MeV
+B 1.1 MeV
+C 7.5 MeV
+D 8.8 MeV
+1 8 The equation represents a typical fission reaction.
+ 235 1 87 146 1 U n Br La 3 n 92 0 35 57 0 + →+ +
+Which statement about this reaction is not true?
+[1 mark]
+A 146 La 57 has the greatest binding energy per nucleon of the three nuclides.
+B The mass of 235U 92 is greater than the sum of the masses of 87Br 35 and 146 La 57 . 
+C The binding energy of the neutrons released in the reaction is zero.
+D The binding energy of 235U 92 is greater than the binding energy of 146 La 57 . 
+PMT

@@ -1,0 +1,31 @@
+33
+*33*
+Turn over ►
+IB/M/Jun24/7408/2
+Do not write 
+outside the 
+2 7 box An ion has a specific charge of −7.1 × 107 C kg−1
+. 
+It is held stationary in a vertical electric field on the surface of the Earth.
+What are the magnitude and direction of the electric field?
+[1 mark]
+A 1.38 × 10−7 V m−1 upwards
+B 1.38 × 10−7 V m−1 downwards
+C 7.24 × 106 V m−1 upwards
+D 7.24 × 106 V m−1 downwards
+2 8 Which particle pair has the largest magnitude of electrostatic force
+gravitational force when separated by 
+the same distance? 
+[1 mark]
+A an electron and a positive pion
+B a helium nucleus and a proton
+C a proton and a positive pion
+D a proton and an electron
+2 9 What can be deduced about the radius r of a nucleus of gold from the scattering 
+of alpha particles by gold nuclei?
+[1 mark]
+A r < 10−14 m
+B r < 10−15 m
+C r ≈ 10−15 m
+D r ≈ 10−16 m
+PMT

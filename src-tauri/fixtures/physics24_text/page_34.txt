@@ -1,0 +1,14 @@
+34
+*34*
+IB/M/Jun24/7408/2
+Do not write 
+outside the 
+3 0 box The graph shows a plot of neutron number N against proton number Z for the known 
+atomic nuclei.
+The nuclide 115Rh 45 is likely to decay by
+[1 mark]
+A α emission.
+B β+ emission.
+C β− emission.
+D electron capture.
+PMT

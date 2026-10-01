@@ -1,0 +1,31 @@
+35
+*35*
+IB/M/Jun24/7408/2
+Do not write 
+outside the 
+box 3 1 Uranium-238 absorbs a neutron in the first stage in a series of nuclear reactions that end 
+in a nucleus Z. 
+ 238Un X 92 + →
+ XY v + + e → β−
+ YZ v + + e → β−
+How many neutrons does Z have?
+[1 mark]
+A 144
+B 145
+C 149
+D 237
+3 2 A rock sample is found to contain the stable isotope lead-207. When it was formed, the 
+rock contained uranium-235 but did not contain any lead-207. 
+Uranium-235 decays by a series of steps into lead-207. The half-life of uranium-235 is 
+0.71 billion years. The half-lives of the nuclides in the intermediate steps are negligible.
+The sample of rock now contains one atom of lead-207 for every four atoms of 
+uranium-235. 
+How long ago was the rock formed?
+[1 mark]
+A 0.23 billion years
+B 0.31 billion years
+C 1.4 billion years
+D 2.0 billion years
+END OF QUESTIONS
+25
+PMT

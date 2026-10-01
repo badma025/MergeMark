@@ -1,0 +1,17 @@
+5 
+*05*
+Turn over ►
+IB/M/Jun24/7408/2
+Do not write 
+outside the 
+0 2 box . 2 The potential difference VR across R is also recorded.
+Figure 3 shows the variation of VR with t between t = 20 s and t = 45 s.
+Figure 3
+The capacitance of C is 31.0 μF. 
+Determine, using Figure 3, the time constant of the circuit.
+Go on to show that the resistance of R is about 2.4 × 105 Ω. 
+[2 marks]
+time constant = s 
+resistance = Ω
+Question 2 continues on the next page
+PMT

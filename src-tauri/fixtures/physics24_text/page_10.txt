@@ -1,0 +1,18 @@
+10
+*10*
+IB/M/Jun24/7408/2
+Do not write 
+outside the 
+0 4 box . 1 One purpose of the coolant in a thermal nuclear reactor is to maintain a safe working 
+temperature within the core.
+State the other purpose.
+[1 mark]
+0 4 . 2 State two properties that engineers consider when choosing a liquid to use as a 
+coolant in a thermal nuclear reactor.
+[2 marks]
+1
+2
+0 4 . 3 Explain how the power output of a thermal nuclear reactor is decreased.
+[2 marks]
+5
+PMT

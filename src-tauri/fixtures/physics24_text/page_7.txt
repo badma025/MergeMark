@@ -1,0 +1,26 @@
+7 
+*07*
+Turn over ►
+IB/M/Jun24/7408/2
+Do not write 
+outside the 
+Table 2 gives information about C box 1 and C2.
+Table 2
+C1 C2
+charge Q Q 
+surface area S S 
+potential difference V1 V2
+plate separation d 2d
+dielectric constant 4.0 1.0 
+Determine 1
+2
+V
+V . 
+[2 marks]
+1
+2
+V
+V =
+Turn over for the next question 
+9
+PMT

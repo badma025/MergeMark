@@ -1,0 +1,45 @@
+13 
+ 
+*13* 
+Turn over ► 
+ 
+IB/M/Jun24/7408/2 
+ 
+Do not write 
+outside the  
+box 
+ 
+0 5 
+ 
+. 1 
+ 
+The resultant force on S1 is due to the gravitational forces from the Earth and  
+the Moon. 
+The magnitude of the Earth’s gravitational field strength at the orbital radius  
+of S1 is 1.98 × 10−3 N kg−1. 
+The magnitude of the Moon’s gravitational field strength at the orbital radius  
+of S1 is gM. 
+ 
+Show that gM is approximately 1.2 × 10−3 N kg−1. 
+ 
+period of the Moon’s orbit = 27.3 days 
+orbital radius of S1 = 4.489 × 105 km 
+[3 marks] 
+   
+   
+   
+0 5 
+ 
+. 2 
+ 
+Calculate the distance from S1 to the centre of the Moon. 
+ 
+     mass of the Moon = 7.35 × 1022 kg 
+[2 marks] 
+   
+  distance = 
+ 
+ m 
+ 
+Question 5 continues on the next page 
+PMT

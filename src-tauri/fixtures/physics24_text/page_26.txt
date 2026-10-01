@@ -1,0 +1,33 @@
+26
+*26*
+IB/M/Jun24/7408/2
+Do not write 
+outside the 
+1 5 box A transmission cable consists of many strands of wire. Electrical energy is transmitted 
+along the cable at a frequency of 50 Hz. 
+Which change gives the largest increase in the efficiency of the electrical energy transfer 
+along the cable?
+[1 mark]
+A doubling the transmission voltage of the cable
+B doubling the current in the cable
+C halving the resistivity of the material of the wires
+D halving the number of wires in the cable
+1 6 An electron enters a uniform magnetic field at right angles to the field.
+The flux density of the field is B. 
+The electron moves with a non-relativistic speed v in a circular path of radius r. 
+What is the number of circuits completed by the electron in one second?
+[1 mark]
+A e 2 m
+Be
+π
+B
+2 r
+v
+π
+C
+v
+πr
+D e 2
+Be
+πm
+PMT

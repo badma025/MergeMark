@@ -1,0 +1,20 @@
+19
+*19*
+Turn over ►
+IB/M/Jun24/7408/2
+Do not write 
+outside the 
+0 7 box A team of students uses 900 dice, each with n sides, to model the decay of 
+a radioactive material. Each dice represents a single undecayed nucleus.
+A throw of the dice represents a constant time interval.
+When the dice are thrown, those that show a 1 represent decayed nuclei and are 
+removed.
+The students count the number N of ‘undecayed’ dice that remain.
+The procedure is repeated using the undecayed dice.
+Figure 10 shows the students’ data.
+Figure 10
+ 
+0 7 . 1 Explain why N has been plotted on a logarithmic scale in Figure 10. 
+[1 mark]
+Question 7 continues on the next page
+PMT

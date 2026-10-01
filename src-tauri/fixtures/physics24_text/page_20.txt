@@ -1,0 +1,18 @@
+20
+*20*
+IB/M/Jun24/7408/2
+Do not write 
+outside the 
+0 7 box . 2 In this experiment, a decay constant λ can be defined that models the radioactive 
+decay constant.
+Determine λ. 
+Go on to use your value for λ to show that n = 4 for the dice used in this experiment.
+[5 marks]
+λ = throw−1
+0 7 . 3 A typical radioactive source used in schools has an activity of 100 kBq. 
+A radioactive source used in a hospital has an activity of 370 GBq. 
+State one safety measure when using a radioactive source in a school laboratory.
+Go on to discuss how this safety measure needs to be adapted for safe use of the 
+hospital radioactive source.
+[2 marks]
+PMT

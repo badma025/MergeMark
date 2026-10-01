@@ -1,0 +1,15 @@
+6 
+*06*
+IB/M/Jun24/7408/2
+Do not write 
+outside the 
+0 2 box . 3 The current I0 at time t = 0 is 3.6 × 10−5
+ A. 
+Determine the time at which VC is 6.0 V. 
+[3 marks]
+time = s 
+0 2 . 4 Figure 4 shows two fully charged parallel-plate capacitors C1 and C2 in a circuit.
+A dielectric fills the space between the plates of C1 and air fills the space between the 
+plates of C2. 
+Figure 4
+PMT

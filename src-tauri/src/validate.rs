@@ -50,6 +50,13 @@ pub fn sum_inline_marks(content: &str) -> u32 {
         .sum()
 }
 
+/// Style-and-clarity allocations printed as "(+S1)" / "(+S2)" (AEA papers):
+/// they count towards the question total but belong to no single part.
+pub fn sum_style_marks(content: &str) -> u32 {
+    let re_style = re(r"\(\+\s*S\s*([1-9])\s*\)");
+    re_style.captures_iter(content).filter_map(|c| c[1].parse::<u32>().ok()).sum()
+}
+
 /// Tolerant coercion of a model-supplied marks field (int, float, or string).
 pub fn value_to_marks(v: &serde_json::Value) -> Option<i32> {
     match v {
@@ -233,19 +240,138 @@ fn parse_question_number_string(t: &str) -> Option<u64> {
 
 // ── Truncation detection ────────────────────────────────────────────────────
 
+/// Navigation/decorative trailing lines that mean "this question ended here".
+static TERMINAL_NAV_RE: LazyLock<regex::Regex> = LazyLock::new(|| {
+    regex::Regex::new(
+        r"(?i)(?:turn\s+over|end\s+of\s+(?:questions?|section|paper|examination)\b(?:\s+[A-Z])?|continued|blank\s+page)\s*[►▶]?\s*\**\s*$",
+    )
+    .unwrap()
+});
+
+/// Bracket-only mark allocation ("[2]", "**[2]**"). Parenthesised bare numbers
+/// are NOT accepted here: "(2)" is far too common in ordinary prose and in
+/// coordinate pairs to treat as a mark tag.
+static BARE_BRACKET_MARK_RE: LazyLock<regex::Regex> =
+    LazyLock::new(|| regex::Regex::new(r"\*{0,2}\[\s*\d{1,2}\s*\]\*{0,2}\s*$").unwrap());
+
+/// A bare value+unit pair at the end of a line ("12 N", "0.50 A",
+/// "5.1 × 10−15 m"). Data-table rows end with bare numbers, which this
+/// deliberately does NOT accept.
+static VALUE_UNIT_TAIL_RE: LazyLock<regex::Regex> = LazyLock::new(|| {
+    regex::Regex::new(
+        r"(?i)\d\s*(?:[×xX*]\s*10\s*\^?\s*[-\u{2212}]?\s*\d+\s*)?(?:J|kJ|W|kW|MW|N|C|V|mV|A|mA|Hz|kHz|kg|g|mg|m|cm|mm|s|ms|K|Pa|kPa|mol|Ω|°C)\s*\*{0,2}\s*$",
+    )
+    .unwrap()
+});
+
+/// A "complete formula ending": the final line closes a balanced LaTeX group
+/// ("...\text{kg m}^{-3}", "...^{238}_{92}\text{U}") or ends a written
+/// equation / answer line with a value ("x = 2.5", "energy released = J").
+///
+/// Deliberately narrow: trailing prose, dangling operators and mid-word
+/// cut-offs are never accepted.
+pub fn ends_with_complete_formula(content: &str) -> bool {
+    let Some(line) = content.lines().rev().find(|l| !l.trim().is_empty()) else {
+        return false;
+    };
+    let line = line.trim();
+    let last = match line.chars().last() {
+        Some(c) => c,
+        None => return false,
+    };
+    // Balanced LaTeX group. A dangling opener ("... x^{2") cannot satisfy the
+    // brace balance, and bare prose never contains a backslash/script marker.
+    if last == '}' {
+        let opens = line.matches('{').count();
+        let closes = line.matches('}').count();
+        if opens == closes && (line.contains('\\') || line.contains('^') || line.contains('_')) {
+            return true;
+        }
+    }
+    let written_equation =
+        line.contains('=') || line.contains("\\rightarrow") || line.contains("->");
+    // A written equation/answer line that ends on a VALUE is complete.
+    // A dangling unit with no number ("energy released = J") is answer debris,
+    // not proof of a finished equation, and stays non-terminal (phase-3 cleanup).
+    if written_equation && last.is_ascii_digit() {
+        return true;
+    }
+    // A bare value with a unit reads as a completed answer ("12 N", "0.50 A").
+    if VALUE_UNIT_TAIL_RE.is_match(line) {
+        return true;
+    }
+    false
+}
+
 /// True when the content ends like finished prose / math, not mid-word.
+///
+/// Consistent at every seam (deterministic gate, assembly, LLM validation):
+/// mark tags with or without the word "marks", balanced LaTeX groups, complete
+/// equations/answer lines, navigation markers ("END OF SECTION A",
+/// "Turn over ►"), code fences, tables and ordinary terminal punctuation.
+/// A multiple-choice card closes with its option list: tagged options from A
+/// through at least D on consecutive final lines are a complete structure
+/// (option text carries no terminal punctuation). A run that stops short of
+/// D is a truncation.
+fn ends_with_complete_option_run(t: &str) -> bool {
+    static OPTION_RE: LazyLock<regex::Regex> =
+        LazyLock::new(|| regex::Regex::new(r"^[ \t]*-[ \t]+\[MCQ:([A-E])\][ \t]+\S").unwrap());
+    let mut letters: Vec<char> = t
+        .lines()
+        .rev()
+        .map_while(|l| OPTION_RE.captures(l).map(|c| c[1].chars().next().unwrap()))
+        .collect();
+    letters.reverse();
+    letters.len() >= 4 && letters.iter().enumerate().all(|(i, &c)| c == (b'A' + i as u8) as char)
+}
+
+/// A structured question's part may end on its own lettered choice list,
+/// kept as plain lines ("A The set of integers" … "E The set of real
+/// numbers"): A, B, C … in order on the final lines, at least three.
+fn ends_with_plain_option_run(t: &str) -> bool {
+    static PLAIN_RE: LazyLock<regex::Regex> = LazyLock::new(|| regex::Regex::new(r"^[ \t]*([A-E])[ \t]+\S").unwrap());
+    let mut letters: Vec<char> = t
+        .lines()
+        .rev()
+        .map_while(|l| PLAIN_RE.captures(l).map(|c| c[1].chars().next().unwrap()))
+        .collect();
+    letters.reverse();
+    letters.len() >= 3 && letters.iter().enumerate().all(|(i, &c)| c == (b'A' + i as u8) as char)
+}
+
+/// A "Circle / Tick / Shade" instruction answered from a printed row of
+/// short choices ("1  3  4  7"): the row is the question's end.
+fn ends_with_choice_row(t: &str) -> bool {
+    static INSTRUCTION_RE: LazyLock<regex::Regex> =
+        LazyLock::new(|| regex::Regex::new(r"(?i)\b(?:circle|tick|shade|underline|choose|select)\b").unwrap());
+    let Some(last) = t.lines().rev().find(|l| !l.trim().is_empty()) else { return false };
+    let tokens: Vec<&str> = last.split_whitespace().collect();
+    (2..=8).contains(&tokens.len())
+        && tokens.iter().all(|w| w.chars().count() <= 12 && !w.chars().any(|c| c.is_alphabetic() && c.is_lowercase() && !w.starts_with('$')))
+        && INSTRUCTION_RE.is_match(&t[..last.as_ptr() as usize - t.as_ptr() as usize])
+}
+
 pub fn has_terminal_ending(content: &str) -> bool {
     let t = content.trim_end();
     if t.is_empty() {
         return false;
     }
-    // Ends with a marks tag?
+    // Ends with a marks tag, with or without the word "marks"?
     let re_tag = re(r"(?i)(?:\[|\()\s*\d{1,2}\s*marks?\s*(?:\]|\))\s*\**\s*$");
     if re_tag.is_match(t) {
         return true;
     }
+    if BARE_BRACKET_MARK_RE.is_match(t) {
+        return true;
+    }
     // Ends with display math close, code fence, or terminal punctuation?
-    if t.ends_with("$$") || t.ends_with("```") || t.ends_with('$') || t.ends_with('`') {
+    if t.ends_with("$$")
+        || t.ends_with("```")
+        || t.ends_with('$')
+        || t.ends_with('`')
+        || t.ends_with("\\]")
+        || t.ends_with("\\)")
+    {
         return true;
     }
     // Markdown tables (AQA trace tables) end with '|' — treat as terminal.
@@ -254,8 +380,13 @@ pub fn has_terminal_ending(content: &str) -> bool {
     if t.ends_with('|') {
         return true;
     }
-    let lower = t.to_ascii_lowercase();
-    if lower.ends_with("continued") || lower.ends_with("turn over") || lower.ends_with("blank page") {
+    if TERMINAL_NAV_RE.is_match(t) {
+        return true;
+    }
+    if ends_with_complete_option_run(t) || ends_with_plain_option_run(t) || ends_with_choice_row(t) {
+        return true;
+    }
+    if ends_with_complete_formula(t) {
         return true;
     }
     matches!(
@@ -274,6 +405,16 @@ pub fn clean_ligatures(s: &str) -> String {
      .replace('ﬄ', "ffl")
      .replace('ﬅ', "st")
      .replace('ﬆ', "st")
+     .replace('\u{f084}', "\\le ")
+     .replace('\u{f052}', "\\mathbb{R}")
+     .replace('\u{f0a2}', "")
+     .replace('\u{f0bf}', "")
+     .replace("/lpar", "(")
+     .replace("/rpar", ")")
+     .replace("/thetaslant", "\\theta ")
+     .replace("/surd", "\\sqrt ")
+     .replace("/degrees", "^{\\circ}")
+     .replace("/solidcircle", "\\bullet ")
 }
 
 // ── Uniform sub-part labelling ──────────────────────────────────────────────
@@ -489,7 +630,7 @@ static RE_MULTI_CURVE_CONST: LazyLock<regex::Regex> = LazyLock::new(|| {
 });
 
 pub fn heal_polar_equations(content: &str) -> String {
-    let content = RE_TRIPLE_DOLLARS.replace_all(content, "$$");
+    let content = normalize_dollar_runs_outside_code(content);
     let lines: Vec<&str> = content.lines().collect();
     let mut result: Vec<String> = Vec::with_capacity(lines.len());
 
@@ -578,54 +719,274 @@ pub fn heal_polar_equations(content: &str) -> String {
 //     options grid), strips nested `$` inside `$$` blocks, and closes an
 //     unterminated display block at the end of the content.
 
-/// Collapse runs of `$` to exactly `$$` before scanning (mirrors the TS side).
-/// The replacement is a closure because the regex crate interpolates `$`
-/// sequences in plain replacement strings (`$$` would yield a single `$`).
-fn normalize_dollar_runs(s: &str) -> std::borrow::Cow<'_, str> {
-    RE_TRIPLE_DOLLARS.replace_all(s, |_: &regex::Captures| "$$")
+/// Byte ranges of inline code spans in one line, using CommonMark backtick-run
+/// rules: a span opens with a run of N backticks and closes at the next run of
+/// EXACTLY N backticks; an unclosed run extends to the end of the line. This
+/// keeps ``a ` b`` (a code span containing a backtick) and ``$`` (a code span
+/// containing a dollar) opaque to the delimiter machinery.
+fn inline_code_spans(line: &str) -> Vec<(usize, usize)> {
+    let bytes = line.as_bytes();
+    let mut spans = Vec::new();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if bytes[i] != b'`' {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        let mut run = 0usize;
+        while i < bytes.len() && bytes[i] == b'`' {
+            run += 1;
+            i += 1;
+        }
+        // The closing run must be EXACTLY as long as the opening run.
+        let mut j = i;
+        let mut close_end = None;
+        while j < bytes.len() {
+            if bytes[j] == b'`' {
+                let mut m = 0usize;
+                while j < bytes.len() && bytes[j] == b'`' {
+                    m += 1;
+                    j += 1;
+                }
+                if m == run {
+                    close_end = Some(j);
+                    break;
+                }
+            } else {
+                j += 1;
+            }
+        }
+        let end = close_end.unwrap_or(bytes.len());
+        spans.push((start, end));
+        i = end;
+    }
+    spans
 }
 
-/// Scan one line, returning `(unescaped_single_dollar_parity_odd, display_toggles)`
-/// where `display_toggles` counts `$$` occurrences.
-fn scan_line_delimiters(line: &str) -> (bool, usize) {
-    let bytes = line.as_bytes();
+/// `(marker char, run length)` when a line is a code-fence marker: up to three
+/// leading spaces, then a run of at least three backticks or tildes. A backtick
+/// fence may not carry another backtick in its info string.
+fn fence_marker(line: &str) -> Option<(u8, usize)> {
+    let trimmed = line.trim_start_matches(' ');
+    if line.len().saturating_sub(trimmed.len()) > 3 {
+        return None;
+    }
+    let bytes = trimmed.as_bytes();
+    let ch = *bytes.first()?;
+    if ch != b'`' && ch != b'~' {
+        return None;
+    }
+    let run = bytes.iter().take_while(|b| **b == ch).count();
+    if run < 3 {
+        return None;
+    }
+    if ch == b'`' && bytes[run..].contains(&b'`') {
+        return None;
+    }
+    Some((ch, run))
+}
+
+/// Per-line code structure for one document.
+struct LineCode {
+    /// The whole line sits inside a fenced code block.
+    fenced: bool,
+    /// Byte ranges of inline code spans (empty inside a fence).
+    spans: Vec<(usize, usize)>,
+}
+
+/// Walk the content once, tracking fenced blocks by MARKER CHAR and RUN LENGTH
+/// (a four-backtick fence is not closed by a three-backtick line, and a tilde
+/// fence is not closed by backticks) and recording each line's inline code
+/// spans.
+fn line_code_map(content: &str) -> Vec<LineCode> {
+    let mut map = Vec::new();
+    let mut open_fence: Option<(u8, usize)> = None;
+    for line in content.split('\n') {
+        if let Some((ch, run)) = open_fence {
+            let closes = fence_closes(line, ch, run);
+            map.push(LineCode { fenced: true, spans: Vec::new() });
+            if closes {
+                open_fence = None;
+            }
+            continue;
+        }
+        if let Some(marker) = fence_marker(line) {
+            open_fence = Some(marker);
+            map.push(LineCode { fenced: true, spans: Vec::new() });
+            continue;
+        }
+        map.push(LineCode { fenced: false, spans: inline_code_spans(line) });
+    }
+    map
+}
+
+/// True when `line` CLOSES a fenced block opened with `(marker_char, run)`:
+/// same marker character, a run at least as long, and nothing but whitespace
+/// after the run. (A closing fence may not carry an info string; only the
+/// opening fence may.)
+fn fence_closes(line: &str, marker_char: u8, run: usize) -> bool {
+    let Some((close_char, close_run)) = fence_marker(line) else {
+        return false;
+    };
+    if close_char != marker_char || close_run < run {
+        return false;
+    }
+    let trimmed = line.trim_start_matches(' ');
+    trimmed[close_run..].trim().is_empty()
+}
+
+/// Unescaped single-dollar count and `$$` (or longer run) toggle count for one
+/// segment of text. A run of two or more dollars counts as ONE display toggle,
+/// mirroring the old `normalize_dollar_runs`.
+fn scan_segment_dollars(segment: &str) -> (usize, usize) {
+    let chars: Vec<char> = segment.chars().collect();
     let mut singles = 0usize;
     let mut doubles = 0usize;
     let mut i = 0usize;
-    while i < bytes.len() {
-        if bytes[i] == b'\\' {
-            i += 2; // skip escaped char verbatim (\$, \\, \frac…)
+    while i < chars.len() {
+        if chars[i] == '\\' {
+            i += 2; // escaped char is verbatim (\$, \\, \frac ...)
             continue;
         }
-        if bytes[i] == b'$' {
-            if i + 1 < bytes.len() && bytes[i + 1] == b'$' {
-                doubles += 1;
-                i += 2;
-                continue;
+        if chars[i] == '$' {
+            let mut run = 0usize;
+            while i + run < chars.len() && chars[i + run] == '$' {
+                run += 1;
             }
-            singles += 1;
+            if run >= 2 {
+                doubles += 1;
+            } else {
+                singles += 1;
+            }
+            i += run;
+            continue;
         }
         i += 1;
+    }
+    (singles, doubles)
+}
+
+/// `(unescaped_single_dollar_parity_odd, display_toggles)` for one line,
+/// ignoring inline `code` spans.
+fn scan_line_delimiters_outside_spans(line: &str, spans: &[(usize, usize)]) -> (bool, usize) {
+    let mut singles = 0usize;
+    let mut doubles = 0usize;
+    let mut pos = 0usize;
+    for &(start, end) in spans {
+        if start > pos {
+            let (s, d) = scan_segment_dollars(&line[pos..start]);
+            singles += s;
+            doubles += d;
+        }
+        pos = end.max(pos);
+    }
+    if pos < line.len() {
+        let (s, d) = scan_segment_dollars(&line[pos..]);
+        singles += s;
+        doubles += d;
     }
     (singles % 2 == 1, doubles)
 }
 
+/// `(unescaped_single_dollar_parity_odd, display_toggles)` for one line.
+fn scan_line_delimiters(line: &str) -> (bool, usize) {
+    scan_line_delimiters_outside_spans(line, &inline_code_spans(line))
+}
+
+/// `$$$` (and longer) becomes `$$`; nothing else changes.
+fn collapse_dollar_runs(segment: &str) -> String {
+    if !segment.contains("$$$") {
+        return segment.to_string();
+    }
+    RE_TRIPLE_DOLLARS
+        .replace_all(segment, |_: &regex::Captures| "$$")
+        .into_owned()
+}
+
+/// Collapse runs of three or more `$` to `$$` OUTSIDE code. Fenced lines and
+/// inline code spans are copied verbatim: a literal `$$$` in code must never be
+/// rewritten by the delimiter machinery.
+fn normalize_dollar_runs_outside_code(content: &str) -> String {
+    let map = line_code_map(content);
+    let mut out = String::with_capacity(content.len() + 8);
+    for (idx, (line, code)) in content.split('\n').zip(map.iter()).enumerate() {
+        if idx > 0 {
+            out.push('\n');
+        }
+        if code.fenced {
+            out.push_str(line);
+            continue;
+        }
+        let mut pos = 0usize;
+        for &(start, end) in &code.spans {
+            out.push_str(&collapse_dollar_runs(&line[pos..start]));
+            out.push_str(&line[start..end]);
+            pos = end;
+        }
+        out.push_str(&collapse_dollar_runs(&line[pos..]));
+    }
+    out
+}
+
+/// Rewrite one non-code segment for the delimiter healer: escaped characters
+/// pass through, a `$` run of two or more becomes one `$$` display toggle, and
+/// a stray single `$` is kept only outside display math.
+fn push_balanced_segment(segment: &str, out: &mut String, in_display: &mut bool) {
+    let chars: Vec<char> = segment.chars().collect();
+    let mut i = 0usize;
+    while i < chars.len() {
+        let c = chars[i];
+        if c == '\\' {
+            out.push(c);
+            if i + 1 < chars.len() {
+                out.push(chars[i + 1]);
+                i += 2;
+            } else {
+                i += 1;
+            }
+            continue;
+        }
+        if c == '$' {
+            let mut run = 0usize;
+            while i + run < chars.len() && chars[i + run] == '$' {
+                run += 1;
+            }
+            if run >= 2 {
+                *in_display = !*in_display;
+                out.push_str("$$");
+            } else if !*in_display {
+                out.push('$');
+            }
+            i += run;
+            continue;
+        }
+        out.push(c);
+        i += 1;
+    }
+}
+
 /// Validator: human-readable violations for unbalanced `$` / `$$` pairing.
 /// Quoted back to the model by the repair loop via `validate_span_items`.
+/// Code (fenced blocks and inline spans) is opaque: a `$` in code is literal.
 pub fn math_delimiter_balance_errors(content: &str) -> Vec<String> {
     let mut errors = Vec::new();
-    let s = normalize_dollar_runs(content);
+    let s = normalize_dollar_runs_outside_code(content);
+    let map = line_code_map(&s);
     let mut in_display = false;
     let mut total_doubles = 0usize;
-    for (idx, line) in s.split('\n').enumerate() {
-        let (odd_singles, doubles) = scan_line_delimiters(line);
+    for (idx, (line, code)) in s.split('\n').zip(map.iter()).enumerate() {
+        if code.fenced {
+            continue;
+        }
+        let (odd_singles, doubles) = scan_line_delimiters_outside_spans(line, &code.spans);
         total_doubles += doubles;
         if doubles % 2 == 1 {
             in_display = !in_display;
         }
         if odd_singles && !in_display {
             errors.push(format!(
-                "line {} opens an inline math `$` that is never closed on the same line — every $ must be paired on ONE line (e.g. $x^2 + 1$)",
+                "line {} opens an inline math `$` that is never closed on the same line - every $ must be paired on ONE line (e.g. $x^2 + 1$)",
                 idx + 1
             ));
         }
@@ -642,50 +1003,36 @@ pub fn math_delimiter_balance_errors(content: &str) -> Vec<String> {
 /// `validateAndEnforceDelimiters`, applied where the model cannot be asked
 /// again): closes broken inline `$` at the end of its own line, strips
 /// nested `$` inside `$$`, and appends a closing `$$` for an unterminated
-/// display block. Never invents content.
+/// display block. Never invents content. Code (fenced blocks and inline spans)
+/// is copied verbatim and never rewritten.
 pub fn balance_math_delimiters(content: &str) -> String {
-    let s = normalize_dollar_runs(content);
+    let s = normalize_dollar_runs_outside_code(content);
+    let map = line_code_map(&s);
     let mut out = String::with_capacity(s.len() + 16);
     let mut in_display = false;
-
-    for line in s.split('\n') {
-        let mut chars = line.chars().peekable();
-        while let Some(c) = chars.next() {
-            if c == '\\' {
-                out.push(c);
-                if let Some(&next) = chars.peek() {
-                    out.push(next);
-                    chars.next();
-                }
-                continue;
-            }
-            if c == '$' {
-                if chars.peek() == Some(&'$') {
-                    chars.next();
-                    in_display = !in_display;
-                    out.push_str("$$");
-                    continue;
-                }
-                if !in_display {
-                    out.push('$');
-                }
-                // Inside display math a stray single `$` is stripped (KaTeX
-                // parse-error prevention).
-                continue;
-            }
-            out.push(c);
+    for (line, code) in s.split('\n').zip(map.iter()) {
+        if code.fenced {
+            out.push_str(line);
+            out.push('\n');
+            continue;
         }
-        // Close broken inline math at the END OF ITS OWN LINE — never let a
-        // stray `$` swallow the next paragraph, table, or MCQ option grid.
-        let (odd_singles, _) = scan_line_delimiters(line);
+        let mut pos = 0usize;
+        for &(start, end) in &code.spans {
+            if start > pos {
+                push_balanced_segment(&line[pos..start], &mut out, &mut in_display);
+            }
+            out.push_str(&line[start..end]);
+            pos = end;
+        }
+        if pos < line.len() {
+            push_balanced_segment(&line[pos..], &mut out, &mut in_display);
+        }
+        let (odd_singles, _) = scan_line_delimiters_outside_spans(line, &code.spans);
         if odd_singles && !in_display {
             out.push('$');
         }
         out.push('\n');
     }
-
-    // Drop the synthetic trailing newline, then close an unterminated display
-    // block so KaTeX never sees an open $$ boundary.
     while out.ends_with('\n') {
         out.pop();
     }
@@ -694,7 +1041,6 @@ pub fn balance_math_delimiters(content: &str) -> String {
     }
     out
 }
-
 // ── Multi-line display-math preservation ────────────────────────────────────
 //
 // KaTeX treats a raw newline inside $$ ... $$ as ordinary whitespace, so
@@ -719,11 +1065,23 @@ pub fn ensure_display_math_line_breaks(content: &str) -> String {
     if !content.contains("$$") {
         return content.to_string();
     }
-    let s = normalize_dollar_runs(content);
+    let s = normalize_dollar_runs_outside_code(content);
     let mut result: Vec<String> = Vec::new();
     let mut in_display = false;
 
-    for line in s.split('\n') {
+    let code_map = line_code_map(&s);
+    for (idx, line) in s.split('\n').enumerate() {
+        let code = &code_map[idx];
+        // Fenced blocks and lines that are entirely inline code are opaque:
+        // they cannot open, close or continue display math.
+        let entirely_inline_code = code
+            .spans
+            .iter()
+            .any(|&(start, end)| start == 0 && end >= line.len());
+        if code.fenced || entirely_inline_code {
+            result.push(line.to_string());
+            continue;
+        }
         let trimmed = line.trim();
         let (_, doubles) = scan_line_delimiters(line);
         let toggles = doubles % 2 == 1;
@@ -868,7 +1226,7 @@ pub fn clean_question_content(content: &str) -> String {
 
     // Minimal cleanup: ligatures, harden line breaks (preserve source lines)
     let with_ligatures = clean_ligatures(&collapsed);
-    harden_line_breaks(&with_ligatures)
+    harden_line_breaks(&crate::sanitize::wrap_orphan_latex(&with_ligatures))
 }
 
 static RE_MATH_DEGREE: LazyLock<regex::Regex> = LazyLock::new(|| {
@@ -1447,6 +1805,294 @@ pub fn figure_reference_numbers(content: &str) -> Vec<u32> {
         .collect()
 }
 
+// ── Structural card validator (post-sanitizer quality gate) ────────────────
+//
+// Runs on the SANITIZED content of every assembled card. The sanitizer fixes
+// what is deterministically fixable; anything still failing here is a genuine
+// extraction defect that must go back to the model (repair round) or escalate
+// to vision. Every message is phrased as actionable feedback for the model.
+
+/// Raw LaTeX commands sitting OUTSIDE any $...$ / $$...$$ math span.
+fn latex_outside_math(content: &str) -> Option<String> {
+    static OUTSIDE_RE: LazyLock<regex::Regex> = LazyLock::new(|| {
+        regex::Regex::new(r"\\(text|frac|times|mu|pi|approx|propto|lambda|beta|alpha|nu|Omega|varepsilon|circ|div|sqrt|rightarrow|to)\b")
+            .unwrap()
+    });
+    let mut stripped = String::with_capacity(content.len());
+    let mut rest = content;
+    while let Some(dstart) = rest.find("$$") {
+        stripped.push_str(&rest[..dstart]);
+        match rest[dstart + 2..].find("$$") {
+            Some(dend) => {
+                rest = &rest[dstart + 4 + dend..];
+            }
+            None => {
+                rest = &rest[dstart + 2..];
+                break;
+            }
+        }
+    }
+    stripped.push_str(rest);
+    let mut final_stripped = String::with_capacity(stripped.len());
+    let mut rest = stripped.as_str();
+    while let Some(dstart) = rest.find('$') {
+        final_stripped.push_str(&rest[..dstart]);
+        match rest[dstart + 1..].find('$') {
+            Some(dend) => {
+                rest = &rest[dstart + 2 + dend..];
+            }
+            None => break,
+        }
+    }
+    final_stripped.push_str(rest);
+    OUTSIDE_RE
+        .find(&final_stripped)
+        .map(|m| m.as_str().to_string())
+}
+
+/// Isotope scramble families that survive the sanitizer:
+///   math spans holding bare digit runs + element symbols ("$235 1 87 146 1 U n$")
+///   "6C12"-style element-embedded masses
+fn isotope_scramble_errors(content: &str) -> Vec<String> {
+    let mut errors = Vec::new();
+    static SCRAMBLE_SPAN_RE: LazyLock<regex::Regex> = LazyLock::new(|| {
+        regex::Regex::new(r"\$[^$\n]*\$").unwrap()
+    });
+    static BARE_DIGITS_ELEM_RE: LazyLock<regex::Regex> = LazyLock::new(|| {
+        regex::Regex::new(r"^(?:[^A-Za-z]*\d{1,3}[\s,]+){2,}[A-Z][a-z]?[^A-Za-z0-9]*$").unwrap()
+    });
+    for m in SCRAMBLE_SPAN_RE.find_iter(content) {
+        let span = m.as_str().trim_matches('$');
+        if BARE_DIGITS_ELEM_RE.is_match(span) && span.chars().filter(|c| c.is_ascii_digit()).count() >= 3
+        {
+            errors.push(
+                "math span holds a scrambled nuclear equation (bare mass/atomic numbers around an element symbol) — reconstruct every nuclide as $^{mass}_{atomic}\\text{Symbol}$ and write the decay/fusion equation with \\rightarrow".to_string(),
+            );
+            break;
+        }
+    }
+    static EMBEDDED_MASS_RE: LazyLock<regex::Regex> = LazyLock::new(|| {
+        // Case-SENSITIVE: element symbols are capitalized; this keeps hex-like
+        // diagram-filename fragments ("08d9") from false-matching.
+        regex::Regex::new(r"\b\d{2,3}\s*[A-Z][a-z]?\s*-?\s*\d{1,3}\b").unwrap()
+    });
+    // Strip image links/URLs first: crop filenames contain digit-letter
+    // runs ("...08d9...png") that are never isotope notation.
+    let outside = strip_math_spans(content);
+    let link_re = regex::Regex::new(r"!?\[[^\]]*\]\([^)]*\)|https?://\S+").unwrap();
+    let outside = link_re.replace_all(&outside, " ").to_string();
+    if let Some(m) = EMBEDDED_MASS_RE.find(&outside) {
+        errors.push(format!(
+            "isotope notation is scrambled in plaintext (\"{}\") — write nuclides as LaTeX $^{{mass}}_{{atomic}}\\text{{Symbol}}$",
+            m.as_str()
+        ));
+    }
+    errors
+}
+
+/// Remove $...$ and $$...$$ spans so checks run on plaintext only.
+fn strip_math_spans(content: &str) -> String {
+    let re_span = regex::Regex::new(r"\$\$?[^$]*\$\$?").unwrap();
+    re_span.replace_all(content, " ").to_string()
+}
+
+/// Structural quality gate for a fully assembled card. Returns actionable
+/// error strings; an empty vec means the card is structurally sound.
+pub fn card_structure_errors(content: &str, _question_number: u32) -> Vec<String> {
+    let mut errors = Vec::new();
+    let trimmed = content.trim();
+    if trimmed.is_empty() {
+        return errors;
+    }
+
+    // 1. One-mark Section-B cards are MCQs: exactly four tagged options, in
+    //    order. Cards carrying more marks (flow charts, extended questions)
+    //    are exempt — they are structured questions that happen to sit late
+    //    in the paper.
+    static TAGGED_RE: LazyLock<regex::Regex> =
+        LazyLock::new(|| regex::Regex::new(r"(?m)^[ \t]*-[ \t]+\[MCQ:([A-E])\]").unwrap());
+    let letters: Vec<char> = TAGGED_RE
+        .captures_iter(trimmed)
+        .map(|c| c[1].chars().next().unwrap())
+        .collect();
+    // MCQ-ness is detected from CONTENT, not question number: Section B
+    // starts at Q7 on some papers and at Q8 on others. Tagged option lists
+    // always demand full A–D structure. A plain A–D option run only infers
+    // MCQ structure when there are no diagrams — four stacked graphs WITHOUT
+    // tags are image options the model boxed.
+    let has_diagram = trimmed.contains("[DIAGRAM_PLACEHOLDER]") || trimmed.contains("![");
+    static TAGGED_HINT_RE: LazyLock<regex::Regex> =
+        LazyLock::new(|| regex::Regex::new(r"- \[MCQ:[A-E]\]").unwrap());
+    let has_tags = TAGGED_HINT_RE.is_match(trimmed);
+    // An untagged card only owes us MCQ structure when its body actually
+    // shows a plain A–D option run; prose like "Part one … Part two" or
+    // multi-mark flow charts must never be forced into option lists.
+    static PLAIN_RUN_RE: LazyLock<regex::Regex> =
+        LazyLock::new(|| regex::Regex::new(r"(?m)^[ \t]*[-*]?[ \t]*\(?([A-E])[\).]?[ \t]+\S").unwrap());
+    let distinct_plain = {
+        let mut seen = std::collections::BTreeSet::new();
+        for c in PLAIN_RUN_RE.captures_iter(trimmed) {
+            if seen.len() >= 4 {
+                break;
+            }
+            let letter = c[1].chars().next().unwrap();
+            let expected = (b'A' + seen.len() as u8) as char;
+            if letter == expected {
+                seen.insert(letter);
+            }
+        }
+        seen.len() == 4
+    };
+    // Only a–h are lettered sub-parts. `(i)` is a Roman-numeral sub-sub-part
+    // (e.g. CS "07.1 (i) …"), not letter part 9 — treating it as a letter broke
+    // the sequential gate on every CS paper. Restricting to a–h keeps genuine
+    // missing-part detection ("['b','c','d'] must be ['a','b','c']") intact.
+    // A roman part may open the line of its first lettered sub-part
+    // ("(ii) (a) Prove that …").
+    static PART_SEQ_RE: LazyLock<regex::Regex> =
+        LazyLock::new(|| regex::Regex::new(r"(?m)^(?:\((?:i{1,3}|iv|vi{0,3}|ix|x)\)[ \t]+)?\(([a-h])\)").unwrap());
+    let parts: Vec<char> = PART_SEQ_RE
+        .captures_iter(trimmed)
+        .map(|c| c[1].chars().next().unwrap())
+        .collect();
+
+    if has_tags {
+        if letters.len() != 4 || letters != ['A', 'B', 'C', 'D'] {
+            errors.push(
+                "multiple-choice card must end with exactly four consecutive option lines tagged - [MCQ:A] through - [MCQ:D] (no blank lines between them); reconstruct every option, using \\frac for stacked fractions".to_string(),
+            );
+        } else {
+            static MARK1_RE: LazyLock<regex::Regex> =
+                LazyLock::new(|| regex::Regex::new(r"\*\*\[1 mark\]\*\*").unwrap());
+            if !MARK1_RE.is_match(trimmed) {
+                errors.push("multiple-choice card must end with **[1 mark]** after option D".to_string());
+            }
+            static PART_LABEL_START_RE: LazyLock<regex::Regex> =
+                LazyLock::new(|| regex::Regex::new(r"^\([a-i]\)").unwrap());
+            if PART_LABEL_START_RE.is_match(trimmed) {
+                errors.push("multiple-choice stem must not begin with a sub-part label like (a) — remove it".to_string());
+            }
+            if parts.len() >= 2 {
+                errors.push(
+                    "multiple-choice card must not also carry (a)/(b) sub-part labels — an MCQ is a single stem plus its four tagged options".to_string(),
+                );
+            }
+        }
+    } else if !has_diagram && distinct_plain && parts.len() < 2 {
+        errors.push(
+            "the four answer options must be tagged - [MCQ:A] through - [MCQ:D] as consecutive lines; rebuild each option, using \\frac for stacked fractions".to_string(),
+        );
+    }
+
+    // Sub-part labels: strictly sequential, no duplicates — applies to every
+    // structured card regardless of its position in the paper. When roman
+    // parts are the outer level ("(i) … (a) (b) (ii) … (a) (b)"), lettered
+    // sub-parts restart under each roman part.
+    if parts.len() >= 2 && letters.len() < 2 {
+        static ROMAN_START_RE: LazyLock<regex::Regex> =
+            LazyLock::new(|| regex::Regex::new(r"^\((?:i{1,3}|iv|vi{0,3}|ix|x)\)").unwrap());
+        let first_label_roman = trimmed
+            .lines()
+            .map(str::trim_start)
+            .find(|l| ROMAN_START_RE.is_match(l) || PART_SEQ_RE.is_match(l))
+            .is_some_and(|l| ROMAN_START_RE.is_match(l));
+        let mut groups: Vec<Vec<char>> = vec![Vec::new()];
+        for line in trimmed.lines().map(str::trim_start) {
+            if first_label_roman && ROMAN_START_RE.is_match(line) {
+                groups.push(Vec::new());
+            }
+            if let Some(c) = PART_SEQ_RE.captures(line) {
+                groups.last_mut().unwrap().push(c[1].chars().next().unwrap());
+            }
+        }
+        for group in groups.iter().filter(|g| !g.is_empty()) {
+            let expected: Vec<char> = (0..group.len()).map(|i| (b'a' + i as u8) as char).collect();
+            if *group != expected {
+                errors.push(format!(
+                    "sub-part labels are {:?} but must be exactly {:?} in printed order, each appearing once — an unlabelled introduction line must NOT carry a part label",
+                    parts, expected
+                ));
+                break;
+            }
+        }
+    }
+
+    // 3. Raw LaTeX outside math delimiters.
+    if let Some(cmd) = latex_outside_math(trimmed) {
+        errors.push(format!(
+            "LaTeX command \\{} appears outside $...$ math delimiters — wrap the expression in $ ... $",
+            cmd
+        ));
+    }
+
+    // 4. Math-alphanumeric italic glyphs (OCR artifact).
+    if trimmed
+        .chars()
+        .any(|c| (0x1D400..=0x1D7FF).contains(&(c as u32)))
+    {
+        errors.push(
+            "mathematical italic/bold unicode letters (𝑞𝑚𝑉…) are present — replace them with plain ASCII letters inside $...$ math".to_string(),
+        );
+    }
+
+    // 5. Nested-brace unit artifact.
+    static NESTED_UNIT_RE: LazyLock<regex::Regex> =
+        LazyLock::new(|| regex::Regex::new(r"\\text\{[A-Za-z]+\^\{-\d+\}\}").unwrap());
+    if NESTED_UNIT_RE.is_match(trimmed) {
+        errors.push(
+            "unit written as \\text{kg^{-1}} — the exponent must sit OUTSIDE the braces: \\text{kg}^{-1}".to_string(),
+        );
+    }
+
+    // 6. Sentence-level math wrapping.
+    static SPAN_RE: LazyLock<regex::Regex> =
+        LazyLock::new(|| regex::Regex::new(r"\$([^$\n]+)\$").unwrap());
+    static WORD_RE: LazyLock<regex::Regex> =
+        LazyLock::new(|| regex::Regex::new(r"^[A-Za-z]{3,}$").unwrap());
+    for m in SPAN_RE.find_iter(trimmed) {
+        let inner = m.as_str().trim_matches('$');
+        let english = inner
+            .split_whitespace()
+            .filter(|w| !w.contains('\\') && WORD_RE.is_match(w))
+            .count();
+        if english >= 4 {
+            errors.push(
+                "an entire English sentence is wrapped in $...$ — only math symbols, variables and numbers-with-units belong inside math delimiters".to_string(),
+            );
+            break;
+        }
+    }
+
+    // 7. Isotope scrambles.
+    errors.extend(isotope_scramble_errors(trimmed));
+
+    // 8. \text{A} sentence-start artifact.
+    static TXT_A_RE: LazyLock<regex::Regex> =
+        LazyLock::new(|| regex::Regex::new(r"(?m)^(?:\([a-i]\)[ \t]+)?\\text\{A\}[ \t]").unwrap());
+    if TXT_A_RE.is_match(trimmed) {
+        errors.push(
+            "the article \"A\" was transcribed as the LaTeX command \\text{A} — write plain text \"A\"".to_string(),
+        );
+    }
+
+    // 9. OCR margin boilerplate.
+    static BOILER_RE: LazyLock<regex::Regex> = LazyLock::new(|| {
+        regex::Regex::new(r"(?m)^\s*(box\b|PMT\s*$|IB/M/|\*\d{1,3}\*\s*$)|IB\$?/M/").unwrap()
+    });
+    if BOILER_RE.is_match(trimmed) {
+        errors.push(
+            "OCR margin boilerplate (\"box\", page footers, \"IB/M/...\", PMT) leaked into the card — remove it; it is never question content".to_string(),
+        );
+    }
+
+    // 10. Unbalanced math delimiters (quoted back verbatim).
+    for e in math_delimiter_balance_errors(trimmed) {
+        errors.push(e);
+    }
+
+    errors
+}
+
 /// Semantic figure kind validation: genuine figures have visual structure
 /// beyond plain text. Returns true if the content suggests a legitimate
 /// figure type (graph, schema, flowchart, circuit, multi-panel).
@@ -1744,6 +2390,26 @@ mod tests {
     }
 
     #[test]
+    fn roman_numeral_subsubparts_are_not_lettered_parts() {
+        // CS 2022/23/24: "(i)" is a Roman-numeral sub-sub-part, not letter
+        // part 9. It must not fail the sequential sub-part gate.
+        let with_roman = "(a) First thing.\n(i) A sub-sub-part.\n(ii) Another.\n(b) Second thing.\n(c) Third thing. **[3 marks]**";
+        let errs = card_structure_errors(with_roman, 7);
+        assert!(
+            !errs.iter().any(|e| e.contains("sub-part labels")),
+            "roman-numeral labels wrongly treated as letter parts: {errs:?}"
+        );
+
+        // A genuinely missing lettered part is still flagged.
+        let missing_a = "(b) Second thing.\n(c) Third thing.\n(d) Fourth thing. **[3 marks]**";
+        let errs = card_structure_errors(missing_a, 6);
+        assert!(
+            errs.iter().any(|e| e.contains("sub-part labels")),
+            "missing real part not flagged: {errs:?}"
+        );
+    }
+
+    #[test]
     fn question_number_rejects_decimals_and_junk() {
         assert_eq!(value_to_question_number(&serde_json::json!(7)), Some(7));
         assert_eq!(value_to_question_number(&serde_json::json!("12")), Some(12));
@@ -1827,6 +2493,196 @@ mod tests {
         assert!(has_terminal_ending("| A | B |\n| --- | --- |\n| 1 | 2 |"));
         assert!(has_terminal_ending("| Temp | Done | Pos |"));
         assert!(has_terminal_ending("Some table:\n| a | b |"));
+    }
+
+    #[test]
+    fn terminal_endings_phase2_forms() {
+        // Bare bracket allocations (no word "marks").
+        assert!(has_terminal_ending("1. Solve x=2. [2]"));
+        assert!(has_terminal_ending("State the unit. **[1]**"));
+        // Navigation markers that end the question / section.
+        assert!(has_terminal_ending(
+            "Discuss how the properties affect the rate of fusion.\n[3 marks]\nEND OF SECTION A"
+        ));
+        assert!(has_terminal_ending("Some question text\nTurn over ►"));
+        assert!(has_terminal_ending("Question text\nEND OF QUESTIONS"));
+        assert!(has_terminal_ending("Question text\nturn over"));
+        // Complete formula / answer endings.
+        assert!(ends_with_complete_formula(r"The unit is \text{kg m}^{-3}"));
+        assert!(ends_with_complete_formula("x = 2.5"));
+        assert!(ends_with_complete_formula("momentum = 0.50 kg"));
+        assert!(has_terminal_ending("Hence the tension is 12 N"));
+        // A dangling unit with no value is answer debris, not a complete
+        // equation: it must stay non-terminal (phase-3 cleanup owns it).
+        assert!(!ends_with_complete_formula("energy released = J"));
+        assert!(!has_terminal_ending("energy released = J"));
+        // Genuinely cut-off prose stays rejected.
+        assert!(!has_terminal_ending("The student then"));
+        assert!(!has_terminal_ending("Calculate the value of"));
+        assert!(!has_terminal_ending("The force is equal to"));
+        assert!(!has_terminal_ending("x ="));
+        assert!(!has_terminal_ending("Evaluate $x^{2"));
+        assert!(!ends_with_complete_formula("The student then"));
+        // A parenthesised bare number is NOT a mark tag (too common in prose).
+        assert!(!has_terminal_ending("The coordinates are (2"));
+    }
+
+    #[test]
+    fn lettered_parts_restart_under_outer_roman_parts() {
+        // Core Pure 2021 Q4 shape: (i) (a) (b) … (ii) (a) (b).
+        let nested = "(i) A is a 2 by 2 matrix.\n(a) AB\n(b) A + B\n**[2 marks]**\n(ii) Given that M = I,\n(a) determine the value of k\n(b) Hence deduce the inverse.\n**[3 marks]**";
+        assert!(card_structure_errors(nested, 4).is_empty(), "{:?}", card_structure_errors(nested, 4));
+        // AEA 2024 Q3 shape: the first lettered part shares the roman label's line.
+        let shared = "(i) Determine k.\n**[3 marks]**\n(ii) (a) Prove the identity.\n**[3 marks]**\n(b) Write down cos 40.\n**[1 mark]**";
+        assert!(card_structure_errors(shared, 3).is_empty(), "{:?}", card_structure_errors(shared, 3));
+        // A part skipped inside a roman group is still an error.
+        let gap = "(i) Show that.\n(a) first\n(b) second\n(ii) Hence.\n(b) skipped (a)";
+        assert!(!card_structure_errors(gap, 4).is_empty());
+        // Letters as the outer level with roman sub-parts never restart.
+        let outer_letters = "(a) Find x.\n(b) (i) Show that.\n(ii) Hence find y.\n(c) State z.";
+        assert!(card_structure_errors(outer_letters, 2).is_empty(), "{:?}", card_structure_errors(outer_letters, 2));
+    }
+
+    #[test]
+    fn multiple_choice_card_ending_on_its_last_option_is_complete() {
+        // AQA prints [1 mark] at the end of the stem; the card then closes
+        // with its option list, and option text carries no full stop.
+        let card = "In which process is work done by an ideal gas?\n\n**[1 mark]**\n\
+            - [MCQ:A] doubling the pressure at constant volume\n\
+            - [MCQ:B] doubling the volume at constant pressure\n\
+            - [MCQ:C] doubling the absolute temperature at constant volume\n\
+            - [MCQ:D] doubling the pressure at constant temperature";
+        assert!(has_terminal_ending(card));
+        // A list cut off after option B is still a truncation.
+        let cut = "Which change will increase the efficiency?\n\n**[1 mark]**\n\
+            - [MCQ:A] increasing the thickness of the iron layers\n\
+            - [MCQ:B] decreasing the frequency of the";
+        assert!(!has_terminal_ending(cut));
+    }
+
+    #[test]
+    fn a_part_ending_on_its_printed_choices_is_complete() {
+        // A structured question keeps an embedded lettered list as plain lines.
+        let shade = "(b) Shade one lozenge to indicate the co-domain of the function.\n\n**[1 mark]**\n\
+            A The set of integers\nB The set of irrational numbers\nC The set of natural numbers\n\
+            D The set of rational numbers\nE The set of real numbers";
+        assert!(has_terminal_ending(shade));
+        assert!(!has_terminal_ending("Shade one lozenge.\nA The set of integers\nB The set of"), "A, B is not a list");
+        // "Circle your answer" over a printed row of values.
+        let circle = "Circle the limiting value of $\\frac{3n + 4}{n}$ as $n \\rightarrow \\infty$\n\n**[1 mark]**\n1 3 4 7";
+        assert!(has_terminal_ending(circle));
+        // Prose cut off mid-sentence is still a truncation.
+        assert!(!has_terminal_ending("Circle the value.\nthe answer is 7"));
+        assert!(!has_terminal_ending("The values are\n1 3 4 7"), "no choice instruction");
+    }
+
+    #[test]
+    fn fence_closer_requires_marker_only_and_display_breaks_respect_code() {
+        // A closing fence may not carry an info string: the block stays open, so
+        // the inner `$$$` and `$x$` stay literal.
+        let info_close = "```text\na $$$ b\n```not-a-close\n$x$\n```";
+        assert_eq!(balance_math_delimiters(info_close), info_close);
+        assert!(
+            math_delimiter_balance_errors(info_close).is_empty(),
+            "an unclosed fence keeps its contents literal"
+        );
+
+        // The display-math break pass must treat fenced code as opaque.
+        let fenced_display = "before\n```\n$$\npacket\n```\nafter";
+        assert_eq!(
+            ensure_display_math_line_breaks(fenced_display),
+            fenced_display
+        );
+        assert!(math_delimiter_balance_errors(fenced_display).is_empty());
+
+        // Real display math still gets its explicit row separator.
+        let display = "$$x = 1\ny = 2$$";
+        let out = ensure_display_math_line_breaks(display);
+        assert!(out.contains("\\\\ y = 2"), "{out}");
+    }
+
+    #[test]
+    fn delimiter_machinery_treats_code_as_opaque() {
+        // A literal `$$$` inside a fence must survive untouched.
+        let fenced = "Intro\n```text\na $$$ b\n```\nDone.";
+        assert_eq!(balance_math_delimiters(fenced), fenced, "fenced $$$ is literal");
+        assert!(
+            math_delimiter_balance_errors(fenced).is_empty(),
+            "fenced $$$ is not a delimiter run"
+        );
+
+        // A double-backtick span containing a single dollar (and a backtick):
+        // the inline scanner must match backtick RUN LENGTHS.
+        let double_ticks = "Use ``$`` and ``a ` b`` in code; keep $x$ in math.";
+        assert_eq!(balance_math_delimiters(double_ticks), double_ticks);
+        assert!(
+            math_delimiter_balance_errors(double_ticks).is_empty(),
+            "{double_ticks}"
+        );
+
+        // A four-backtick fence is NOT closed by an inner three-backtick line.
+        let four_ticks = "````\n```\n$$\n````";
+        assert_eq!(balance_math_delimiters(four_ticks), four_ticks);
+        assert!(
+            math_delimiter_balance_errors(four_ticks).is_empty(),
+            "a 4-backtick fence is opaque until a 4-backtick close"
+        );
+
+        // Fence characters must match: a tilde fence is not closed by backticks.
+        let tilde = "~~~\n```\n$$\n~~~";
+        assert_eq!(balance_math_delimiters(tilde), tilde);
+        assert!(
+            math_delimiter_balance_errors(tilde).is_empty(),
+            "mismatched fence characters must not close the block"
+        );
+
+        // Escaped dollars stay literal, and the prose repair stays idempotent.
+        let escaped = "Costs \\$5 for $n$ items.";
+        assert_eq!(balance_math_delimiters(escaped), escaped);
+        assert!(math_delimiter_balance_errors(escaped).is_empty());
+        let broken = "The transformer is $90\\$% efficient.\nNext line.";
+        let once = balance_math_delimiters(broken);
+        assert!(math_delimiter_balance_errors(&once).is_empty(), "{once}");
+        assert_eq!(balance_math_delimiters(&once), once, "idempotent");
+    }
+
+    #[test]
+    fn delimiter_balancer_preserves_code_and_is_idempotent() {
+        let fenced = "Intro\n```python\nprice = \"$5\"\nprint(price)\n```\nDone.";
+        assert_eq!(
+            balance_math_delimiters(fenced),
+            fenced,
+            "fenced code must be opaque"
+        );
+        assert!(
+            math_delimiter_balance_errors(fenced).is_empty(),
+            "a `$` inside a fence is not math"
+        );
+
+        let inline = "Use `$x$` in code and $y = 2$ in maths.";
+        assert_eq!(balance_math_delimiters(inline), inline);
+        assert!(math_delimiter_balance_errors(inline).is_empty(), "{inline}");
+
+        // A stray unescaped single `$` is closed at its own line end, and the
+        // repair is idempotent.
+        let broken = "The transformer is $90\\$% efficient.\nNext line.";
+        let once = balance_math_delimiters(broken);
+        assert!(
+            math_delimiter_balance_errors(&once).is_empty(),
+            "repaired content must balance: {once}"
+        );
+        assert_eq!(balance_math_delimiters(&once), once, "balancer is idempotent");
+
+        // Escaped currency and paired math are untouched.
+        let fine = "It costs \\$5 for $n$ items, and $$y = 2x$$ holds.";
+        assert_eq!(balance_math_delimiters(fine), fine);
+        assert!(math_delimiter_balance_errors(fine).is_empty(), "{fine}");
+
+        // A genuinely malformed display block is closed, not silently dropped.
+        let malformed = "$$r = 1 + \\sin 2\\theta";
+        let repaired = balance_math_delimiters(malformed);
+        assert!(repaired.ends_with("$$"), "{repaired}");
+        assert!(math_delimiter_balance_errors(&repaired).is_empty(), "{repaired}");
     }
 
     #[test]
