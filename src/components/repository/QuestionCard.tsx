@@ -286,7 +286,7 @@ export const QuestionCard = memo(function QuestionCard(props: QuestionCardProps)
         {/* Left: Badges (wrap naturally without overlapping actions) */}
         <div className="flex flex-wrap items-center gap-1.5 min-w-0 flex-1">
           {needsReview && (
-            <Badge className="text-xs font-semibold tracking-wide bg-amber-500/15 text-amber-700 dark:text-amber-400 border-amber-500/30 hover:bg-amber-500/25 cursor-help shrink-0" title="Extracted with vision fallback or low confidence">
+            <Badge className="text-xs font-semibold tracking-wide bg-amber-500/15 text-amber-700 dark:text-amber-400 border-amber-500/30 hover:bg-amber-500/25 cursor-help shrink-0" title="Flagged by the import's checks: compare this card with the paper before using it">
               <AlertTriangle className="size-3 mr-1 inline" />
               REVIEW
             </Badge>

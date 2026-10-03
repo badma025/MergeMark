@@ -9,7 +9,6 @@ import {
   Plus,
   Trash2,
   Edit2,
-  BrainCircuit,
   Search,
   BookOpen,
   Folder,
@@ -64,8 +63,6 @@ export function TaxonomyManager() {
     id: string;
     name: string;
   } | null>(null);
-
-  const [generatingFor, setGeneratingFor] = useState<string | null>(null);
 
   const loadTaxonomy = async () => {
     try {
@@ -198,26 +195,6 @@ export function TaxonomyManager() {
       loadTaxonomy();
     } catch (err) {
       toast.error("Failed to delete topic", { description: String(err) });
-    }
-  };
-
-  const handleGenerateTopics = async (moduleId: string, moduleName: string, subjectName: string) => {
-    setGeneratingFor(moduleId);
-    const modelName = localStorage.getItem("mergemark_openai_model") || "google/gemini-2.5-flash";
-    try {
-      await invoke("generate_topics_for_module", {
-        subjectName,
-        moduleName,
-        moduleId,
-        modelName
-      });
-      toast.success(`Generated topics for ${moduleName}!`);
-      loadTaxonomy();
-      setExpandedModules(prev => new Set(prev).add(moduleId));
-    } catch (e) {
-      toast.error("Failed to generate topics", { description: String(e) });
-    } finally {
-      setGeneratingFor(null);
     }
   };
 
@@ -491,7 +468,6 @@ export function TaxonomyManager() {
                     {subject.modules?.map((module) => {
                       const isModExpanded = expandedModules.has(module.id) || !!searchQuery;
                       const topicCount = module.topics?.length || 0;
-                      const isGenerating = generatingFor === module.id;
 
                       return (
                         <div
@@ -553,18 +529,6 @@ export function TaxonomyManager() {
                               className="flex items-center gap-1 opacity-0 group-hover:opacity-100 transition-opacity"
                               onClick={(e) => e.stopPropagation()}
                             >
-                              <Button
-                                variant="ghost"
-                                size="sm"
-                                className="h-6 px-1.5 text-[11px] text-amber-500 hover:bg-amber-500/10 gap-1"
-                                onClick={() => handleGenerateTopics(module.id, module.name, subject.name)}
-                                disabled={isGenerating}
-                                title="Auto-generate core topics from official syllabus using AI"
-                              >
-                                <BrainCircuit className={cn("size-3", isGenerating && "animate-spin text-amber-500")} />
-                                <span>{isGenerating ? "Generating..." : "Auto-Topics"}</span>
-                              </Button>
-
                               <Button
                                 variant="ghost"
                                 size="sm"

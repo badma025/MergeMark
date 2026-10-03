@@ -41,6 +41,10 @@ export interface ImportReport {
 
 // ── IngestionDropzone ─────────────────────────────────────────────────────────
 
+// Every imported card is filed under a module, so a subject needs one first.
+const NO_MODULE_MESSAGE =
+  "This subject has no modules yet. Add one in Settings → Curriculum Taxonomy, then import.";
+
 interface IngestionDropzoneProps {
   isActive?: boolean;
   onSuccess?: () => void;
@@ -190,6 +194,9 @@ export function IngestionDropzone({ isActive = false, onSuccess }: IngestionDrop
         if (cancelledRef.current) return;
         setPendingMappings(mappings);
       } else {
+        if (moduleOverride.trim() === "") {
+          throw new Error(NO_MODULE_MESSAGE);
+        }
         const questions = await invoke<any[]>("parse_pdf_vision", {
           filePath,
           subject,
@@ -206,7 +213,7 @@ export function IngestionDropzone({ isActive = false, onSuccess }: IngestionDrop
       }
     } catch (err) {
       if (cancelledRef.current) return;
-      const errMsg = String(err);
+      const errMsg = err instanceof Error ? err.message : String(err);
       if (errMsg.includes("Import cancelled by user")) {
         toast.info("Import Cancelled", {
           description: `Stopped processing ${paperName}`,
@@ -403,6 +410,12 @@ export function IngestionDropzone({ isActive = false, onSuccess }: IngestionDrop
             </select>
           </div>
 
+          {importMode === "questions" && availableModules.length === 0 && (
+            <p className="text-sm text-muted-foreground italic">
+              {NO_MODULE_MESSAGE}
+            </p>
+          )}
+
           {importMode === "questions" && availableModules.length > 0 && (
             <div className="flex flex-wrap sm:flex-nowrap items-center gap-2 sm:gap-3">
               <label htmlFor="module-override" className="text-sm font-medium text-foreground min-w-[100px]">
@@ -449,6 +462,12 @@ export function IngestionDropzone({ isActive = false, onSuccess }: IngestionDrop
           </div>
         )}
 
+        {importMode === "mark_scheme" && (
+          <p className="text-xs text-muted-foreground max-w-md text-center">
+            Mark-scheme import is limited in this beta: MergeMark reads schemes on this
+            computer only, and most can't be read yet.
+          </p>
+        )}
 
       </div>
 

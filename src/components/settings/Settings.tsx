@@ -1,20 +1,13 @@
 import { useState } from "react";
-import { 
-  Settings as SettingsIcon, 
-  Key, 
-  RefreshCw, 
-  AlertCircle, 
-  Trash2, 
-  Archive, 
-  Download, 
-  Upload, 
-  Sparkles, 
-  DollarSign, 
-  FolderTree, 
-  ShieldAlert,
-  Server,
-  Eye,
-  EyeOff
+import {
+  Settings as SettingsIcon,
+  Trash2,
+  Archive,
+  Download,
+  Upload,
+  Sparkles,
+  FolderTree,
+  ShieldAlert
 } from "lucide-react";
 import { Input } from "@/components/ui/input";
 import { Button } from "@/components/ui/button";
@@ -23,7 +16,6 @@ import { open, save } from "@tauri-apps/plugin-dialog";
 import { toast } from "sonner";
 import { TaxonomyManager } from "./TaxonomyManager";
 import { SplashScreen } from "@/components/common/SplashScreen";
-import { UsageDashboard } from "./UsageDashboard";
 import { cn } from "@/lib/utils";
 
 interface ExportReport {
@@ -51,15 +43,10 @@ interface PendingImport {
 }
 
 export function Settings() {
-  const [activeTab, setActiveTab] = useState<"api_usage" | "taxonomy" | "backup_danger">("api_usage");
+  // MergeMark works offline, so the AI-only settings (API credentials and
+  // OpenRouter spend) are not shown.
+  const [activeTab, setActiveTab] = useState<"taxonomy" | "backup_danger">("taxonomy");
 
-  const [apiKey, setApiKey] = useState("");
-  const [showApiKey, setShowApiKey] = useState(false);
-  const [baseUrl, setBaseUrl] = useState("https://openrouter.ai/api/v1");
-  const [modelName, setModelName] = useState("google/gemini-2.5-flash");
-  const [availableModels, setAvailableModels] = useState<string[]>([]);
-  const [fetchingModels, setFetchingModels] = useState(false);
-  const [modelFetchError, setModelFetchError] = useState("");
   const [confirmingClear, setConfirmingClear] = useState(false);
   const [clearInput, setClearInput] = useState("");
   const [clearing, setClearing] = useState(false);
@@ -72,33 +59,6 @@ export function Settings() {
   const [importMode, setImportMode] = useState<"merge" | "replace">("merge");
   const [replaceInput, setReplaceInput] = useState("");
   const [showSplashPreview, setShowSplashPreview] = useState(false);
-
-  // MergeMark works offline: the AI fields below are switched off, so
-  // nothing typed in them is stored or sent.
-  function handleKeyChange(e: React.ChangeEvent<HTMLInputElement>) {
-    setApiKey(e.target.value);
-  }
-
-  function handleBaseUrlChange(e: React.ChangeEvent<HTMLInputElement>) {
-    setBaseUrl(e.target.value);
-  }
-
-  function handleModelChange(e: React.ChangeEvent<HTMLInputElement>) {
-    setModelName(e.target.value);
-  }
-
-  async function handleFetchModels() {
-    setFetchingModels(true);
-    setModelFetchError("");
-    try {
-      const models = await invoke<string[]>("fetch_models", { baseUrl, apiKey });
-      setAvailableModels(models);
-    } catch (err: any) {
-      setModelFetchError(err.toString());
-    } finally {
-      setFetchingModels(false);
-    }
-  }
 
   async function handleExportBackup() {
     setBackupBusy("export");
@@ -195,25 +155,11 @@ export function Settings() {
           </h1>
         </div>
         <p className="text-xs text-muted-foreground max-w-md">
-          Configure API endpoints, monitor real-time OpenRouter spending, manage curriculum taxonomies, and manage database backups.
+          Manage curriculum taxonomies and database backups.
         </p>
 
         {/* ── Segmented Tab Switcher ── */}
         <div className="inline-flex items-center p-1 bg-muted/60 dark:bg-muted/40 border border-border/80 rounded-xl shadow-xs mt-3">
-          <button
-            type="button"
-            onClick={() => setActiveTab("api_usage")}
-            className={cn(
-              "flex items-center gap-2 px-4 py-1.5 rounded-lg text-xs font-semibold transition-all select-none",
-              activeTab === "api_usage" 
-                ? "bg-card text-foreground shadow-xs border border-border/80" 
-                : "text-muted-foreground hover:text-foreground"
-            )}
-          >
-            <DollarSign className="size-3.5 text-primary" />
-            <span>API &amp; Spend</span>
-          </button>
-
           <button
             type="button"
             onClick={() => setActiveTab("taxonomy")}
@@ -246,132 +192,14 @@ export function Settings() {
 
       {/* ── Tab Content Container ── */}
       <div className="w-full max-w-4xl flex flex-col gap-6 mb-12">
-        {/* ════════════════ TAB 1: API & USAGE SPEND ════════════════ */}
-        {activeTab === "api_usage" && (
-          <div className="flex flex-col gap-6 animate-in fade-in-50 duration-150">
-            {/* API Configuration Card */}
-            <div className="flex flex-col gap-5 rounded-xl border border-border/70 bg-card p-6 shadow-xs">
-              <div className="border-b border-border/60 pb-3">
-                <h2 className="text-sm font-bold flex items-center gap-2 text-foreground">
-                  <Key className="size-4 text-primary" />
-                  API &amp; Model Credentials
-                </h2>
-                <p className="text-xs text-muted-foreground mt-0.5">
-                  MergeMark works offline and sends nothing to AI services, so these settings are turned off.
-                </p>
-              </div>
-
-              <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                {/* Base URL */}
-                <div className="flex flex-col gap-1.5">
-                  <label htmlFor="base-url" className="text-xs font-semibold flex items-center gap-1.5 text-foreground">
-                    <Server className="size-3.5 text-muted-foreground" />
-                    <span>Base URL</span>
-                  </label>
-                  <Input
-                    id="base-url"
-                    type="text"
-                    placeholder="https://openrouter.ai/api/v1"
-                    value={baseUrl}
-                    onChange={handleBaseUrlChange}
-                    disabled
-                    className="font-mono text-xs bg-muted/20"
-                  />
-                  <p className="text-[11px] text-muted-foreground">
-                    Default: <code className="bg-muted px-1 py-0.5 rounded text-[10px]">https://openrouter.ai/api/v1</code>
-                  </p>
-                </div>
-
-                {/* Model Identifier */}
-                <div className="flex flex-col gap-1.5">
-                  <div className="flex items-center justify-between">
-                    <label htmlFor="model-name" className="text-xs font-semibold text-foreground">
-                      <span>Model Identifier</span>
-                    </label>
-                    <Button 
-                      variant="outline" 
-                      size="sm" 
-                      className="h-6 text-[11px] px-2 gap-1" 
-                      onClick={handleFetchModels}
-                      disabled
-                    >
-                      <RefreshCw className={cn("size-3", fetchingModels && "animate-spin text-primary")} />
-                      <span>Fetch</span>
-                    </Button>
-                  </div>
-                  <div className="relative">
-                    <Input
-                      id="model-name"
-                      type="text"
-                      list="models-list"
-                      placeholder="google/gemini-2.5-flash"
-                      value={modelName}
-                      onChange={handleModelChange}
-                      disabled
-                      className="font-mono text-xs w-full bg-muted/20"
-                    />
-                    {availableModels.length > 0 && (
-                      <datalist id="models-list">
-                        {availableModels.map(m => <option key={m} value={m} />)}
-                      </datalist>
-                    )}
-                  </div>
-                  {modelFetchError ? (
-                    <p className="text-[11px] text-destructive flex items-center gap-1">
-                      <AlertCircle className="size-3" /> {modelFetchError}
-                    </p>
-                  ) : (
-                    <p className="text-[11px] text-muted-foreground">
-                      Recommended: <code className="bg-muted px-1 py-0.5 rounded text-[10px]">google/gemini-2.5-flash</code>
-                    </p>
-                  )}
-                </div>
-              </div>
-
-              {/* API Key */}
-              <div className="flex flex-col gap-1.5 pt-3 border-t border-border/40">
-                <label htmlFor="openai-api-key" className="text-xs font-semibold flex items-center gap-1.5 text-foreground">
-                  <Key className="size-3.5 text-primary" />
-                  <span>OpenRouter / OpenAI API Key</span>
-                </label>
-                <div className="relative">
-                  <Input
-                    id="openai-api-key"
-                    type={showApiKey ? "text" : "password"}
-                    placeholder="sk-or-v1-..."
-                    value={apiKey}
-                    onChange={handleKeyChange}
-                    disabled
-                    className="font-mono text-xs pr-9 bg-muted/20"
-                  />
-                  <button
-                    type="button"
-                    onClick={() => setShowApiKey(!showApiKey)}
-                    className="absolute right-2.5 top-1/2 -translate-y-1/2 text-muted-foreground hover:text-foreground"
-                    title={showApiKey ? "Hide key" : "Show key"}
-                  >
-                    {showApiKey ? <EyeOff className="size-3.5" /> : <Eye className="size-3.5" />}
-                  </button>
-                </div>
-                <p className="text-[11px] text-muted-foreground">
-                  Stored securely on this local device only. Providing an OpenRouter key enables live account spend metrics.
-                </p>
-              </div>
-            </div>
-
-            {/* Live OpenRouter Usage & Historical Spend Dashboard */}
-            <UsageDashboard apiKey={apiKey} />
-          </div>
-        )}
-
-        {/* ════════════════ TAB 2: CURRICULUM TAXONOMY ════════════════ */}
+        {/* ════════════════ TAB 1: CURRICULUM TAXONOMY ════════════════ */}
         {activeTab === "taxonomy" && (
           <div className="rounded-xl border border-border/70 bg-card p-6 shadow-xs animate-in fade-in-50 duration-150">
             <TaxonomyManager />
           </div>
         )}
 
-        {/* ════════════════ TAB 3: BACKUP & MAINTENANCE ════════════════ */}
+        {/* ════════════════ TAB 2: BACKUP & MAINTENANCE ════════════════ */}
         {activeTab === "backup_danger" && (
           <div className="flex flex-col gap-6 animate-in fade-in-50 duration-150">
             {/* Backup & Restore */}

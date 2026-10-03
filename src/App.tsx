@@ -7,7 +7,6 @@ import { IngestionDropzone } from "@/components/ingestion/IngestionDropzone";
 import { Settings } from "@/components/settings/Settings";
 import { type QuestionCardProps } from "@/components/repository/QuestionCard";
 import { type WorksheetItemData } from "@/components/worksheet/WorksheetItem";
-import { UploadCounter, useUploadCounter } from "@/components/UploadCounter";
 import { TaxonomyProvider } from "@/lib/TaxonomyContext";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
@@ -28,9 +27,6 @@ function App() {
   const [activeTab, setActiveTab] = useState<Tab>("repository");
   const [selectedQuestions, setSelectedQuestions] = useState<WorksheetItemData[]>([]);
   const [isWorksheetDrawerOpen, setIsWorksheetDrawerOpen] = useState(false);
-
-  // ── Free-tier upload counter ──────────────────────────────────────────
-  const { status: usageStatus, loading: usageLoading } = useUploadCounter();
 
   function handleAddQuestion(question: SelectedQuestion) {
     setSelectedQuestions((prev) => {
@@ -129,10 +125,8 @@ function App() {
               </div>
             </div>
 
-            {/* Right: Counter & Mobile Worksheet Toggle */}
+            {/* Right: Mobile Worksheet Toggle */}
             <div className="flex items-center gap-2 shrink-0 ml-auto">
-              <UploadCounter status={usageStatus} loading={usageLoading} />
-
               {/* Mobile/Tablet Drawer Toggle Button (only on screens < 1024px) */}
               <Button
                 variant="outline"
