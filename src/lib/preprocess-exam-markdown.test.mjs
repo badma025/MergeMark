@@ -2,6 +2,21 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import { healLatexDelimiters, stripOrphanedDollars } from './preprocess-exam-markdown.ts';
 
+test('a minus touching an opening dollar moves inside the maths', () => {
+  const out = healLatexDelimiters(String.raw`A −$7.1\times10^{7}$ C`);
+  assert.ok(out.includes(String.raw`A $-7.1`) && !out.includes('−-'), out);
+  assert.ok(healLatexDelimiters(String.raw`(−$x$)`).includes(String.raw`($-x$)`));
+  // A spaced dash is prose punctuation: it is left as printed.
+  const prose = healLatexDelimiters(String.raw`the force – $F$ – acts`);
+  assert.ok(prose.includes(String.raw`force – $F$`), prose);
+  // The fixture physics '18 Q17 card (before the layout put the minus in the
+  // maths): the option line must stay an option line.
+  const option = String.raw`- [MCQ:A] – $6.76 \times 10^{14}$ J`;
+  assert.ok(healLatexDelimiters(option).includes(option), healLatexDelimiters(option));
+  // A dash before a CLOSING dollar is maths inside its span.
+  assert.ok(healLatexDelimiters(String.raw`$a -$ b $c$`).includes(String.raw`$a -$ b $c$`));
+});
+
 test('an inline formula ending a line keeps its span before a display block', () => {
   // Core Pure 2023 Q4: the sentence ends in $n \in \mathbb{N}$ and the matrix
   // identity follows as its own (display) line.

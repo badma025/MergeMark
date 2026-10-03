@@ -843,8 +843,10 @@ export function healFracturedMath(text: string): string {
   if (!text) return '';
   let s = text;
 
-  // 1. Minus sign outside opening $: −$7.1 \times 10^7 -> $-7.1 \times 10^7$
-  s = s.replace(/(?:^|[\s(])([−–\-])\s*\$([^\$\n]+)\$/g, '$1-$2$');
+  // 1. Minus sign touching an opening $: −$7.1 \times 10^7$ -> $-7.1 \times 10^7$.
+  //    (A dash set apart by a space is prose punctuation and stays; an
+  //    opening $ is followed by its maths, a closing one by a space.)
+  s = s.replace(/(^|[\s(])[−–\-]\$([^\s\$][^\$\n]*)\$/g, '$1$$-$2$$');
 
   // 2. Exponent and unit outside closing $: `$4.0 \times 10$−6 \text{kg}` or `$4.0 \times 10$-6 kg`
   s = s.replace(

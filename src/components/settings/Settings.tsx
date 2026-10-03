@@ -1,4 +1,4 @@
-import { useState, useEffect } from "react";
+import { useState } from "react";
 import { 
   Settings as SettingsIcon, 
   Key, 
@@ -73,41 +73,18 @@ export function Settings() {
   const [replaceInput, setReplaceInput] = useState("");
   const [showSplashPreview, setShowSplashPreview] = useState(false);
 
-  useEffect(() => {
-    const savedKey = localStorage.getItem("mergemark_openai_key");
-    if (savedKey) setApiKey(savedKey);
-
-    const savedBaseUrl = localStorage.getItem("mergemark_openai_base_url");
-    if (savedBaseUrl) setBaseUrl(savedBaseUrl);
-
-    const savedModel = localStorage.getItem("mergemark_openai_model");
-    if (savedModel) setModelName(savedModel);
-
-    // Sync to backend for billing logic
-    invoke("set_byok_key", { 
-      apiKey: savedKey || null, 
-      baseUrl: savedBaseUrl || null 
-    }).catch(console.error);
-  }, []);
-
+  // MergeMark works offline: the AI fields below are switched off, so
+  // nothing typed in them is stored or sent.
   function handleKeyChange(e: React.ChangeEvent<HTMLInputElement>) {
-    const newKey = e.target.value;
-    setApiKey(newKey);
-    localStorage.setItem("mergemark_openai_key", newKey);
-    invoke("set_byok_key", { apiKey: newKey || null, baseUrl: baseUrl || null }).catch(console.error);
+    setApiKey(e.target.value);
   }
 
   function handleBaseUrlChange(e: React.ChangeEvent<HTMLInputElement>) {
-    const newUrl = e.target.value;
-    setBaseUrl(newUrl);
-    localStorage.setItem("mergemark_openai_base_url", newUrl);
-    invoke("set_byok_key", { apiKey: apiKey || null, baseUrl: newUrl || null }).catch(console.error);
+    setBaseUrl(e.target.value);
   }
 
   function handleModelChange(e: React.ChangeEvent<HTMLInputElement>) {
-    const newModel = e.target.value;
-    setModelName(newModel);
-    localStorage.setItem("mergemark_openai_model", newModel);
+    setModelName(e.target.value);
   }
 
   async function handleFetchModels() {
@@ -280,7 +257,7 @@ export function Settings() {
                   API &amp; Model Credentials
                 </h2>
                 <p className="text-xs text-muted-foreground mt-0.5">
-                  MergeMark connects directly to OpenRouter or your custom OpenAI-compatible endpoint using your key.
+                  MergeMark works offline and sends nothing to AI services, so these settings are turned off.
                 </p>
               </div>
 
@@ -297,6 +274,7 @@ export function Settings() {
                     placeholder="https://openrouter.ai/api/v1"
                     value={baseUrl}
                     onChange={handleBaseUrlChange}
+                    disabled
                     className="font-mono text-xs bg-muted/20"
                   />
                   <p className="text-[11px] text-muted-foreground">
@@ -315,7 +293,7 @@ export function Settings() {
                       size="sm" 
                       className="h-6 text-[11px] px-2 gap-1" 
                       onClick={handleFetchModels}
-                      disabled={fetchingModels}
+                      disabled
                     >
                       <RefreshCw className={cn("size-3", fetchingModels && "animate-spin text-primary")} />
                       <span>Fetch</span>
@@ -329,6 +307,7 @@ export function Settings() {
                       placeholder="google/gemini-2.5-flash"
                       value={modelName}
                       onChange={handleModelChange}
+                      disabled
                       className="font-mono text-xs w-full bg-muted/20"
                     />
                     {availableModels.length > 0 && (
@@ -362,6 +341,7 @@ export function Settings() {
                     placeholder="sk-or-v1-..."
                     value={apiKey}
                     onChange={handleKeyChange}
+                    disabled
                     className="font-mono text-xs pr-9 bg-muted/20"
                   />
                   <button

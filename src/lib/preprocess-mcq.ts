@@ -304,8 +304,13 @@ export function fuseSplitMcqLines(text: string): string {
   let currentLetter: string | null = null;
   let currentContent: string[] = [];
   const parsedOpts: Array<{ letter: string; body: string }> = [];
+  // A part printed after the options ("(iv) Describe …", "(c) …") ends the
+  // option list: it and everything after it stay as written, below the list.
+  const tailAt = optLines.findIndex((l, i) => i > 0 && optLines[i - 1].trim() === '' && /^\((?:[a-z]|[ivx]+)\)(?:\s|$)/.test(l.trim()));
+  const tail = tailAt === -1 ? '' : optLines.slice(tailAt).join('\n').trim();
+  const listLines = tailAt === -1 ? optLines : optLines.slice(0, tailAt);
 
-  for (const l of optLines) {
+  for (const l of listLines) {
     const trimmed = l.trim();
     if (trimmed === '') continue;
     if (/^!\[/.test(trimmed) && currentContent.length > 0 && !/^!\[(?:Option|Choice)\s+[A-E]\]/i.test(trimmed)) {
@@ -366,7 +371,7 @@ export function fuseSplitMcqLines(text: string): string {
     return `- [MCQ:${opt.letter}] ${body}`;
   });
 
-  return `${stem}\n\n${formatted.join('\n')}\n`;
+  return `${stem}\n\n${formatted.join('\n')}\n${tail ? `\n${tail}\n` : ''}`;
 }
 
 export function normalizeMCQOptions(markdown: string): string {

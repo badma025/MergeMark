@@ -32,6 +32,17 @@ test('never invents a stacked fraction from flattened option rows', () => {
   assert.equal(normalizeMCQOptions(result), result);
 });
 
+test('the parts printed after an option list stay outside its last option', () => {
+  // Edexcel A Biology Jun 2021 Q5: part (iii) closes with options A-D, then
+  // the card goes on with parts (iv) and (c).
+  const raw = 'Which part of the cell is the location for this process?\n\n**[1 mark]**\nA cytoplasm\nB mitochondrion\nC nucleus\nD rough endoplasmic reticulum\n\n(iv) Describe the role of the tRNA.\n\n**[2 marks]**\n\n(c) Give two differences.';
+  const result = normalizeMCQOptions(raw);
+  assert.ok(result.includes('- [MCQ:D] rough endoplasmic reticulum\n'), result);
+  assert.ok(result.includes('\n(iv) Describe the role of the tRNA.'), result);
+  assert.ok(result.includes('\n(c) Give two differences.'), result);
+  assert.ok(!/\[MCQ:D\][^\n]*\(iv\)/.test(result), result);
+});
+
 test('leaves a number and variable in ordinary prose unchanged', () => {
   const raw = 'A 3\nR is the radius of the orbit.';
   assert.equal(normalizeMCQOptions(raw), raw);

@@ -3,7 +3,6 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { ReviewSyncModal, type ProposedMapping } from "./ReviewSyncModal";
 import { open } from "@tauri-apps/plugin-dialog";
-import { notifyUsageChanged } from "@/components/UploadCounter";
 import { toast } from "sonner";
 import { UploadCloud, FileText, Loader2, AlertTriangle, CheckCircle2 } from "lucide-react";
 import { cn } from "@/lib/utils";
@@ -28,11 +27,9 @@ export interface ImportReport {
   questionsSkipped: number;
   marksChecksumOk: boolean | null;
   quarantined: Quarantine[];
-  repairs: number;
-  repairReasons?: Record<string, number>;
-  salvageEvents: number;
-  textFirst?: number;
-  cropFirst?: number;
+  deterministic?: number;
+  recovered?: number;
+  pagesNotTranscribed?: number[];
   figuresDetected?: number;
   cropRejections: number;
   diagramsSaved: number;
@@ -110,6 +107,8 @@ export function IngestionDropzone({ isActive = false, onSuccess }: IngestionDrop
     const unlisten = listen('import-report', (event: any) => {
       const r = event.payload as ImportReport;
       setReports(prev => [r, ...prev]);
+      // An import that read nothing fails with its own message.
+      if (r.questionsExtracted === 0) return;
       const warnings: number = r.quarantined.length;
       
       const elapsedSec = r?.totalElapsedMs 
@@ -119,9 +118,9 @@ export function IngestionDropzone({ isActive = false, onSuccess }: IngestionDrop
       const timingStr = ` (took ${elapsedSec}s)`;
       
       if (warnings === 0) {
-        if (r.repairs > 0 || r.salvageEvents > 0 || r.cropRejections > 0) {
+        if (r.cropRejections > 0) {
           toast.success("Import complete", {
-            description: `${r.paperName}: all checks passed (${r.repairs} auto-repairs, ${r.salvageEvents} truncations salvaged, ${r.cropRejections} bad crops rejected).${timingStr}`,
+            description: `${r.paperName}: all checks passed (${r.cropRejections} bad crops rejected).${timingStr}`,
             duration: 8000,
           });
         }
@@ -164,16 +163,7 @@ export function IngestionDropzone({ isActive = false, onSuccess }: IngestionDrop
   // ── Core processing logic ──────────────────────────────────────────────────
 
   async function processFile(filePath: string) {
-    let apiKey = localStorage.getItem("mergemark_openai_key");
-    const baseUrl = localStorage.getItem("mergemark_openai_base_url") || "https://openrouter.ai/api/v1/";
-    const modelName = localStorage.getItem("mergemark_openai_model") || "google/gemini-2.5-flash";
-
-    // If it's a local base URL (like Ollama) we can tolerate an empty API key, otherwise default to a dummy if they left it blank but still try to proceed, though it'll likely fail at the provider level if they actually need one.
-    // For simplicity, we just default to "dummy" if it's empty, allowing local Ollama to work without a key.
-    if (!apiKey || apiKey.trim() === "") {
-      apiKey = "dummy";
-    }
-
+    // Imports run entirely on this machine: no key, model or provider.
     // Derive the paper name from the file's basename (minus extension).
     // e.g. "C:\\exams\\2024_June_P1.pdf" → "2024_June_P1"
     const paperName =
@@ -195,19 +185,13 @@ export function IngestionDropzone({ isActive = false, onSuccess }: IngestionDrop
         }
         const mappings = await invoke<ProposedMapping[]>("parse_mark_scheme_vision", {
           filePath,
-          apiKey,
-          baseUrl,
-          modelName,
           paperName: effectivePaperName,
         });
         if (cancelledRef.current) return;
         setPendingMappings(mappings);
       } else {
-        const questions = await invoke<any[]>("parse_pdf_vision", { 
-          filePath, 
-          apiKey,
-          baseUrl,
-          modelName,
+        const questions = await invoke<any[]>("parse_pdf_vision", {
+          filePath,
           subject,
           moduleOverride: moduleOverride.trim() !== "" ? moduleOverride.trim() : null,
           paperName,
@@ -235,7 +219,6 @@ export function IngestionDropzone({ isActive = false, onSuccess }: IngestionDrop
         });
       }
     } finally {
-      notifyUsageChanged();
       if (!cancelledRef.current) {
         setLastFile(null);
         setProgressMsg("");
@@ -667,37 +650,16 @@ export function IngestionDropzone({ isActive = false, onSuccess }: IngestionDrop
                       )}
 
                       <div className="text-xs font-medium text-muted-foreground/70 pt-2 border-t border-border/50 flex flex-wrap gap-x-4 gap-y-1">
-                        <span>Repairs: {r.repairs}</span>
-                        <span>Salvaged: {r.salvageEvents}</span>
+                        {r.deterministic !== undefined && <span>Clean: {r.deterministic}</span>}
+                        {r.recovered !== undefined && r.recovered > 0 && <span>Kept for review: {r.recovered}</span>}
                         <span>Crops Rejected: {r.cropRejections}</span>
                         {r.figuresDetected !== undefined && r.figuresDetected > 0 && (
-                          <span className="text-emerald-500 font-semibold">Figures detected: {r.figuresDetected} (free)</span>
+                          <span className="text-emerald-500 font-semibold">Figures detected: {r.figuresDetected}</span>
                         )}
-                        {r.cropFirst !== undefined && r.cropFirst > 0 && (
-                          <span className="text-emerald-500 font-semibold">Crop-first: {r.cropFirst} (tiny figure crops)</span>
-                        )}
-                        {r.textFirst !== undefined && r.textFirst > 0 && (
-                          <span className="text-emerald-500 font-semibold">Text-first: {r.textFirst} (0 image tokens)</span>
+                        {r.pagesNotTranscribed && r.pagesNotTranscribed.length > 0 && (
+                          <span className="text-yellow-500 font-semibold">Pages not transcribed: {r.pagesNotTranscribed.join(", ")}</span>
                         )}
                       </div>
-
-                      {r.repairReasons && Object.keys(r.repairReasons).length > 0 && (
-                        <div className="mt-3">
-                          <span className="text-xs font-semibold text-orange-500 uppercase tracking-wider">
-                            Repair reasons ({r.repairs}) — each re-sends the same images
-                          </span>
-                          <ul className="mt-2 space-y-1">
-                            {Object.entries(r.repairReasons)
-                              .sort((a, b) => b[1] - a[1])
-                              .map(([rule, count]) => (
-                                <li key={rule} className="text-xs text-foreground bg-orange-500/10 px-3 py-1.5 rounded-md border border-orange-500/20 flex justify-between">
-                                  <span className="font-mono">{rule}</span>
-                                  <span className="font-semibold">{count}</span>
-                                </li>
-                              ))}
-                          </ul>
-                        </div>
-                      )}
                     </div>
                   );
                 })}
