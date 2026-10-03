@@ -3,8 +3,8 @@
 Everything a new conversation needs to continue the offline import fixes. Round 1 (clusters 1–5) is finished and written up in `docs/TRIAGE_FIX_REPORT.md`. This file covers round 2 (clusters 5b, 5c and 6–11), which is now done and written up in the same report; the plan below is kept as it was.
 
 ## Where things stand (3 Oct 2026, end of round 2)
-- **Nothing is committed.** All round-1 and round-2 work is uncommitted on `master`. Don't commit or push unless the user asks.
-  - `git status` also shows old paper PDFs deleted from the repo root (`edexcel/'17 edexcel.pdf`, `physics '17.pdf` and others). Those deletions predate this work. Any commit should leave them out, unless the user confirms they were intended.
+- **Committed on branch `import-fixes-rounds-1-2`** (3 Oct 2026, at the user's request), not pushed. See "Windows beta" below for what followed.
+  - `git status` also shows old paper PDFs deleted from the repo root (`edexcel/'17 edexcel.pdf`, `physics '17.pdf` and others). Those deletions predate this work and were left out of the commits; leave them out unless the user confirms they were intended.
 - **The main tree holds the final round-2 code:** clusters 5b–11, each with its review corrections, on top of the seam session's refactor (`output/fix-log/seam/`, which changes no card). Each cluster is reported in `docs/TRIAGE_FIX_REPORT.md`.
   - `cargo test --manifest-path src-tauri/Cargo.toml`: 371 passed, 0 failed.
   - Calibration run c11b: 64/64 OK. The 22 originals give 243/244 strict historical cards and 69/69 test-paper cards, with zero network attempts and zero tokens.
@@ -28,6 +28,22 @@ The user asked whether the app is ready to deploy. The answer given: **not yet.*
   - *Windows beta (days):* commit; build the installer; test the app end to end on a few papers; hide the AI-only UI; tell testers that flagged cards need checking and that mark schemes are not supported.
   - *Public release:* also round 3 (wrong strict cards first), a working mark-scheme reader, and macOS/Linux OCR run on real machines.
 - **Asked and not yet answered:** who the release is for (testers or users), and whether to commit.
+
+## Windows beta (3 Oct 2026, after round 2)
+The user chose: commit, then the Windows beta, then round 3. The first release is for **testers**, so the AI-only UI is hidden, not removed.
+- **Committed** on branch `import-fixes-rounds-1-2` (four commits on top of `master`), without the old paper-PDF deletions.
+- **Built and installed** the NSIS installer (`tauri build`), then drove the installed app end to end over the WebView's DevTools port (`WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS=--remote-debugging-port=9333`; the script simulates a native drop with `plugin:event|emit_to` `tauri://drag-drop`). The user's library was moved aside for the test and restored.
+- **Imports in the installed app match calibration c11b:** physics '21 (31 IDs, 30 strict), AQA Biology GCSE Jun 2022 (10, 8 strict), core pure 1 '23 (8, all strict), the M3 Jun 2004 scan (7, all flagged, Windows OCR). A refused mark scheme says it was not transcribed.
+- **Found and fixed:**
+  - `pdfium.dll` was not bundled: `src-tauri/tauri.windows.conf.json` ships it and its licences beside the exe (Windows only).
+  - No diagram ever loaded in a release build: the CSP lacked `http://asset.localhost` (how WebView2 serves the asset protocol). Added it to `img-src` and `connect-src`, with `http://ipc.localhost` for IPC. The cluster 5b guard test now allows exactly those two hosts.
+  - Toasts were unstyled: Tauri adds a nonce to `style-src`, which voids `'unsafe-inline'`, so injected styles were blocked. `dangerousDisableAssetCspModification: ["style-src"]`.
+  - A subject with no modules hid the module picker and failed with "A module must be selected." The import page now says to add a module first.
+  - Worksheet PDFs printed `[MCQ:A]` markers; options now print their letter.
+  - A worksheet compile that pdflatex did not finish (MiKTeX installing packages mid-run) was reported as compiled. It is now an error that keeps the log.
+  - Hidden: the free-parses counter, the Settings "API & Spend" tab (credentials, OpenRouter dashboard), the "Auto-Topics" button. The REVIEW badge no longer mentions a vision fallback. Mark-scheme mode says import is limited.
+- **Known, not fixed:** the installer also ships the developer CLI `e2e_import.exe` (Tauri bundles every `src/bin` target); the flashcard CSV export carries pdflatex layout commands (`\needspace`, `\hfill`); the installer is unsigned (SmartScreen warning); a compile leaves `mergemark_logo.png` in Downloads.
+- Tester notes: `docs/BETA_TESTERS.md`.
 
 ## Rules (from the user's original brief; still in force)
 - **Never guess or invent content.** If a symbol, mark or boundary can't be established from the source, keep the card flagged (`needs_review`) and never strict. Don't relax any gate, expected count or threshold to improve a metric.
