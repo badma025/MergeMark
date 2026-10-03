@@ -17,9 +17,8 @@ Currently optimized for **GCSE and A-Level Mathematics & Further Mathematics**, 
 
 ## ✨ Key Features
 * **Zero-Friction Parsing:** Drag and drop full exam papers or question booklets. The engine automatically isolates distinct questions from the layout.
-* **Zero-Cost Import for Digital PDFs:** Papers with a text layer (almost every board PDF) are transcribed entirely on your machine, with no AI requests, no tokens and no cost. See [How importing works](#-how-importing-works).
-* **100% Local & Private:** Built on a local SQLite database. Your files, extractions, and data live strictly on your machine and are never uploaded to a central server.
-* **BYOK (Bring Your Own Key):** AI is only needed for scanned papers with no text layer. The app includes 3 free parses out of the box. After that, plug in your own AI provider key in the Settings tab to process unlimited scanned papers at raw wholesale API cost—bypassing expensive SaaS subscriptions.
+* **Fully Offline Import:** Every paper and mark scheme is read on your machine. MergeMark makes no AI requests of any kind, needs no API key and costs nothing. See [How importing works](#-how-importing-works).
+* **100% Local & Private:** Built on a local SQLite database. Your files, extractions, and data live strictly on your machine and are never uploaded anywhere.
 * **Markdown & LaTeX Ready:** Export extractions instantly into your preferred knowledge management workflows (like Obsidian) or use them to compile targeted topic tests.
 
 ## 🛠️ Tech Stack
@@ -28,10 +27,15 @@ This application is engineered for maximum performance and a minimal memory foot
 * **Frontend:** React & TypeScript
 * **Database:** SQLite (Local)
 * **PDF engine:** PDFium (via `pdfium-render`) for glyphs, fonts, vector paths and page rendering
-* **Intelligence:** A local geometry-first layout engine for digital papers; multimodal vision models only for scanned ones
+* **Intelligence:** A local geometry-first layout engine for digital papers and a local table reader for mark schemes; the operating system's own OCR engine (Windows, macOS) or Tesseract (Linux) for scanned papers. No AI models.
 
 ## 🔍 How importing works
-Any PDF with extractable text is imported **locally only**: the app never sends it to an AI provider, needs no API key, and does not use a free parse. Only a fully scanned PDF (no text at all) falls back to the vision models.
+Everything is imported **on this machine**. MergeMark has no AI service to send anything to: it makes no requests, needs no API key and costs nothing.
+* **Question papers with a text layer** (almost every board PDF) are rebuilt from the PDF itself, in the four stages below.
+* **Scanned papers** (pages printed as pictures or outlines, with no text layer or only a watermark) are read on this computer: on Windows by the operating system's own OCR engine, on macOS by Apple's Vision framework, and elsewhere by Tesseract when it is installed (`tesseract` on the PATH, for example `sudo apt install tesseract-ocr`). OCR reads words, not mathematics, so every question it produces is kept for review. Where no local OCR engine is available, a scanned paper is reported as not transcribed.
+* **Mark schemes** are read by a local table reader (`src-tauri/src/mark_scheme_deterministic.rs`), which accepts a scheme only when it can account for every answer page. A scheme it cannot read is reported as not transcribed, with the reason.
+
+The Settings screens for API keys, models, usage, free parses and topic generation are still in the app, but those features are turned off: each one answers that MergeMark works offline.
 
 A local import runs in four stages:
 1. **Layout** (`src-tauri/src/layout.rs`). Reads every glyph's position, baseline, font and size from PDFium, together with the page's rules and vector paths. From these it rebuilds reading-order lines and the maths itself: fractions, radicals, scripts, sums and integrals with limits, matrices, piecewise definitions, vector arrows. It also rebuilds tables and code listings, and sets aside page furniture (headers, footers, margin text, barcodes, repeated QR codes). Font codes with no usable Unicode are resolved from the font's own tables; anything it can't identify is kept as `�` and flagged, never guessed.
@@ -42,13 +46,25 @@ A local import runs in four stages:
 On the 18 historical papers used for testing (Edexcel, AQA, Cambridge and practice papers across maths, physics and computer science), 243 of 244 questions import cleanly, and all 69 test-paper questions do. The one exception is flagged because its source draws a symbol as an outline with no character behind it. All of this runs with zero AI requests and zero cost.
 
 ### Verifying the pipeline (developers)
-The corpus papers are not in the repository (`past papers for mergemark/` and `test_papers/` are local), and outputs go to the gitignored `output/`.
+The corpus papers are not in the repository (`papers/` is local: `papers/used/` holds the calibration papers: the 22 originals and the triage fixtures moved there after being fixed against; `papers/unused/` the papers not yet tuned against), and outputs go to the gitignored `output/`.
 ```bash
 cargo test --manifest-path src-tauri/Cargo.toml
 node scripts/run-zero-cost-calibration.mjs --stamp <run-id>
 node scripts/verify-corpus-render.mjs output/zero-cost-orchestration/c-calibration/run-<run-id>
 ```
-The calibration imports every corpus paper offline. It fails if any request is attempted, any artifact is stale, or the question IDs differ from the independent list in `scripts/fixtures/source-expected-ids.json`. The render check passes every card through the app's Markdown/KaTeX pipeline.
+To find problems on papers the engine has not been tuned against, triage everything in `papers/unused/` (offline, no hand-made expected IDs; it checks printed mark totals, ID gaps, unidentified glyphs, missing figures and KaTeX rendering) and read `output/triage/run-<stamp>/summary.md`:
+```bash
+node scripts/triage-papers.mjs --stamp <run-id>            # resumable
+node scripts/triage-papers.mjs --stamp <run-id> --rescore  # re-apply the checks to saved imports
+```
+A paper that is fixed against moves from `papers/unused/` to `papers/used/` and becomes a regression fixture.
+
+The calibration imports every corpus paper offline. It fails if any artifact is stale or the question IDs differ from the independent list in `scripts/fixtures/source-expected-ids.json` (MergeMark has no model client, so a request cannot be attempted at all). The render check passes every card through the app's Markdown/KaTeX pipeline.
+
+To see what the local reader makes of a mark scheme:
+```bash
+cargo run --manifest-path src-tauri/Cargo.toml --bin e2e_import -- "<scheme>.pdf" "<name>" --mark-scheme --out <dir>
+```
 
 ## 🚀 Getting Started (Beta)
 
