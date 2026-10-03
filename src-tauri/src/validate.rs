@@ -1160,6 +1160,10 @@ static RE_BARE_MATRIX: LazyLock<regex::Regex> = LazyLock::new(|| {
 static RE_BARE_EQ_LINE: LazyLock<regex::Regex> = LazyLock::new(|| {
     regex::Regex::new(r"(?m)^[ \t]*(\\(?:tan|sin|cos|frac)\b[^\n]+)$").unwrap()
 });
+// An MCQ option as the import stores it: `- [MCQ:A] text`.
+static RE_LATEX_MCQ_ITEM: LazyLock<regex::Regex> = LazyLock::new(|| {
+    regex::Regex::new(r"(?m)^[ \t]*[\*\-][ \t]+\[MCQ:([A-E])\][ \t]*(.*)").unwrap()
+});
 static RE_LATEX_LIST_ITEM: LazyLock<regex::Regex> = LazyLock::new(|| {
     regex::Regex::new(r"(?m)^[ \t]*[\*\-]\s+(.*)").unwrap()
 });
@@ -1318,6 +1322,9 @@ fn process_non_math_latex(content: &str) -> String {
 
     // Auto-wrap bare equation lines with \tan, \sin, \cos, \frac if isolated
     t = RE_BARE_EQ_LINE.replace_all(&t, r"\[ ${1} \]").to_string();
+
+    // MCQ options print their letter, never the card's `[MCQ:X]` marker
+    t = RE_LATEX_MCQ_ITEM.replace_all(&t, r"\par\textbf{${1}}\hspace{0.5em}${2}").to_string();
 
     // Convert markdown bullet lists (* item or - item)
     t = RE_LATEX_LIST_ITEM.replace_all(&t, r"\par\textbullet\hspace{0.5em}${1}").to_string();
@@ -2970,6 +2977,19 @@ mod tests {
         assert!(output.contains("\\par\\textbullet\\hspace{0.5em}the value of $\\lambda$"));
         assert!(output.contains("\\null\\hfill\\textbf{[2 marks]}"));
         assert!(output.contains("\\needspace{2.5cm}"));
+    }
+
+    #[test]
+    fn mcq_options_print_their_letters_not_the_card_markers() {
+        // physics '21 Q5: options are stored as `- [MCQ:X] …` list items.
+        let raw = "How many photons pass through the area every second?\n- [MCQ:A] 500\n- [MCQ:B] 250\n- [MCQ:D] $1.33 \\times 10^{-13}$ J";
+        let output = format_markdown_for_latex(raw);
+        assert!(!output.contains("[MCQ:"), "marker leaked: {output}");
+        assert!(output.contains("\\par\\textbf{A}\\hspace{0.5em}500"), "{output}");
+        assert!(output.contains("\\par\\textbf{B}\\hspace{0.5em}250"), "{output}");
+        assert!(output.contains("\\par\\textbf{D}\\hspace{0.5em}$1.33 \\times 10^{-13}$ J"), "{output}");
+        // An ordinary bullet keeps its bullet.
+        assert!(format_markdown_for_latex("- the value of $a$").contains("\\par\\textbullet\\hspace{0.5em}the value of $a$"));
     }
 
     #[test]

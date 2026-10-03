@@ -1137,6 +1137,7 @@ pub async fn compile_worksheet(
             stdout, stderr
         ));
     }
+    reject_unfinished_pdf(&worksheet_pdf, &download_dir, &worksheet_stem)?;
 
     // 2-Pass Compilation for Answer Key
     let _ = std::process::Command::new(&pdflatex_cmd)
@@ -1165,6 +1166,7 @@ pub async fn compile_worksheet(
             stdout, stderr
         ));
     }
+    reject_unfinished_pdf(&answer_key_pdf, &download_dir, &answer_stem)?;
 
     // Clean up all intermediary files
     let _ = std::fs::remove_file(download_dir.join(format!("{}.tex", worksheet_stem)));
@@ -1178,6 +1180,28 @@ pub async fn compile_worksheet(
         worksheet_pdf.to_string_lossy().to_string(),
         answer_key_pdf.to_string_lossy().to_string(),
     ])
+}
+
+/// A PDF pdflatex finished writing ends with `%%EOF`. pdflatex's exit code
+/// can't tell us that: it is non-zero for any recoverable LaTeX error.
+fn pdf_is_complete(bytes: &[u8]) -> bool {
+    let tail = &bytes[bytes.len().saturating_sub(1024)..];
+    tail.windows(5).any(|w| w == b"%%EOF")
+}
+
+/// Deletes a PDF that pdflatex stopped writing part-way (seen when MiKTeX
+/// installs packages during the run) and reports it, keeping the log.
+fn reject_unfinished_pdf(pdf: &std::path::Path, dir: &std::path::Path, stem: &str) -> Result<(), String> {
+    let bytes = std::fs::read(pdf).map_err(|e| format!("Failed to read {}: {}", pdf.display(), e))?;
+    if pdf_is_complete(&bytes) {
+        return Ok(());
+    }
+    let _ = std::fs::remove_file(pdf);
+    Err(format!(
+        "pdflatex did not finish writing {}.pdf. If MiKTeX was installing packages, compile again. Log: {}",
+        stem,
+        dir.join(format!("{}.log", stem)).display()
+    ))
 }
 
 // ── Per-page text-layer extraction (hint text + document-map scan) ───────────
@@ -2443,6 +2467,21 @@ pub async fn prune_orphaned_import_logs(
 mod tests {
     use super::*;
 
+    // ── Worksheet compile ───────────────────────────────────────────────────
+
+    #[test]
+    fn a_pdf_pdflatex_stopped_writing_is_not_complete() {
+        // A finished PDF ends with %%EOF (and maybe a newline).
+        let finished = b"%PDF-1.5\n...\nstartxref\n2390771\n%%EOF\n";
+        assert!(pdf_is_complete(finished));
+        assert!(pdf_is_complete(b"%PDF-1.5\n...\n%%EOF"));
+        // Practice_Examination_Paper_12.pdf: pdflatex died while MiKTeX was
+        // installing packages, leaving the file cut off mid-stream.
+        let cut_off = b"%PDF-1.5\n%\xd0\xd4\xc5\xd8\n5 0 obj\n<< /Length 6 >>\nstream\n\xeb$5=10\xa4\x89H";
+        assert!(!pdf_is_complete(cut_off));
+        assert!(!pdf_is_complete(b""));
+    }
+
     // ── No request leaves the machine ───────────────────────────────────────
 
     use std::io::{Read, Write};
@@ -2710,7 +2749,12 @@ mod tests {
         }
         let config: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(dir.join("tauri.conf.json")).unwrap()).unwrap();
         let csp = config["app"]["security"]["csp"].as_str().unwrap();
-        assert!(!csp.contains("http://") && !csp.contains("https://"), "the window may connect to an outside host: {csp}");
+        // On Windows, WebView2 serves Tauri's own protocols as these hosts;
+        // they never leave the process. Any other http(s) source is outside.
+        let tauri_protocols = ["http://ipc.localhost", "http://asset.localhost"];
+        for source in csp.split(|c: char| c.is_whitespace() || c == ';').filter(|s| s.contains("://")) {
+            assert!(tauri_protocols.contains(&source), "the window may connect to an outside host: {source}");
+        }
     }
 
     /// A mark scheme the local reader cannot read is reported as not

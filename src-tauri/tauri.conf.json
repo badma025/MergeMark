@@ -26,7 +26,8 @@
         "enable": true,
         "scope": ["$APPDATA/**/*", "$RESOURCE/**/*"]
       },
-      "csp": "default-src 'self' tauri:; img-src 'self' tauri: asset: data: blob:; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-eval' 'unsafe-inline'; worker-src 'self' blob:;"
+      "dangerousDisableAssetCspModification": ["style-src"],
+      "csp": "default-src 'self' tauri:; connect-src 'self' tauri: ipc: http://ipc.localhost asset: http://asset.localhost; img-src 'self' tauri: asset: http://asset.localhost data: blob:; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-eval' 'unsafe-inline'; worker-src 'self' blob:;"
     }
   },
   "bundle": {
