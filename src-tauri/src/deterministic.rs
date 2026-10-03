@@ -1,12 +1,10 @@
 // ── Tier-0 deterministic extraction ────────────────────────────────────────
 //
-// Zero-cost import cascade, work item #1: replaces the LLM text-first call
-// with a LOCAL Rust transcriber for text-reliable, figure-free question
-// spans. The carved + converted transcription flows through the UNCHANGED
-// acceptance seam (`pipeline::build_question_from_parsed_page`), so Tier 0
-// inherits every future validator improvement for free. Any hard-gate
-// refusal escalates invisibly to the LLM text-first path (today's status
-// quo) — Tier 0 can only ever save calls, never produce a wrong card.
+// The local transcriber: each question span is carved out of the PDF's own
+// text and layout evidence. A transcription becomes a clean card only through
+// the acceptance seam (`pipeline::build_question_from_seam`); a span that
+// fails a gate is kept as a flagged local recovery (`try_local_recovery`),
+// never passed as clean.
 
 use crate::doc_map::QuestionSpan;
 use crate::pipeline::{BuiltQuestion, ImportReport, PageInput, PipelineConfig};
@@ -2114,11 +2112,15 @@ fn check_gates(
     if LEFTOVER_BLANK_RE.is_match(&norm.content) || is_answer_line(norm.content.trim_end()) {
         return Err("leftover_answer_line");
     }
-    // ── Figure-reference cost lever ──────────────────────────────────────
-    // A figure reference used to refuse the carve outright, forcing every
-    // figure question onto a paid LLM call. The deterministic detector
-    // (`page_figures`) already supplies crop-able regions for free, and the
-    // caller splices them into `[DIAGRAM_PLACEHOLDER]` tokens. So:
+    // Another question's printed total inside the body: that question ran
+    // on into this one ("(Total for Question 14 = 6 marks)" in Q13).
+    let plain = crate::layout::plain_line(&norm.content);
+    if NUMBERED_FOOTER_RES[1].captures_iter(&plain).any(|c| c[1].parse::<u32>().ok() != Some(span.number)) {
+        return Err("another_questions_total");
+    }
+    // ── Figure references ────────────────────────────────────────────────
+    // The deterministic detector (`page_figures`) supplies crop-able regions,
+    // and the caller splices them into `[DIAGRAM_PLACEHOLDER]` tokens. So:
     // A graph-reading instruction is transcribed, not solved. Both reading
     // and illustrative references accept independently of crop detection;
     // the caller verifies persistence and flags missing attachments for review.
@@ -2160,8 +2162,9 @@ fn check_gates(
         .unwrap_or(false);
     // (Reference material appended to a layout body ends where it is
     // printed, punctuated or not.)
-    let ends_with_reference = _config.layout_questions.as_ref().and_then(|m| m.get(&span.number)).is_some_and(|b| b.ends_with_reference);
-    if !validate::has_terminal_ending(&norm.content) && !ends_on_mcq_option && !ends_on_choice_row && !ends_with_reference {
+    // (So does a body the question's printed total closes.)
+    let end_is_printed = _config.layout_questions.as_ref().and_then(|m| m.get(&span.number)).is_some_and(|b| b.end_is_printed());
+    if !validate::has_terminal_ending(&norm.content) && !ends_on_mcq_option && !ends_on_choice_row && !end_is_printed {
         return Err("no_terminal_ending");
     }
     let len = norm.content.chars().count();
@@ -2180,6 +2183,9 @@ fn check_gates(
     }
     if !validate::math_delimiter_balance_errors(&norm.content).is_empty() {
         return Err("unbalanced_math");
+    }
+    if !validate::math_structure_errors(&norm.content).is_empty() {
+        return Err("math_structure");
     }
     // Flattened table rows (column gaps in plain text). Markdown table rows
     // are a recovered table, not a flattened one.
@@ -2326,6 +2332,23 @@ fn layout_transcription(span: &QuestionSpan, body: &crate::layout::QuestionBody)
     let mut norm = normalize_layout(&text);
     norm.content = validate::balance_math_delimiters(&norm.content);
     (carved, norm)
+}
+
+/// The span lies on a page local OCR read.
+fn read_by_ocr(config: &PipelineConfig, span: &QuestionSpan) -> bool {
+    (span.start_page..=span.end_page).any(|p| config.ocr_pages.contains(&p))
+}
+
+/// A single-part question prints its allocation only in its footer
+/// ("(Total for Question 3 is 2 marks)"): the card shows it as the
+/// question's tag.
+fn with_footer_allocation(content: String, marks_total: u32, carved: &CarvedSpan) -> String {
+    match carved.footer_marks {
+        Some(m) if m > 0 && marks_total == 0 && carved.subpart_numbers.is_empty() => {
+            format!("{}\n\n**[{} {}]**", content.trim_end(), m, if m == 1 { "mark" } else { "marks" })
+        }
+        _ => content,
+    }
 }
 
 /// Part labels printed without an opening bracket ("a) Determine …", Madas)
@@ -2675,8 +2698,8 @@ fn transcribe_span_with_marks(
 
 /// Tier-0 deterministic extraction for ONE span. Returns
 /// `Some((question, report))` when the span was carved locally with every
-/// gate green; the caller attaches figures / mark-checks exactly as it does
-/// for the LLM text-first path. `None` ⇒ caller falls back unchanged.
+/// gate green; the caller attaches figures and mark-checks. `None` ⇒ the
+/// caller tries a flagged local recovery (`try_local_recovery`).
 pub fn try_deterministic_extraction(
     config: &PipelineConfig,
     span: &QuestionSpan,
@@ -2700,13 +2723,21 @@ pub fn try_deterministic_extraction(
         })
         .collect();
     let texts = texts?;
+    // OCR reads words, not mathematics: a question on a scanned page is
+    // never strict, whichever way it is carved.
+    if read_by_ocr(config, span) {
+        tier0_fallback(span.number, "ocr_transcription");
+        return None;
+    }
     let layout_body = config.layout_questions.as_ref().and_then(|m| m.get(&span.number)).cloned();
     let transcribed = match layout_body {
         Some(body) => {
             let (carved, mut norm) = layout_transcription(span, &body);
-            unknown_glyph_gate(&norm.content)
+            // OCR reads words, not mathematics: a scan is never strict.
+            (if body.ocr { Err("ocr_transcription") } else { Ok(()) })
+                .and_then(|_| unknown_glyph_gate(&norm.content))
                 .and_then(|_| check_gates(&carved, &mut norm, span, config, available_figures))
-                .map(|_| norm.content)
+                .map(|_| with_footer_allocation(norm.content, norm.marks_total, &carved))
         }
         None => transcribe_span_with_marks(config, span, &texts, paper_last_page, available_figures, margin),
     };
@@ -2718,14 +2749,13 @@ pub fn try_deterministic_extraction(
             return None;
         }
     };
-    // Structural formatting gate: the transcription must satisfy the same
-    // formatting rules as every LLM card. Evaluated on SANITIZED content —
-    // the sanitizer's free fixes (e.g. wrapping stray \text{kg} into math)
-    // must not burn a Tier-0 accept and push a question onto the paid path.
-    // A transcription that still cannot comply (e.g. scrambled fractions the
-    // text layer mangled) falls through to the LLM text-first path.
-    // Layout bodies are already source-faithful; the marker/LLM repair pass
-    // is only for text-layer and model output.
+    // Structural formatting gate: the transcription must satisfy the card
+    // formatting rules. Evaluated on SANITIZED content — the sanitizer's
+    // fixes (e.g. wrapping stray \text{kg} into math) must not cost a Tier-0
+    // accept. A transcription that still cannot comply (e.g. scrambled
+    // fractions the text layer mangled) is refused, and kept as a flagged
+    // local recovery. Layout bodies are already source-faithful; the
+    // text-cleanup pass is only for text-layer carves.
     let cleaned = if crate::pipeline::is_layout_question(config, span) {
         content.clone()
     } else {
@@ -2776,8 +2806,8 @@ pub fn try_deterministic_extraction(
 }
 
 /// All-or-nothing Tier-0 attempt for a shared page: EVERY target span must
-/// carve cleanly, otherwise `None` (caller falls back to the combined LLM
-/// call unchanged — fallback-for-all semantics).
+/// carve cleanly, otherwise `None` (the caller then resolves each span on its
+/// own).
 pub fn try_deterministic_batch(
     config: &PipelineConfig,
     spans: &[&QuestionSpan],
@@ -2787,9 +2817,7 @@ pub fn try_deterministic_batch(
     paper_last_page: usize,
     cancel: &AtomicBool,
 ) -> Option<Vec<BuiltQuestion>> {
-    // Digital documents force the deterministic cascade regardless of the
-    // tuning switch, exactly as the single-span path does.
-    if cancel.load(Ordering::Relaxed) || !(config.deterministic || config.is_digital_document()) {
+    if cancel.load(Ordering::Relaxed) {
         return None;
     }
     let mut out = Vec::with_capacity(spans.len());
@@ -2814,10 +2842,10 @@ pub fn try_deterministic_batch(
 /// local failure, not a recoverable card.
 const MIN_RECOVERED_CHARS: usize = 20;
 
-/// Zero-cloud local recovery for a span whose strict Tier-0 gates failed.
+/// Local recovery for a span whose strict Tier-0 gates failed.
 ///
-/// Born-digital documents may not make ANY model request, so a failed gate
-/// must resolve locally: carve the span, keep the real content, and flag it
+/// There is nothing else to ask, so a failed gate resolves locally: carve
+/// the span, keep the real content, and flag it
 /// for review with the failed gate recorded. This never invents content,
 /// marks, or boundaries - when the carve cannot isolate the question at all
 /// (`found_start`/`found_end` absent) the function returns `None` and the
@@ -2851,11 +2879,12 @@ pub fn try_local_recovery(
     let layout_body = config.layout_questions.as_ref().and_then(|m| m.get(&span.number)).cloned();
     if let Some(body) = layout_body {
         let (carved, mut norm) = layout_transcription(span, &body);
-        let mut reason: Option<String> = unknown_glyph_gate(&norm.content).err().map(str::to_string);
+        let mut reason: Option<String> = if body.ocr || read_by_ocr(config, span) { Some("ocr_transcription".to_string()) } else { unknown_glyph_gate(&norm.content).err().map(str::to_string) };
         if reason.is_none() {
             reason = check_gates(&carved, &mut norm, span, config, available_figures).err().map(|r| r.to_string());
         }
-        let sanitized = crate::sanitize::sanitize_question_content(&norm.content, span.number);
+        let content = with_footer_allocation(norm.content.clone(), norm.marks_total, &carved);
+        let sanitized = crate::sanitize::sanitize_question_content(&content, span.number);
         if sanitized.trim().chars().count() < MIN_RECOVERED_CHARS {
             tier0_fallback(span.number, "recovery_too_little_content");
             return None;
@@ -3008,8 +3037,8 @@ mod tests {
         // Used to separate boundary defects from glyph/gate defects.
         let _guard = crate::pdf_render::pdfium_test_lock();
         for path in [
-            "../past papers for mergemark/madas_paper_2_t.pdf",
-            "../past papers for mergemark/core pure 1 '21.pdf",
+            "../papers/used/madas_paper_2_t.pdf",
+            "../papers/used/core pure 1 '21.pdf",
             "../physics '21.pdf",
         ] {
             if !std::path::Path::new(path).exists() {
@@ -3023,7 +3052,6 @@ mod tests {
             let map = crate::doc_map::build_text_only_map(&page_texts, pages.len(), &scan);
             let paper_last_page = map.spans.iter().map(|s| s.end_page).max().unwrap_or(0);
             let cfg = PipelineConfig::new(
-                "diag".into(),
                 "diag".into(),
                 "Maths".into(),
                 "Mod".into(),
@@ -3163,7 +3191,7 @@ mod tests {
             ambiguous_pages: vec![],
         };
         let cfg_with = |pages: Vec<PageLayoutEvidence>| {
-            let mut cfg = PipelineConfig::new("m".into(), "p".into(), "Maths".into(), "Mod".into(), None);
+            let mut cfg = PipelineConfig::new("p".into(), "Maths".into(), "Mod".into(), None);
             cfg.layout_evidence = Some(std::sync::Arc::new(ImportEvidence { pages, layout: Vec::new() }));
             cfg
         };
@@ -3292,7 +3320,7 @@ mod tests {
                     C pressure in Pa temperature in K\n\
                     D temperature in K pressure in Pa\n\
                     2 The next question starts here. [1 mark]\n";
-        let cfg = PipelineConfig::new("m".into(), "p".into(), "Physics".into(), "Mod".into(), None);
+        let cfg = PipelineConfig::new("p".into(), "Physics".into(), "Mod".into(), None);
         let content = transcribe_span(&cfg, &span(1, 0, 0, None), &[text], 0, 0)
             .expect("two-column MCQ must pass the local gates");
         let sanitized = crate::sanitize::sanitize_question_content(&content, 1);
@@ -3329,7 +3357,7 @@ mod tests {
 
         // The deterministic gate accepts the span, and the sanitizer tags the
         // four options without inventing an isotope.
-        let cfg = PipelineConfig::new("m".into(), "p".into(), "Physics".into(), "Mod".into(), None);
+        let cfg = PipelineConfig::new("p".into(), "Physics".into(), "Mod".into(), None);
         let content = transcribe_span(&cfg, &span(27, 0, 0, None), &[page], 0, 0)
             .expect("Q27-shaped numeric MCQ must pass the local gates");
         let sanitized = crate::sanitize::sanitize_question_content(&content, 27);
@@ -3347,10 +3375,10 @@ mod tests {
 
     /// A config whose span bodies come from the geometric layout map.
     fn layout_config(bodies: Vec<(u32, &str, Option<u32>)>) -> PipelineConfig {
-        let mut cfg = PipelineConfig::new("m".into(), "p".into(), "Mathematics".into(), "Mod".into(), None);
+        let mut cfg = PipelineConfig::new("p".into(), "Mathematics".into(), "Mod".into(), None);
         let map: std::collections::HashMap<u32, crate::layout::QuestionBody> = bodies
             .into_iter()
-            .map(|(n, text, footer_marks)| (n, crate::layout::QuestionBody { text: text.to_string(), footer_marks, pages: (0, 0), undetected_figures: 0, ends_with_reference: false }))
+            .map(|(n, text, footer_marks)| (n, crate::layout::QuestionBody { text: text.to_string(), footer_marks, pages: (0, 0), ..Default::default() }))
             .collect();
         cfg.layout_questions = Some(std::sync::Arc::new(map));
         cfg
@@ -3373,6 +3401,39 @@ mod tests {
         let q = layout_extract(&cfg, &span(3, 0, 0, Some(2))).expect("footer-only allocation is the whole allocation");
         assert_eq!(q.marks, 2);
         assert!(!q.needs_review, "{:?}", q.notes);
+        // The card shows the allocation the footer prints.
+        assert!(q.content.trim_end().ends_with("**[2 marks]**"), "{}", q.content);
+    }
+
+    #[test]
+    fn a_body_holding_another_questions_total_is_never_strict() {
+        // Edexcel Physics AS Jun 2022 P1: Q14 ran on into Q13's body with its
+        // own total, while Q13's parts still matched Q13's total.
+        let cfg = layout_config(vec![(
+            13,
+            "13 A trebuchet is a medieval catapult designed to project a rock over large distances.\n(a) Give two reasons why this is not correct.\n(2)\n(b) Calculate the horizontal distance travelled by the rock in this time.\n(4)\n(c) Explain why the horizontal distance travelled by the rock decreases.\n(5)\n*14 A student is travelling forwards at constant speed on a skateboard.\nExplain how Newton’s laws of motion apply to the student and the skateboard as he jumps forward off the moving skateboard.\n(Total for Question $\\mathbf{1}\\mathbf{4} = \\mathbf{6}$ marks)",
+            Some(11),
+        )]);
+        assert!(layout_extract(&cfg, &span(13, 0, 0, Some(11))).is_none());
+    }
+
+    #[test]
+    fn a_command_closed_by_its_printed_total_is_ended() {
+        // Edexcel GCSE Jun 2022 Q21: the command has no full stop, and the
+        // question's printed total follows it.
+        let body = |ends_at_footer| crate::layout::QuestionBody {
+            text: "21 Work out the lowest common multiple (LCM) of 24 and 56".to_string(),
+            footer_marks: Some(2),
+            ends_at_footer,
+            ..Default::default()
+        };
+        let mut cfg = PipelineConfig::new("p".into(), "Mathematics".into(), "Mod".into(), None);
+        cfg.layout_questions = Some(std::sync::Arc::new([(21, body(true))].into_iter().collect()));
+        let q = layout_extract(&cfg, &span(21, 0, 0, Some(2))).expect("the printed total ends the question");
+        assert!(!q.needs_review, "{:?}", q.notes);
+        // Without that evidence the unpunctuated end is still suspect.
+        cfg.layout_questions = Some(std::sync::Arc::new([(21, body(false))].into_iter().collect()));
+        assert!(layout_extract(&cfg, &span(21, 0, 0, Some(2))).is_none());
     }
 
     #[test]
@@ -3464,7 +3525,7 @@ mod tests {
                     ,\n(5)\n4 cm\nA B\nC D\nE\n(6)\n\
                     Question 2 (*****)\n\
                     Find the value of x.\n(7)\n";
-        let cfg = PipelineConfig::new("m".into(), "p".into(), "Maths".into(), "Mod".into(), None);
+        let cfg = PipelineConfig::new("p".into(), "Maths".into(), "Mod".into(), None);
         assert_eq!(
             transcribe_span(&cfg, &span(1, 0, 0, None), &[text], 0, 0),
             Err("ambiguous_mark_allocation"),
@@ -3504,7 +3565,7 @@ mod tests {
 
     #[test]
     fn phase2_labelled_and_single_allocations_stay_strict() {
-        let cfg = PipelineConfig::new("m".into(), "p".into(), "Maths".into(), "Mod".into(), None);
+        let cfg = PipelineConfig::new("p".into(), "Maths".into(), "Mod".into(), None);
         // Labelled sub-parts with equal allocations are legitimate.
         let labelled = "1 The student investigates the lamp.\n\
                         (a) State what happens to the resistance of the lamp. [2 marks]\n\
@@ -3585,7 +3646,7 @@ mod tests {
                     Question 2 (*****)\n\
                     Show by a suitable algebraic method that the sum is 1620.\n\
                     (6)\n";
-        let cfg = PipelineConfig::new("m".into(), "p".into(), "Maths".into(), "Mod".into(), None);
+        let cfg = PipelineConfig::new("p".into(), "Maths".into(), "Mod".into(), None);
         let content = transcribe_span(&cfg, &span(1, 0, 0, None), &[text], 0, 0)
             .expect("madas-shaped Q1 must carve and pass the gates");
         assert_eq!(validate::sum_inline_marks(&content), 5, "{content}");
@@ -3597,7 +3658,7 @@ mod tests {
 
     #[test]
     fn physics24_structured_subparts_keep_marks() {
-        let cfg = PipelineConfig::new("m".into(), "p".into(), "Physics".into(), "Mod".into(), None);
+        let cfg = PipelineConfig::new("p".into(), "Physics".into(), "Mod".into(), None);
         for (number, texts, marks, figures) in [
             (1, vec![include_str!("../fixtures/physics24_text/page_2.txt"), include_str!("../fixtures/physics24_text/page_3.txt")], 9, 0),
             (7, vec![include_str!("../fixtures/physics24_text/page_19.txt"), include_str!("../fixtures/physics24_text/page_20.txt"), include_str!("../fixtures/physics24_text/page_21.txt")], 10, 1),
@@ -3610,7 +3671,7 @@ mod tests {
     }
     #[test]
     fn physics24_frequency_choices_keep_both_columns() {
-        let cfg = PipelineConfig::new("m".into(), "p".into(), "Physics".into(), "Mod".into(), None);
+        let cfg = PipelineConfig::new("p".into(), "Physics".into(), "Mod".into(), None);
         let content = transcribe_span(&cfg, &span(14, 0, 0, Some(1)), &[include_str!("../fixtures/physics24_text/page_25.txt")], 0, 3).unwrap();
         let content = crate::marker_client::clean_marker_markdown(&content);
         let content = crate::sanitize::sanitize_question_content(&content, 14);
@@ -3629,13 +3690,13 @@ mod tests {
         // are the ones printed in the source (stacked fractions, radicals,
         // powers and nuclide prescripts rebuilt from glyph geometry).
         let _guard = crate::pdf_render::pdfium_test_lock();
-        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../past papers for mergemark/physics '24.pdf");
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../papers/used/physics '24.pdf");
         let Some(pages) = path.exists().then(|| crate::pdf_render::load_layout_pages(&path)).flatten() else {
             eprintln!("[P24] fixture or PDFium unavailable");
             return;
         };
         let map = crate::layout::build_layout_map(&pages);
-        let mut cfg = PipelineConfig::new("m".into(), "p".into(), "Physics".into(), "Mod".into(), None);
+        let mut cfg = PipelineConfig::new("p".into(), "Physics".into(), "Mod".into(), None);
         let bodies: std::collections::HashMap<u32, crate::layout::QuestionBody> =
             map.questions.iter().map(|q| (q.number, crate::layout::question_body(&pages, q))).collect();
         cfg.layout_questions = Some(std::sync::Arc::new(bodies.clone()));
@@ -3675,7 +3736,7 @@ mod tests {
     }
     #[test]
     fn physics24_remaining_tier0_spans() {
-        let cfg = PipelineConfig::new("m".into(), "p".into(), "Physics".into(), "Mod".into(), None);
+        let cfg = PipelineConfig::new("p".into(), "Physics".into(), "Mod".into(), None);
         for (number, pages, marks) in [
             (2, vec![include_str!("../fixtures/physics24_text/page_4.txt"), include_str!("../fixtures/physics24_text/page_5.txt"), include_str!("../fixtures/physics24_text/page_6.txt"), include_str!("../fixtures/physics24_text/page_7.txt")], 9),
             (4, vec![include_str!("../fixtures/physics24_text/page_10.txt"), include_str!("../fixtures/physics24_text/page_11.txt")], 5),
@@ -3704,7 +3765,7 @@ mod tests {
     #[test]
     fn physics24_numeric_heading_preserves_energy() {
         let raw = "1 9 4.8 kW h of heat energy is supplied to a heater. What is the power?\n[1 mark]\nA 1 kW\nB 2 kW\nC 3 kW\nD 4 kW\n2 0 The next question starts here.";
-        let cfg = PipelineConfig::new("m".into(), "p".into(), "Physics".into(), "Mod".into(), None);
+        let cfg = PipelineConfig::new("p".into(), "Physics".into(), "Mod".into(), None);
         let content = transcribe_span(&cfg, &span(19, 0, 0, Some(1)), &[raw], 0, 0).unwrap();
         let content = crate::marker_client::clean_marker_markdown(&content);
         assert!(content.contains("4.8"), "{content}");
@@ -3716,7 +3777,7 @@ mod tests {
     #[test]
     fn physics24_shared_page_31_32() {
         let raw = "box 3 1 Uranium-238 absorbs a neutron in the first stage in a series of nuclear reactions that end\nin a nucleus Z.\n238Un X 92 + →\nXY v + + e → β−\nYZ v + + e → β−\nHow many neutrons does Z have?\n[1 mark]\nA 144\nB 145\nC 149\nD 237\n3 2 A rock sample is found to contain the stable isotope lead-207. When it was formed, the\nrock contained uranium-235 but did not contain any lead-207.\nHow long ago was the rock formed?\n[1 mark]\nA 0.23 billion years\nB 0.31 billion years\nC 1.4 billion years\nD 2.0 billion years\nEND OF QUESTIONS";
-        let cfg = PipelineConfig::new("m".into(), "p".into(), "Physics".into(), "Mod".into(), None);
+        let cfg = PipelineConfig::new("p".into(), "Physics".into(), "Mod".into(), None);
         for number in [31, 32] {
             let content = transcribe_span(&cfg, &span(number, 0, 0, Some(1)), &[raw], 0, 0).unwrap();
             let content = crate::sanitize::sanitize_question_content(&content, number);
@@ -4024,7 +4085,7 @@ mod tests {
         let s = span(6, 0, 0, marks);
         let carved = carve_span(&s, &[&page], false);
         let mut norm = normalize(&carved.text);
-        let cfg = PipelineConfig::new("m".into(), "p".into(), "Physics".into(), "Mod".into(), None);
+        let cfg = PipelineConfig::new("p".into(), "Physics".into(), "Mod".into(), None);
         let err = check_gates(&carved, &mut norm, &s, &cfg, 0).unwrap_err();
         assert_eq!(err, expected_reason);
     }
@@ -4045,7 +4106,7 @@ mod tests {
         let s = span(6, 0, 0, Some(2));
         let carved = carve_span(&s, &[&page], false);
         let mut norm = normalize(&carved.text);
-        let cfg = PipelineConfig::new("m".into(), "p".into(), "Physics".into(), "Mod".into(), None);
+        let cfg = PipelineConfig::new("p".into(), "Physics".into(), "Mod".into(), None);
         assert_eq!(
             check_gates(&carved, &mut norm, &s, &cfg, 0).unwrap_err(),
             "subpart_gap"
@@ -4070,7 +4131,7 @@ mod tests {
         let s = span(6, 0, 0, Some(6));
         let carved = carve_span(&s, &[&page], false);
         let mut norm = normalize(&carved.text);
-        let cfg = PipelineConfig::new("m".into(), "p".into(), "Physics".into(), "Mod".into(), None);
+        let cfg = PipelineConfig::new("p".into(), "Physics".into(), "Mod".into(), None);
         let gate = check_gates(&carved, &mut norm, &s, &cfg, 1);
         assert!(gate.is_ok(), "illustrative figure must pass with supply: {:?}", gate.err());
         assert!(
@@ -4083,7 +4144,7 @@ mod tests {
     #[test]
     fn physics24_unmapped_fraction_glyphs_require_fallback() {
         let s = span(20, 0, 0, Some(1));
-        let cfg = PipelineConfig::new("m".into(), "p".into(), "Physics".into(), "Mod".into(), None);
+        let cfg = PipelineConfig::new("p".into(), "Physics".into(), "Mod".into(), None);
         let page = "20. What is the nuclear radius of an element with nucleon number y?\n[1 mark]\nA x r y\n\u{f8eb}\u{f8f6}\nB y r x\nC 3 x r y\nD y 3 r x";
         assert_eq!(transcribe_span(&cfg, &s, &[page], 0, 0).unwrap_err(), "unmapped_symbol_font_glyphs");
     }
@@ -4093,7 +4154,7 @@ mod tests {
         for reference in ["Figure 3 shows the graph. ", ""] {
             let page = format!("6. {reference}Use the graph to determine the acceleration of the trolley during the first ten seconds of its journey. [2 marks]\n(Total for Question 6 is 2 marks)");
             let s = span(6, 0, 0, Some(2));
-            let cfg = PipelineConfig::new("m".into(), "p".into(), "Physics".into(), "Mod".into(), None);
+            let cfg = PipelineConfig::new("p".into(), "Physics".into(), "Mod".into(), None);
             assert!(transcribe_span(&cfg, &s, &[&page], 0, 1).is_ok());
             assert!(transcribe_span(&cfg, &s, &[&page], 0, 0).unwrap().contains("[DIAGRAM_PLACEHOLDER]"));
         }
@@ -4109,7 +4170,7 @@ mod tests {
         let s = span(6, 0, 0, Some(2));
         let carved = carve_span(&s, &[&page], false);
         let mut norm = normalize(&carved.text);
-        let mut cfg = PipelineConfig::new("m".into(), "p".into(), "Physics".into(), "Mod".into(), None);
+        let mut cfg = PipelineConfig::new("p".into(), "Physics".into(), "Mod".into(), None);
         cfg.allowed_topics = vec!["Mechanics".into()];
         assert!(
             check_gates(&carved, &mut norm, &s, &cfg, 0).is_ok(),
@@ -4134,7 +4195,7 @@ mod tests {
         assert!(carved.found_start && carved.found_end);
         assert_eq!(carved.footer_marks, Some(4));
         let mut norm = normalize(&carved.text);
-        let cfg = PipelineConfig::new("m".into(), "p".into(), "Physics".into(), "Mod".into(), None);
+        let cfg = PipelineConfig::new("p".into(), "Physics".into(), "Mod".into(), None);
         assert!(check_gates(&carved, &mut norm, &s, &cfg, 0).is_ok(), "gates refused: {:?}", check_gates(&carved, &mut norm, &s, &cfg, 0));
         assert!(validate::math_delimiter_balance_errors(&norm.content).is_empty());
     }
@@ -4146,7 +4207,7 @@ mod tests {
         let s = span(7, 0, 0, Some(6));
         let carved = carve_span(&s, &[&page], false);
         let mut norm = normalize(&carved.text);
-        let cfg = PipelineConfig::new("m".into(), "p".into(), "Physics".into(), "Mod".into(), None);
+        let cfg = PipelineConfig::new("p".into(), "Physics".into(), "Mod".into(), None);
         let gate = check_gates(&carved, &mut norm, &s, &cfg, 0);
         assert!(gate.is_ok(), "gates refused: {:?}", gate);
         let built = crate::pipeline::build_question_from_seam(
@@ -4164,7 +4225,7 @@ mod tests {
     }
 
     /// Fixture calibration harness: prints per-paper Tier-0 accept rates and
-    /// gate-refusal reasons for physics '17–'24 and test_papers/*_qp.pdf.
+    /// gate-refusal reasons for every question paper in papers/used and papers/unused.
     /// Manual-inspection output only — no assertions.
     
     #[test]
@@ -4189,25 +4250,25 @@ mod tests {
         let _guard = crate::pdf_render::pdfium_test_lock();
         let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).to_path_buf();
         let mut fixtures: Vec<std::path::PathBuf> = Vec::new();
-        for year in 17..=24 {
-            let p = manifest.join(format!("../physics '{}.pdf", year));
-            if p.exists() {
-                fixtures.push(p);
-            }
-        }
-        if let Ok(entries) = std::fs::read_dir(manifest.join("../test_papers")) {
-            for e in entries.flatten() {
-                let name = e.file_name().to_string_lossy().to_string();
-                if name.ends_with("_qp.pdf") {
-                    fixtures.push(e.path());
+        for dir in ["../papers/used", "../papers/unused"] {
+            if let Ok(entries) = std::fs::read_dir(manifest.join(dir)) {
+                for e in entries.flatten() {
+                    let name = e.file_name().to_string_lossy().to_string();
+                    let is_question_paper = name.ends_with(".pdf")
+                        && !name.ends_with("_ms.pdf")
+                        && !name.contains("solutions");
+                    if is_question_paper {
+                        fixtures.push(e.path());
+                    }
                 }
             }
         }
+        fixtures.sort();
         if fixtures.is_empty() {
             eprintln!("[TIER0] no fixtures found");
             return;
         }
-        let cfg = PipelineConfig::new("m".into(), "p".into(), "Physics".into(), "Mod".into(), None);
+        let cfg = PipelineConfig::new("p".into(), "Physics".into(), "Mod".into(), None);
         for fixture in fixtures {
             let texts = match crate::pdf_render::pdf_page_texts(&fixture) {
                 Ok(v) => v,
@@ -4228,7 +4289,7 @@ mod tests {
                 kind: crate::pipeline::PageInputKind::TextOnly,
                 text: text.clone(),
             }).collect();
-            let map = crate::doc_map::build_hybrid_map_with_scan(&texts, &[], texts.len(), &scan);
+            let map = crate::doc_map::build_text_only_map(&texts, texts.len(), &scan);
             let paper_last = map.spans.iter().map(|s| s.end_page).max().unwrap_or(0);
             let mut accepted = 0usize;
             let mut reasons: std::collections::BTreeMap<&'static str, usize> = Default::default();

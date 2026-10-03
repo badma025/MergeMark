@@ -8,16 +8,13 @@ use tokio::sync::Mutex;
 mod db;
 
 mod backup;
-mod billing;
 mod commands;
-pub mod cost;
 mod deterministic;
 mod doc_map;
 mod geometry;
-mod json_salvage;
 pub mod layout;
 pub mod mark_scheme_deterministic;
-pub mod llm;
+pub mod ocr;
 pub mod pdf_render;
 pub mod pipeline;
 pub mod sanitize;
@@ -29,10 +26,8 @@ pub mod marker_client;
 pub struct AppState {
     pub db: Arc<Mutex<SqlitePool>>,
     pub cancel_flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    /// Concurrency guard for the hybrid-billing command. Only one
-    /// `generate_worksheet_from_pdf` call may be in flight at a time; the
-    /// command attempts a non-blocking `try_lock` and rejects overlapping
-    /// calls with a 429-style `BillingError` instead of queueing them.
+    /// Only one import runs at a time: an import attempts a non-blocking
+    /// `try_lock` and rejects an overlapping one instead of queueing it.
     pub extraction_in_progress: tokio::sync::Mutex<()>,
 }
 

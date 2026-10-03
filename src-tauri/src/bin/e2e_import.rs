@@ -1,31 +1,24 @@
 //! Headless end-to-end import harness.
 //!
-//! Runs the EXACT production extraction pipeline (doc map → Tier-0 →
-//! text-first → crop-first → vision repair loop → deterministic figure
-//! splicing → sanitizer) against a real PDF and writes the resulting cards
-//! to disk as markdown for verification — no GUI, no Tauri state.
+//! Runs the EXACT production import pipeline (layout map → local
+//! transcriber → deterministic figure splicing → sanitizer) against a real
+//! PDF and writes the resulting cards to disk as markdown for verification —
+//! no GUI, no Tauri state, no network.
 //!
 //! Usage:
-//!   cargo run --bin e2e_import -- "physics '17.pdf" "physics '17" --out dir
+//!   cargo run --bin e2e_import -- "physics '24.pdf" "physics '24" --out dir
+//!   cargo run --bin e2e_import -- "<scheme>.pdf" "<name>" --mark-scheme --out dir
 //!
-//!   # Offline certification: no credentials, no network. Every attempted
-//!   # model request is refused and counted, and the run exits non-zero if
-//!   # anything at all was attempted.
-//!   cargo run --bin e2e_import -- "physics '24.pdf" "physics '24" --offline --out dir
-//!
-//! Environment:
-//!   OPENROUTER_API_KEY   (required unless MERGEMARK_E2E_MODEL is a groq key)
-//!   OPENROUTER_BASE_URL  (optional, default https://openrouter.ai/api/v1/)
-//!   MERGEMARK_E2E_MODEL  (default google/gemini-2.5-flash)
+//! `--offline` is accepted for older scripts: every run is offline. The
+//! certification it writes records zero model requests, because MergeMark
+//! has no model client to make one.
 
-use mergemark_lib::llm::{LlmConfig, RefusingLlm, ReqwestLlm};
 use mergemark_lib::pipeline::{
     run_question_pipeline, NullProgress, PageInput, PipelineConfig,
 };
 use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
-use std::time::Duration;
 
 #[tokio::main]
 async fn main() -> Result<(), String> {
@@ -43,14 +36,11 @@ async fn main() -> Result<(), String> {
         .and_then(|i| args.get(i + 1))
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("e2e_output"));
-    // Offline certification mode: refuse + count every request instead of
-    // calling a provider. No credentials, no network, no spend.
-    let offline = args.iter().any(|a| a == "--offline");
     // Reject flags that require a value but were given none, or were followed
     // by another option token (`--subject --offline` must NOT silently treat
     // `--offline` as the subject). Never silently fall back to a default for an
     // explicit flag.
-    for flag in ["--out", "--subject", "--module", "--config-db"] {
+    for flag in ["--out", "--subject", "--module"] {
         if let Some(i) = args.iter().position(|a| a == flag) {
             match args.get(i + 1) {
                 None => return Err(format!("{flag} requires a value")),
@@ -77,6 +67,29 @@ async fn main() -> Result<(), String> {
         std::fs::write(out_dir.join("figures.json"), serde_json::to_string_pretty(&json).unwrap()).map_err(|e| e.to_string())?;
         return Ok(());
     }
+    // Developer view of the geometry layout: every page's lines (furniture
+    // tagged) and the question map with each mapped body.
+    if args.iter().any(|a| a == "--dump-layout") {
+        std::fs::create_dir_all(&out_dir).map_err(|e| e.to_string())?;
+        let pages = mergemark_lib::pdf_render::load_layout_pages(std::path::Path::new(&pdf_path)).ok_or("layout unavailable")?;
+        let mut s = String::new();
+        for lp in &pages {
+            s.push_str(&format!("===== page {} ({}x{})\nfigures {:?}\ndrawings {:?}\n{}", lp.page + 1, lp.width, lp.height, lp.figures, lp.drawings, lp.debug()));
+        }
+        std::fs::write(out_dir.join("layout_pages.txt"), s).map_err(|e| e.to_string())?;
+        let map = mergemark_lib::layout::build_layout_map(&pages);
+        let mut s = format!("anomalies: {:?}\n", map.anomalies);
+        for q in &map.questions {
+            let body = mergemark_lib::layout::question_body(&pages, q);
+            s.push_str(&format!("===== Q{} pages {}-{} footer={:?}\n{}\n", q.number, q.start_page + 1, q.end_page + 1, body.footer_marks, body.text));
+        }
+        std::fs::write(out_dir.join("layout_map.txt"), s).map_err(|e| e.to_string())?;
+        let unknown = mergemark_lib::pdf_render::unknown_glyph_report(std::path::Path::new(&pdf_path)).unwrap_or_default();
+        std::fs::write(out_dir.join("unknown_glyphs.txt"), unknown).map_err(|e| e.to_string())?;
+        let glyphs = mergemark_lib::pdf_render::glyph_report(std::path::Path::new(&pdf_path)).unwrap_or_default();
+        std::fs::write(out_dir.join("glyphs.txt"), glyphs).map_err(|e| e.to_string())?;
+        return Ok(());
+    }
     if args.iter().any(|a| a == "--render-source") {
         std::fs::create_dir_all(&out_dir).map_err(|e| e.to_string())?;
         for page in [15, 25, 27, 28, 31, 34] {
@@ -86,29 +99,34 @@ async fn main() -> Result<(), String> {
         }
         return Ok(());
     }
-    let model =
-        std::env::var("MERGEMARK_E2E_MODEL").unwrap_or_else(|_| "google/gemini-2.5-flash".into());
-    // Explicit opt-in to the app's configured provider; open SQLite read-only
-    // and never print credentials or modify the user's imports. Offline mode
-    // needs no credentials at all, so it skips this entirely.
-    let mut api_key: Option<String> = None;
-    let mut base_url: Option<String> = None;
-    if !offline {
-        let mut stored_key = None;
-        let mut stored_url = None;
-        if let Some(db_path) = args.iter().position(|a| a == "--config-db").and_then(|i| args.get(i+1)) {
-            let options = sqlx::sqlite::SqliteConnectOptions::new().filename(db_path).read_only(true);
-            let pool = sqlx::SqlitePool::connect_with(options).await.map_err(|e| e.to_string())?;
-            let row: (Option<String>, Option<String>) = sqlx::query_as("SELECT byok_api_key, byok_base_url FROM usage_config WHERE id = 1")
-                .fetch_one(&pool).await.map_err(|e| e.to_string())?;
-            stored_key = row.0.filter(|s| !s.trim().is_empty());
-            stored_url = row.1.filter(|s| !s.trim().is_empty());
-            pool.close().await;
+    // Mark-scheme import: what the app's local reader makes of the scheme.
+    if args.iter().any(|a| a == "--mark-scheme") {
+        let path = PathBuf::from(&pdf_path);
+        let pages: Vec<PageInput> = mergemark_lib::pdf_render::render_pdf_pages(&path)?;
+        let config = PipelineConfig::new(paper_name.clone(), "MarkScheme".into(), "MarkScheme".into(), Some(path.clone()));
+        let (drafts, report) = mergemark_lib::pipeline::run_markscheme_pipeline(&pages, &config, &NullProgress, &AtomicBool::new(false)).await?;
+        std::fs::create_dir_all(&out_dir).map_err(|e| e.to_string())?;
+        let slug = paper_name.replace(' ', "_").replace('\'', "");
+        let md: String = drafts.iter().map(|d| format!("\n\n===== Q{} =====\n{}\n", d.question_number, d.markdown)).collect();
+        std::fs::write(out_dir.join(format!("{slug}_answers.md")), md).map_err(|e| e.to_string())?;
+        let certification = serde_json::json!({
+            "mode": "offline-mark-scheme",
+            "paper": paper_name,
+            "pages": pages.len(),
+            "modelClient": "none",
+            "cloudAttempts": 0,
+            "answers": drafts.len(),
+            "localAnswers": report.deterministic,
+            "anomalies": &report.anomalies,
+            "quarantined": report.quarantined.iter().map(|q| &q.reason).collect::<Vec<_>>(),
+        });
+        std::fs::write(out_dir.join(format!("{slug}_offline_certification.json")), serde_json::to_string_pretty(&certification).unwrap()).map_err(|e| e.to_string())?;
+        println!("[E2E][MS] answers={} local={}", drafts.len(), report.deterministic);
+        for a in &report.anomalies {
+            println!("  - {a}");
         }
-        api_key = std::env::var("OPENROUTER_API_KEY").ok().or(stored_key);
-        base_url = std::env::var("OPENROUTER_BASE_URL").ok().or(stored_url);
+        return Ok(());
     }
-
     let path = PathBuf::from(&pdf_path);
     let pages: Vec<PageInput> = mergemark_lib::pdf_render::render_pdf_pages(&path)?;
     println!(
@@ -136,23 +154,14 @@ async fn main() -> Result<(), String> {
         .cloned()
         .unwrap_or_else(|| "A-Level Physics".to_string());
     let mut config = PipelineConfig::new(
-        model.clone(),
         paper_name.clone(),
         subject,
         module_name,
         Some(path.clone()),
     );
-    // Production values (mirror commands.rs parse_pdf_vision).
-    config.max_repairs = 2;
-    config.max_output_tokens = 32768;
-    config.text_first = true;
-    config.ms_text_first = true;
-    config.deterministic = true;
     // Same per-import layout evidence the production path attaches.
     config.layout_evidence =
         mergemark_lib::pdf_render::load_import_evidence(&path).map(Arc::new);
-    // Free-tier routes (Google AI Studio) enforce per-minute quotas — run
-    // serially there via MERGEMARK_E2E_PARALLELISM=1; default mirrors prod.
     config.parallelism = std::env::var("MERGEMARK_E2E_PARALLELISM")
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
@@ -176,45 +185,14 @@ async fn main() -> Result<(), String> {
     config.diagrams_dir = Some(diagrams_dir);
 
     let cancel = Arc::new(AtomicBool::new(false));
-    // `attempts` is (total, image, text) and only exists in offline mode, where
-    // the refusing client is the source of truth for the $0 certification.
-    let (built, report, attempts): (_, _, Option<(usize, usize, usize)>) = if offline {
-        let client = RefusingLlm::new();
-        let (built, report) = run_question_pipeline(
-            &client,
-            &pages,
-            &page_figures,
-            &config,
-            &NullProgress,
-            &cancel,
-        )
-        .await?;
-        (
-            built,
-            report,
-            Some((client.calls(), client.image_calls(), client.text_calls())),
-        )
-    } else {
-        let api_key = api_key.ok_or(
-            "No API key: set OPENROUTER_API_KEY or supply --config-db with a configured provider",
-        )?;
-        let client = ReqwestLlm::new(LlmConfig {
-            base_url: base_url.unwrap_or_else(|| "https://openrouter.ai/api/v1/".to_string()),
-            api_key,
-            model: model.clone(),
-            timeout: Duration::from_secs(300),
-        });
-        let (built, report) = run_question_pipeline(
-            &client,
-            &pages,
-            &page_figures,
-            &config,
-            &NullProgress,
-            &cancel,
-        )
-        .await?;
-        (built, report, None)
-    };
+    let (built, report) = run_question_pipeline(
+        &pages,
+        &page_figures,
+        &config,
+        &NullProgress,
+        &cancel,
+    )
+    .await?;
 
     std::fs::create_dir_all(&out_dir).map_err(|e| e.to_string())?;
     let mut md = String::new();
@@ -277,16 +255,11 @@ async fn main() -> Result<(), String> {
 
     println!("\n[E2E] extracted {} questions -> {}", built.len(), out_file.display());
     println!(
-        "[E2E] tier0={} text_first={} crop_first={} vision_repairs={} quarantined={}",
+        "[E2E] tier0={} quarantined={} structural_flags={}/{}",
         report.deterministic,
-        report.text_first,
-        report.crop_first,
-        report.repairs,
-        report.quarantined.len()
-    );
-    println!(
-        "[E2E] prompt_tokens={} completion_tokens={} structural_flags={}/{}",
-        report.prompt_tokens, report.completion_tokens, flagged, built.len()
+        report.quarantined.len(),
+        flagged,
+        built.len()
     );
     println!(
         "[E2E] text_layer={} strict_tier0={} local_recoveries={} quarantined={}",
@@ -295,67 +268,52 @@ async fn main() -> Result<(), String> {
         report.recovered,
         report.quarantined.len()
     );
-    if let Some((calls, image_calls, text_calls)) = attempts {
+    {
         let slug = paper_name.replace(' ', "_").replace('\'', "");
-        // A refused request makes no HTTP call, so offline spend is always
-        // exactly zero. The zero-ATTEMPT policy is a separate, stricter gate:
-        // it is what proves the digital circuit breaker held.
-        let tokens_zero = report.prompt_tokens == 0 && report.completion_tokens == 0;
-        let zero_attempt_policy = calls == 0;
+        // MergeMark has no model client: no request can be attempted, so the
+        // request and token counts the certification records are zero by
+        // construction, not by measurement. What enforces it is the test
+        // `mergemark_has_no_way_to_reach_an_ai_service` (no HTTP client in
+        // Cargo.toml, no outside host in the window's CSP); the calibration
+        // still checks the fields, so an older build's certification fails.
         let usable_cards = built.len().saturating_sub(placeholder_fallbacks);
         let certification = serde_json::json!({
             "mode": "offline",
             "paper": paper_name,
             "pages": pages.len(),
             "textLayer": report.text_layer,
-            "cloudAttempts": calls,
-            "imageAttempts": image_calls,
-            "textOnlyAttempts": text_calls,
-            "promptTokens": report.prompt_tokens,
-            "completionTokens": report.completion_tokens,
+            "modelClient": "none",
+            "cloudAttempts": 0,
+            "imageAttempts": 0,
+            "textOnlyAttempts": 0,
+            "promptTokens": 0,
+            "completionTokens": 0,
             "costUsd": "0.0000",
-            "tokensZero": tokens_zero,
-            "zeroAttemptPolicyPassed": zero_attempt_policy,
+            "tokensZero": true,
+            "zeroAttemptPolicyPassed": true,
             "questionsExpected": report.questions_expected,
             "questionsExtracted": report.questions_extracted,
             "strictTier0": report.deterministic,
             "localRecoveries": report.recovered,
-            "textFirst": report.text_first,
-            "cropFirst": report.crop_first,
-            "repairs": report.repairs,
             "quarantined": report.quarantined.len(),
             "structuralFlags": flagged,
             "placeholderFallbackCards": placeholder_fallbacks,
             "usableCards": usable_cards,
+            "pagesNotTranscribed": &report.pages_not_transcribed,
             "anomalies": &report.anomalies,
+            "choiceGroups": &report.choice_groups,
         });
         let cert_file = out_dir.join(format!("{}_offline_certification.json", slug));
         std::fs::write(&cert_file, serde_json::to_string_pretty(&certification).unwrap())
             .map_err(|e| e.to_string())?;
         println!(
-            "[E2E][OFFLINE] cloud_attempts={} (text={} image={}) prompt_tokens={} completion_tokens={} spend=$0.0000 (refused requests never leave the machine)",
-            calls,
-            text_calls,
-            image_calls,
-            report.prompt_tokens,
-            report.completion_tokens
-        );
-        println!(
-            "[E2E][OFFLINE] zero_attempt_policy={} tokens_zero={} strict_tier0={} local_recoveries={} placeholder_fallbacks={} usable_cards={}",
-            zero_attempt_policy,
-            tokens_zero,
+            "[E2E][OFFLINE] strict_tier0={} local_recoveries={} placeholder_fallbacks={} usable_cards={} (no model client: zero requests possible)",
             report.deterministic,
             report.recovered,
             placeholder_fallbacks,
             usable_cards
         );
         println!("[E2E][OFFLINE] certification -> {}", cert_file.display());
-        if !zero_attempt_policy || !tokens_zero {
-            return Err(format!(
-                "zero-cost certification FAILED: attempted={} (text {}, image {}), prompt_tokens={}, completion_tokens={}",
-                calls, text_calls, image_calls, report.prompt_tokens, report.completion_tokens
-            ));
-        }
     }
     if !report.anomalies.is_empty() {
         println!("[E2E] anomalies:");

@@ -1,4 +1,3 @@
-use crate::llm::{LlmConfig, ReqwestLlm};
 use crate::pipeline::{
     self, AnswerDraft, BuiltQuestion, ImportReport, PageInput, PipelineConfig, Progress,
 };
@@ -18,48 +17,25 @@ static RE_CLASSIFIER_MARKS: LazyLock<regex::Regex> = LazyLock::new(|| regex::Reg
 static RE_CLASSIFIER_QSPLIT: LazyLock<regex::Regex> = LazyLock::new(|| regex::Regex::new(r"(?m)(?:^|\n)(?:Question\s+\d+|Q\.?\s*\d+|\d{1,2}[.)]\s)").unwrap());
 static RE_CLASSIFIER_MATH: LazyLock<regex::Regex> = LazyLock::new(|| regex::Regex::new(r"(?s)\$\$?.+?\$\$?|\\\[.+?\\\]|\\\(.+?\\\)").unwrap());
 
-// Provider vs on-device client for question-paper ingestion.
-
-/// Which client a question-paper import runs with.
-///
-/// Digital documents (any page carrying machine-readable question text) are
-/// ingested entirely on-device: no provider resolution, no credentials, no
-/// upload entitlement. The local variant uses the offline refusing client, so
-/// even a bug in the orchestration layer cannot reach the network.
-enum QuestionClient {
-    Provider(ReqwestLlm),
-    Local(crate::llm::RefusingLlm),
-}
-
-impl crate::llm::LlmClient for QuestionClient {
-    fn chat<'a>(
-        &'a self,
-        body: &'a serde_json::Value,
-    ) -> std::pin::Pin<
-        Box<
-            dyn std::future::Future<Output = Result<serde_json::Value, crate::llm::LlmError>>
-                + Send
-                + 'a,
-        >,
-    > {
-        match self {
-            QuestionClient::Provider(client) => client.chat(body),
-            QuestionClient::Local(client) => client.chat(body),
-        }
+/// Why an import read no questions, in words for the import screen.
+fn not_transcribed_message(report: &ImportReport, file: &std::path::Path) -> String {
+    const OFFLINE: &str = "MergeMark works offline and sends nothing to AI services.";
+    let picture = file
+        .extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| ["png", "jpg", "jpeg", "webp"].contains(&e.to_ascii_lowercase().as_str()));
+    if picture {
+        format!("This picture was not transcribed: MergeMark reads scanned PDFs with local OCR, but not pictures imported on their own. Import the paper as a PDF. {OFFLINE}")
+    } else if !report.pages_not_transcribed.is_empty() {
+        let why = if crate::ocr::available() { "local OCR could not read them" } else { "this computer has no local OCR engine to read them" };
+        format!("This paper was not transcribed: pages {:?} are scanned, and {why}. {OFFLINE}", report.pages_not_transcribed)
+    } else {
+        format!("No questions were found in this paper: its text gave no question headings MergeMark could place. {OFFLINE}")
     }
 }
 
-/// Provider requirement for one import, decided from the page text ALONE and
-/// before any credential or quota lookup.
-///
-/// `false` means a digital document: the import must run on-device and must
-/// not resolve a provider, read a key, or spend free-tier uploads. Extracted
-/// so the rule is testable without Tauri state.
-fn import_requires_provider(pages: &[PageInput]) -> bool {
-    !pipeline::is_local_only_document(pages)
-}
-
-
+/// The model name the local import history records: no AI model ran.
+const LOCAL_IMPORT_MODEL: &str = "local (no AI)";
 
 // ── Shared data model ─────────────────────────────────────────────────────────
 
@@ -94,52 +70,6 @@ pub struct ProposedMapping {
     pub raw_content: String,
     pub proposed_answer: String,
     pub paper_name: String,
-}
-
-// ── Billing integration helper ──────────────────────────────────────────────────
-
-async fn resolve_llm_client<'a>(
-    state: &State<'a, AppState>,
-    frontend_model: String,
-) -> Result<(crate::billing::BillingRoute, ReqwestLlm), crate::billing::BillingError> {
-    let pool = state.db.lock().await;
-    let free_uploads_used = crate::db::get_free_uploads_used(&pool)
-        .await
-        .map_err(|e| crate::billing::BillingError::network(&format!("DB read failed: {e}")))?;
-    let byok_key = crate::db::get_byok_api_key(&pool)
-        .await
-        .map_err(|e| crate::billing::BillingError::network(&format!("DB read failed: {e}")))?;
-    let byok_base = crate::db::get_byok_base_url(&pool)
-        .await
-        .map_err(|e| crate::billing::BillingError::network(&format!("DB read failed: {e}")))?
-        .unwrap_or_else(|| "https://api.openai.com/v1".to_string());
-    drop(pool);
-
-    let route = crate::billing::pick_route(free_uploads_used, byok_key.is_some());
-    let config = match &route {
-        crate::billing::BillingRoute::FreeTier { .. } => {
-            let key = crate::billing::openrouter_api_key();
-            if key == "dev-openrouter-key-not-set" {
-                return Err(crate::billing::BillingError::network("The built-in Free Tier is unavailable on this installation. Please enter your own API Key in Settings."));
-            }
-            LlmConfig {
-                base_url: crate::billing::OPENROUTER_API_URL.to_string(),
-                api_key: key.to_string(),
-                model: crate::billing::OPENROUTER_MODEL.to_string(),
-                timeout: crate::billing::REQUEST_TIMEOUT,
-            }
-        }
-        crate::billing::BillingRoute::Byok => LlmConfig {
-            base_url: byok_base,
-            api_key: byok_key.unwrap(),
-            model: frontend_model,
-            timeout: crate::billing::REQUEST_TIMEOUT,
-        },
-        crate::billing::BillingRoute::NeedsByok => {
-            return Err(crate::billing::BillingError::needs_byok(free_uploads_used));
-        }
-    };
-    Ok((route, ReqwestLlm::new(config)))
 }
 
 // ── Progress bridge: pipeline stages → frontend `import-progress` events ──────
@@ -1283,30 +1213,62 @@ pub(crate) fn extract_page_texts(file_path: &str, num_pages: usize) -> Vec<Strin
     texts
 }
 
-// ── Vision question-paper ingestion (PVRV pipeline) ─────────────────────────
+// ── Question-paper import ─────────────────────────────────────────────────────
 
 #[tauri::command]
 pub async fn parse_pdf_vision(
     app: tauri::AppHandle,
-    _api_key: String,
     file_path: String,
     pdf_base64_pages: Option<Vec<String>>,
-    _base_url: String,
-    model_name: String,
     subject: String,
     module_override: Option<String>,
     paper_name: String,
     state: State<'_, AppState>,
 ) -> Result<Vec<Question>, String> {
-    // Unambiguous build marker: if the running binary does not print this,
-    // it predates the figure-fix-v3 build. Rebuild before trusting any cost
-    // measurement.
-    eprintln!("[BUILD] figure-fix-v6: accurate cost metering + slim text-first prompts + text-first batching");
+    let host = TauriProgress { app };
+    import_question_paper(
+        &state,
+        &host,
+        QuestionImportRequest { file_path, pdf_base64_pages, subject, module_override, paper_name },
+    )
+    .await
+}
+
+/// One question-paper import, as the import screen asks for it.
+pub(crate) struct QuestionImportRequest {
+    pub file_path: String,
+    pub pdf_base64_pages: Option<Vec<String>>,
+    pub subject: String,
+    pub module_override: Option<String>,
+    pub paper_name: String,
+}
+
+/// Where an import reports to: its progress stages, its finished report, and
+/// the folder its figure crops are saved in. The app sends both to the
+/// window; tests collect them.
+pub(crate) trait ImportHost: Progress {
+    fn report<T: Serialize>(&self, report: &T);
+    fn diagrams_dir(&self) -> Option<std::path::PathBuf>;
+}
+
+impl ImportHost for TauriProgress {
+    fn report<T: Serialize>(&self, report: &T) {
+        let _ = self.app.emit("import-report", report);
+    }
+    fn diagrams_dir(&self) -> Option<std::path::PathBuf> {
+        self.app.path().app_data_dir().map(|d| d.join("diagrams")).ok()
+    }
+}
+
+pub(crate) async fn import_question_paper<H: ImportHost>(
+    state: &AppState,
+    host: &H,
+    request: QuestionImportRequest,
+) -> Result<Vec<Question>, String> {
+    let QuestionImportRequest { file_path, pdf_base64_pages, subject, module_override, paper_name } = request;
     let _concurrency_guard = state.extraction_in_progress.try_lock().map_err(|_| {
         "Another extraction is already in progress. Please wait for it to finish.".to_string()
     })?;
-
-    let model_name = model_name.trim().to_string();
 
     state
         .cancel_flag
@@ -1389,12 +1351,9 @@ pub async fn parse_pdf_vision(
         ));
     }
 
-    // ── Fast path: pure-text PDF (all pages TextOnly) → heuristic extraction ──
-    // If every page is TextOnly (no rendered images = no diagrams, no visual
-    // elements), we can skip the expensive PVRV vision pipeline entirely and
-    // use the SubjectClassifier heuristic on the combined text layer. This
-    // avoids all LLM calls for pure-text PDFs while still classifying subject,
-    // extracting marks, and inserting into the repository.
+    // ── Plain-text path: no page carries a picture or a drawing ──────────────
+    // Such a file is split into questions by the legacy text heuristic
+    // (SubjectClassifier) instead of the layout map.
     let all_text_only = pages.iter().all(|p| matches!(p.kind, crate::pipeline::PageInputKind::TextOnly));
     if all_text_only && !pages.is_empty() {
         let combined_text = pages.iter().map(|p| p.text.as_str()).collect::<Vec<_>>().join("\n\n");
@@ -1408,20 +1367,18 @@ pub async fn parse_pdf_vision(
             .to_string();
 
         let classifier = SubjectClassifier::new();
-        let state_clone = state.clone();
-        let app_clone = app.clone();
-        let pool = state_clone.db.lock().await;
+        let pool = state.db.lock().await;
         let inserted = insert_questions_from_text(&*pool, &cleaned, &classifier).await?;
         drop(pool);
 
         // Emit a progress event so the UI knows we're done
-        let _ = app_clone.emit("import-report", &serde_json::json!({
+        host.report(&serde_json::json!({
             "paper_name": paper_name,
             "kind": "questions",
             "pages_total": pages.len(),
             "pages_processed": pages.len(),
             "questions_extracted": inserted,
-            "anomalies": ["Used pure-text fast path (no vision pipeline)"]
+            "anomalies": ["Used the plain-text path (no layout map)"]
         }));
 
         // Return the inserted questions (they're already in the DB; fetch them)
@@ -1437,7 +1394,7 @@ pub async fn parse_pdf_vision(
         return Ok(questions);
     }
 
-    let diagrams_dir = app.path().app_data_dir().map(|d| d.join("diagrams")).ok();
+    let diagrams_dir = host.diagrams_dir();
 
     // ── Fetch Taxonomy ───────────────────────────────────────────
     let pool = state.db.lock().await;
@@ -1468,7 +1425,6 @@ pub async fn parse_pdf_vision(
     drop(pool);
 
     let mut config = PipelineConfig::new(
-        model_name.clone(),
         paper_name.trim().to_string(),
         subject_name.0,
         module_name.0,
@@ -1483,89 +1439,23 @@ pub async fn parse_pdf_vision(
         std::path::Path::new(&file_path),
     )
     .map(std::sync::Arc::new);
-    config.max_repairs = 2;
-    // Phase 0: questions now get the same output budget as mark schemes.
-    // Long physics questions with sub-parts (a)–(f), derivations, graph
-    // descriptions, and circuit analysis routinely hit the previous 16k
-    // cap, triggering truncation-salvage + repair retries that doubled
-    // latency and quarantined questions. 32k gives a healthy headroom at
-    // modest cost (output tokens are the expensive part, but a truncated
-    // question that requires a full retry is far more expensive).
-    config.max_output_tokens = 32768;
+    config.parallelism = std::env::var("MERGEMARK_PARALLELISM")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .map(|v| v.clamp(1, 16))
+        .unwrap_or(8);
 
-    // Text-layer-first extraction: the PDF text layer is authoritative for
-    // digital papers (the vision structure pass is skipped for them), so each
-    // question is transcribed from text with ZERO image tokens and vision is
-    // used only when a figure is actually needed. This is the dominant cost
-    // lever on pixel-billed providers (Gemini). Disable with
-    // MERGEMARK_TEXT_FIRST=0.
-    config.text_first = std::env::var("MERGEMARK_TEXT_FIRST")
-        .map(|v| v != "0")
-        .unwrap_or(true);
-    // Same lever for mark-scheme windows (Phase 2): reliable-text windows
-    // transcribe with zero image tokens; figure signals fall back to vision.
-    config.ms_text_first = config.text_first
-        && std::env::var("MERGEMARK_MS_TEXT_FIRST")
-            .map(|v| v != "0")
-            .unwrap_or(true);
-    // Tier-0 deterministic extraction: text-reliable, figure-free question
-    // spans are carved out of the text layer by a local Rust transcriber —
-    // zero API calls. Any gate refusal falls back to the LLM unchanged.
-    config.deterministic = std::env::var("MERGEMARK_DETERMINISTIC")
-        .map(|v| v != "0")
-        .unwrap_or(true);
-
-    // Digital question papers are ingested entirely on-device. Decide that from
-    // the pages BEFORE touching the provider/billing layer so an exhausted free
-    // tier or a missing BYOK key can never block a local import, and a local
-    // import never spends an upload entitlement.
-    let local_only = !import_requires_provider(&pages);
-    let (route, client): (Option<crate::billing::BillingRoute>, QuestionClient) = if local_only {
-        eprintln!(
-            "[LOCAL_ONLY] digital question paper: running on-device with the refusing local client (no provider, no credentials, no quota)"
-        );
-        (None, QuestionClient::Local(crate::llm::RefusingLlm::new()))
-    } else {
-        let (route, client) = resolve_llm_client(&state, model_name.clone())
-            .await
-            .map_err(|e| e.hint.unwrap_or(e.message))?;
-        (Some(route), QuestionClient::Provider(client))
-    };
-
-    // Use higher parallelism for BYOK (user controls their own rate limits);
-    // conservative for the shared Free Tier key. The 429 retry loop in
-    // llm.rs handles backpressure automatically if the provider throttles.
-    config.parallelism = match route.as_ref() {
-        Some(crate::billing::BillingRoute::FreeTier { .. }) => {
-            std::env::var("MERGEMARK_PARALLELISM")
-                .ok()
-                .and_then(|v| v.parse::<usize>().ok())
-                .map(|v| v.clamp(1, 4))
-                .unwrap_or(4)
-        }
-        _ => std::env::var("MERGEMARK_PARALLELISM")
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-            .map(|v| v.clamp(1, 16))
-            .unwrap_or(8),
-    };
-
-    let progress = TauriProgress { app: app.clone() };
 
     // ── Extraction cache: skip the pipeline if we've seen this input before ──
-    // Compute a content-addressed cache key from the PDF bytes + model +
-    // paper name. On cache hit, return the stored questions immediately
-    // without making any API calls — re-ingestion becomes instant.
+    // Compute a content-addressed cache key from the PDF bytes + paper name.
+    // On cache hit, return the stored questions immediately: re-ingestion
+    // becomes instant.
     let file_bytes = std::fs::read(&file_path).unwrap_or_default();
-    let cache_key = crate::db::extraction_cache_key(
-        &file_bytes,
-        &model_name,
-        paper_name.trim(),
-    );
+    let cache_key = crate::db::extraction_cache_key(&file_bytes, paper_name.trim());
     let pool_check = state.db.lock().await;
     if let Ok(Some(cached_json)) = crate::db::get_cached_extraction(&pool_check, &cache_key).await {
         if let Ok(cached_questions) = serde_json::from_str::<Vec<Question>>(&cached_json) {
-            progress.stage("Loaded from cache — syncing to repository.");
+            host.stage("Loaded from cache — syncing to repository.");
             for q in &cached_questions {
                 let topics_json = q.topics.as_deref().unwrap_or("[]");
                 let subtopic = if q.subtopic.is_empty() { "Imported" } else { &q.subtopic };
@@ -1653,11 +1543,10 @@ pub async fn parse_pdf_vision(
 
     let (built, mut report): (Vec<BuiltQuestion>, ImportReport) =
         pipeline::run_question_pipeline(
-            &client,
             &pages,
             &page_figures,
             &config,
-            &progress,
+            host,
             &state.cancel_flag,
         )
         .await?;
@@ -1667,16 +1556,15 @@ pub async fn parse_pdf_vision(
     }
 
     // Surface the report to the UI — nothing fails silently anymore.
-    let _ = app.emit("import-report", &report);
+    host.report(&report);
+
+    // A paper nothing could be read from is not an import: say why instead
+    // of reporting zero questions as a success.
+    if built.is_empty() {
+        return Err(not_transcribed_message(&report, std::path::Path::new(&file_path)));
+    }
 
     let pool = state.db.lock().await;
-
-    // Increment free uploads if we used the Free Tier
-    // A local-only (digital) import resolved no route and therefore spends no
-    // upload entitlement: `route` is `None` for those runs.
-    if matches!(route.as_ref(), Some(crate::billing::BillingRoute::FreeTier { .. })) {
-        let _ = crate::db::increment_free_uploads(&pool).await;
-    }
 
     // ── Persist: idempotent upserts keyed by (paper_name, question_number) ──
     let mut final_questions = Vec::with_capacity(built.len());
@@ -1684,7 +1572,7 @@ pub async fn parse_pdf_vision(
 
     for q in built {
         // ── Deterministic content sanitizer (last line of defense) ─────────
-        // Runs on every card regardless of origin (LLM / Tier-0 / fallback):
+        // Runs on every card regardless of origin (strict / recovered / fallback):
         // strips OCR margin boilerplate, repairs unicode-minus exponents,
         // balances rogue `$` delimiters, unwraps sentence-level math,
         // reconstructs scrambled isotope notation, and tightens MCQ lists.
@@ -1779,57 +1667,13 @@ pub async fn parse_pdf_vision(
         }
     }
 
-    // ── Log import run metrics to audit log ───────────────────────────────
-    // Use the REAL token totals accumulated from every API response's `usage`
-    // block during the run (pipeline `report.prompt_tokens/completion_tokens`),
-    // multiplied by the model's actual per-million rates. Fall back to a crude
-    // pages/questions guess only when the provider returned no usage data.
-    let (prompt_tok, comp_tok) = if report.prompt_tokens > 0 || report.completion_tokens > 0 {
-        (report.prompt_tokens, report.completion_tokens)
-    } else {
-        (
-            (pages.len() as u64) * 1400,
-            (final_questions.len() as u64) * 350,
-        )
-    };
-
-    // Try to get real cost from OpenRouter usage delta
-    let real_cost = {
-        let api_key = crate::db::get_byok_api_key(&pool).await.unwrap_or(None);
-        if let Some(ref key) = api_key {
-            // Query current usage from OpenRouter
-            match crate::cost::fetch_openrouter_key_info(key).await {
-                Ok(info) => {
-                    let after_usage = info.usage_usd;
-                    // We can't do a true before/after without storing state,
-                    // so use the model-rate estimate but scale it to be more
-                    // accurate using higher token multipliers for reasoning models.
-                    let m_lower = model_name.to_lowercase();
-                    let is_reasoning = m_lower.contains("3.7") || m_lower.contains("o1") || m_lower.contains("o3");
-                    let multiplier = if is_reasoning { 3.0 } else { 1.0 };
-                    let est = crate::cost::calculate_cost(&model_name, prompt_tok, comp_tok) * multiplier;
-                    // Use the estimate but log that we have live data available
-                    eprintln!("[COST] OpenRouter live usage_usd={:.4}, estimated import cost=${:.4} (prompt={} completion={} reasoning_multiplier={:.1}x)", after_usage, est, prompt_tok, comp_tok, multiplier);
-                    est
-                },
-                Err(_) => crate::cost::calculate_cost(&model_name, prompt_tok, comp_tok),
-            }
-        } else {
-            crate::cost::calculate_cost(&model_name, prompt_tok, comp_tok)
-        }
-    };
-
+    // ── Log the import to the local history (no tokens, no cost) ─────────
     let _ = crate::db::record_import_cost(
         &pool,
         &config.paper_name,
-        &model_name,
+        LOCAL_IMPORT_MODEL,
         "question_paper",
         final_questions.len() as i64,
-        prompt_tok as i64,
-        comp_tok as i64,
-        real_cost,
-        0,
-        Some(&serde_json::to_string(&report.stage_breakdown).unwrap_or_default()),
     )
     .await;
 
@@ -1846,41 +1690,6 @@ pub async fn get_paper_names(state: State<'_, AppState>) -> Result<Vec<String>, 
     .await
     .map_err(|e| e.to_string())?;
     Ok(rows.into_iter().map(|(name,)| name).collect())
-}
-
-#[tauri::command]
-pub async fn fetch_models(base_url: String, api_key: String) -> Result<Vec<String>, String> {
-    let client = reqwest::Client::new();
-    let base_url = base_url.trim();
-    let api_key = api_key.trim();
-
-    let url = format!("{}/models", base_url.trim_end_matches('/'));
-
-    let res = client
-        .get(&url)
-        .header("Authorization", format!("Bearer {}", api_key))
-        .send()
-        .await
-        .map_err(|e| format!("Network error: {}", e))?;
-
-    if !res.status().is_success() {
-        let err_text = res.text().await.unwrap_or_default();
-        return Err(format!("API error: {}", err_text));
-    }
-
-    let json: serde_json::Value = res.json().await.map_err(|e| e.to_string())?;
-
-    let mut models = Vec::new();
-    if let Some(data) = json["data"].as_array() {
-        for item in data {
-            if let Some(id) = item["id"].as_str() {
-                models.push(id.to_string());
-            }
-        }
-    }
-
-    models.sort();
-    Ok(models)
 }
 
 #[tauri::command]
@@ -1968,19 +1777,37 @@ pub async fn update_question(
 #[tauri::command]
 pub async fn parse_mark_scheme_vision(
     app: tauri::AppHandle,
-    _api_key: String,
     file_path: String,
     pdf_base64_pages: Option<Vec<String>>,
-    _base_url: String,
-    model_name: String,
     paper_name: String,
     state: State<'_, AppState>,
 ) -> Result<Vec<ProposedMapping>, String> {
+    let host = TauriProgress { app };
+    import_mark_scheme(
+        &state,
+        &host,
+        MarkSchemeImportRequest { file_path, pdf_base64_pages, paper_name },
+    )
+    .await
+}
+
+/// One mark-scheme import: the scheme's file and the question paper (already
+/// imported) its answers belong to.
+pub(crate) struct MarkSchemeImportRequest {
+    pub file_path: String,
+    pub pdf_base64_pages: Option<Vec<String>>,
+    pub paper_name: String,
+}
+
+pub(crate) async fn import_mark_scheme<H: ImportHost>(
+    state: &AppState,
+    host: &H,
+    request: MarkSchemeImportRequest,
+) -> Result<Vec<ProposedMapping>, String> {
+    let MarkSchemeImportRequest { file_path, pdf_base64_pages, paper_name } = request;
     let _concurrency_guard = state.extraction_in_progress.try_lock().map_err(|_| {
         "Another extraction is already in progress. Please wait for it to finish.".to_string()
     })?;
-
-    let model_name = model_name.trim().to_string();
 
     state
         .cancel_flag
@@ -2083,55 +1910,24 @@ pub async fn parse_mark_scheme_vision(
         ));
     }
 
-    let diagrams_dir = app.path().app_data_dir().map(|d| d.join("diagrams")).ok();
+    let diagrams_dir = host.diagrams_dir();
 
     let mut config = PipelineConfig::new(
-        model_name.clone(),
         paper_name.trim().to_string(),
         "MarkScheme".into(),
         "MarkScheme".into(),
         Some(std::path::PathBuf::from(&file_path)),
     );
-    config.deterministic = std::env::var("MERGEMARK_DETERMINISTIC")
-        .map(|value| value != "0")
-        .unwrap_or(true);
     config.diagrams_dir = diagrams_dir;
-    config.max_repairs = 2;
-    config.max_output_tokens = 32768;
 
-    let (route, client) = resolve_llm_client(&state, model_name.clone())
-        .await
-        .map_err(|e| e.hint.unwrap_or(e.message))?;
 
-    // Route-aware parallelism: higher for BYOK, conservative for Free Tier.
-    config.parallelism = match &route {
-        crate::billing::BillingRoute::FreeTier { .. } => {
-            std::env::var("MERGEMARK_PARALLELISM")
-                .ok()
-                .and_then(|v| v.parse::<usize>().ok())
-                .map(|v| v.clamp(1, 4))
-                .unwrap_or(4)
-        }
-        _ => std::env::var("MERGEMARK_PARALLELISM")
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-            .map(|v| v.clamp(1, 16))
-            .unwrap_or(8),
-    };
-
-    let progress = TauriProgress { app: app.clone() };
-
-    // ── Mark Scheme Extraction cache: skip vision pipeline if we've seen this file before ──
+    // ── Mark Scheme Extraction cache: skip the reader if we've seen this file before ──
     let file_bytes = std::fs::read(&file_path).unwrap_or_default();
-    let cache_key = crate::db::extraction_cache_key(
-        &file_bytes,
-        &model_name,
-        &format!("MS:{}", paper_name.trim()),
-    );
+    let cache_key = crate::db::extraction_cache_key(&file_bytes, &format!("MS:{}", paper_name.trim()));
     let pool_check = state.db.lock().await;
     if let Ok(Some(cached_json)) = crate::db::get_cached_extraction(&pool_check, &cache_key).await {
         if let Ok(cached_mappings) = serde_json::from_str::<Vec<ProposedMapping>>(&cached_json) {
-            progress.stage("Loaded mark scheme from cache — mapping answers.");
+            host.stage("Loaded mark scheme from cache — mapping answers.");
             drop(pool_check);
             return Ok(cached_mappings);
         }
@@ -2139,34 +1935,36 @@ pub async fn parse_mark_scheme_vision(
     drop(pool_check);
 
     let (drafts, report): (Vec<AnswerDraft>, ImportReport) =
-        pipeline::run_markscheme_pipeline(&client, &pages, &config, &progress, &state.cancel_flag)
+        pipeline::run_markscheme_pipeline(&pages, &config, host, &state.cancel_flag)
             .await?;
 
     if state.cancel_flag.load(std::sync::atomic::Ordering::Relaxed) {
         return Err("Import cancelled by user".to_string());
     }
 
-    let _ = app.emit("import-report", &report);
-
-    let pool = state.db.lock().await;
-
-    // Increment free uploads if we used the Free Tier
-    if matches!(route, crate::billing::BillingRoute::FreeTier { .. }) {
-        let _ = crate::db::increment_free_uploads(&pool).await;
-    }
+    host.report(&report);
 
     if drafts.is_empty() {
-        return Err("No answers could be extracted from this document. It may be unreadable, or contain no mark-scheme content.".to_string());
+        let reason = report
+            .quarantined
+            .iter()
+            .find(|q| q.scope == pipeline::MARK_SCHEME_REFUSAL)
+            .map(|q| q.reason.as_str())
+            .unwrap_or("no mark-scheme answers were found");
+        return Err(format!(
+            "This mark scheme was not transcribed: MergeMark's local reader could not read it ({reason}). MergeMark works offline and sends nothing to AI services."
+        ));
     }
 
     // ── Match answers to DB questions for this paper ────────────────────────
-    let pool = state.db.lock().await;
-    let questions: Vec<Question> =
+    let questions: Vec<Question> = {
+        let pool = state.db.lock().await;
         sqlx::query_as("SELECT * FROM questions WHERE paper_name = ? ORDER BY rowid ASC")
             .bind(paper_name.trim())
             .fetch_all(&*pool)
             .await
-            .map_err(|e| format!("DB error: {}", e))?;
+            .map_err(|e| format!("DB error: {}", e))?
+    };
 
     let leading_num_re = regex::Regex::new(r"^(?:Question\s+)?(\d+)").unwrap();
     let mut q_by_number: std::collections::HashMap<i64, &Question> =
@@ -2225,28 +2023,14 @@ pub async fn parse_mark_scheme_vision(
         }
     }
 
-    // ── Log mark scheme import metrics to audit log ──────────────────────────
-    let (prompt_est, comp_est) = if report.prompt_tokens > 0 || report.completion_tokens > 0 {
-        (report.prompt_tokens, report.completion_tokens)
-    } else {
-        ((pages.len() as u64) * 1200, (proposed_mappings.len() as u64) * 300)
-    };
-    let m_lower = model_name.to_lowercase();
-    let is_reasoning = m_lower.contains("3.7") || m_lower.contains("o1") || m_lower.contains("o3");
-    let multiplier = if is_reasoning { 3.0 } else { 1.0 };
-    let cost_usd = crate::cost::calculate_cost(&model_name, prompt_est, comp_est) * multiplier;
+    // ── Log the import to the local history (no tokens, no cost) ─────────
     let pool = state.db.lock().await;
     let _ = crate::db::record_import_cost(
         &pool,
         &format!("MS:{}", paper_name.trim()),
-        &model_name,
+        LOCAL_IMPORT_MODEL,
         "mark_scheme",
         proposed_mappings.len() as i64,
-        prompt_est as i64,
-        comp_est as i64,
-        cost_usd,
-        0,
-        Some(&serde_json::to_string(&report.stage_breakdown).unwrap_or_default()),
     )
     .await;
 
@@ -2401,244 +2185,50 @@ impl pdf_extract::OutputDev for HybridTextOutput {
     }
 }
 
-// ── Hybrid billing command: generate_worksheet_from_pdf ──────────────────────
+// ── Features that needed an AI service ──────────────────────────────────────
 //
-// This is the entry point the React frontend calls to ask MergeMark to
-// extract a PDF, route it through the correct LLM transport (free tier or
-// the user's own key), and return the structured worksheet JSON.
-//
-// The command implements every requirement in the spec:
-//   1. Reads `usage_config.free_uploads_used` and the stored BYOK key.
-//   2. Picks OpenRouter (free tier) or BYOK accordingly.
-//   3. Rejects concurrent calls with a 429-style BillingError.
-//   4. Drops oversize payloads locally (60 000 chars) before any HTTP.
-//   5. Increments `free_uploads_used` ONLY on a 200 OK from OpenRouter.
-//   6. Hard 45-second reqwest timeout + 15 000-token cap are owned by
-//      `billing.rs`; this command just orchestrates them.
+// MergeMark makes no AI requests of any kind: every import is read on this
+// machine. The screens for API keys, models, usage, free parses, worksheet
+// generation and topic generation stay in the app, and each of their commands
+// answers with this message. None reads a stored key or opens a connection.
 
-/// The shape React will receive on success. Wraps the raw chat-completion
-/// `choices[0].message.content` plus a billing summary so the UI can show
-/// "2 of 3 free uploads remaining" without an extra round-trip.
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct WorksheetBillingSummary {
-    pub route: crate::billing::BillingRoute,
-    pub free_uploads_used: i64,
-    pub free_uploads_remaining: i64,
-}
+/// What every feature that needed an AI service answers.
+pub(crate) const WORKS_OFFLINE: &str =
+    "MergeMark works offline: it sends nothing to AI services, so this feature is turned off.";
 
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct WorksheetResult {
-    /// Raw chat-completion payload from the LLM (provider-agnostic).
-    pub completion: serde_json::Value,
-    pub billing: WorksheetBillingSummary,
+#[tauri::command]
+pub async fn fetch_models() -> Result<Vec<String>, String> {
+    Err(WORKS_OFFLINE.into())
 }
 
 #[tauri::command]
-pub async fn generate_worksheet_from_pdf(
-    app: tauri::AppHandle,
-    file_path: String,
-    system_prompt: Option<String>,
-    model: Option<String>,
-) -> Result<WorksheetResult, crate::billing::BillingError> {
-    use crate::billing::{
-        call_byok_direct, call_openrouter_free_tier, pick_route, BillingError, BillingRoute,
-        MAX_PDF_TEXT_CHARS,
-    };
-    use crate::AppState;
-    use tauri::Manager;
-
-    // ── 1. Concurrency lock — reject overlapping calls with 429 ───────────
-    // We hold the lock for the full lifetime of the extraction. The lock
-    // is non-blocking: if it can't be acquired instantly, we surface a
-    // BillingError::too_many_requests() without doing any work.
-    let state: tauri::State<'_, AppState> = app.state();
-    let _concurrency_guard = match state.extraction_in_progress.try_lock() {
-        Ok(g) => g,
-        Err(_) => {
-            // Another call is already running. The spec wants a 429.
-            return Err(BillingError::too_many_requests());
-        }
-    };
-    // _concurrency_guard is held until end of scope, releasing the lock
-    // on any return path.
-
-    // ── 2. Pre-flight payload cap ─────────────────────────────────────────
-    // Extract the PDF text off the async runtime. We measure the cleaned
-    // length BEFORE any HTTP so the bandwidth is never wasted.
-    let path_clone = file_path.clone();
-    let extracted_text = tokio::task::spawn_blocking(move || -> Result<String, String> {
-        let lower = path_clone.to_lowercase();
-        if lower.ends_with(".pdf") {
-            pdf_extract::extract_text_encrypted(&path_clone, "")
-                .map_err(|e| format!("PDF extraction failed: {}", e))
-        } else {
-            std::fs::read_to_string(&path_clone).map_err(|e| format!("Failed to read file: {e}"))
-        }
-    })
-    .await
-    .map_err(|e| BillingError::network(&format!("thread pool error: {e}")))?
-    .map_err(|e| BillingError::network(&e))?;
-    let extracted_text = crate::validate::clean_ligatures(&extracted_text);
-
-    let cleaned: String = extracted_text
-        .lines()
-        .map(|l| l.trim())
-        .collect::<Vec<_>>()
-        .join("\n");
-    let cleaned = regex::Regex::new(r"\n{3,}")
-        .unwrap()
-        .replace_all(&cleaned, "\n\n")
-        .to_string();
-
-    if cleaned.trim().is_empty() {
-        return Err(BillingError::network(
-            "No text could be extracted from this file. It may be a scanned/image-only PDF.",
-        ));
-    }
-
-    if cleaned.chars().count() > MAX_PDF_TEXT_CHARS {
-        return Err(BillingError::payload_too_large(cleaned.chars().count()));
-    }
-
-    // ── 3. Read the live billing state from SQLite ───────────────────────
-    let pool = state.db.lock().await;
-    let free_uploads_used = crate::db::get_free_uploads_used(&pool)
-        .await
-        .map_err(|e| BillingError::network(&format!("DB read failed: {e}")))?;
-    let byok_key = crate::db::get_byok_api_key(&pool)
-        .await
-        .map_err(|e| BillingError::network(&format!("DB read failed: {e}")))?;
-    let byok_key_present = byok_key.is_some();
-    drop(pool);
-
-    // ── 4. Pick the route ────────────────────────────────────────────────
-    let route = pick_route(free_uploads_used, byok_key_present);
-    // The free tier pins its model inside `billing::call_openrouter_free_tier`
-    // (google/gemini-2.5-flash), so `model_name` is only forwarded to the
-    // BYOK path. We still resolve a sensible default up front so the
-    // BYOK arm has something to send if the caller didn't override.
-    let model_name = model.unwrap_or_else(|| {
-        if matches!(route, BillingRoute::Byok) {
-            "gpt-4o-mini".to_string()
-        } else {
-            crate::billing::OPENROUTER_MODEL.to_string()
-        }
-    });
-    let system = system_prompt
-        .as_deref()
-        .unwrap_or("You are a teacher creating a structured educational worksheet from the given source material. Return JSON only.");
-
-    // ── 5. Make the HTTP call ────────────────────────────────────────────
-    // The free-tier transport returns a raw `String` (the model's
-    // `choices[0].message.content`). The BYOK transport returns the full
-    // `serde_json::Value` chat-completion payload. We normalise both into
-    // a `serde_json::Value` for the `WorksheetResult.completion` field so
-    // the React side sees a consistent shape regardless of route.
-    let completion = match &route {
-        BillingRoute::FreeTier { .. } => {
-            // Route through OpenRouter (Gemini 2.5 Flash, developer's
-            // embedded key). The `?` here is the gating step: only when
-            // this returns `Ok(_)` do we fall through to step 6 and
-            // increment `free_uploads_used`. Any BillingError short-
-            // circuits the counter.
-            let raw = call_openrouter_free_tier(&cleaned).await?;
-            serde_json::Value::String(raw)
-        }
-        BillingRoute::Byok => {
-            // Re-read the base URL on this branch since we didn't need it
-            // for the other routes.
-            let pool = state.db.lock().await;
-            let byok_base = crate::db::get_byok_base_url(&pool)
-                .await
-                .map_err(|e| BillingError::network(&format!("DB read failed: {e}")))?
-                .unwrap_or_else(|| "https://api.openai.com/v1".to_string());
-            let byok_key = byok_key.expect("byok_key must be Some when route is Byok");
-            drop(pool);
-            call_byok_direct(&byok_base, &byok_key, &model_name, system, &cleaned).await?
-        }
-        BillingRoute::NeedsByok => {
-            // 3 free uploads used and no key on file. Refuse cleanly.
-            return Err(BillingError::needs_byok(free_uploads_used));
-        }
-    };
-
-    // ── 6. Increment the counter — ONLY on a 200 OK from OpenRouter ────
-    let (new_used, remaining) = if matches!(route, BillingRoute::FreeTier { .. }) {
-        let pool = state.db.lock().await;
-        let updated = crate::db::increment_free_uploads(&pool)
-            .await
-            .map_err(|e| BillingError::network(&format!("DB write failed: {e}")))?;
-        let remaining = (crate::db::FREE_UPLOAD_LIMIT - updated).max(0);
-        (updated, remaining)
-    } else {
-        (
-            free_uploads_used,
-            crate::db::FREE_UPLOAD_LIMIT - free_uploads_used,
-        )
-    };
-
-    let summary = WorksheetBillingSummary {
-        route,
-        free_uploads_used: new_used,
-        free_uploads_remaining: remaining,
-    };
-
-    Ok(WorksheetResult {
-        completion,
-        billing: summary,
-    })
-}
-
-// ── BYOK key CRUD commands (called from React Settings page) ─────────────────
-
-/// Returns the current free-tier counter plus a boolean indicating whether
-/// a BYOK key is on file. The actual key value is never returned to the
-/// frontend (it lives only in SQLite).
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct UsageStatus {
-    pub free_uploads_used: i64,
-    pub free_uploads_limit: i64,
-    pub free_uploads_remaining: i64,
-    pub byok_key_present: bool,
-    pub byok_base_url: Option<String>,
+pub async fn generate_worksheet_from_pdf() -> Result<(), String> {
+    Err(WORKS_OFFLINE.into())
 }
 
 #[tauri::command]
-pub async fn get_usage_status(state: tauri::State<'_, AppState>) -> Result<UsageStatus, String> {
-    let pool = state.db.lock().await;
-    let used = crate::db::get_free_uploads_used(&pool)
-        .await
-        .map_err(|e| format!("DB read failed: {e}"))?;
-    let byok = crate::db::get_byok_api_key(&pool)
-        .await
-        .map_err(|e| format!("DB read failed: {e}"))?;
-    let base = crate::db::get_byok_base_url(&pool)
-        .await
-        .map_err(|e| format!("DB read failed: {e}"))?;
-    Ok(UsageStatus {
-        free_uploads_used: used,
-        free_uploads_limit: crate::db::FREE_UPLOAD_LIMIT,
-        free_uploads_remaining: (crate::db::FREE_UPLOAD_LIMIT - used).max(0),
-        byok_key_present: byok.is_some(),
-        byok_base_url: base,
-    })
+pub async fn get_usage_status() -> Result<(), String> {
+    Err(WORKS_OFFLINE.into())
 }
 
-/// Save (or clear, with empty string) the user's BYOK key.
 #[tauri::command]
-pub async fn set_byok_key(
-    api_key: Option<String>,
-    base_url: Option<String>,
-    state: tauri::State<'_, AppState>,
-) -> Result<(), String> {
-    let pool = state.db.lock().await;
-    crate::db::set_byok_api_key(&pool, api_key.as_deref(), base_url.as_deref())
-        .await
-        .map_err(|e| format!("DB write failed: {e}"))?;
-    Ok(())
+pub async fn set_byok_key() -> Result<(), String> {
+    Err(WORKS_OFFLINE.into())
+}
+
+#[tauri::command]
+pub async fn generate_topics_for_module() -> Result<Vec<String>, String> {
+    Err(WORKS_OFFLINE.into())
+}
+
+#[tauri::command]
+pub async fn get_openrouter_usage() -> Result<(), String> {
+    Err(WORKS_OFFLINE.into())
+}
+
+#[tauri::command]
+pub async fn get_generation_cost() -> Result<(), String> {
+    Err(WORKS_OFFLINE.into())
 }
 
 // ── Flashcards Export & Import ────────────────────────────────────────────────
@@ -2806,113 +2396,7 @@ pub async fn import_flashcards(app: tauri::AppHandle, file_path: String) -> Resu
     Ok(count)
 }
 
-#[tauri::command]
-pub async fn generate_topics_for_module(
-    app: tauri::AppHandle,
-    module_id: String,
-    api_key: String,
-    base_url: String,
-    model_name: String,
-) -> Result<Vec<String>, String> {
-    use crate::llm::{LlmClient, LlmConfig, ReqwestLlm};
-    use crate::AppState;
-    use serde_json::json;
-    use tauri::Manager;
-
-    let state: tauri::State<'_, AppState> = app.state();
-    let pool = state.db.lock().await;
-
-    // Fetch the module name and subject name
-    let module: Option<(String, String)> = sqlx::query_as(
-        "SELECT modules.name, subjects.name FROM modules JOIN subjects ON modules.subject_id = subjects.id WHERE modules.id = ?"
-    )
-    .bind(&module_id)
-    .fetch_optional(&*pool)
-    .await
-    .map_err(|e| e.to_string())?;
-
-    let (module_name, subject_name) = module.ok_or_else(|| "Module not found".to_string())?;
-
-    // Drop the lock before await
-    drop(pool);
-
-    let config = LlmConfig {
-        base_url,
-        api_key,
-        model: model_name.clone(),
-        timeout: crate::billing::REQUEST_TIMEOUT,
-    };
-    let client = ReqwestLlm::new(config);
-
-    let system_prompt = "You are an educational taxonomy assistant. Your job is to output a JSON array of curriculum topics for a given module and subject. Output ONLY a valid JSON array of strings.";
-    let user_prompt = format!("Subject: {}\nModule: {}\n\nAct strictly according to the official syllabus and textbook chapters for this specific subject and module. Provide an exhaustive list of core topics covered in this module as a JSON array of strings.\n\nCRITICAL INSTRUCTIONS:\n- Output ONLY the exact, short, high-level chapter names (e.g. \"Complex Numbers\", \"Matrices\", \"Proof by Induction\").\n- Do NOT include parentheses, subtopics, or any explanatory descriptions.\n- Output nothing but the JSON array.", subject_name, module_name);
-
-    let request_body = json!({
-        "model": model_name,
-        "messages": [
-            { "role": "system", "content": system_prompt },
-            { "role": "user", "content": user_prompt }
-        ],
-        "temperature": 0.2
-    });
-
-    let result = client
-        .chat(&request_body)
-        .await
-        .map_err(|e| format!("LLM request failed: {:?}", e))?;
-
-    let content = crate::llm::message_content(&result)
-        .map_err(|e| format!("Failed to extract content: {:?}", e))?;
-
-    let mut json_str = content.trim();
-    
-    // Find the first '[' and last ']' to extract the JSON array robustly
-    if let (Some(start), Some(end)) = (json_str.find('['), json_str.rfind(']')) {
-        if start <= end {
-            json_str = &json_str[start..=end];
-        }
-    }
-
-    let topics: Vec<String> = serde_json::from_str(json_str)
-        .map_err(|e| format!("Failed to parse JSON array from LLM. Raw content: {}\nError: {}", content, e))?;
-
-    // Save topics to DB
-    let pool = state.db.lock().await;
-    for topic_name in &topics {
-        let id = uuid::Uuid::new_v4().to_string();
-        let _ = sqlx::query("INSERT INTO topics (id, module_id, name) VALUES (?, ?, ?)")
-            .bind(&id)
-            .bind(&module_id)
-            .bind(topic_name)
-            .execute(&*pool)
-            .await;
-    }
-
-    Ok(topics)
-}
-
-// ── OpenRouter Live Spend & Ingestion Cost Commands ──────────────────────────
-
-#[tauri::command]
-pub async fn get_openrouter_usage(
-    api_key: Option<String>,
-    state: State<'_, AppState>,
-) -> Result<crate::cost::OpenRouterKeyInfo, String> {
-    let key = if let Some(k) = api_key.filter(|s| !s.trim().is_empty()) {
-        k
-    } else {
-        let pool = state.db.lock().await;
-        let stored_key = crate::db::get_byok_api_key(&pool).await.unwrap_or(None);
-        drop(pool);
-        stored_key.unwrap_or_else(|| crate::billing::openrouter_api_key().to_string())
-    };
-
-    if key.is_empty() || key.contains("dev-openrouter-key") {
-        return Err("No OpenRouter API key configured.".to_string());
-    }
-
-    crate::cost::fetch_openrouter_key_info(&key).await
-}
+// ── Local import history ─────────────────────────────────────────────────────
 
 #[tauri::command]
 pub async fn get_import_cost_history(
@@ -2955,78 +2439,301 @@ pub async fn prune_orphaned_import_logs(
         .map_err(|e| format!("Failed to prune import logs: {}", e))
 }
 
-#[tauri::command]
-pub async fn get_generation_cost(
-    generation_id: String,
-    api_key: Option<String>,
-    state: State<'_, AppState>,
-) -> Result<crate::cost::GenerationCostDetails, String> {
-    let key = if let Some(k) = api_key.filter(|s| !s.trim().is_empty()) {
-        k
-    } else {
-        let pool = state.db.lock().await;
-        let stored_key = crate::db::get_byok_api_key(&pool).await.unwrap_or(None);
-        drop(pool);
-        stored_key.unwrap_or_else(|| crate::billing::openrouter_api_key().to_string())
-    };
-
-    crate::cost::fetch_openrouter_generation_cost(&generation_id, &key).await
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn text_page(text: &str) -> PageInput {
-        PageInput {
-            kind: crate::pipeline::PageInputKind::TextOnly,
-            text: text.to_string(),
+    // ── No request leaves the machine ───────────────────────────────────────
+
+    use std::io::{Read, Write};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    /// Every HTTP(S) request this process makes goes to a local listener that
+    /// counts and refuses it: the proxy settings HTTP clients read point at
+    /// it. A test sees any request, whatever host it was meant for.
+    struct NetworkTrap {
+        connections: Arc<AtomicUsize>,
+        saved: Vec<(&'static str, Option<std::ffi::OsString>)>,
+        _serial: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl NetworkTrap {
+        fn start() -> Self {
+            static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+            let serial = SERIAL.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let proxy = format!("http://{}", listener.local_addr().unwrap());
+            let connections = Arc::new(AtomicUsize::new(0));
+            let counter = Arc::clone(&connections);
+            std::thread::spawn(move || {
+                for stream in listener.incoming() {
+                    let Ok(mut stream) = stream else { continue };
+                    counter.fetch_add(1, Ordering::SeqCst);
+                    let _ = stream.set_read_timeout(Some(std::time::Duration::from_millis(500)));
+                    let _ = stream.read(&mut [0u8; 4096]);
+                    let _ = stream.write_all(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+                }
+            });
+            let mut saved = Vec::new();
+            for var in ["HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY"] {
+                saved.push((var, std::env::var_os(var)));
+                if var == "NO_PROXY" {
+                    std::env::remove_var(var);
+                } else {
+                    std::env::set_var(var, &proxy);
+                }
+            }
+            Self { connections, saved, _serial: serial }
+        }
+
+        fn connections(&self) -> usize {
+            self.connections.load(Ordering::SeqCst)
         }
     }
 
-    fn image_page(text: &str) -> PageInput {
-        PageInput {
-            kind: crate::pipeline::PageInputKind::Image {
-                b64: "data:image/webp;base64,AAAA".to_string(),
+    impl Drop for NetworkTrap {
+        fn drop(&mut self) {
+            for (var, value) in self.saved.drain(..) {
+                match value {
+                    Some(value) => std::env::set_var(var, value),
+                    None => std::env::remove_var(var),
+                }
+            }
+        }
+    }
+
+    /// Collects what an import reports instead of sending it to a window.
+    struct TestHost {
+        dir: std::path::PathBuf,
+        reports: std::sync::Mutex<Vec<serde_json::Value>>,
+    }
+
+    impl Progress for TestHost {
+        fn stage(&self, _message: &str) {}
+    }
+
+    impl ImportHost for TestHost {
+        fn report<T: Serialize>(&self, report: &T) {
+            self.reports.lock().unwrap().push(serde_json::to_value(report).unwrap());
+        }
+        fn diagrams_dir(&self) -> Option<std::path::PathBuf> {
+            Some(self.dir.join("diagrams"))
+        }
+    }
+
+    /// A fresh app database in a temporary folder, with an AI provider key
+    /// and base URL saved, as an earlier version of MergeMark stored them.
+    async fn app_with_a_provider_key() -> (AppState, TestHost) {
+        let dir = std::env::temp_dir().join(format!("mm_offline_{}", uuid::Uuid::new_v4()));
+        let pool = crate::db::init_db(dir.clone()).await.unwrap();
+        sqlx::query("CREATE TABLE usage_config (id INTEGER PRIMARY KEY CHECK (id = 1), free_uploads_used INTEGER NOT NULL DEFAULT 0, byok_api_key TEXT, byok_base_url TEXT, updated_at INTEGER NOT NULL DEFAULT 0)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO usage_config (id, byok_api_key, byok_base_url) VALUES (1, 'sk-test-not-a-real-key', 'http://ai.mergemark.invalid/v1')")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO subjects (id, name) VALUES ('offline-subject', 'Offline Test Subject')")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO modules (id, subject_id, name) VALUES ('offline-module', 'offline-subject', 'Offline Test Module')")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let state = AppState {
+            db: Arc::new(tokio::sync::Mutex::new(pool)),
+            cancel_flag: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            extraction_in_progress: tokio::sync::Mutex::new(()),
+        };
+        (state, TestHost { dir, reports: Default::default() })
+    }
+
+    fn fixture(rel: &str) -> Option<String> {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join(rel);
+        if !path.exists() {
+            eprintln!("[OFFLINE] fixture missing: {rel}");
+            return None;
+        }
+        Some(path.to_string_lossy().into_owned())
+    }
+
+    /// A scanned paper on a computer with no local OCR engine is reported as
+    /// not transcribed. Nothing is sent anywhere, even with a key saved.
+    #[tokio::test]
+    async fn a_scan_with_no_local_ocr_is_not_transcribed_and_sends_nothing() {
+        let _pdfium = crate::pdf_render::pdfium_test_lock();
+        let Some(file_path) = fixture("papers/used/Maths_A-level_M3_Papers-Edexcel__June_2004_QP.pdf") else { return };
+        let _no_ocr = crate::ocr::unavailable_for_test::guard();
+        let trap = NetworkTrap::start();
+        let (state, host) = app_with_a_provider_key().await;
+        let result = import_question_paper(
+            &state,
+            &host,
+            QuestionImportRequest {
+                file_path,
+                pdf_base64_pages: None,
+                subject: "offline-subject".into(),
+                module_override: Some("offline-module".into()),
+                paper_name: "Edexcel M3 June 2004".into(),
             },
-            text: text.to_string(),
+        )
+        .await;
+        assert_eq!(trap.connections(), 0, "no request may leave the machine");
+        let error = result.expect_err("a paper nobody transcribed is not an import");
+        assert!(error.contains("not transcribed"), "{error}");
+        let reports = host.reports.lock().unwrap();
+        assert_eq!(reports.len(), 1);
+        assert_eq!(reports[0]["pagesNotTranscribed"], serde_json::json!([1, 2, 3, 4, 5]), "{}", reports[0]);
+    }
+
+    /// Tick-box options printed as bare numbers are part of the question:
+    /// the imported card keeps them as the paper prints them.
+    #[tokio::test]
+    async fn tick_box_options_printed_as_numbers_survive_the_import() {
+        let _pdfium = crate::pdf_render::pdfium_test_lock();
+        let Some(file_path) = fixture("papers/used/Chemistry_GCSE_Past-Papers_AQA__June_2024_QP.pdf") else { return };
+        let (state, host) = app_with_a_provider_key().await;
+        let questions = import_question_paper(
+            &state,
+            &host,
+            QuestionImportRequest {
+                file_path,
+                pdf_base64_pages: None,
+                subject: "offline-subject".into(),
+                module_override: Some("offline-module".into()),
+                paper_name: "AQA GCSE Chemistry June 2024".into(),
+            },
+        )
+        .await
+        .expect("the paper is read locally");
+        let q1 = questions.iter().find(|q| q.question_number == Some(1)).expect("Q1 imported");
+        assert!(q1.content.contains("Tick (✓) one box.\n2\n6\n14\n20\n"), "{}", q1.content);
+    }
+
+    /// A question printed twice, ending "EITHER (f) … OR (g) …", is imported
+    /// once, and its tags agree with the total it prints.
+    #[tokio::test]
+    async fn a_question_with_alternative_parts_keeps_its_printed_total() {
+        let _pdfium = crate::pdf_render::pdfium_test_lock();
+        let Some(file_path) = fixture("papers/used/Economics_A-level_Past-Papers_Edexcel-A__June_2018_QP_-_Paper_2_Edexcel_(A)_Economics_AS-level.pdf") else { return };
+        let (state, host) = app_with_a_provider_key().await;
+        let questions = import_question_paper(
+            &state,
+            &host,
+            QuestionImportRequest {
+                file_path,
+                pdf_base64_pages: None,
+                subject: "offline-subject".into(),
+                module_override: Some("offline-module".into()),
+                paper_name: "Edexcel A Economics June 2018 Paper 2".into(),
+            },
+        )
+        .await
+        .expect("the paper is read locally");
+        // "(Total for Question 6 = 60 marks)": (a)-(e) 40, then EITHER (f) OR (g), 20 each.
+        let q6 = questions.iter().find(|q| q.question_number == Some(6)).expect("Q6 imported");
+        assert_eq!(q6.marks, 60, "{}", q6.content);
+        assert_eq!(crate::validate::sum_inline_marks(&q6.content), 60, "{}", q6.content);
+    }
+
+    /// Every feature that only worked through an AI service answers that
+    /// MergeMark works offline. None sends anything, even with a key saved.
+    #[tokio::test]
+    async fn ai_only_features_answer_that_mergemark_works_offline() {
+        let trap = NetworkTrap::start();
+        let (_state, _host) = app_with_a_provider_key().await;
+        let errors = [
+            fetch_models().await.err(),
+            generate_topics_for_module().await.err(),
+            generate_worksheet_from_pdf().await.err(),
+            get_usage_status().await.err(),
+            set_byok_key().await.err(),
+            get_openrouter_usage().await.err(),
+            get_generation_cost().await.err(),
+        ];
+        assert_eq!(trap.connections(), 0, "no request may leave the machine");
+        for (i, error) in errors.iter().enumerate() {
+            let error = error.as_deref().unwrap_or_else(|| panic!("feature {i} must refuse"));
+            assert!(error.contains("MergeMark works offline"), "feature {i}: {error}");
         }
     }
 
-    /// A digital document must not require a provider: the route is decided
-    /// from page text alone, before any credential or quota lookup, and the
-    /// free-tier debit is skipped because no route is resolved.
-    #[test]
-    fn digital_import_never_requires_a_provider() {
-        let digital = vec![
-            text_page("Answer ALL questions. Instructions to candidates."),
-            text_page("1 Explain why the resistance of a filament lamp increases as the temperature of the filament rises during the experiment. [3 marks]"),
-            text_page("END OF QUESTIONS"),
-        ];
-        assert!(!import_requires_provider(&digital));
-
-        // A short modular paper is still digital: there is no document-size floor.
-        let short = vec![text_page(
-            "1 Prove that the sum of two even numbers is always even. [2 marks]",
-        )];
-        assert!(!import_requires_provider(&short));
-
-        // Blank / back-matter pages cannot hand a digital paper to the cloud.
-        let with_blank = vec![
-            text_page("1 Calculate the mean of 3, 7 and 11. [2 marks]"),
-            text_page(""),
-            image_page(""),
-            text_page("END OF QUESTIONS"),
-        ];
-        assert!(!import_requires_provider(&with_blank));
+    /// A scheme the local reader accepts is mapped onto the paper's imported
+    /// questions, offline, and the import finishes (it once locked the
+    /// database twice and never returned).
+    #[tokio::test]
+    async fn a_mark_scheme_the_local_reader_accepts_maps_onto_its_questions() {
+        let _pdfium = crate::pdf_render::pdfium_test_lock();
+        let trap = NetworkTrap::start();
+        let (state, host) = app_with_a_provider_key().await;
+        std::fs::create_dir_all(&host.dir).unwrap();
+        let scheme = host.dir.join("scheme.pdf");
+        crate::mark_scheme_deterministic::tests::write_pdf_fixture(&scheme, false);
+        {
+            let pool = state.db.lock().await;
+            sqlx::query("INSERT INTO questions (id, subject, subtopic, topics, marks, content, math_snippet, is_code, paper_name, question_number) VALUES ('q1', 'Physics', 'Imported', '[]', 2, '1 State what happens to the force.', '', 0, 'Spring paper', 1)")
+                .execute(&*pool)
+                .await
+                .unwrap();
+        }
+        let request = MarkSchemeImportRequest {
+            file_path: scheme.to_string_lossy().into_owned(),
+            pdf_base64_pages: None,
+            paper_name: "Spring paper".into(),
+        };
+        let mappings = tokio::time::timeout(std::time::Duration::from_secs(60), import_mark_scheme(&state, &host, request))
+            .await
+            .expect("the import finishes")
+            .expect("the scheme is read locally");
+        assert_eq!(trap.connections(), 0, "no request may leave the machine");
+        assert_eq!(mappings.len(), 1);
+        assert_eq!(mappings[0].question_id, "q1");
+        assert!(mappings[0].proposed_answer.contains("The force increases."), "{}", mappings[0].proposed_answer);
     }
 
-    /// Only a genuine scan / image-only input keeps the provider route (and
-    /// therefore the free-tier accounting).
+    /// MergeMark has no HTTP client of its own, and its window may connect to
+    /// nothing outside the app: there is no way left to reach an AI service.
     #[test]
-    fn scanned_only_import_still_requires_a_provider() {
-        let scanned = vec![image_page(""), image_page("   "), image_page("\u{200a}")];
-        assert!(import_requires_provider(&scanned));
+    fn mergemark_has_no_way_to_reach_an_ai_service() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let manifest = std::fs::read_to_string(dir.join("Cargo.toml")).unwrap();
+        for client in ["reqwest", "ureq", "hyper", "isahc", "curl", "attohttpc", "surf", "tauri-plugin-http", "tauri-plugin-upload"] {
+            let declares = |line: &str| {
+                let line = line.trim();
+                [" ", "=", "."].iter().any(|after| line.starts_with(&format!("{client}{after}")))
+                    || line.starts_with('[') && line.ends_with(&format!("dependencies.{client}]"))
+            };
+            assert!(!manifest.lines().any(declares), "Cargo.toml depends on the HTTP client {client}");
+        }
+        let config: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(dir.join("tauri.conf.json")).unwrap()).unwrap();
+        let csp = config["app"]["security"]["csp"].as_str().unwrap();
+        assert!(!csp.contains("http://") && !csp.contains("https://"), "the window may connect to an outside host: {csp}");
+    }
+
+    /// A mark scheme the local reader cannot read is reported as not
+    /// transcribed. Nothing is sent anywhere, even with a key saved.
+    #[tokio::test]
+    async fn a_mark_scheme_the_local_reader_refuses_sends_nothing() {
+        let _pdfium = crate::pdf_render::pdfium_test_lock();
+        let Some(file_path) = fixture("papers/used/07_legacy_c3_or_c4_ms.pdf") else { return };
+        let trap = NetworkTrap::start();
+        let (state, host) = app_with_a_provider_key().await;
+        let result = import_mark_scheme(
+            &state,
+            &host,
+            MarkSchemeImportRequest {
+                file_path,
+                pdf_base64_pages: None,
+                paper_name: "07_legacy_c3_or_c4_qp".into(),
+            },
+        )
+        .await;
+        assert_eq!(trap.connections(), 0, "no request may leave the machine");
+        let error = result.expect_err("a scheme nobody transcribed is not an import");
+        assert!(error.contains("not transcribed") && error.contains("unrecognized table or continuation"), "{error}");
     }
 }
 

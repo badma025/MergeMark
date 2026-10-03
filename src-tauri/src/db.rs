@@ -161,51 +161,6 @@ pub async fn init_db(app_data_dir: PathBuf) -> Result<SqlitePool, sqlx::Error> {
         .execute(&pool)
         .await;
 
-    // ── Billing / usage_config table ───────────────────────────────────────
-    // A single-row table (id = 1) that tracks the beta-launch hybrid billing
-    // model:
-    //   * `free_uploads_used`  — count of successful 200 OK responses through
-    //                            the OpenRouter free tier (Gemini 2.5 Flash).
-    //                            Capped at 3 by the Tauri command; we never
-    //                            auto-reset it here.
-    //   * `byok_api_key`       — user-supplied personal LLM key. When present
-    //                            the OpenRouter free-tier route is bypassed
-    //                            entirely and requests go direct to the
-    //                            upstream provider.
-    //   * `byok_base_url`      — optional override of the LLM base URL used
-    //                            when the user supplies a BYOK key. Defaults
-    //                            to OpenAI's compatible endpoint if NULL.
-    sqlx::query(
-        r#"
-        CREATE TABLE IF NOT EXISTS usage_config (
-            id INTEGER PRIMARY KEY CHECK (id = 1),
-            free_uploads_used INTEGER NOT NULL DEFAULT 0,
-            byok_api_key TEXT,
-            byok_base_url TEXT,
-            updated_at INTEGER NOT NULL DEFAULT 0
-        );
-        "#,
-    )
-    .execute(&pool)
-    .await?;
-
-    // Make sure the singleton row exists. INSERT OR IGNORE is safe across
-    // re-opens because of the CHECK (id = 1) primary key.
-    sqlx::query(
-        r#"
-        INSERT OR IGNORE INTO usage_config (id, free_uploads_used, byok_api_key, byok_base_url, updated_at)
-        VALUES (1, 0, NULL, NULL, ?);
-        "#,
-    )
-    .bind(
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs() as i64)
-            .unwrap_or(0),
-    )
-    .execute(&pool)
-    .await?;
-
     // ── Taxonomy Tables (BYOT) ─────────────────────────────────────────────
     sqlx::query(
         r#"
@@ -302,131 +257,31 @@ pub async fn init_db(app_data_dir: PathBuf) -> Result<SqlitePool, sqlx::Error> {
     Ok(pool)
 }
 
-// ── usage_config helpers ─────────────────────────────────────────────────────
-//
-// These are the only sanctioned entry points for the rest of the crate to
-// touch the billing table. Keeping the SQL in one place means the schema can
-// evolve without grepping the whole codebase.
-
-/// Free-tier ceiling. Once `free_uploads_used >= FREE_UPLOAD_LIMIT` the
-/// command will refuse to route through the OpenRouter free tier.
-pub const FREE_UPLOAD_LIMIT: i64 = 3;
-
-/// Read the current `free_uploads_used` counter.
-pub async fn get_free_uploads_used(pool: &SqlitePool) -> Result<i64, sqlx::Error> {
-    let row: (i64,) = sqlx::query_as("SELECT free_uploads_used FROM usage_config WHERE id = 1")
-        .fetch_one(pool)
-        .await?;
-    Ok(row.0)
-}
-
-/// Increment `free_uploads_used` by one. Returns the new value.
-pub async fn increment_free_uploads(pool: &SqlitePool) -> Result<i64, sqlx::Error> {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0);
-    sqlx::query(
-        r#"
-        UPDATE usage_config
-        SET free_uploads_used = free_uploads_used + 1,
-            updated_at = ?
-        WHERE id = 1
-        "#,
-    )
-    .bind(now)
-    .execute(pool)
-    .await?;
-    get_free_uploads_used(pool).await
-}
-
-/// Read the user-supplied BYOK key. `None` means no key is stored.
-pub async fn get_byok_api_key(pool: &SqlitePool) -> Result<Option<String>, sqlx::Error> {
-    let row: (Option<String>,) =
-        sqlx::query_as("SELECT byok_api_key FROM usage_config WHERE id = 1")
-            .fetch_one(pool)
-            .await?;
-    Ok(row.0.and_then(|s| {
-        let trimmed = s.trim().to_string();
-        if trimmed.is_empty() {
-            None
-        } else {
-            Some(trimmed)
-        }
-    }))
-}
-
-/// Read the optional BYOK base URL override.
-pub async fn get_byok_base_url(pool: &SqlitePool) -> Result<Option<String>, sqlx::Error> {
-    let row: (Option<String>,) = sqlx::query_as("SELECT byok_base_url FROM usage_config WHERE id = 1")
-        .fetch_one(pool)
-        .await?;
-    Ok(row.0.and_then(|s| {
-        let trimmed = s.trim().to_string();
-        if trimmed.is_empty() {
-            None
-        } else {
-            Some(trimmed)
-        }
-    }))
-}
-
-/// Persist (or clear) the user's BYOK key. Empty/whitespace strings clear it.
-pub async fn set_byok_api_key(
-    pool: &SqlitePool,
-    key: Option<&str>,
-    base_url: Option<&str>,
-) -> Result<(), sqlx::Error> {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0);
-    let key = key.map(|k| k.trim()).filter(|k| !k.is_empty());
-    let base_url = base_url.map(|b| b.trim()).filter(|b| !b.is_empty());
-    sqlx::query(
-        r#"
-        UPDATE usage_config
-        SET byok_api_key = ?,
-            byok_base_url = ?,
-            updated_at = ?
-        WHERE id = 1
-        "#,
-    )
-    .bind(key)
-    .bind(base_url)
-    .bind(now)
-    .execute(pool)
-    .await?;
-    Ok(())
-}
-
 // ── Extraction cache helpers ─────────────────────────────────────────────
 //
 // Content-addressed cache for completed extraction results. When a user
-// re-ingests the same PDF with the same model, the pipeline is skipped
-// entirely and cached questions are returned instantly.
+// re-ingests the same PDF, the pipeline is skipped entirely and cached
+// questions are returned instantly.
 //
-// Bump EXTRACTION_CACHE_VERSION when the extraction logic, validation
-// rules, or prompt templates change in a way that would produce different
-// output for the same input.
+// Bump EXTRACTION_CACHE_VERSION when the extraction logic or validation
+// rules change in a way that would produce different output for the same
+// input.
 
 /// Bump this to invalidate all cached extraction results after logic changes.
 /// v3: formatting-rules pipeline (sanitize seam, structural validator,
 /// Tier-0 figure lever) — cached v2 entries hold unformatted cards.
-pub const EXTRACTION_CACHE_VERSION: u32 = 3;
+/// v4: imports are local only; entries cached from AI-model runs are dropped.
+/// v5: import fixes round 2 (question ends, marks, symbol fonts, numbers
+/// as options): a cached v4 card can lack options, allocations or parts.
+pub const EXTRACTION_CACHE_VERSION: u32 = 5;
 
 /// Compute a deterministic cache key from file content + parameters.
 /// Uses a fast FNV-1a hash of the file bytes (not cryptographic, just
 /// collision-resistant enough for a local cache).
-pub fn extraction_cache_key(
-    file_bytes: &[u8],
-    model: &str,
-    paper_name: &str,
-) -> String {
+pub fn extraction_cache_key(file_bytes: &[u8], paper_name: &str) -> String {
     use std::hash::{Hash, Hasher};
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     file_bytes.hash(&mut hasher);
-    model.hash(&mut hasher);
     paper_name.hash(&mut hasher);
     EXTRACTION_CACHE_VERSION.hash(&mut hasher);
     format!("{:016x}", hasher.finish())
@@ -615,12 +470,11 @@ pub async fn record_import_cost(
     model_name: &str,
     paper_type: &str,
     questions_count: i64,
-    prompt_tokens: i64,
-    completion_tokens: i64,
-    cost_usd: f64,
-    duration_ms: i64,
-    stage_breakdown: Option<&str>,
 ) -> Result<ImportCostRecord, sqlx::Error> {
+    // A local import: no tokens, no cost (the columns stay for the records
+    // earlier versions wrote).
+    let (prompt_tokens, completion_tokens, cost_usd, duration_ms, stage_breakdown): (i64, i64, f64, i64, Option<&str>) =
+        (0, 0, 0.0, 0, None);
     let id = uuid::Uuid::new_v4().to_string();
     let total_tokens = prompt_tokens + completion_tokens;
     let now = std::time::SystemTime::now()

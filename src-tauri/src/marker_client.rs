@@ -2,40 +2,6 @@ use regex::Regex;
 use std::sync::LazyLock;
 
 // ══════════════════════════════════════════════════════════════════════════
-// VLM System Prompts & Strict Formatting Rules
-// ══════════════════════════════════════════════════════════════════════════
-
-pub const VLM_RULE_INLINE_IMAGE_PLACEMENT: &str =
-    "If an image or diagram is present, insert its placeholder [DIAGRAM_PLACEHOLDER] (or ![Diagram](image_key)) IMMEDIATELY after the sentence or paragraph that references it (e.g., directly after 'shown in Figure 3'). Never place diagrams at the end of the question if they were referenced earlier.";
-
-pub const VLM_RULE_DELIMITER_DISCIPLINE: &str =
-    "NEVER place inline math delimiters $ inside a display math $$ block. Display math must start with $$ and end with $$ with NO inner $ signs.";
-
-pub const VLM_RULE_CHARACTER_PRECISION: &str =
-    "Pay close attention to function notation. Do not confuse the italic function symbol $f$ in $f(x)$ or $f(t)$ with the number 1. Pay extreme attention to Greek symbols: do not confuse \\theta with the number 1, or \\alpha with a. Accurately transcribe all complex number forms, e.g., r(\\cos \\theta + \\text{i}\\sin \\theta).";
-
-pub const VLM_RULE_LIST_CLEANUP: &str =
-    "Do not output empty list bullets or empty numbered prefixes.";
-
-pub const VLM_RULE_TABLE_FORMATTING: &str =
-    "If a grid or table contains standard text or numbers, you MUST format it as a standard Markdown table using pipes | and dashes -. NEVER use LaTeX array environments or \\hline for data tables.";
-
-pub const VLM_RULE_EQUATION_COHESION: &str =
-    "A mathematical equation MUST remain inside a single, cohesive display math block $$ ... $$. Never split an equation into multiple blocks. Operators like =, +, or exponents like ^n and ^{-1} must remain inside the same block as the matrices or variables they belong to.";
-
-pub const VLM_RULE_SYMBOL_PRESERVATION: &str =
-    "Pay extreme attention to Greek symbols. Do not confuse \\theta with the number 1, or \\alpha with a. Accurately transcribe all complex number forms, e.g., r(\\cos \\theta + \\text{i}\\sin \\theta).";
-
-pub const VLM_RULE_DELIMITER_NESTING: &str =
-    "Never wrap regular prose or full sentences in $$ display math delimiters. Only use $$ for standalone mathematical equations. Never nest inline math $ inside a display math $$ block.";
-
-pub const VLM_FEW_SHOT_INLINE_FRACTURE: &str =
-    "CRITICAL: Never fracture inline math. WRONG: $r(\\cos$ \\theta $). RIGHT: $r(\\cos \\theta)$.";
-
-pub const VLM_FEW_SHOT_PROSE_WRAPPING: &str =
-    "CRITICAL: Never wrap English sentences in $$. Use $ for variables inside text.";
-
-// ══════════════════════════════════════════════════════════════════════════
 // Compiled Regex Patterns for Post-Processing Fixes
 // ══════════════════════════════════════════════════════════════════════════
 

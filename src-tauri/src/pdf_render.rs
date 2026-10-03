@@ -169,13 +169,28 @@ pub fn render_pdf_pages(path: &Path) -> Result<Vec<PageInput>, String> {
     let target_width = (8.27 * render_dpi as f32).round() as i32;
     let render_config = PdfRenderConfig::new().set_target_width(target_width.try_into().unwrap());
 
+    // A scanned paper (half its pages or more printed with no text layer)
+    // is given one by local OCR, so it is transcribed on this machine.
+    let blank_text: Vec<bool> = document
+        .pages()
+        .iter()
+        .enumerate()
+        .map(|(i, page)| crate::ocr::available() && page.text().is_ok_and(|t| t.all().trim().is_empty()) && crate::layout::page_has_print(&crate::layout::extract_page(&page, i)))
+        .collect();
+    let ocr_paper = scanned_paper(&blank_text);
+
     // Phase 1: Fast sequential pass to extract text, object types, and rasterize page bitmaps
     let mut raw_pages = Vec::with_capacity(document.pages().len() as usize);
     for (i, page) in document.pages().iter().enumerate() {
-        let text = page.text().map_err(|e| e.to_string())?.all();
-        
+        let mut text = page.text().map_err(|e| e.to_string())?.all();
+
         let objects = page.objects();
         let has_images = objects.iter().any(|obj| matches!(obj.object_type(), PdfPageObjectType::Image));
+        if ocr_paper && blank_text[i] {
+            if let Some((lines, _)) = ocr_page(&document, path, i) {
+                text = ocr_text(&lines);
+            }
+        }
         let has_vectors = objects.iter().any(|obj| matches!(obj.object_type(), PdfPageObjectType::Path));
 
         if text.trim().is_empty() && !has_images && !has_vectors {
@@ -589,8 +604,100 @@ pub fn load_layout_pages(path: &Path) -> Option<Vec<crate::layout::LayoutPage>> 
     let pdfium = get_pdfium().ok()?;
     let document = pdfium.load_pdf_from_file(path, None).ok()?;
     let catalog = crate::layout::font_catalog(path);
-    let glyphs = document.pages().iter().enumerate().map(|(i, page)| crate::layout::extract_page_with(&page, i, catalog.get(i))).collect();
-    Some(crate::layout::layout_document(glyphs))
+    let glyphs: Vec<crate::layout::PageGlyphs> = document.pages().iter().enumerate().map(|(i, page)| crate::layout::extract_page_with(&page, i, catalog.get(i))).collect();
+    let printed: Vec<bool> = glyphs.iter().map(crate::layout::page_has_print).collect();
+    let mut pages = crate::layout::layout_document(glyphs);
+    // A scanned paper (pages printed as pictures or outlines whose only text
+    // is a watermark) is read by local OCR.
+    let candidates: Vec<bool> = pages.iter().enumerate().map(|(i, lp)| printed[i] && crate::layout::page_text_free(lp)).collect();
+    if scanned_paper(&candidates) {
+        for (i, lp) in pages.iter_mut().enumerate() {
+            if candidates[i] {
+                match ocr_page(&document, path, i) {
+                    Some((lines, px)) => crate::layout::set_ocr_lines(lp, &lines, px),
+                    None => lp.scan_unread = true,
+                }
+            }
+        }
+    }
+    Some(pages)
+}
+
+/// Text-free printed pages are a scan when they are half the paper or more:
+/// a digital paper's one picture page (a photograph, graph paper) is not.
+fn scanned_paper(candidates: &[bool]) -> bool {
+    let n = candidates.iter().filter(|&&c| c).count();
+    n > 0 && 2 * n >= candidates.len()
+}
+
+/// Resolution scanned pages are rendered at for OCR.
+const OCR_DPI: u32 = 300;
+
+/// The exact texts local OCR gave pages: a page whose text is one of them
+/// was read by OCR, never printed, however it reaches the transcriber.
+static OCR_TEXTS: std::sync::LazyLock<Mutex<std::collections::HashSet<String>>> = std::sync::LazyLock::new(Default::default);
+
+/// Whether a page text came from local OCR.
+pub fn is_ocr_text(text: &str) -> bool {
+    !text.trim().is_empty() && OCR_TEXTS.lock().is_ok_and(|t| t.contains(text))
+}
+
+/// Local OCR of one scanned page: its lines and the points per pixel of the
+/// image read. Each page of a file is read once (the text layer and the
+/// layout both ask for it); a changed file is read again.
+fn ocr_page(document: &PdfDocument, path: &Path, page_idx: usize) -> Option<(Vec<crate::ocr::OcrLine>, f32)> {
+    type Key = (PathBuf, u64, Option<std::time::SystemTime>, usize);
+    static CACHE: std::sync::LazyLock<Mutex<HashMap<Key, (Vec<crate::ocr::OcrLine>, f32)>>> = std::sync::LazyLock::new(Default::default);
+    if !crate::ocr::available() {
+        return None;
+    }
+    let meta = std::fs::metadata(path).ok();
+    let key = (path.to_path_buf(), meta.as_ref().map_or(0, |m| m.len()), meta.and_then(|m| m.modified().ok()), page_idx);
+    if let Some(hit) = CACHE.lock().ok()?.get(&key) {
+        return Some(hit.clone());
+    }
+    let width_pt = document.pages().get((page_idx as u16).into()).ok()?.width().value;
+    let img = render_page_from_document(document, page_idx, OCR_DPI).ok()?.to_rgba8();
+    let points_per_px = width_pt / img.width().max(1) as f32;
+    let read = (crate::ocr::recognize(&img)?, points_per_px);
+    CACHE.lock().ok()?.insert(key, read.clone());
+    Some(read)
+}
+
+/// The text layer local OCR gives a page (recorded as OCR text).
+fn ocr_text(lines: &[crate::ocr::OcrLine]) -> String {
+    let text = lines.iter().map(|l| l.words.iter().map(|w| w.text.as_str()).collect::<Vec<_>>().join(" ")).collect::<Vec<_>>().join("\n");
+    if let Ok(mut t) = OCR_TEXTS.lock() {
+        t.insert(text.clone());
+    }
+    text
+}
+
+/// Every page's glyphs, as the layout reads them (developer reports).
+fn document_glyphs(path: &Path) -> Option<Vec<crate::layout::PageGlyphs>> {
+    let pdfium = get_pdfium().ok()?;
+    let document = pdfium.load_pdf_from_file(path, None).ok()?;
+    let catalog = crate::layout::font_catalog(path);
+    Some(document.pages().iter().enumerate().map(|(i, page)| crate::layout::extract_page_with(&page, i, catalog.get(i))).collect())
+}
+
+/// Developer report: every page's glyphs (identity, raw text-layer value,
+/// origin, box, size, font), rules and paths.
+pub fn glyph_report(path: &Path) -> Option<String> {
+    Some(document_glyphs(path)?.iter().map(|pg| format!("===== page {}\n{}", pg.page + 1, crate::layout::debug_glyphs(pg))).collect())
+}
+
+/// Developer report: every glyph whose identity is still unknown after
+/// extraction, as (page, font, raw text-layer value, position).
+pub fn unknown_glyph_report(path: &Path) -> Option<String> {
+    let mut out = String::new();
+    for pg in document_glyphs(path)? {
+        let i = pg.page;
+        for g in pg.glyphs.iter().filter(|g| g.ch == crate::layout::UNKNOWN_GLYPH) {
+            out.push_str(&format!("p{} {} raw=U+{:04X} at ({:.1},{:.1}) size {:.1}\n", i + 1, g.font, g.raw, g.x0, g.oy, g.size));
+        }
+    }
+    Some(out)
 }
 
 /// Repair a page's text using its character evidence. Currently:
@@ -1788,6 +1895,16 @@ pub fn render_pdf_page_at_300dpi(path: &Path, page_idx: usize) -> Result<image::
 mod tests {
     use super::*;
 
+    #[test]
+    fn only_a_mostly_text_free_paper_is_read_as_a_scan() {
+        // A digital paper's one picture page is not a scan.
+        assert!(!scanned_paper(&[false, true, false, false]));
+        assert!(scanned_paper(&[true, true, false, false]));
+        assert!(scanned_paper(&[true; 5]));
+        assert!(!scanned_paper(&[false; 3]));
+        assert!(!scanned_paper(&[]));
+    }
+
     fn run(y: f32, h: f32, x: f32, w: f32, text: &str) -> LocalTextRun {
         LocalTextRun { text: text.into(), bbox: [x, y, w, h], font_size: None }
     }
@@ -2405,7 +2522,7 @@ mod tests {
     fn core_pure_2021_matrix_is_reconstructed_from_source_paths() {
         let _guard = pdfium_test_lock();
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../past papers for mergemark/core pure 1 '21.pdf");
+            .join("../papers/used/core pure 1 '21.pdf");
         if !path.exists() {
             eprintln!("[MX] fixture missing");
             return;
@@ -2630,3 +2747,4 @@ mod tests {
         );
     }
 }
+

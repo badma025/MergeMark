@@ -36,9 +36,10 @@ pub fn strip_question_heading(content: &str, number: u32) -> String {
     )).unwrap();
     if subpart.is_match(content) { return content.to_string(); }
     let re = regex::Regex::new(&format!(
-        r"\A[ \t]*(?:box[ \t]+)?(?:Q(?:uestion)?\.?[ \t]*)?0?[ \t]*{}(?:[.)])?(?:[ \t]+|[ \t]*\r?\n)(?:box[ \t]+)?", digits
+        // (OCR's "2*" marks an extended-response question: the mark stays.)
+        r"\A[ \t]*(?:box[ \t]+)?(?:Q(?:uestion)?\.?[ \t]*)?0?[ \t]*{}(?:[.)])?(\*)?(?:[ \t]+|[ \t]*\r?\n)(?:box[ \t]+)?", digits
     )).unwrap();
-    re.replace(content, "").to_string()
+    re.replace(content, |c: &regex::Captures| if c.get(1).is_some() { r"\* ".to_string() } else { String::new() }).to_string()
 }
 
 /// Wrap orphan text commands while preserving existing inline/display math
@@ -86,11 +87,12 @@ static BOILER_LINE_RE: LazyLock<regex::Regex> = LazyLock::new(|| {
     .unwrap()
 });
 
-static BARE_PAGE_NO_RE: LazyLock<regex::Regex> =
-    LazyLock::new(|| regex::Regex::new(r"^[ \t]*\d{1,2}[ \t]*$").unwrap());
-
 static INLINE_BOX_RE: LazyLock<regex::Regex> =
-    LazyLock::new(|| regex::Regex::new(r"[ \t]+box[ \t]*\.").unwrap());
+    LazyLock::new(|| regex::Regex::new(r"(\S*)[ \t]+box[ \t]*\.").unwrap());
+
+/// Words that take "box" as their noun in question prose ("Tick (✓) one
+/// box.", "from the box."): the margin's "box" never follows one.
+const BOX_NOUN_LEADS: &[&str] = &["a", "an", "the", "one", "two", "each", "every", "any", "this", "that", "correct", "appropriate", "empty", "blank", "shaded"];
 
 static INLINE_IB_RE: LazyLock<regex::Regex> =
     LazyLock::new(|| regex::Regex::new(r"IB\$?/M/\$?[A-Za-z0-9$/]*").unwrap());
@@ -101,17 +103,23 @@ pub fn strip_ocr_boilerplate(content: &str) -> String {
     let mut kept: Vec<&str> = Vec::new();
     for line in content.lines() {
         let t = line.trim();
+        // A line holding only a number is content here (an option such as
+        // "14" under "Tick (✓) one box."): page numbers never reach a card,
+        // the layout engine drops them by position and the text-layer carve
+        // by its furniture rules.
         if BOILER_LINE_RE.is_match(t) {
             continue;
-        }
-        if BARE_PAGE_NO_RE.is_match(t) {
-            continue; // bare page-number debris lines
         }
         kept.push(line);
     }
     let out = kept.join("\n");
     let out = INLINE_IB_RE.replace_all(&out, "").to_string();
-    let out = INLINE_BOX_RE.replace_all(&out, " .").to_string();
+    let out = INLINE_BOX_RE
+        .replace_all(&out, |c: &regex::Captures| {
+            let lead = c[1].trim_matches(|ch: char| !ch.is_alphanumeric()).to_ascii_lowercase();
+            if BOX_NOUN_LEADS.contains(&lead.as_str()) { c[0].to_string() } else { format!("{} .", &c[1]) }
+        })
+        .to_string();
     // margin debris "box" glued after a part label or at line start:
     //   "(i) box Three molecules..." -> "(i) Three molecules..."
     // "Tick the correct box" prose is NOT touched (box not at line-start/label).
@@ -984,6 +992,22 @@ mod tests {
         assert!(!out.contains("IB/"));
         assert!(!out.contains("*03*"));
         assert!(!out.contains("PMT"));
+    }
+
+    #[test]
+    fn extended_response_heading_is_stripped_whole() {
+        // The number goes; the printed extended-response mark stays.
+        assert_eq!(strip_question_heading("2* There are more than 10 million dogs", 2), "\\* There are more than 10 million dogs");
+        assert_eq!(strip_question_heading("2. There are", 2), "There are");
+    }
+
+    #[test]
+    fn box_as_the_noun_of_a_sentence_is_question_text() {
+        // AQA "Tick (✓) one box." and Edexcel "… at random from the box."
+        assert_eq!(strip_ocr_boilerplate("Tick (✓) one box."), "Tick (✓) one box.");
+        assert_eq!(strip_ocr_boilerplate("selects 2 pieces of fruit at random from the box."), "selects 2 pieces of fruit at random from the box.");
+        // Margin debris glued to a sentence still goes.
+        assert_eq!(strip_ocr_boilerplate("Which change increases the efficiency box."), "Which change increases the efficiency .");
     }
 
     #[test]

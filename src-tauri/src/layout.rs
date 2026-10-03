@@ -338,7 +338,15 @@ pub fn extract_page_with(page: &PdfPage, page_index: usize, fonts: Option<&PageF
                 continue;
             }
             let mut raw = c.unicode_value();
-            if raw == 0x0D || raw == 0x0A {
+            let Ok(tb) = c.tight_bounds() else { continue };
+            // A tab, line feed or carriage return with a glyph's extent is a
+            // glyph the text layer could not name: a subset numbering its
+            // glyphs in order of use puts "2" at code 9 and "4" at code 10
+            // (Edexcel S1 Jun 2012). It keeps its code. Whitespace has no
+            // height (a tab's box is about 1% of the size; a stop's, 10%).
+            // Otherwise a line feed is the text layer's own and a tab a space.
+            let has_extent = (tb.top().value - tb.bottom().value).abs() > 0.03 * c.scaled_font_size().value.max(1.0);
+            if (raw == 0x0D || raw == 0x0A) && !has_extent {
                 continue;
             }
             // UTF-16 surrogate halves arrive as separate chars (Cambria Math
@@ -350,10 +358,9 @@ pub fn extract_page_with(page: &PdfPage, page_index: usize, fonts: Option<&PageF
                     k += 1;
                 }
             }
-            if raw == 0x09 {
+            if raw == 0x09 && !has_extent {
                 raw = 0x20;
             }
-            let Ok(tb) = c.tight_bounds() else { continue };
             let bx = frame.rect(tb.left().value, tb.right().value, tb.top().value, tb.bottom().value);
             let (ox, oy) = match c.origin() {
                 Ok((x, y)) => {
@@ -416,6 +423,7 @@ pub fn extract_page_with(page: &PdfPage, page_index: usize, fonts: Option<&PageF
     }
     if let Some(cat) = fonts {
         resolve_control_codes(&mut out.glyphs, cat);
+        resolve_glyph_ids(&mut out.glyphs, cat);
     }
     // Glyphs whose identity is still unknown: when they leave no ink at all
     // they are invisible placeholders (MathType spacing glyphs) and carry no
@@ -478,6 +486,7 @@ pub fn extract_page_with(page: &PdfPage, page_index: usize, fonts: Option<&PageF
     add_vector_bars(&mut out);
     add_vector_dots(&mut out);
     add_outline_glyphs(&mut out);
+    add_vector_suns(&mut out);
     add_inline_images(&mut out);
     out
 }
@@ -583,6 +592,68 @@ fn add_outline_glyphs(out: &mut PageGlyphs) {
         next_idx += 1;
     }
     out.glyphs.extend(outlined);
+}
+
+/// The sun sign "☉" drawn as a small stroked ring with a filled dot at its
+/// centre and no character behind it (Edexcel physics prints L☉ and M☉ so):
+/// the shape is the symbol. Set after the letter it qualifies.
+fn add_vector_suns(out: &mut PageGlyphs) {
+    let mut next_idx = out.glyphs.iter().map(|g| g.idx + 1).max().unwrap_or(0);
+    let round = |p: &VPath| {
+        let (w, h) = (p.x1 - p.x0, p.y1 - p.y0);
+        let (cx, cy, r) = ((p.x0 + p.x1) * 0.5, (p.y0 + p.y1) * 0.5, 0.25 * (w + h));
+        (w - h).abs() <= 0.15 * w.max(h)
+            && p.pts.len() >= 8
+            && p.pts.iter().all(|(_, q)| {
+                let d = (q[0] - cx).hypot(q[1] - cy);
+                d >= 0.85 * r && d <= 1.15 * r
+            })
+    };
+    let mut suns: Vec<Glyph> = Vec::new();
+    for ring in out.paths.iter().filter(|p| p.stroked && !p.filled && round(p)) {
+        let (w, h) = (ring.x1 - ring.x0, ring.y1 - ring.y0);
+        let (cx, cy) = ((ring.x0 + ring.x1) * 0.5, (ring.y0 + ring.y1) * 0.5);
+        // A round dot at the centre.
+        let dotted = out.paths.iter().any(|d| {
+            let (dw, dh) = (d.x1 - d.x0, d.y1 - d.y0);
+            d.filled && dw >= 0.1 * w && dw <= 0.4 * w && (dw - dh).abs() <= 0.25 * dw.max(dh) && ((d.x0 + d.x1) * 0.5 - cx).abs() <= 0.12 * w && ((d.y0 + d.y1) * 0.5 - cy).abs() <= 0.12 * w
+        });
+        let inked = out.glyphs.iter().any(|g| !is_space_char(g.ch) && g.x0 < ring.x1 && g.x1 > ring.x0 && g.y0 < ring.y1 && g.y1 > ring.y0);
+        if !dotted || inked {
+            continue;
+        }
+        // Script-sized beside a letter of the text it qualifies.
+        let host = out
+            .glyphs
+            .iter()
+            .filter(|g| g.ch.is_alphabetic() && w >= 0.2 * g.size && w <= 0.6 * g.size && g.x1 <= ring.x0 + 0.5 && ring.x0 - g.x1 <= 0.6 * g.size.max(4.0) && cy > g.y0 && cy < g.y1 + 0.3 * g.size)
+            .max_by(|a, b| a.x1.partial_cmp(&b.x1).unwrap_or(std::cmp::Ordering::Equal));
+        if host.is_none() {
+            continue;
+        }
+        suns.push(Glyph {
+            idx: next_idx,
+            ch: '☉',
+            raw: 0x2609,
+            font: "VectorSymbol".to_string(),
+            italic: false,
+            bold: false,
+            mono: false,
+            // A ring of cap height h is set in type about h / 0.7.
+            size: h / 0.7,
+            x0: ring.x0,
+            x1: ring.x1,
+            y0: ring.y0,
+            y1: ring.y1,
+            ox: ring.x0,
+            oy: ring.y1,
+            lx0: ring.x0,
+            lx1: ring.x1,
+            angle: 0.0,
+        });
+        next_idx += 1;
+    }
+    out.glyphs.extend(suns);
 }
 
 /// An unidentified glyph whose ink is a thin full-height stroke, standing in
@@ -966,6 +1037,21 @@ fn space_between(spaces: &[[f32; 3]], x_left: f32, x_right: f32, base: f32, size
 #[derive(Debug, Clone, Default)]
 pub struct PageFontCatalog {
     pub control_glyphs: std::collections::HashMap<(String, u32), Vec<(String, f32)>>,
+    /// Glyph ids shown with CID TrueType fonts that neither the ToUnicode
+    /// map nor the embedded `cmap` names, per base font: the text layer
+    /// reports such a glyph's id as its Unicode value ("í" for Times New
+    /// Roman's minus, glyph 237). With the width `/W` states for it, when
+    /// that is evidence (subsets of one family share the base name in the
+    /// text layer; two that state different widths give none).
+    pub unnamed_glyph_ids: std::collections::HashMap<String, std::collections::HashMap<u32, Option<f32>>>,
+    /// Values another font of the base family can give a glyph on the page
+    /// (a simple font's codes, ToUnicode destinations), with that glyph's
+    /// width (NaN when unknown): an id reported as one of them is only told
+    /// apart by the advance it is set with.
+    pub producible: std::collections::HashMap<String, std::collections::HashMap<u32, Vec<f32>>>,
+    /// Base families with a font whose values cannot be known (a CID font
+    /// with its own `cmap`, or not TrueType/Identity).
+    pub uncertain: std::collections::HashSet<String>,
 }
 
 /// Read every page's control-glyph catalog by walking its content stream
@@ -974,12 +1060,15 @@ pub struct PageFontCatalog {
 pub fn font_catalog(path: &std::path::Path) -> Vec<PageFontCatalog> {
     let Ok(doc) = pdf_extract::Document::load(path) else { return Vec::new() };
     let mut out = Vec::new();
+    // (A font is read once per document, not once per page.)
+    let mut cid_fonts = std::collections::HashMap::new();
     for (_, page_id) in doc.get_pages() {
         let mut cat = PageFontCatalog::default();
         let res = page_resources(&doc, page_id);
         if let (Some(res), Ok(content)) = (res, doc.get_and_decode_page_content(page_id)) {
-            let mut state = StreamState::default();
+            let mut state = StreamState { cid_fonts: std::mem::take(&mut cid_fonts), ..Default::default() };
             walk_content(&doc, &content.operations, res, &mut state, &mut cat, 0);
+            cid_fonts = state.cid_fonts;
         }
         out.push(cat);
     }
@@ -1010,24 +1099,184 @@ struct StreamFont {
     first_char: u32,
     widths: Vec<f32>,
     differences: std::collections::HashMap<u32, String>,
+    /// A CID TrueType font with Identity encoding and glyph map.
+    cid: Option<std::rc::Rc<CidFont>>,
+}
+
+#[derive(Debug, Default)]
+struct CidFont {
+    /// CIDs the ToUnicode map names, and the value it gives each.
+    named: std::collections::HashSet<u32>,
+    named_values: Vec<(u32, u32)>,
+    widths: std::collections::HashMap<u32, f32>,
+    /// The embedded font program carries a `cmap` table.
+    has_cmap: bool,
+    /// Every glyph the ToUnicode map names agrees with the original font's
+    /// glyph order we know (see [`original_glyph`]): its ids are that order.
+    order_confirmed: bool,
 }
 
 #[derive(Debug, Clone, Default)]
 struct StreamState {
     font: Option<StreamFont>,
     stack: Vec<Option<StreamFont>>,
+    cid_fonts: std::collections::HashMap<pdf_extract::ObjectId, std::rc::Rc<CidFont>>,
 }
 
-fn font_from_resources(doc: &pdf_extract::Document, res: &pdf_extract::Dictionary, name: &[u8]) -> Option<StreamFont> {
+fn stream_bytes(doc: &pdf_extract::Document, o: &pdf_extract::Object) -> Option<Vec<u8>> {
+    let (_, o) = doc.dereference(o).ok()?;
+    let s = o.as_stream().ok()?;
+    Some(s.decompressed_content().unwrap_or_else(|_| s.content.clone()))
+}
+
+/// Source codes and destination values of a ToUnicode CMap (bfchar and
+/// bfrange entries).
+fn to_unicode_entries(cmap: &[u8]) -> Vec<(u32, u32)> {
+    // Hex strings may be written back to back ("<0044><0061>").
+    static TOKEN_RE: std::sync::LazyLock<regex::Regex> =
+        std::sync::LazyLock::new(|| regex::Regex::new(r"<[0-9A-Fa-f\s]*>|\[|\]|beginbfchar|endbfchar|beginbfrange|endbfrange").unwrap());
+    let text = String::from_utf8_lossy(cmap);
+    let toks: Vec<&str> = TOKEN_RE.find_iter(&text).map(|m| m.as_str()).collect();
+    let digits = |s: &str| s.chars().filter(|c| c.is_ascii_hexdigit()).collect::<String>();
+    let hex = |s: &str| Some(digits(s)).filter(|h| !h.is_empty() && h.len() <= 8).and_then(|h| u32::from_str_radix(&h, 16).ok());
+    // The first character of a UTF-16BE destination, and whether it is the
+    // whole destination (a range then counts up from it).
+    let dest = |s: &str| {
+        let h = digits(s);
+        let units: Vec<u32> = (0..h.len() / 4).filter_map(|i| u32::from_str_radix(&h[i * 4..i * 4 + 4], 16).ok()).collect();
+        match units.as_slice() {
+            [hi, lo, rest @ ..] if (0xD800..0xDC00).contains(hi) && (0xDC00..0xE000).contains(lo) => Some((0x10000 + ((hi - 0xD800) << 10) + (lo - 0xDC00), rest.is_empty())),
+            [u, rest @ ..] if !(0xD800..0xE000).contains(u) => Some((*u, rest.is_empty())),
+            _ => None,
+        }
+    };
+    let is_hex = |t: &str| t.starts_with('<');
+    let mut out = Vec::new();
+    let mut mode = "";
+    let mut i = 0;
+    while i < toks.len() {
+        let t = toks[i];
+        if matches!(t, "beginbfchar" | "beginbfrange" | "endbfchar" | "endbfrange") {
+            mode = t;
+            i += 1;
+            continue;
+        }
+        match mode {
+            "beginbfchar" if i + 1 < toks.len() && is_hex(t) && is_hex(toks[i + 1]) => {
+                if let (Some(s), Some((d, _))) = (hex(t), dest(toks[i + 1])) {
+                    out.push((s, d));
+                }
+                i += 2;
+            }
+            "beginbfrange" if i + 2 < toks.len() && is_hex(t) && is_hex(toks[i + 1]) => {
+                let (lo, hi) = (hex(t), hex(toks[i + 1]));
+                if toks[i + 2] == "[" {
+                    let mut k = i + 3;
+                    let mut code = lo.unwrap_or(0);
+                    while k < toks.len() && toks[k] != "]" {
+                        if let (Some(_), Some((d, _))) = (lo, dest(toks[k])) {
+                            out.push((code, d));
+                        }
+                        code += 1;
+                        k += 1;
+                    }
+                    i = k + 1;
+                } else {
+                    if let (Some(lo), Some(hi), Some((d, single))) = (lo, hi, dest(toks[i + 2])) {
+                        for (n, code) in (lo..=hi.min(lo + 0xFFFF)).enumerate() {
+                            out.push((code, if single { d + n as u32 } else { d }));
+                        }
+                    }
+                    i += 3;
+                }
+            }
+            _ => i += 1,
+        }
+    }
+    out
+}
+
+/// The CID side of a Type0 font when it is TrueType with Identity encoding
+/// and glyph map (each CID is the original font's glyph id).
+fn cid_font(doc: &pdf_extract::Document, font: &pdf_extract::Dictionary) -> Option<CidFont> {
+    if font.get(b"Encoding").ok().and_then(|e| e.as_name().ok()) != Some(b"Identity-H".as_slice()) {
+        return None;
+    }
+    let desc = font.get(b"DescendantFonts").ok().and_then(|d| doc.dereference(d).ok()).and_then(|(_, d)| d.as_array().ok())?.first()?;
+    let (_, desc) = doc.dereference(desc).ok()?;
+    let desc = desc.as_dict().ok()?;
+    if desc.get(b"Subtype").ok().and_then(|s| s.as_name().ok()) != Some(b"CIDFontType2".as_slice()) {
+        return None;
+    }
+    if let Ok(map) = desc.get(b"CIDToGIDMap") {
+        if map.as_name().ok() != Some(b"Identity".as_slice()) {
+            return None;
+        }
+    }
+    let base = font.get(b"BaseFont").ok().and_then(|b| b.as_name().ok()).map(|b| strip_subset(&String::from_utf8_lossy(b))).unwrap_or_default();
+    let mut cf = CidFont { order_confirmed: true, ..Default::default() };
+    let num = |o: &pdf_extract::Object| doc.dereference(o).ok().and_then(|(_, o)| o.as_float().ok().or_else(|| o.as_i64().ok().map(|v| v as f32)));
+    if let Some(w) = desc.get(b"W").ok().and_then(|w| doc.dereference(w).ok()).and_then(|(_, w)| w.as_array().ok()) {
+        let mut i = 0;
+        while i + 1 < w.len() {
+            let Some(c0) = num(&w[i]) else { break };
+            if let Ok((_, arr)) = doc.dereference(&w[i + 1]) {
+                if let Ok(arr) = arr.as_array() {
+                    for (k, v) in arr.iter().enumerate() {
+                        if let Some(v) = num(v) {
+                            cf.widths.insert(c0 as u32 + k as u32, v);
+                        }
+                    }
+                    i += 2;
+                    continue;
+                }
+            }
+            let (Some(c1), Some(v)) = (num(&w[i + 1]), w.get(i + 2).and_then(num)) else { break };
+            for c in c0 as u32..=(c1 as u32).min(c0 as u32 + 0xFFFF) {
+                cf.widths.insert(c, v);
+            }
+            i += 3;
+        }
+    }
+    // A TrueType table directory naming "cmap".
+    let fd = desc.get(b"FontDescriptor").ok().and_then(|d| doc.dereference(d).ok()).and_then(|(_, d)| d.as_dict().ok());
+    if let Some(prog) = fd.and_then(|fd| fd.get(b"FontFile2").ok()).and_then(|f| stream_bytes(doc, f)) {
+        let n = prog.get(4..6).map(|b| u16::from_be_bytes([b[0], b[1]]) as usize).unwrap_or(0);
+        cf.has_cmap = (0..n).any(|i| prog.get(12 + 16 * i..16 + 16 * i) == Some(b"cmap".as_slice()));
+    }
+    if let Some(cmap) = font.get(b"ToUnicode").ok().and_then(|t| stream_bytes(doc, t)) {
+        for (code, value) in to_unicode_entries(&cmap) {
+            cf.named.insert(code);
+            cf.named_values.push((code, value));
+            if original_char(&base, code).is_some_and(|c| c as u32 != value) {
+                cf.order_confirmed = false;
+            }
+        }
+    }
+    Some(cf)
+}
+
+fn font_from_resources(doc: &pdf_extract::Document, res: &pdf_extract::Dictionary, name: &[u8], cid_fonts: &mut std::collections::HashMap<pdf_extract::ObjectId, std::rc::Rc<CidFont>>) -> Option<StreamFont> {
     let fonts = res.get(b"Font").ok()?;
     let (_, fonts) = doc.dereference(fonts).ok()?;
     let fonts = fonts.as_dict().ok()?;
     let f = fonts.get(name).ok()?;
-    let (_, f) = doc.dereference(f).ok()?;
+    let (font_id, f) = doc.dereference(f).ok()?;
     let font = f.as_dict().ok()?;
     let subtype = font.get(b"Subtype").ok().and_then(|s| s.as_name().ok()).unwrap_or(b"");
     let base = font.get(b"BaseFont").ok().and_then(|s| s.as_name().ok()).map(|b| strip_subset(&String::from_utf8_lossy(b))).unwrap_or_default();
     let simple = subtype != b"Type0";
+    let cid = if simple {
+        None
+    } else if let Some(cf) = font_id.and_then(|id| cid_fonts.get(&id)) {
+        Some(cf.clone())
+    } else {
+        let cf = cid_font(doc, font).map(std::rc::Rc::new);
+        if let (Some(id), Some(cf)) = (font_id, cf.as_ref()) {
+            cid_fonts.insert(id, cf.clone());
+        }
+        cf
+    };
     let first_char = font.get(b"FirstChar").ok().and_then(|o| o.as_i64().ok()).unwrap_or(0).max(0) as u32;
     let mut widths = Vec::new();
     if let Ok(w) = font.get(b"Widths") {
@@ -1062,13 +1311,45 @@ fn font_from_resources(doc: &pdf_extract::Document, res: &pdf_extract::Dictionar
             }
         }
     }
-    Some(StreamFont { base, simple, first_char, widths, differences })
+    Some(StreamFont { base, simple, first_char, widths, differences, cid })
 }
 
 fn record_codes(state: &StreamState, bytes: &[u8], cat: &mut PageFontCatalog) {
     let Some(f) = state.font.as_ref() else { return };
     if !f.simple {
+        let Some(cf) = f.cid.as_ref().filter(|cf| !cf.has_cmap) else {
+            cat.uncertain.insert(f.base.clone());
+            return;
+        };
+        for pair in bytes.chunks_exact(2) {
+            let cid = u16::from_be_bytes([pair[0], pair[1]]) as u32;
+            if cf.named.contains(&cid) {
+                continue;
+            }
+            // (A width the PDF does not state, or a glyph order the named
+            // glyphs contradict, is no evidence.)
+            let w = cf.widths.get(&cid).copied().filter(|_| cf.order_confirmed);
+            let ids = cat.unnamed_glyph_ids.entry(f.base.clone()).or_default();
+            match ids.get(&cid) {
+                Some(seen) if *seen != w => {
+                    ids.insert(cid, None);
+                }
+                Some(_) => {}
+                None => {
+                    ids.insert(cid, w);
+                }
+            }
+        }
         return;
+    }
+    // A simple font gives its code (Latin-1 / WinAnsi) or a named glyph's value.
+    let values = cat.producible.entry(f.base.clone()).or_default();
+    for &b in bytes {
+        let w = (b as u32).checked_sub(f.first_char).and_then(|i| f.widths.get(i as usize)).copied().unwrap_or(f32::NAN);
+        let ws = values.entry(winansi(b)).or_default();
+        if !ws.contains(&w) {
+            ws.push(w);
+        }
     }
     for &b in bytes {
         let code = b as u32;
@@ -1102,7 +1383,15 @@ fn walk_content(
             }
             "Tf" => {
                 if let Some(name) = op.operands.first().and_then(|o| o.as_name().ok()) {
-                    state.font = font_from_resources(doc, res, name);
+                    state.font = font_from_resources(doc, res, name, &mut state.cid_fonts);
+                    if let Some(f) = state.font.as_ref() {
+                        if let Some(cf) = f.cid.as_ref() {
+                            let values = cat.producible.entry(f.base.clone()).or_default();
+                            for (cid, v) in &cf.named_values {
+                                values.entry(*v).or_default().push(cf.widths.get(cid).copied().unwrap_or(f32::NAN));
+                            }
+                        }
+                    }
                 }
             }
             "Tj" | "'" => {
@@ -1196,11 +1485,140 @@ fn resolve_control_codes(glyphs: &mut [Glyph], cat: &PageFontCatalog) {
     }
 }
 
+/// Glyphs of CID TrueType fonts that nothing names: the text layer reports
+/// the glyph id, which is never the character ("í" is glyph 237, Times New
+/// Roman's minus). Resolved through the original font's glyph order when
+/// the width the PDF declares for it is that glyph's advance; otherwise the
+/// glyph is unknown.
+/// Glyphs the text layer reports by their id (a CID font nothing names
+/// them in) are never the character the id spells: resolved through the
+/// original font's glyph order when the source establishes it (a stated
+/// width that is that glyph's advance, and no other font of the family on
+/// the page that could give the value), otherwise unknown.
+fn resolve_glyph_ids(glyphs: &mut [Glyph], cat: &PageFontCatalog) {
+    for g in glyphs.iter_mut() {
+        let Some(&width) = cat.unnamed_glyph_ids.get(&g.font).and_then(|m| m.get(&g.raw)) else { continue };
+        let resolved = width.and_then(|w| original_glyph(&g.font, g.raw, w)).unwrap_or(UNKNOWN_GLYPH);
+        if cat.uncertain.contains(&g.font) {
+            g.ch = UNKNOWN_GLYPH;
+            continue;
+        }
+        let Some(others) = cat.producible.get(&g.font).and_then(|v| v.get(&g.raw)) else {
+            g.ch = resolved;
+            continue;
+        };
+        // Another font of the family gives this value too: the glyph's
+        // advance tells which one set it, when it fits one only.
+        let advance = (g.lx1 - g.lx0).abs() / g.size.max(0.1) * 1000.0;
+        let fits = |w: f32| (advance - w).abs() <= 20.0;
+        let as_id = width.is_some_and(fits);
+        let as_other = others.iter().any(|w| w.is_nan() || fits(*w));
+        g.ch = match (as_id, as_other) {
+            (true, false) => resolved,
+            (false, true) => g.ch,
+            _ => UNKNOWN_GLYPH,
+        };
+    }
+}
+
+/// The Unicode value of a WinAnsi (Windows-1252) code.
+fn winansi(b: u8) -> u32 {
+    const HIGH: [u32; 32] = [
+        0x20AC, 0x81, 0x201A, 0x0192, 0x201E, 0x2026, 0x2020, 0x2021, 0x02C6, 0x2030, 0x0160, 0x2039, 0x0152, 0x8D, 0x017D, 0x8F,
+        0x90, 0x2018, 0x2019, 0x201C, 0x201D, 0x2022, 0x2013, 0x2014, 0x02DC, 0x2122, 0x0161, 0x203A, 0x0153, 0x9D, 0x017E, 0x0178,
+    ];
+    if (0x80..0xA0).contains(&b) { HIGH[(b - 0x80) as usize] } else { b as u32 }
+}
+
+/// Monotype Symbol (symbol.ttf) orders its glyphs by the Symbol encoding:
+/// ids 3..=97 are codes 0x20..=0x7E and ids 98..=191 codes 0xA1..=0xFE (the
+/// installed font's own cmap, every glyph).
+fn symbol_code(gid: u32) -> Option<u32> {
+    match gid {
+        3..=97 => Some(gid + 29),
+        98..=191 => Some(gid + 63),
+        _ => None,
+    }
+}
+
+/// A glyph id of a known font program → its character and advances.
+fn original_entry(font: &str, gid: u32) -> Option<(char, f32)> {
+    let lower = font.to_ascii_lowercase();
+    if lower.starts_with("timesnewroman") {
+        let style = match (font_is_bold(font), font_is_italic_name(font)) {
+            (false, false) => 0,
+            (false, true) => 1,
+            (true, false) => 2,
+            (true, true) => 3,
+        };
+        if gid == 3 {
+            return Some((' ', 250.0));
+        }
+        return TIMES_NEW_ROMAN_GIDS.iter().find(|e| e.0 == gid).map(|e| (e.1, e.2[style]));
+    }
+    if lower.contains("euclidmathtwo") {
+        // MathType's Euclid Math Two as a TrueType subset: established from
+        // the rendered glyphs of Edexcel C4 Jan 2006 ("0 ⩽ t ⩽ 2π",
+        // "t ⩾ 0"), with the advances its glyph program carries.
+        return [(45, '⩽', 778.0), (46, '⩾', 778.0)].iter().find(|e| e.0 == gid).map(|e| (e.1, e.2));
+    }
+    if lower.starts_with("symbolmt") {
+        // Monotype Symbol as a TrueType subset (Edexcel FP2 Jun 2014), with
+        // the standard Symbol advances.
+        let code = symbol_code(gid)?;
+        let (_, _, advance) = SYMBOL_AFM.iter().find(|(c, _, _)| *c as u32 == code)?;
+        return Some((adobe_symbol(u8::try_from(code).ok()?)?, *advance));
+    }
+    if lower.contains("euclidsymbol") {
+        // MathType's Euclid Symbol: established from the rendered glyphs of
+        // Edexcel physics 2018, with the advances that paper declares.
+        return [(29, '<', 778.0), (31, '>', 778.0), (120, '≈', 778.0), (152, '⟨', 389.0), (167, '⟩', 389.0)].iter().find(|e| e.0 == gid).map(|e| (e.1, e.2));
+    }
+    None
+}
+
+/// The character a known font program draws at glyph id `gid`.
+fn original_char(font: &str, gid: u32) -> Option<char> {
+    original_entry(font, gid).map(|e| e.0)
+}
+
+/// A glyph id of a known font program → its character, accepted only when
+/// `width` (/1000 em) is that glyph's advance.
+fn original_glyph(font: &str, gid: u32, width: f32) -> Option<char> {
+    let (c, advance) = original_entry(font, gid)?;
+    ((advance - width).abs() <= 2.0).then_some(c)
+}
+
 /// Glyph name → character. `gNNN` names are glyph ids of the original
-/// TrueType font: for Monotype SymbolMT (symbol.ttf) the glyph order follows
-/// the Symbol encoding (ids 3..=97 are codes 0x20..=0x7E, ids 98.. are codes
-/// 0xA1..), verified against the standard Symbol advance width.
+/// TrueType font: Times New Roman's own glyph order, and Monotype SymbolMT's
+/// (`symbol_code`), each verified against the glyph's advance.
 fn glyph_name_to_char(name: &str, font: &str, width: f32) -> Option<char> {
+    // Advent 3B2 maths fonts name their control-range slots "C<n>"; the
+    // identities were established from the rendered glyphs (see `advent`).
+    let lower_font = font.to_ascii_lowercase();
+    let advent_slot: &[(&str, char)] = if lower_font.starts_with("advp4c4e74") {
+        &[("C0", '−'), ("C2", '×'), ("C20", '≤'), ("C21", '≥')]
+    } else if lower_font.starts_with("advp4c4e46") {
+        &[("C16", '('), ("C17", ')'), ("C18", '('), ("C19", ')')]
+    } else {
+        &[]
+    };
+    if lower_font.starts_with("advp4c4e") {
+        return advent_slot.iter().find(|(n, _)| *n == name).map(|(_, c)| *c);
+    }
+    // Maths glyph names that say what they draw (CIE NewMathSymb sets θ and
+    // ° under control codes this way).
+    if let Some(c) = match name {
+        "thetaslant" => Some('θ'),
+        // (MathType's Euclid Math Two, Edexcel FP2 Jun 2014.)
+        "lessthanorequalangled" => Some('⩽'),
+        "degrees" | "degree" => Some('°'),
+        "minus" => Some('−'),
+        "equal" => Some('='),
+        _ => None,
+    } {
+        return Some(c);
+    }
     if let Some((code, _, w)) = SYMBOL_AFM.iter().find(|(_, n, _)| *n == name) {
         let _ = w;
         return adobe_symbol(*code);
@@ -1228,18 +1646,17 @@ fn glyph_name_to_char(name: &str, font: &str, width: f32) -> Option<char> {
     }
     let lower = font.to_ascii_lowercase();
     if let Some(num) = name.strip_prefix('g') {
+        let id: u32 = num.parse().ok()?;
+        // Times New Roman converted to CFF keeps its glyph ids as names
+        // ("g153" is ∑, Edexcel S1 Jun 2012).
+        if lower.starts_with("timesnewroman") {
+            return original_glyph(font, id, width);
+        }
         if lower.contains("symbol") {
-            let id: u32 = num.parse().ok()?;
-            let candidates: Vec<u32> = if (3..=97).contains(&id) { vec![id + 29] } else { vec![id + 63, id + 62] };
-            for code in candidates {
-                if code > 0xFF {
-                    continue;
-                }
-                if let Some((_, _, afm)) = SYMBOL_AFM.iter().find(|(c, _, _)| *c as u32 == code) {
-                    if width < 0.0 || (*afm - width).abs() <= 25.0 {
-                        return adobe_symbol(code as u8);
-                    }
-                }
+            let code = symbol_code(id)?;
+            let (_, _, afm) = SYMBOL_AFM.iter().find(|(c, _, _)| *c as u32 == code)?;
+            if width < 0.0 || (*afm - width).abs() <= 25.0 {
+                return adobe_symbol(code as u8);
             }
         }
         return None;
@@ -1317,6 +1734,285 @@ const SYMBOL_AFM: &[(u8, &str, f32)] = &[
     (0xFE, "bracerightbt", 494.0),
 ];
 
+
+/// Times New Roman (Monotype, version 7.12) glyph ids with the character each
+/// draws and its advance (/1000 em) in the regular, italic, bold and bold
+/// italic faces: only glyphs whose id and character agree in all four.
+const TIMES_NEW_ROMAN_GIDS: &[(u32, char, [f32; 4])] = &[
+    (4, '!', [333.0, 333.0, 333.0, 389.0]),
+    (5, '"', [408.0, 420.0, 555.0, 555.0]),
+    (6, '#', [500.0, 500.0, 500.0, 500.0]),
+    (7, '$', [500.0, 500.0, 500.0, 500.0]),
+    (8, '%', [833.0, 833.0, 1000.0, 833.0]),
+    (9, '&', [778.0, 778.0, 833.0, 778.0]),
+    (10, '\'', [180.0, 214.0, 278.0, 278.0]),
+    (11, '(', [333.0, 333.0, 333.0, 333.0]),
+    (12, ')', [333.0, 333.0, 333.0, 333.0]),
+    (13, '*', [500.0, 500.0, 500.0, 500.0]),
+    (14, '+', [564.0, 675.0, 570.0, 570.0]),
+    (15, ',', [250.0, 250.0, 250.0, 250.0]),
+    (16, '-', [333.0, 333.0, 333.0, 333.0]),
+    (17, '.', [250.0, 250.0, 250.0, 250.0]),
+    (18, '/', [278.0, 278.0, 278.0, 278.0]),
+    (19, '0', [500.0, 500.0, 500.0, 500.0]),
+    (20, '1', [500.0, 500.0, 500.0, 500.0]),
+    (21, '2', [500.0, 500.0, 500.0, 500.0]),
+    (22, '3', [500.0, 500.0, 500.0, 500.0]),
+    (23, '4', [500.0, 500.0, 500.0, 500.0]),
+    (24, '5', [500.0, 500.0, 500.0, 500.0]),
+    (25, '6', [500.0, 500.0, 500.0, 500.0]),
+    (26, '7', [500.0, 500.0, 500.0, 500.0]),
+    (27, '8', [500.0, 500.0, 500.0, 500.0]),
+    (28, '9', [500.0, 500.0, 500.0, 500.0]),
+    (29, ':', [278.0, 333.0, 333.0, 333.0]),
+    (30, ';', [278.0, 333.0, 333.0, 333.0]),
+    (31, '<', [564.0, 675.0, 570.0, 570.0]),
+    (32, '=', [564.0, 675.0, 570.0, 570.0]),
+    (33, '>', [564.0, 675.0, 570.0, 570.0]),
+    (34, '?', [444.0, 500.0, 500.0, 500.0]),
+    (35, '@', [921.0, 920.0, 930.0, 832.0]),
+    (36, 'A', [722.0, 611.0, 722.0, 667.0]),
+    (37, 'B', [667.0, 611.0, 667.0, 667.0]),
+    (38, 'C', [667.0, 667.0, 722.0, 667.0]),
+    (39, 'D', [722.0, 722.0, 722.0, 722.0]),
+    (40, 'E', [611.0, 611.0, 667.0, 667.0]),
+    (41, 'F', [556.0, 611.0, 611.0, 667.0]),
+    (42, 'G', [722.0, 722.0, 778.0, 722.0]),
+    (43, 'H', [722.0, 722.0, 778.0, 778.0]),
+    (44, 'I', [333.0, 333.0, 389.0, 389.0]),
+    (45, 'J', [389.0, 444.0, 500.0, 500.0]),
+    (46, 'K', [722.0, 667.0, 778.0, 667.0]),
+    (47, 'L', [611.0, 556.0, 667.0, 611.0]),
+    (48, 'M', [889.0, 833.0, 944.0, 889.0]),
+    (49, 'N', [722.0, 667.0, 722.0, 722.0]),
+    (50, 'O', [722.0, 722.0, 778.0, 722.0]),
+    (51, 'P', [556.0, 611.0, 611.0, 611.0]),
+    (52, 'Q', [722.0, 722.0, 778.0, 722.0]),
+    (53, 'R', [667.0, 611.0, 722.0, 667.0]),
+    (54, 'S', [556.0, 500.0, 556.0, 556.0]),
+    (55, 'T', [611.0, 556.0, 667.0, 611.0]),
+    (56, 'U', [722.0, 722.0, 722.0, 722.0]),
+    (57, 'V', [722.0, 611.0, 722.0, 667.0]),
+    (58, 'W', [944.0, 833.0, 1000.0, 889.0]),
+    (59, 'X', [722.0, 611.0, 722.0, 667.0]),
+    (60, 'Y', [722.0, 556.0, 722.0, 611.0]),
+    (61, 'Z', [611.0, 556.0, 667.0, 611.0]),
+    (62, '[', [333.0, 389.0, 333.0, 333.0]),
+    (63, '\\', [278.0, 278.0, 278.0, 278.0]),
+    (64, ']', [333.0, 389.0, 333.0, 333.0]),
+    (65, '^', [469.0, 422.0, 581.0, 570.0]),
+    (66, '_', [500.0, 500.0, 500.0, 500.0]),
+    (67, '`', [333.0, 333.0, 333.0, 333.0]),
+    (68, 'a', [444.0, 500.0, 500.0, 500.0]),
+    (69, 'b', [500.0, 500.0, 556.0, 500.0]),
+    (70, 'c', [444.0, 444.0, 444.0, 444.0]),
+    (71, 'd', [500.0, 500.0, 556.0, 500.0]),
+    (72, 'e', [444.0, 444.0, 444.0, 444.0]),
+    (73, 'f', [333.0, 278.0, 333.0, 333.0]),
+    (74, 'g', [500.0, 500.0, 500.0, 500.0]),
+    (75, 'h', [500.0, 500.0, 556.0, 556.0]),
+    (76, 'i', [278.0, 278.0, 278.0, 278.0]),
+    (77, 'j', [278.0, 278.0, 333.0, 278.0]),
+    (78, 'k', [500.0, 444.0, 556.0, 500.0]),
+    (79, 'l', [278.0, 278.0, 278.0, 278.0]),
+    (80, 'm', [778.0, 722.0, 833.0, 778.0]),
+    (81, 'n', [500.0, 500.0, 556.0, 556.0]),
+    (82, 'o', [500.0, 500.0, 500.0, 500.0]),
+    (83, 'p', [500.0, 500.0, 556.0, 500.0]),
+    (84, 'q', [500.0, 500.0, 556.0, 500.0]),
+    (85, 'r', [333.0, 389.0, 444.0, 389.0]),
+    (86, 's', [389.0, 389.0, 389.0, 389.0]),
+    (87, 't', [278.0, 278.0, 333.0, 278.0]),
+    (88, 'u', [500.0, 500.0, 556.0, 556.0]),
+    (89, 'v', [500.0, 444.0, 500.0, 444.0]),
+    (90, 'w', [722.0, 667.0, 722.0, 667.0]),
+    (91, 'x', [500.0, 444.0, 500.0, 500.0]),
+    (92, 'y', [500.0, 444.0, 500.0, 444.0]),
+    (93, 'z', [444.0, 389.0, 444.0, 389.0]),
+    (94, '{', [480.0, 400.0, 394.0, 348.0]),
+    (95, '|', [200.0, 275.0, 220.0, 220.0]),
+    (96, '}', [480.0, 400.0, 394.0, 348.0]),
+    (97, '~', [541.0, 541.0, 520.0, 570.0]),
+    (98, 'Ä', [722.0, 611.0, 722.0, 667.0]),
+    (99, 'Å', [722.0, 611.0, 722.0, 667.0]),
+    (100, 'Ç', [667.0, 667.0, 722.0, 667.0]),
+    (101, 'É', [611.0, 611.0, 667.0, 667.0]),
+    (102, 'Ñ', [722.0, 667.0, 722.0, 722.0]),
+    (103, 'Ö', [722.0, 722.0, 778.0, 722.0]),
+    (104, 'Ü', [722.0, 722.0, 722.0, 722.0]),
+    (105, 'á', [444.0, 500.0, 500.0, 500.0]),
+    (106, 'à', [444.0, 500.0, 500.0, 500.0]),
+    (107, 'â', [444.0, 500.0, 500.0, 500.0]),
+    (108, 'ä', [444.0, 500.0, 500.0, 500.0]),
+    (109, 'ã', [444.0, 500.0, 500.0, 500.0]),
+    (110, 'å', [444.0, 500.0, 500.0, 500.0]),
+    (111, 'ç', [444.0, 444.0, 444.0, 444.0]),
+    (112, 'é', [444.0, 444.0, 444.0, 444.0]),
+    (113, 'è', [444.0, 444.0, 444.0, 444.0]),
+    (114, 'ê', [444.0, 444.0, 444.0, 444.0]),
+    (115, 'ë', [444.0, 444.0, 444.0, 444.0]),
+    (116, 'í', [278.0, 278.0, 278.0, 278.0]),
+    (117, 'ì', [278.0, 278.0, 278.0, 278.0]),
+    (118, 'î', [278.0, 278.0, 278.0, 278.0]),
+    (119, 'ï', [278.0, 278.0, 278.0, 278.0]),
+    (120, 'ñ', [500.0, 500.0, 556.0, 556.0]),
+    (121, 'ó', [500.0, 500.0, 500.0, 500.0]),
+    (122, 'ò', [500.0, 500.0, 500.0, 500.0]),
+    (123, 'ô', [500.0, 500.0, 500.0, 500.0]),
+    (124, 'ö', [500.0, 500.0, 500.0, 500.0]),
+    (125, 'õ', [500.0, 500.0, 500.0, 500.0]),
+    (126, 'ú', [500.0, 500.0, 556.0, 556.0]),
+    (127, 'ù', [500.0, 500.0, 556.0, 556.0]),
+    (128, 'û', [500.0, 500.0, 556.0, 556.0]),
+    (129, 'ü', [500.0, 500.0, 556.0, 556.0]),
+    (131, '°', [400.0, 400.0, 400.0, 400.0]),
+    (132, '¢', [500.0, 500.0, 500.0, 500.0]),
+    (133, '£', [500.0, 500.0, 500.0, 500.0]),
+    (134, '§', [500.0, 500.0, 500.0, 500.0]),
+    (135, '•', [350.0, 350.0, 350.0, 350.0]),
+    (136, '¶', [453.0, 523.0, 540.0, 500.0]),
+    (137, 'ß', [500.0, 500.0, 556.0, 500.0]),
+    (138, '®', [760.0, 760.0, 747.0, 747.0]),
+    (139, '©', [760.0, 760.0, 747.0, 747.0]),
+    (140, '™', [980.0, 980.0, 1000.0, 1000.0]),
+    (141, '´', [333.0, 333.0, 333.0, 333.0]),
+    (142, '¨', [333.0, 333.0, 333.0, 333.0]),
+    (143, '≠', [549.0, 549.0, 549.0, 549.0]),
+    (144, 'Æ', [889.0, 889.0, 1000.0, 944.0]),
+    (145, 'Ø', [722.0, 722.0, 778.0, 722.0]),
+    (146, '∞', [713.0, 713.0, 713.0, 713.0]),
+    (147, '±', [549.0, 549.0, 549.0, 549.0]),
+    (148, '≤', [549.0, 549.0, 549.0, 549.0]),
+    (149, '≥', [549.0, 549.0, 549.0, 549.0]),
+    (150, '¥', [500.0, 500.0, 500.0, 500.0]),
+    (151, 'µ', [576.0, 576.0, 576.0, 576.0]),
+    (152, '∂', [494.0, 494.0, 494.0, 494.0]),
+    (153, '∑', [713.0, 713.0, 713.0, 713.0]),
+    (154, '∏', [823.0, 823.0, 823.0, 823.0]),
+    (156, '∫', [274.0, 274.0, 274.0, 274.0]),
+    (157, 'ª', [276.0, 276.0, 300.0, 266.0]),
+    (158, 'º', [310.0, 310.0, 330.0, 300.0]),
+    (159, 'Ω', [768.0, 768.0, 768.0, 768.0]),
+    (160, 'æ', [667.0, 667.0, 722.0, 722.0]),
+    (161, 'ø', [500.0, 500.0, 500.0, 500.0]),
+    (162, '¿', [444.0, 500.0, 500.0, 500.0]),
+    (163, '¡', [333.0, 389.0, 333.0, 389.0]),
+    (164, '¬', [564.0, 675.0, 570.0, 606.0]),
+    (165, '√', [549.0, 549.0, 549.0, 549.0]),
+    (167, '≈', [549.0, 549.0, 549.0, 549.0]),
+    (168, '∆', [612.0, 612.0, 612.0, 612.0]),
+    (169, '«', [500.0, 500.0, 500.0, 500.0]),
+    (170, '»', [500.0, 500.0, 500.0, 500.0]),
+    (171, '…', [1000.0, 889.0, 1000.0, 1000.0]),
+    (172, 'À', [722.0, 611.0, 722.0, 667.0]),
+    (173, 'Ã', [722.0, 611.0, 722.0, 667.0]),
+    (174, 'Õ', [722.0, 722.0, 778.0, 722.0]),
+    (177, '–', [500.0, 500.0, 500.0, 500.0]),
+    (178, '—', [1000.0, 889.0, 1000.0, 1000.0]),
+    (179, '“', [444.0, 556.0, 500.0, 500.0]),
+    (180, '”', [444.0, 556.0, 500.0, 500.0]),
+    (181, '‘', [333.0, 333.0, 333.0, 333.0]),
+    (182, '’', [333.0, 333.0, 333.0, 333.0]),
+    (183, '÷', [549.0, 549.0, 549.0, 549.0]),
+    (185, 'ÿ', [500.0, 444.0, 500.0, 444.0]),
+    (197, '‰', [1000.0, 1000.0, 1000.0, 1000.0]),
+    (198, 'Â', [722.0, 611.0, 722.0, 667.0]),
+    (199, 'Ê', [611.0, 611.0, 667.0, 667.0]),
+    (200, 'Á', [722.0, 611.0, 722.0, 667.0]),
+    (201, 'Ë', [611.0, 611.0, 667.0, 667.0]),
+    (202, 'È', [611.0, 611.0, 667.0, 667.0]),
+    (203, 'Í', [333.0, 333.0, 389.0, 389.0]),
+    (204, 'Î', [333.0, 333.0, 389.0, 389.0]),
+    (205, 'Ï', [333.0, 333.0, 389.0, 389.0]),
+    (206, 'Ì', [333.0, 333.0, 389.0, 389.0]),
+    (207, 'Ó', [722.0, 722.0, 778.0, 722.0]),
+    (208, 'Ô', [722.0, 722.0, 778.0, 722.0]),
+    (209, 'Ò', [722.0, 722.0, 778.0, 722.0]),
+    (210, 'Ú', [722.0, 722.0, 722.0, 722.0]),
+    (211, 'Û', [722.0, 722.0, 722.0, 722.0]),
+    (212, 'Ù', [722.0, 722.0, 722.0, 722.0]),
+    (220, '¸', [333.0, 333.0, 333.0, 333.0]),
+    (230, '¦', [200.0, 275.0, 220.0, 220.0]),
+    (231, 'Ð', [722.0, 722.0, 722.0, 722.0]),
+    (232, 'ð', [500.0, 500.0, 500.0, 500.0]),
+    (233, 'Ý', [722.0, 556.0, 722.0, 611.0]),
+    (234, 'ý', [500.0, 444.0, 500.0, 444.0]),
+    (235, 'Þ', [556.0, 611.0, 611.0, 611.0]),
+    (236, 'þ', [500.0, 500.0, 556.0, 500.0]),
+    (237, '−', [564.0, 675.0, 570.0, 606.0]),
+    (238, '×', [564.0, 675.0, 570.0, 570.0]),
+    (239, '¹', [300.0, 300.0, 300.0, 300.0]),
+    (240, '²', [300.0, 300.0, 300.0, 300.0]),
+    (241, '³', [300.0, 300.0, 300.0, 300.0]),
+    (242, '½', [750.0, 750.0, 750.0, 750.0]),
+    (243, '¼', [750.0, 750.0, 750.0, 750.0]),
+    (244, '¾', [750.0, 750.0, 750.0, 750.0]),
+    (256, '¯', [500.0, 500.0, 500.0, 500.0]),
+    (299, 'Γ', [578.0, 569.0, 636.0, 604.0]),
+    (300, 'Θ', [722.0, 722.0, 778.0, 763.0]),
+    (301, 'Φ', [731.0, 761.0, 829.0, 789.0]),
+    (302, 'α', [524.0, 525.0, 558.0, 553.0]),
+    (303, 'δ', [471.0, 465.0, 519.0, 512.0]),
+    (304, 'ε', [420.0, 394.0, 427.0, 410.0]),
+    (305, 'σ', [539.0, 493.0, 544.0, 539.0]),
+    (306, 'τ', [402.0, 358.0, 461.0, 444.0]),
+    (307, 'φ', [577.0, 553.0, 624.0, 585.0]),
+    (312, '←', [1000.0, 1000.0, 1000.0, 1000.0]),
+    (313, '↑', [500.0, 500.0, 500.0, 500.0]),
+    (314, '→', [1000.0, 1000.0, 1000.0, 1000.0]),
+    (315, '↓', [500.0, 500.0, 500.0, 500.0]),
+    (397, '′', [219.0, 219.0, 281.0, 281.0]),
+    (398, '″', [417.0, 417.0, 552.0, 552.0]),
+    (505, 'Α', [722.0, 611.0, 722.0, 667.0]),
+    (506, 'Β', [667.0, 611.0, 667.0, 667.0]),
+    (507, 'Δ', [643.0, 587.0, 627.0, 627.0]),
+    (508, 'Ε', [611.0, 611.0, 667.0, 667.0]),
+    (509, 'Ζ', [611.0, 556.0, 667.0, 611.0]),
+    (510, 'Η', [722.0, 722.0, 778.0, 778.0]),
+    (511, 'Ι', [333.0, 333.0, 389.0, 389.0]),
+    (512, 'Κ', [722.0, 667.0, 778.0, 667.0]),
+    (513, 'Λ', [725.0, 604.0, 717.0, 667.0]),
+    (514, 'Μ', [889.0, 833.0, 944.0, 889.0]),
+    (515, 'Ν', [722.0, 667.0, 722.0, 722.0]),
+    (516, 'Ξ', [643.0, 639.0, 677.0, 659.0]),
+    (517, 'Ο', [722.0, 722.0, 778.0, 722.0]),
+    (518, 'Π', [722.0, 722.0, 778.0, 778.0]),
+    (519, 'Ρ', [556.0, 611.0, 611.0, 611.0]),
+    (520, 'Σ', [582.0, 594.0, 654.0, 619.0]),
+    (521, 'Τ', [611.0, 556.0, 667.0, 611.0]),
+    (522, 'Υ', [722.0, 556.0, 722.0, 611.0]),
+    (523, 'Χ', [722.0, 611.0, 722.0, 667.0]),
+    (524, 'Ψ', [738.0, 703.0, 780.0, 800.0]),
+    (525, 'Ω', [743.0, 723.0, 801.0, 746.0]),
+    (526, 'Ϊ', [333.0, 333.0, 389.0, 389.0]),
+    (527, 'Ϋ', [722.0, 556.0, 722.0, 611.0]),
+    (528, 'ά', [524.0, 525.0, 558.0, 553.0]),
+    (529, 'έ', [420.0, 394.0, 427.0, 410.0]),
+    (530, 'ή', [523.0, 496.0, 568.0, 549.0]),
+    (531, 'ί', [269.0, 278.0, 310.0, 278.0]),
+    (532, 'ΰ', [495.0, 459.0, 519.0, 490.0]),
+    (533, 'β', [509.0, 498.0, 527.0, 512.0]),
+    (534, 'γ', [442.0, 394.0, 468.0, 416.0]),
+    (535, 'ζ', [414.0, 405.0, 413.0, 441.0]),
+    (536, 'η', [523.0, 496.0, 568.0, 549.0]),
+    (537, 'θ', [479.0, 491.0, 522.0, 519.0]),
+    (538, 'ι', [269.0, 278.0, 310.0, 278.0]),
+    (539, 'κ', [504.0, 480.0, 555.0, 530.0]),
+    (540, 'λ', [485.0, 433.0, 491.0, 444.0]),
+    (541, 'μ', [536.0, 502.0, 567.0, 556.0]),
+    (542, 'ν', [452.0, 444.0, 447.0, 444.0]),
+    (543, 'ξ', [446.0, 428.0, 446.0, 449.0]),
+    (544, 'ο', [500.0, 500.0, 500.0, 500.0]),
+    (545, 'ρ', [499.0, 480.0, 535.0, 515.0]),
+    (546, 'ς', [396.0, 406.0, 422.0, 446.0]),
+    (547, 'υ', [495.0, 459.0, 519.0, 490.0]),
+    (548, 'χ', [444.0, 440.0, 462.0, 465.0]),
+    (549, 'ψ', [626.0, 621.0, 688.0, 668.0]),
+    (550, 'ω', [658.0, 706.0, 731.0, 723.0]),
+    (651, '№', [954.0, 943.0, 1005.0, 915.0]),
+    (652, 'π', [505.0, 501.0, 548.0, 546.0]),
+];
+
 // ── Glyph identity ──────────────────────────────────────────────────────────
 
 /// Cambridge (CIE) `NewMathSymb` / `NewMathExtn` fonts carry a ToUnicode map
@@ -1366,9 +2062,13 @@ fn mathtype_private(raw: u32, lower: &str) -> Option<char> {
         };
     }
     if lower.contains("euclidextra") {
+        // (Edexcel chemistry: the equilibrium arrow and the standard-state
+        // sign of "E⦵", which arrives as "d".)
         return match raw {
             0xF0A1 => Some('ℝ'),
             0xF0A5 => Some('ℕ'),
+            0xF083 => Some('⇌'),
+            0x64 => Some('⦵'),
             _ => None,
         };
     }
@@ -1379,6 +2079,67 @@ fn mathtype_private(raw: u32, lower: &str) -> Option<char> {
         };
     }
     None
+}
+
+/// MathMagic's equation fonts (OCR and CIE papers) draw maths symbols at
+/// ASCII codes with no ToUnicode map, so the text layer reads "÷" as "'",
+/// "<" as "1" and a bracket piece as "K". Each entry was established from
+/// the rendered glyph in the source papers (glyph inventories of OCR J560
+/// June 2024, OCR MEI June 2025 and CIE 0580 November 2022; MMRelation's ≡
+/// and ⩾ and MMGreekItalic from OCR Further November 2021); other codes of
+/// these symbol fonts stay unknown. The MMTimes fonts are ordinary text.
+fn mathmagic(raw: u32, lower: &str) -> Option<char> {
+    // "MMBinary", "MMaExtra-Regular", "MMaVariable2-Regular" …
+    let name = lower.strip_suffix("-regular").unwrap_or(lower);
+    let family = ["mma", "mm"].iter().find_map(|p| name.strip_prefix(p).filter(|f| MATHMAGIC_FAMILIES.iter().any(|(n, _)| n == f)));
+    let table: &[(u32, char)] = match family {
+        Some(f) => MATHMAGIC_FAMILIES.iter().find(|(n, _)| *n == f)?.1,
+        // The MMTimes faces are text; any other MathMagic font is a symbol
+        // font whose codes are not established.
+        None if name.starts_with("mm") && !name.trim_start_matches("mma").trim_start_matches("mm").starts_with("times") => &[],
+        None => return None,
+    };
+    Some(table.iter().find(|(r, _)| *r == raw).map(|(_, c)| *c).unwrap_or(if raw == 0x20 { ' ' } else { UNKNOWN_GLYPH }))
+}
+
+/// MathMagic symbol fonts and the characters established at their codes.
+const MATHMAGIC_FAMILIES: &[(&str, &[(u32, char)])] = &[
+    ("binary", &[(0x21, '±'), (0x23, '×'), (0x27, '÷')]),
+    ("extra", &[(0x31, '<'), (0x32, '>')]),
+    // Parentheses in steps of size: opening at "^ _ a c e f", closing at
+    // "h i k m o p".
+    ("variablea", &[(0x5E, '('), (0x5F, '('), (0x61, '('), (0x63, '('), (0x65, '('), (0x66, '('), (0x68, ')'), (0x69, ')'), (0x6B, ')'), (0x6D, ')'), (0x6F, ')'), (0x70, ')')]),
+    ("variable", &[(0x2F, '∑'), (0x4A, '⎛'), (0x4B, '⎜'), (0x4C, '⎝'), (0x4E, '⎞'), (0x4F, '⎟'), (0x50, '⎠')]),
+    ("variable2", &[(0x4A, '⎛'), (0x4B, '⎜'), (0x4C, '⎝'), (0x4E, '⎞'), (0x4F, '⎟'), (0x50, '⎠')]),
+    ("greek", &[(0x72, 'π')]),
+    ("relation", &[(0x21, '∈'), (0x2B, '∼'), (0x2F, '≡'), (0x47, '⩽'), (0x48, '⩾')]),
+    // (OCR Further Nov 2021: its own order, not the Symbol font's.)
+    ("greekitalic", &[(0x61, 'α'), (0x62, 'β'), (0x63, 'γ'), (0x69, 'θ'), (0x6D, 'λ'), (0x72, 'π')]),
+    ("arrow", &[(0x22, '→')]),
+    ("etc", &[(0x6C, '′')]),
+    ("fermat", &[(0x4E, 'ℕ'), (0x52, 'ℝ')]),
+];
+
+/// Advent 3B2's maths fonts (AQA papers) carry ToUnicode maps that name the
+/// glyph slot, not the symbol ("¼" for "=", "þ" for "+"). Each entry was
+/// established from the rendered glyph in the source paper (glyph inventory
+/// of AQA 7357/1 June 2019); other codes of these fonts stay unknown.
+/// Control-range codes are resolved by glyph name in [`glyph_name_to_char`].
+fn advent(raw: u32, lower: &str) -> Option<char> {
+    let table: &[(u32, char)] = match lower {
+        "advp4c4e74" => &[(0x21, '→'), (0x31, '∞'), (0x70, '√'), (0xBC, '='), (0xFE, '+')],
+        "advp4c4e46" => &[(0x58, '∑'), (0xF0, '∫')],
+        "advp4c4e51" => &[(0x3A, '.'), (0x3E, '>')],
+        "advpi1" => &[(0x70, 'π')],
+        "advpi2" => &[(0x79, 'θ')],
+        "advps0601" => &[(0xAA, '©')],
+        // The black pointer of "Turn over ►".
+        "advps0501" => &[(0x73, '►')],
+        // Other Advent maths and Greek fonts: codes not established.
+        _ if lower.starts_with("advp4c4e") || lower.starts_with("advpi") => &[],
+        _ => return None,
+    };
+    Some(table.iter().find(|(r, _)| *r == raw).map(|(_, c)| *c).unwrap_or(if raw == 0x20 { ' ' } else { UNKNOWN_GLYPH }))
 }
 
 /// Decorative dingbat fonts (page-corner markers, tier shapes, answer tick
@@ -1400,15 +2161,20 @@ pub fn resolve_identity(raw: u32, font: &str) -> char {
     if let Some(c) = mathtype_private(raw, &lower) {
         return c;
     }
+    if let Some(c) = mathmagic(raw, &lower).or_else(|| advent(raw, &lower)) {
+        return c;
+    }
     if is_decoration_font(font) {
         // Word sets its "-->" / "<--" arrows in Wingdings (the light barb
-        // arrows 0xDF–0xE2); every other dingbat is decoration.
+        // arrows 0xDF–0xE2) and the tick of "Tick (✓) one box" (0xFC);
+        // every other dingbat is decoration.
         if lower.contains("wingdings") && !lower.contains("wingdings2") && !lower.contains("wingdings3") {
             match raw {
                 0xF0DF => return '←',
                 0xF0E0 => return '→',
                 0xF0E1 => return '↑',
                 0xF0E2 => return '↓',
+                0xF0FC => return '✓',
                 _ => {}
             }
         }
@@ -1744,6 +2510,11 @@ pub struct LayoutPage {
     /// Pictures that are page furniture (printed at one place on many
     /// pages: a QR code, the margin strips), withheld from figures.
     pub furniture_images: Vec<[f32; 4]>,
+    /// The page is a scan (one page-sized picture, no text but furniture)
+    /// and its lines come from local OCR.
+    pub ocr: bool,
+    /// The page is a scan and no local OCR could read it.
+    pub scan_unread: bool,
 }
 
 impl LayoutPage {
@@ -1956,18 +2727,46 @@ static HEADER_FOOTER_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock
         r"|(?:\d{1,3}\s+)?[a-z]{1,3}\d{4,6}[a-z]\d{0,4}(?:\s+\d{1,3})?",
         r"|pmt|leave\s+blank",
         r"|do not write (?:in|outside) (?:this area|the box)",
+        r"|typesetter code",
         r")$"
     ))
     .unwrap()
 });
 
 static MARGIN_TEXT_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
-    regex::Regex::new(r"(?i)^(?:do not write|outside the|box|do not write outside the box|do not write outside|the box|outside|leave blank|for examiner.?s use)\s*$").unwrap()
+    regex::Regex::new(r"(?i)^(?:do not write|outside the|box|do not write outside the box|do not write outside|the box|outside|leave blank|for examiner.?s use|examiner(?:\s+only)?|only)\s*$").unwrap()
 });
 
 static NAVIGATION_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
-    regex::Regex::new(r"(?i)^(?:do not write on this page|answer in the spaces provided|turn over for the next question|turn over for question \d+|question \d+ continues on the next page\.?|turn over\s*[►>]*|\(?\s*question \d+ continues? (?:on|over)(?: the)? (?:next|following) page\s*\)?\.?)$").unwrap()
+    // (WJEC's blank pages: "BLANK PAGE / PLEASE DO NOT WRITE / ON THIS PAGE".)
+    regex::Regex::new(concat!(
+        r"(?i)^(?:do not write on this page|blank page|section [a-z0-9]{1,2} (?:starts|begins) on the next page\.?|answer in the spaces provided|turn over for the next question|turn over for question \d+|question \d+ continues on the next page\.?|turn over\s*[►>]*|\(?\s*question \d+ continues? (?:on|over)(?: the)? (?:next|following) page\s*\)?\.?",
+        // Section totals and the candidate's instructions printed around
+        // the questions ("TOTAL FOR SECTION A = 20 MARKS", "Your answer").
+        r"|total for (?:section [a-z]|statistics|mechanics)\s*(?:is|=|:)?\s*\d+\s*marks?|turn over for the next section\.?",
+        // (Matched in their printed capitals: the tail of a sentence
+        // wrapped onto a line of its own, "… for / your answer", stays.)
+        r"|(?-i:Your answer|Start your answer here)\.?|extra space is available on the next page if needed\.?",
+        r"|save your work for question \d+ (?:as|in) (?:a|the) word[- ]processed document named \S+",
+        r"|(?-i:QUESTION \d+ IS THE|LAST QUESTION IN SECTION [A-Z])",
+        // (A notice on a page before the question it names.)
+        r"|question \d+ begins on (?:the next page|page \d+)\.?",
+        // (Edexcel's answer-form box for the alternative answered.)
+        r"|chosen question number:.*",
+        // The board's copyright line, which OCR and WJEC also print above
+        // the footer zone ("© OCR 2018" under a question's last answer
+        // line), and an extract's source attribution.
+        r"|©\s*(?:ocr|wjec)\b.*|source:\s+[^,]{1,60},\s*(?:19|20)\d{2}\.?",
+        r")$"
+    ))
+    .unwrap()
 });
+
+static BLANK_NOTICE_RE: std::sync::LazyLock<regex::Regex> =
+    std::sync::LazyLock::new(|| regex::Regex::new(r"(?i)^(?:please )?do not write(?: on this page)?$|^on this page$").unwrap());
+
+static QUESTION_NO_RE: std::sync::LazyLock<regex::Regex> =
+    std::sync::LazyLock::new(|| regex::Regex::new(r"(?i)^question\s+no\.?\s*[.…_]{5,}$").unwrap());
 
 /// "[Questions 10, 11 and 12 are printed on the next page.]"
 static PRINTED_ON_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
@@ -1985,6 +2784,9 @@ static CONTINUED_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::ne
 
 static ANSWER_RUN_RE: std::sync::LazyLock<regex::Regex> =
     std::sync::LazyLock::new(|| regex::Regex::new(r"[.…]{5,}|_{3,}").unwrap());
+/// The allocation printed at the end of a line ("[2]", "[2 marks]", "(2)").
+static ANSWER_MARK_END_RE: std::sync::LazyLock<regex::Regex> =
+    std::sync::LazyLock::new(|| regex::Regex::new(r"\s*(\[\s*\d{1,2}\s*(?:marks?)?\s*\]|\(\d{1,2}\))\s*$").unwrap());
 static LATEX_WORD_RE: std::sync::LazyLock<regex::Regex> =
     std::sync::LazyLock::new(|| regex::Regex::new(r"\\[A-Za-z]+|[${}]").unwrap());
 
@@ -2008,6 +2810,177 @@ fn is_answer_line_text(t: &str) -> bool {
     let rest = LATEX_WORD_RE.replace_all(&rest, " ");
     let visible: String = rest.chars().filter(|c| !c.is_whitespace()).collect();
     runs >= 10 && visible.chars().count() <= 6 && rest.split_whitespace().count() <= 4
+}
+
+/// Words that open an instruction, never an answer label ("Name the gas
+/// ………", "Explain why …").
+const COMMAND_VERBS: [&str; 25] = [
+    "name", "state", "give", "write", "calculate", "suggest", "identify", "explain", "describe", "complete", "draw", "find", "show",
+    "determine", "estimate", "deduce", "use", "plot", "label", "measure", "predict", "evaluate", "compare", "outline", "tick",
+];
+
+/// The units printed beside answer space ("……… cm", "……… kJ mol⁻¹",
+/// "……… kilometres per hour"): one closed vocabulary for every
+/// answer-space recogniser.
+const ANSWER_UNITS: &str = concat!(
+    r"£|€|¤|%|°|°C|Ω|per|seconds?|minutes?|mins|hours?|days|weeks|months|years",
+    r"|(?:kilo|centi|milli)?(?:metres?|grams?|litres?)|newtons?|joules?|watts?|volts?|ohms?|degrees?|lux|Bq|[kMG]?eV|kWh|Gy|Sv|Wb|rad|dB",
+    r"|(?:(?:[mckµn]|k)?m|g|kg|mg|s|ms|min|h|l|ml|cl|cents|p|N|kN|J|kJ|W|kW|V|A|mA|Hz|Pa|kPa|K|mol|dm|cm)-?[123]?",
+    r"(?:/(?:s|h|min|kg|m|l|mol)-?[123]?)?"
+);
+
+/// A part's answer label before its answer space ("(a)(ii) ………").
+/// A part label's letter or numeral: "(a)" … "(h)", "(i)" … "(x)".
+const PART_LABEL: &str = r"(?:[a-h]|i{1,3}|iv|vi{0,3}|ix|x)";
+
+static PART_LABELS_RE: std::sync::LazyLock<regex::Regex> =
+    std::sync::LazyLock::new(|| regex::Regex::new(&format!(r"^\s*(?:\({PART_LABEL}\)\s*)*")).unwrap());
+
+/// The words printed beside a line's answer space, maths unwrapped
+/// ("$\mathrm{B} =$" reads "B =", "\mathrm{cm}^{2}" reads "cm2",
+/// "$\sigma =$" reads "σ ="); `None` when other maths is printed there: a
+/// radical or a fraction makes the line question text ("√x = ……… [1]"). A
+/// Greek letter naming the quantity ("\sigma", "\lambda_1") is a word, and a
+/// relation spelt in LaTeX ("\leqslant") is the relation.
+fn answer_space_words(s: &str) -> Option<Vec<String>> {
+    static LATEX_RE: std::sync::LazyLock<regex::Regex> =
+        std::sync::LazyLock::new(|| regex::Regex::new(r"\\(?:mathrm|text|mathbf|operatorname|circ)\b|\\").unwrap());
+    static NAME_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| regex::Regex::new(r"\\[A-Za-z]+").unwrap());
+    const RELATIONS: [(&str, char); 4] = [("\\leqslant", '⩽'), ("\\geqslant", '⩾'), ("\\leq", '≤'), ("\\geq", '≥')];
+    let s = NAME_RE.replace_all(s, |c: &regex::Captures| {
+        let symbol = GREEK_LATEX.iter().find(|&&(_, l)| l == &c[0]).map(|&(g, _)| g);
+        symbol.or_else(|| RELATIONS.iter().find(|&&(l, _)| l == &c[0]).map(|&(_, r)| r)).map_or(c[0].to_string(), String::from)
+    });
+    if LATEX_RE.find_iter(&s).any(|w| w.as_str() == "\\") {
+        return None;
+    }
+    let s = s.replace("\\circ", "°");
+    let s = LATEX_RE.replace_all(&s, " ");
+    Some(s.replace(['{', '}', '^', '$', '_'], "").split_whitespace().map(str::to_string).collect())
+}
+
+/// A dotted answer line under a short label: "Total resistance = ………",
+/// "C–H bond enthalpy = ……… kJ mol⁻¹", "Mistake 1: ………", "Explanation ………",
+/// "……… kilometres per hour". It is answer space, like the drawn-rule
+/// prompt "temperature = ____ K" (`is_answer_prompt`). The label is at most
+/// eight words ending in "=" or ":", or at most four words each with a
+/// letter; it opens with no command ("Name the gas ………", "Calculate 15% of
+/// 80 = ………"), and an unlabelled one reads as a name, not a sentence (the
+/// cloze "The nucleus contains protons and ………", "Energy is transferred
+/// ………" and the terms "1 3 6 10 ………" are question text). Beside the dots
+/// there are only units (`ANSWER_UNITS`); a blank in a script
+/// ("${}^{……}_{……}\mathrm{K}$", a nuclide to complete) is no answer space.
+/// Returns the allocation printed at the end of the line, if any
+/// (`Some(None)` when there is none).
+fn dotted_answer_prompt(t: &str) -> Option<Option<String>> {
+    static UNIT_WORD_RE: std::sync::LazyLock<regex::Regex> =
+        std::sync::LazyLock::new(|| regex::Regex::new(&format!(r"^(?:/|{ANSWER_UNITS})$")).unwrap());
+    static SCRIPT_BLANK_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| regex::Regex::new(r"[\^_]\{\s*(?:\.{3,}|…)").unwrap());
+    const RUN_ON: [&str; 22] = [
+        "a", "an", "the", "and", "or", "of", "is", "are", "was", "were", "by", "to", "in", "on", "at", "for", "with", "from", "as",
+        "be", "has", "have",
+    ];
+    const LINKING: [&str; 11] = ["is", "are", "was", "were", "be", "been", "has", "have", "had", "called", "known"];
+    let plain = t.replace("\\$", "¤");
+    let (body, mark) = match ANSWER_MARK_END_RE.captures(&plain) {
+        Some(m) => (plain[..m.get(0)?.start()].to_string(), Some(m[1].to_string())),
+        None => (plain.clone(), None),
+    };
+    if SCRIPT_BLANK_RE.is_match(&body) {
+        return None;
+    }
+    let runs: Vec<regex::Match> = ANSWER_RUN_RE.find_iter(&body).collect();
+    if runs.iter().map(|r| r.as_str().chars().count()).sum::<usize>() < 10 {
+        return None;
+    }
+    let (first, last) = (runs.first()?, runs.last()?);
+    let head = PART_LABELS_RE.replace(&body[..first.start()], "").to_string();
+    let tail = &body[last.end()..];
+    if head.chars().count() > 60 {
+        return None;
+    }
+    let mut head_words = answer_space_words(&head)?;
+    let tail_words = answer_space_words(tail)?;
+    // Between two blanks, only what joins them ("x = ……… or x = ………").
+    for gap in runs.windows(2) {
+        let between = answer_space_words(&body[gap[0].end()..gap[1].start()])?;
+        if !between.iter().all(|w| matches!(w.as_str(), "or" | "and" | "=" | "," | ":") || w.chars().count() == 1 && w.chars().all(char::is_alphabetic)) {
+            return None;
+        }
+    }
+    if head_words.is_empty() && tail_words.is_empty() {
+        return None;
+    }
+    // Sentence punctuation means prose: a cloze or a question.
+    let only_decimal_points = |s: &str| {
+        s.char_indices().filter(|&(_, c)| c == '.').all(|(i, _)| {
+            let b = s.as_bytes();
+            i > 0 && i + 1 < b.len() && b[i - 1].is_ascii_digit() && b[i + 1].is_ascii_digit()
+        })
+    };
+    if head.contains(['?', '!', ';']) || !only_decimal_points(&head) || tail.contains(['?', '!', ';', '.']) {
+        return None;
+    }
+    if !tail_words.iter().all(|w| UNIT_WORD_RE.is_match(w)) {
+        return None;
+    }
+    // A currency sign before the blank is its unit ("Bills = $ ………").
+    while head_words.last().is_some_and(|w| matches!(w.as_str(), "£" | "€" | "¤")) {
+        head_words.pop();
+    }
+    // Ends in "=" or ":" outside the maths.
+    let labelled = head_words.last().is_some_and(|w| w.ends_with(['=', ':']));
+    let label: Vec<String> = head_words.iter().filter(|w| !matches!(w.as_str(), "=" | ":")).map(|w| w.to_lowercase()).collect();
+    let word = |i: usize| label.get(i).map(|w| w.trim_end_matches(':'));
+    // ("Name of compound" is a label; "Name the gas", "Work out" commands.)
+    let command = word(0).is_some_and(|w| COMMAND_VERBS.contains(&w)) && word(1) != Some("of") || word(0) == Some("work") && word(1) == Some("out");
+    let short_noun_phrase = label.len() <= 4
+        && label.iter().all(|w| w.chars().any(char::is_alphabetic))
+        && !label.iter().any(|w| COMMAND_VERBS.contains(&w.trim_end_matches(':')) || LINKING.contains(&w.as_str()))
+        && !word(0).is_some_and(|w| RUN_ON.contains(&w))
+        && !label.last().is_some_and(|w| RUN_ON.contains(&w.as_str()));
+    if label.len() > 8 || command || !(labelled || short_noun_phrase) {
+        return None;
+    }
+    Some(mark)
+}
+
+/// The allocation closing a line of answer space, as printed ("[5]"), for
+/// OCR/CIE answer lines that end in the mark: "(a) ………… [1]",
+/// "………… cm [1]", "(b)(i) x = ……… or x = ……… [3]". Before the dots there
+/// may be the part's answer label; besides the dots only units and the
+/// words of an answer prompt (a variable, "=", "or"). Anything else
+/// ("1 3 6 10 ……… [1]", "Find k ……… [2]", "√x = ……… [1]") is question text.
+fn answer_space_mark(t: &str) -> Option<String> {
+    static PROMPT_WORD_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(&format!(
+            // (A variable or a length named by its end points: "x =", "AB =".)
+            r"^(?:[A-Za-z]|\p{{Greek}}|[A-Z]{{2,3}}|or|and|to|Answer|{ANSWER_UNITS})$|^[=:,()–—<>≤≥⩽⩾-]$"
+        ))
+        .unwrap()
+    });
+    // (A dollar sign in prose is escaped: "\$ ………… [2]".)
+    let plain = plain_line(&t.replace("\\$", "¤"));
+    let m = ANSWER_MARK_END_RE.captures(&plain)?;
+    let head = &plain[..m.get(0)?.start()];
+    let head = PART_LABELS_RE.replace(head, "");
+    let runs: usize = ANSWER_RUN_RE.find_iter(&head).map(|r| r.as_str().chars().count()).sum();
+    if runs < 10 {
+        return None;
+    }
+    let rest = ANSWER_RUN_RE.replace_all(&head, " ");
+    let words = answer_space_words(&rest)?;
+    if words.len() > 6 || !words.iter().all(|w| PROMPT_WORD_RE.is_match(w)) {
+        return None;
+    }
+    // The allocation as printed.
+    Some(m[1].to_string())
+}
+
+/// The allocation printed at the end of a line of answer space, by either
+/// recogniser.
+fn answer_space_tag(t: &str) -> Option<String> {
+    answer_space_mark(t).or_else(|| dotted_answer_prompt(t).flatten())
 }
 
 // ── Glyph classes used by structure recognition and emission ────────────────
@@ -2218,7 +3191,14 @@ pub fn layout_page(pg: &PageGlyphs) -> LayoutPage {
             .iter()
             .min_by(|a, b| a.x0.partial_cmp(&b.x0).unwrap_or(std::cmp::Ordering::Equal))
             .and_then(|it| it.glyphs.first().copied());
-        let bold_lead = first_glyph.map(|g| pg.glyphs[g].bold).unwrap_or(false);
+        // (A star before a question number, "*9", may be set in the text
+        // weight: the number's weight is the heading's.)
+        let mut lead: Vec<usize> = glyphs.iter().copied().filter(|&g| !is_space_char(pg.glyphs[g].ch)).collect();
+        lead.sort_by(|&a, &b| pg.glyphs[a].x0.total_cmp(&pg.glyphs[b].x0));
+        let bold_lead = match lead.as_slice() {
+            [star, digit, ..] if pg.glyphs[*star].ch == '*' && pg.glyphs[*digit].ch.is_ascii_digit() => pg.glyphs[*digit].bold,
+            _ => first_glyph.map(|g| pg.glyphs[g].bold).unwrap_or(false),
+        };
         // Code (a monospace line: a program, an SQL statement) is copied
         // verbatim: no maths, no Markdown interpretation.
         if let Some((text, char_width)) = code_line_text(pg, &glyphs) {
@@ -2256,6 +3236,23 @@ pub fn layout_page(pg: &PageGlyphs) -> LayoutPage {
     }
     for (mut line, kind) in built.into_iter().zip(kinds) {
         line.furniture = kind;
+        // The allocation that closes a line of answer space is the
+        // question's: it stays a body line of its own.
+        if let Some(tag) = matches!(kind, Some(FurnitureKind::AnswerLine | FurnitureKind::AnswerPrompt))
+            .then(|| answer_space_tag(&line.text))
+            .flatten()
+        {
+            let open = if tag.starts_with('(') { '(' } else { '[' };
+            // (Its glyphs are the last opening bracket's and those after it.)
+            let from = line.glyphs.iter().copied().filter(|&g| pg.glyphs[g].ch == open).map(|g| pg.glyphs[g].x0).reduce(f32::max);
+            if let Some(from) = from {
+                let (glyphs, rest): (Vec<usize>, Vec<usize>) = line.glyphs.iter().copied().partition(|&g| pg.glyphs[g].x0 >= from - 0.5);
+                let x0 = glyphs.iter().map(|&g| pg.glyphs[g].x0).fold(f32::MAX, f32::min);
+                let x1 = glyphs.iter().map(|&g| pg.glyphs[g].x1).fold(f32::MIN, f32::max);
+                lp.lines.push(LayoutLine { x0, x1, text: tag, glyphs, furniture: None, bold_lead: false, unplaced: 0, code: false, char_width: 0.0, ..line.clone() });
+                line.glyphs = rest;
+            }
+        }
         if line.furniture.is_some() {
             lp.furniture.push(line);
         } else {
@@ -2297,6 +3294,67 @@ pub fn layout_page(pg: &PageGlyphs) -> LayoutPage {
     lp.lines.extend(table_lines);
     lp.lines.sort_by(|a, b| a.baseline.partial_cmp(&b.baseline).unwrap_or(std::cmp::Ordering::Equal));
     lp
+}
+
+/// A page with print on it (pictures or drawn strokes, text converted to
+/// outlines included), not a blank one.
+pub fn page_has_print(pg: &PageGlyphs) -> bool {
+    let area = |b: [f32; 4]| (b[2] - b[0]).max(0.0) * (b[3] - b[1]).max(0.0);
+    let ink: f32 = pg.images.iter().map(|&im| area(im)).sum::<f32>() + pg.paths.iter().map(|p| area([p.x0, p.y0, p.x1, p.y1])).sum::<f32>();
+    ink >= 0.01 * pg.width * pg.height
+}
+
+/// A page whose text layer holds nothing but a watermark.
+pub fn page_text_free(lp: &LayoutPage) -> bool {
+    lp.lines.is_empty() && lp.furniture.iter().all(|f| f.furniture == Some(FurnitureKind::Watermark))
+}
+
+/// A scanned page's lines from local OCR: word boxes in image pixels, `px`
+/// points per pixel. Page furniture is told from each line's text and
+/// place, as for printed lines; there are no glyphs, so no maths structure.
+pub fn set_ocr_lines(lp: &mut LayoutPage, lines: &[crate::ocr::OcrLine], px: f32) {
+    let (w, h) = (lp.width, lp.height);
+    let mut body = Vec::new();
+    for l in lines {
+        let x0 = l.words.iter().map(|w| w.bbox[0]).fold(f32::MAX, f32::min) * px;
+        let y0 = l.words.iter().map(|w| w.bbox[1]).fold(f32::MAX, f32::min) * px;
+        let x1 = l.words.iter().map(|w| w.bbox[2]).fold(f32::MIN, f32::max) * px;
+        let y1 = l.words.iter().map(|w| w.bbox[3]).fold(f32::MIN, f32::max) * px;
+        let text = escape_prose(&l.words.iter().map(|w| w.text.as_str()).collect::<Vec<_>>().join(" "));
+        let mut line = LayoutLine { x0, x1, y0, y1, baseline: y1, size: (y1 - y0).max(4.0), text, glyphs: Vec::new(), furniture: None, bold_lead: false, unplaced: 0, code: false, char_width: 0.0 };
+        let t = line.text.trim().to_string();
+        let plain = plain_line(&t);
+        let zone = line.y1 < 0.068 * h || line.y0 > 0.915 * h;
+        line.furniture = if is_answer_line_text(&t) || answer_space_mark(&t).is_some() || dotted_answer_prompt(&t).is_some() {
+            Some(FurnitureKind::AnswerLine)
+        } else if CONTINUED_RE.is_match(&t) {
+            Some(FurnitureKind::Continued)
+        } else if NAVIGATION_RE.is_match(&plain) || PRINTED_ON_RE.is_match(&plain) {
+            Some(FurnitureKind::Navigation)
+        } else if WATERMARK_RE.is_match(&plain) {
+            Some(FurnitureKind::Watermark)
+        } else if zone && HEADER_FOOTER_RE.is_match(&plain) {
+            Some(if line.y1 < 0.068 * h { FurnitureKind::Header } else { FurnitureKind::Footer })
+        } else if line.x0 > 0.84 * w && MARGIN_TEXT_RE.is_match(&t) {
+            Some(FurnitureKind::Margin)
+        } else {
+            None
+        };
+        // (An allocation closing a line of answer space is the question's.)
+        if line.furniture == Some(FurnitureKind::AnswerLine) {
+            if let Some(tag) = answer_space_tag(&line.text) {
+                body.push(LayoutLine { text: tag, furniture: None, ..line.clone() });
+            }
+        }
+        if line.furniture.is_some() {
+            lp.furniture.push(line);
+        } else {
+            body.push(line);
+        }
+    }
+    body.sort_by(|a, b| a.baseline.partial_cmp(&b.baseline).unwrap_or(std::cmp::Ordering::Equal));
+    lp.lines = body;
+    lp.ocr = true;
 }
 
 /// Pictures printed at one place on several pages (each page's QR code, a
@@ -2381,21 +3439,48 @@ fn classify_line_furniture(pg: &PageGlyphs, all: &[LayoutLine], idx: usize, rule
     let line = &all[idx];
     let t = line.text.trim();
     // The scales and axis titles of graph paper to draw on belong to that
-    // answer space ("Frequency", "120 140 ... 220" around the grid).
+    // answer space ("Frequency", "120 140 ... 220" around the grid); an
+    // allocation, a part label or the question's total printed beside it
+    // does not.
     let s = line.size.max(4.0);
+    let question_text = FIGURE_LABEL_KEEP_RE.is_match(plain_line(t).trim()) || QUESTION_FOOTER_RE.is_match(plain_line(t).trim());
     if line.glyphs.len() <= 30
+        && !question_text
         && answer_grids.iter().any(|g| line.x0 <= g[2] + 2.0 * s && line.x1 >= g[0] - 6.0 * s && line.y0 <= g[3] + 2.5 * s && line.y1 >= g[1] - 0.5 * s)
     {
         return Some(FurnitureKind::AnswerLine);
     }
-    if is_answer_line_text(t) {
+    if is_answer_line_text(t) || answer_space_mark(t).is_some() {
         return Some(FurnitureKind::AnswerLine);
+    }
+    let heading = line.bold_lead && t.chars().next().is_some_and(|c| c.is_ascii_digit());
+    if !heading && !line.code && dotted_answer_prompt(t).is_some() {
+        return Some(FurnitureKind::AnswerPrompt);
     }
     if CONTINUED_RE.is_match(t) {
         return Some(FurnitureKind::Continued);
     }
-    if NAVIGATION_RE.is_match(t) || PRINTED_ON_RE.is_match(plain_line(t).trim()) {
+    let plain_text = plain_line(t);
+    if NAVIGATION_RE.is_match(&plain_text) || PRINTED_ON_RE.is_match(&plain_text) {
         return Some(FurnitureKind::Navigation);
+    }
+    // The rest of a blank page's notice ("BLANK PAGE / PLEASE DO NOT WRITE /
+    // ON THIS PAGE"), on the page that carries it.
+    if BLANK_NOTICE_RE.is_match(plain_line(t).trim()) && all.iter().any(|o| plain_line(&o.text).trim().eq_ignore_ascii_case("blank page")) {
+        return Some(FurnitureKind::Navigation);
+    }
+    // The "OR" set between alternative questions ("Answer Question 2 or
+    // Question 3"), and the box for the number of the one answered.
+    // ("EITHER … OR …" inside one question stays: the next line must open
+    // the alternative question.)
+    if plain_line(t).trim() == "OR" && line.bold_lead {
+        let next = all.iter().filter(|o| o.y0 > line.y1).min_by(|a, b| a.y0.partial_cmp(&b.y0).unwrap_or(std::cmp::Ordering::Equal));
+        if next.is_some_and(|n| head_token(n).is_some()) {
+            return Some(FurnitureKind::Navigation);
+        }
+    }
+    if QUESTION_NO_RE.is_match(plain_line(t).trim()) {
+        return Some(FurnitureKind::AnswerPrompt);
     }
     // The publisher's small-print notices at the foot of a page (copyright
     // acknowledgements): a block of small lines one of which names it.
@@ -2411,10 +3496,9 @@ fn classify_line_furniture(pg: &PageGlyphs, all: &[LayoutLine], idx: usize, rule
     // ("$2.8 \mathrm{m} \mathrm{s}^{-1}$" is seven characters).
     let printed = line.glyphs.iter().filter(|&&g| !is_space_char(pg.glyphs[g].ch)).count();
     let plain_len = if printed > 0 { printed } else { t.replace('$', "").chars().count() };
-    let heading_like = line.bold_lead && t.chars().next().map(|c| c.is_ascii_digit()).unwrap_or(false);
     // (A caption, a mark allocation or a part label is never a label.)
     let keep = FIGURE_LABEL_KEEP_RE.is_match(plain_line(t).trim());
-    if !heading_like && !keep && plain_len <= 24 {
+    if !heading && !keep && plain_len <= 24 {
         let (cx, cy) = ((line.x0 + line.x1) * 0.5, (line.y0 + line.y1) * 0.5);
         let _ = rule_used;
         if regions.iter().any(|r| cx >= r[0] - 18.0 && cx <= r[2] + 18.0 && cy >= r[1] - 18.0 && cy <= r[3] + 18.0) {
@@ -2460,8 +3544,7 @@ fn classify_line_furniture(pg: &PageGlyphs, all: &[LayoutLine], idx: usize, rule
     }
     // A question/part heading line is never an answer prompt, and neither is
     // code (an SQL skeleton "CREATE TABLE Animal (" before its answer lines).
-    let starts_heading = line.bold_lead && t.chars().next().map(|c| c.is_ascii_digit()).unwrap_or(false);
-    if !starts_heading && !line.code && (is_answer_prompt(pg, line, rule_used) || is_answer_template(pg, line, rule_used)) {
+    if !heading && !line.code && (is_answer_prompt(pg, line, rule_used) || is_answer_template(pg, line, rule_used)) {
         return Some(FurnitureKind::AnswerPrompt);
     }
     // An empty tall bracket pair is an answer grid ("M = ( __ __ )").
@@ -2475,16 +3558,32 @@ fn classify_line_furniture(pg: &PageGlyphs, all: &[LayoutLine], idx: usize, rule
     // Running headers/footers stand apart from the body: a zone line that
     // touches a neighbouring body line (an exponent, a stacked limit) is not
     // page furniture.
-    let isolated = !all.iter().enumerate().any(|(j, o)| {
-        j != idx && {
-            let s = line.size.max(o.size).max(4.0);
-            let hov = o.x1 >= line.x0 - 2.0 * s && o.x0 <= line.x1 + 2.0 * s;
-            let vgap = (o.y0.max(line.y0) - o.y1.min(line.y1)).max(0.0);
-            hov && vgap < 0.9 * s
-        }
-    });
+    // (Answer space is no body line: "© OCR 2024" under the last dotted line.)
+    // Clear of every body line above or below it by `ems` of its size.
+    let clear_by = |ems: f32| {
+        !all.iter().enumerate().any(|(j, o)| {
+            j != idx && !is_answer_line_text(&o.text) && {
+                let s = line.size.max(o.size).max(4.0);
+                let hov = o.x1 >= line.x0 - 2.0 * s && o.x0 <= line.x1 + 2.0 * s;
+                let vgap = (o.y0.max(line.y0) - o.y1.min(line.y1)).max(0.0);
+                hov && vgap < ems * s
+            }
+        })
+    };
+    let isolated = clear_by(0.9);
     if (top_zone || bottom_zone) && isolated && (HEADER_FOOTER_RE.is_match(plain) || WATERMARK_RE.is_match(plain)) {
         return Some(if top_zone { FurnitureKind::Header } else { FurnitureKind::Footer });
+    }
+    // The page's own number, alone and centred at the head of the page:
+    // WJEC sets it 72 pt down an 842 pt page (0.086), below the header zone;
+    // OCR A sets it in the zone, 9 pt above the first line, whose exponent
+    // rises to 0.8 em of it. Within the top eighth, within a twentieth of the
+    // width of the centre, nothing above it, and half a line clear of the
+    // text (an exponent or a limit set to a line touches it).
+    let own_page_number = plain.parse::<usize>().is_ok_and(|n| n == pg.page + 1);
+    let centred = ((line.x0 + line.x1) * 0.5 - 0.5 * pg.width).abs() <= 0.05 * pg.width;
+    if own_page_number && centred && clear_by(0.5) && line.y1 < 0.12 * pg.height && !all.iter().any(|o| o.y1 < line.y0 && !WATERMARK_RE.is_match(o.text.trim())) {
+        return Some(FurnitureKind::Header);
     }
     if line.x0 > 0.84 * pg.width && MARGIN_TEXT_RE.is_match(t) {
         return Some(FurnitureKind::Margin);
@@ -3549,7 +4648,22 @@ fn build_delimited(pg: &PageGlyphs, mut items: Vec<Item>) -> Vec<Item> {
         if guard > 200 {
             return items;
         }
-        let delims: Vec<(usize, char)> = items.iter().enumerate().filter_map(|(i, it)| delimiter_of(pg, it, ref_size).map(|c| (i, c))).collect();
+        // A bracket is tall against the type of its own line: small print
+        // elsewhere on the page ("Examiner only" in the margin) does not make
+        // a mark allocation's "[3]" beside a formula a stretched delimiter.
+        let line_size = |it: &Item| {
+            ref_size.max(median(
+                items
+                    .iter()
+                    .filter(|o| o.glyphs.len() == 1 && !std::ptr::eq(*o, it) && (o.base - it.base).abs() <= 0.5 * it.size.max(1.0))
+                    .filter(|o| !matches!(o.node, Node::G(g) if is_open_delim(pg.glyphs[g].ch) || matches!(pg.glyphs[g].ch, ')' | ']' | '}' | '|')))
+                    .map(|o| o.size)
+                    .collect(),
+            ))
+        };
+        // (Only a bracket glyph is measured against it.)
+        let bracket = |it: &Item| matches!(it.node, Node::G(g) if matches!(pg.glyphs[g].ch, '(' | ')' | '[' | ']' | '{' | '}' | '|' | '‖' | '〈' | '〉' | '⟨' | '⟩'));
+        let delims: Vec<(usize, char)> = items.iter().enumerate().filter_map(|(i, it)| delimiter_of(pg, it, if bracket(it) { line_size(it) } else { ref_size }).map(|c| (i, c))).collect();
         if delims.is_empty() {
             return items;
         }
@@ -3729,6 +4843,7 @@ fn split_matrix(pg: &PageGlyphs, rows: Vec<Vec<Item>>) -> Vec<Vec<Vec<Node>>> {
 fn build_big_op_limits(pg: &PageGlyphs, mut items: Vec<Item>) -> Vec<Item> {
     let mut done: std::collections::HashSet<usize> = std::collections::HashSet::new();
     let body = median(pg.glyphs.iter().filter(|g| g.ch.is_alphanumeric()).map(|g| g.size).collect()).max(4.0);
+    let font_text = font_text_sizes(pg);
     loop {
         let pos = items.iter().position(|it| {
             matches!(it.node, Node::G(g) if matches!(pg.glyphs[g].ch, '∑' | '∏' | '∫' | '∮' | '⌠' | '⌡' | '⎮') && !done.contains(&g))
@@ -3745,13 +4860,25 @@ fn build_big_op_limits(pg: &PageGlyphs, mut items: Vec<Item>) -> Vec<Item> {
         // never taken for a limit. Sums/products carry them centred above and
         // below; integrals usually beside the top and bottom of the sign.
         let integral = matches!(pg.glyphs[g].ch, '∫' | '∮' | '⌠' | '⌡' | '⎮');
-        let small = |o: &Item| o.size <= 0.85 * body;
+        // A sign hung from its origin (an extension-font glyph drawn below
+        // the point it is set at, AQA's Advent Σ) is centred on the maths
+        // axis of its line: that line's baseline lies a quarter em below
+        // the sign's centre.
+        let base = if op.y0 >= op.base - 0.1 * h { (op.y0 + op.y1) * 0.5 + 0.25 * body } else { op.base };
+        // A font set larger than the text (AQA's italic maths at 12 pt
+        // beside 11 pt text) has larger scripts: script size is measured
+        // against the size the item's own font is set at in the text.
+        let small = |o: &Item| {
+            let text = o.glyphs.iter().filter_map(|&k| font_text.get(pg.glyphs[k].font.as_str())).fold(body, |a, &b| a.max(b));
+            o.size <= 0.85 * text
+        };
         let above = items_in(&items, |o| {
             o.glyphs != op.glyphs
                 && small(o)
                 && ((o.cx() >= op.x0 - 0.4 * w && o.cx() <= op.x1 + 0.4 * w && o.y1 <= op.y0 + 1.0 && o.y1 >= op.y0 - 0.9 * body)
                     || integral && o.x0 >= op.x0 + 0.3 * w && o.x0 <= op.x1 + 0.6 * body && o.cy() >= op.y0 - 0.5 * body && o.cy() <= op.y0 + 0.35 * h)
         });
+        let above = extend_limit(&items, above, &[i], &small);
         let below = items_in(&items, |o| {
             o.glyphs != op.glyphs
                 && small(o)
@@ -3759,8 +4886,12 @@ fn build_big_op_limits(pg: &PageGlyphs, mut items: Vec<Item>) -> Vec<Item> {
                 && ((o.cx() >= op.x0 - 0.4 * w && o.cx() <= op.x1 + 0.4 * w && o.y0 >= op.y1 - 1.0 && o.y0 <= op.y1 + 0.9 * body)
                     || integral && o.x0 >= op.x0 && o.x0 <= op.x1 + 0.6 * body && o.cy() >= op.y1 - 0.35 * h && o.cy() <= op.y1 + 0.5 * body)
         });
+        let mut beside = vec![i];
+        beside.extend(&above);
+        let below = extend_limit(&items, below, &beside, &small);
         if above.is_empty() && below.is_empty() {
             items[i].force_base = true;
+            items[i].base = base;
             continue;
         }
         let mut all = vec![i];
@@ -3777,8 +4908,46 @@ fn build_big_op_limits(pg: &PageGlyphs, mut items: Vec<Item>) -> Vec<Item> {
             upper: if up.is_empty() { None } else { Some(parse_box(pg, up).0) },
         };
         items = rest;
-        items.push(composite(node, &taken, op.base, s, true));
+        items.push(composite(node, &taken, base, s, true));
     }
+}
+
+/// The size each font is set at in a page's text: the median size of its
+/// letters and digits.
+fn font_text_sizes(pg: &PageGlyphs) -> std::collections::HashMap<&str, f32> {
+    let mut sizes: std::collections::HashMap<&str, Vec<f32>> = std::collections::HashMap::new();
+    for g in pg.glyphs.iter().filter(|g| g.ch.is_alphanumeric()) {
+        sizes.entry(g.font.as_str()).or_default().push(g.size);
+    }
+    sizes.into_iter().map(|(font, v)| (font, median(v))).collect()
+}
+
+/// A limit printed as several glyphs ("2.5") runs on along its own
+/// baseline past the window that found its first glyphs: take the
+/// script-size items that follow it there with no more than a script space
+/// between them.
+fn extend_limit(items: &[Item], mut limit: Vec<usize>, exclude: &[usize], small: &dyn Fn(&Item) -> bool) -> Vec<usize> {
+    while !limit.is_empty() {
+        let right = limit.iter().map(|&k| items[k].x1).fold(f32::MIN, f32::max);
+        let base = limit.iter().map(|&k| items[k].base).sum::<f32>() / limit.len() as f32;
+        let size = limit.iter().map(|&k| items[k].size).fold(0.0, f32::max);
+        let next = (0..items.len())
+            .filter(|k| !limit.contains(k) && !exclude.contains(k))
+            .filter(|&k| {
+                let o = &items[k];
+                small(o)
+                    && !o.force_base
+                    && (o.base - base).abs() <= 0.25 * size
+                    && o.x0 >= right - 0.15 * size
+                    && o.x0 - right <= 0.5 * size
+            })
+            .min_by(|&a, &b| items[a].x0.total_cmp(&items[b].x0));
+        match next {
+            Some(k) => limit.push(k),
+            None => break,
+        }
+    }
+    limit
 }
 
 /// The dominant baseline and size of a set of items.
@@ -4067,12 +5236,37 @@ fn axis_hung(n: &Node) -> bool {
     }
 }
 
+/// A full stop printed raised between two digits ("2·5", WJEC) is that
+/// number's decimal point: it takes the digits' baseline, so it stays on
+/// their line instead of starting one of its own. The point touches both
+/// digits and sits above `group_lines`' row tolerance (0.18 of the size)
+/// but below the digits' middle: WJEC raises it 3 pt in 11 pt text (0.27).
+fn seat_raised_decimal_points(pg: &PageGlyphs, items: &mut [Item]) {
+    let digit = |it: &Item| matches!(it.node, Node::G(g) if pg.glyphs[g].ch.is_ascii_digit());
+    for d in 0..items.len() {
+        if !matches!(items[d].node, Node::G(g) if pg.glyphs[g].ch == '.') {
+            continue;
+        }
+        let dot = &items[d];
+        let s = dot.size.max(4.0);
+        let left = items.iter().find(|o| digit(o) && o.x1 >= dot.x0 - 0.3 * s && o.x1 <= dot.x0 + 0.1 * s);
+        let right = items.iter().find(|o| digit(o) && o.x0 >= dot.x1 - 0.1 * s && o.x0 <= dot.x1 + 0.4 * s);
+        let (Some(l), Some(r)) = (left, right) else { continue };
+        let lift = l.base - dot.base;
+        if (l.base - r.base).abs() <= 0.18 * s && lift > 0.18 * s && lift < 0.45 * s {
+            let base = l.base;
+            items[d].base = base;
+        }
+    }
+}
+
 /// Group page items into visual lines: baseline rows, with small raised /
 /// lowered items attached to the adjacent larger row as scripts.
-fn group_lines(pg: &PageGlyphs, items: Vec<Item>) -> Vec<Vec<Item>> {
+fn group_lines(pg: &PageGlyphs, mut items: Vec<Item>) -> Vec<Vec<Item>> {
     if items.is_empty() {
         return Vec::new();
     }
+    seat_raised_decimal_points(pg, &mut items);
     let mut order: Vec<usize> = (0..items.len()).collect();
     order.sort_by(|&a, &b| items[a].base.partial_cmp(&items[b].base).unwrap_or(std::cmp::Ordering::Equal));
     let mut rows: Vec<Vec<usize>> = Vec::new();
@@ -4338,7 +5532,17 @@ fn parse_box(pg: &PageGlyphs, items: Vec<Item>) -> (Vec<Node>, f32, f32, usize) 
         Sup,
         Sub,
     }
-    let roles: Vec<Role> = items
+    // Set tight after: the ink or the advance of one abuts the other's (a
+    // "1" inks well inside its advance).
+    let abuts = |it: &Item, o: &Item| [it.x0 - o.x1, it.lx0 - o.lx1].iter().any(|&gap| gap >= -0.1 * s && gap <= 0.12 * s);
+    // A subscript never opens with a stop, and a run of stops set small
+    // after a word is an answer line's leader ("Answer ………" in Edexcel A
+    // Biology Jun 2021). A lone stop inside a subscript is its decimal point.
+    let stop = |it: &Item| matches!(it.node, Node::G(g) if matches!(pg.glyphs[g].ch, '.' | '…'));
+    let leader = |it: &Item| {
+        matches!(it.node, Node::G(g) if pg.glyphs[g].ch == '…') || stop(it) && items.iter().any(|q| !std::ptr::eq(q, it) && stop(q) && (abuts(q, it) || abuts(it, q)))
+    };
+    let mut roles: Vec<Role> = items
         .iter()
         .map(|it| {
             if it.force_base {
@@ -4354,11 +5558,11 @@ fn parse_box(pg: &PageGlyphs, items: Vec<Item>) -> (Vec<Node>, f32, f32, usize) 
             // drops E_k's k by under half a point.
             let tight_sub = it.size < 0.8 * s
                 && d > -0.05 * s
+                && !stop(it)
                 && items.iter().any(|o| {
                     o.size >= 0.9 * s
                         && (o.base - b).abs() < 0.1 * s
-                        && it.x0 - o.x1 >= -0.1 * s
-                        && it.x0 - o.x1 <= 0.12 * s
+                        && abuts(it, o)
                         && matches!(o.node, Node::G(g) if pg.glyphs[g].ch.is_alphabetic())
                 });
             if small && d < -0.14 * s || stacked && d < 0.0 {
@@ -4370,6 +5574,23 @@ fn parse_box(pg: &PageGlyphs, items: Vec<Item>) -> (Vec<Node>, f32, f32, usize) 
             }
         })
         .collect();
+    // The rest of such a subscript follows its first character at the same
+    // size and depth, each set tight after the one before ("14" of C₆H₁₄,
+    // "2n–2" of CₙH₂ₙ₋₂).
+    let mut by_x: Vec<usize> = (0..items.len()).collect();
+    by_x.sort_by(|&x, &y| items[x].x0.partial_cmp(&items[y].x0).unwrap_or(std::cmp::Ordering::Equal));
+    for &i in &by_x {
+        let it = &items[i];
+        if roles[i] != Role::Base || it.force_base || it.size >= 0.8 * s || leader(it) {
+            continue;
+        }
+        let continues = items.iter().enumerate().any(|(k, q)| {
+            roles[k] == Role::Sub && (q.size - it.size).abs() <= 0.15 * it.size && (q.base - it.base).abs() < 0.05 * s && abuts(it, q)
+        });
+        if continues {
+            roles[i] = Role::Sub;
+        }
+    }
     let mut base_idx: Vec<usize> = (0..items.len()).filter(|&i| roles[i] == Role::Base).collect();
     base_idx.sort_by(|&x, &y| items[x].x0.partial_cmp(&items[y].x0).unwrap_or(std::cmp::Ordering::Equal));
     let mut script_idx: Vec<usize> = (0..items.len()).filter(|&i| roles[i] != Role::Base).collect();
@@ -5192,14 +6413,17 @@ fn emit_nodes(pg: &PageGlyphs, nodes: &[Node], in_math: bool) -> String {
             }
         }
     }
-    // A standalone dash between maths is a minus sign.
+    // A standalone dash between maths is a minus sign, and so is one drawn
+    // in a maths font before maths (a negative value after an option letter,
+    // "A −6.76 × 10^14 J").
     for k in 0..words.len() {
         let t = texts[k].as_str();
         if t.chars().count() == 1 && t.chars().all(is_minus_like) && !words[k].0.iter().any(|n| n.is_struct()) {
             let prev_m = k > 0 && matches!(classes[k - 1], WordClass::Math | WordClass::Neutral) && !matches!(words[k - 1].1, Some(Node::Gap));
             let next_m = k + 1 < words.len() && matches!(classes[k + 1], WordClass::Math | WordClass::Neutral | WordClass::Func);
+            let math_font = node_glyphs(pg, &words[k].0).iter().all(|g| is_math_font(&g.font));
             // Inside a script or fraction part a dash is always a minus.
-            if prev_m && next_m || in_math {
+            if (prev_m || math_font) && next_m || in_math {
                 classes[k] = WordClass::Math;
             } else {
                 classes[k] = WordClass::Text;
@@ -5269,7 +6493,9 @@ fn emit_nodes(pg: &PageGlyphs, nodes: &[Node], in_math: bool) -> String {
             let mut latex = String::new();
             while j < words.len() && in_run[j] {
                 let piece = latex_word(pg, &words[j].0);
-                if j > m {
+                // A minus opening the run is the sign of what follows it.
+                let opening_minus = j == m + 1 && latex == "-";
+                if j > m && !opening_minus {
                     if matches!(words[j - 1].1, Some(Node::WideSpace)) {
                         latex.push_str("\\quad ");
                     } else if DIFFERENTIAL_RE.is_match(&piece) && !latex.trim_end().ends_with(['=', '+', '-', '(', '{']) {
@@ -5633,6 +6859,17 @@ fn delim_latex(c: char) -> &'static str {
     }
 }
 
+/// The Greek letters written as LaTeX commands. An answer line's label is
+/// read back through the same table (`answer_space_words`).
+const GREEK_LATEX: &[(char, &str)] = &[
+    ('α', "\\alpha"), ('β', "\\beta"), ('γ', "\\gamma"), ('δ', "\\delta"), ('ε', "\\varepsilon"), ('ϵ', "\\varepsilon"), ('ζ', "\\zeta"),
+    ('η', "\\eta"), ('θ', "\\theta"), ('ϑ', "\\vartheta"), ('ι', "\\iota"), ('κ', "\\kappa"), ('λ', "\\lambda"), ('μ', "\\mu"), ('µ', "\\mu"),
+    ('ν', "\\nu"), ('ξ', "\\xi"), ('π', "\\pi"), ('ϖ', "\\varpi"), ('ρ', "\\rho"), ('σ', "\\sigma"), ('ς', "\\varsigma"), ('τ', "\\tau"),
+    ('υ', "\\upsilon"), ('φ', "\\phi"), ('ϕ', "\\phi"), ('χ', "\\chi"), ('ψ', "\\psi"), ('ω', "\\omega"),
+    ('Γ', "\\Gamma"), ('Δ', "\\Delta"), ('Θ', "\\Theta"), ('Λ', "\\Lambda"), ('Ξ', "\\Xi"), ('Π', "\\Pi"), ('Σ', "\\Sigma"),
+    ('Υ', "\\Upsilon"), ('Φ', "\\Phi"), ('Ψ', "\\Psi"), ('Ω', "\\Omega"),
+];
+
 fn latex_glyph(g: &Glyph) -> String {
     let c = g.ch;
     if c.is_ascii_alphabetic() {
@@ -5721,48 +6958,15 @@ fn latex_glyph(g: &Glyph) -> String {
         'ℤ' => "\\mathbb{Z}",
         'ℚ' => "\\mathbb{Q}",
         'ℂ' => "\\mathbb{C}",
+        '⇌' => "\\rightleftharpoons",
+        // The standard-state sign is typeset as a circle with a bar.
+        '⦵' => "\\ominus",
+        '✓' => "\\checkmark",
+        '☉' => "\\odot",
         '∗' => "*",
         '⁄' => "/",
         '\u{203E}' => "",
-        'α' => "\\alpha",
-        'β' => "\\beta",
-        'γ' => "\\gamma",
-        'δ' => "\\delta",
-        'ε' | 'ϵ' => "\\varepsilon",
-        'ζ' => "\\zeta",
-        'η' => "\\eta",
-        'θ' => "\\theta",
-        'ϑ' => "\\vartheta",
-        'ι' => "\\iota",
-        'κ' => "\\kappa",
-        'λ' => "\\lambda",
-        'μ' | 'µ' => "\\mu",
-        'ν' => "\\nu",
-        'ξ' => "\\xi",
         'ο' => "o",
-        'π' => "\\pi",
-        'ϖ' => "\\varpi",
-        'ρ' => "\\rho",
-        'σ' => "\\sigma",
-        'ς' => "\\varsigma",
-        'τ' => "\\tau",
-        'υ' => "\\upsilon",
-        'φ' => "\\phi",
-        'ϕ' => "\\phi",
-        'χ' => "\\chi",
-        'ψ' => "\\psi",
-        'ω' => "\\omega",
-        'Γ' => "\\Gamma",
-        'Δ' => "\\Delta",
-        'Θ' => "\\Theta",
-        'Λ' => "\\Lambda",
-        'Ξ' => "\\Xi",
-        'Π' => "\\Pi",
-        'Σ' => "\\Sigma",
-        'Υ' => "\\Upsilon",
-        'Φ' => "\\Phi",
-        'Ψ' => "\\Psi",
-        'Ω' => "\\Omega",
         'Α' => "A",
         'Β' => "B",
         'Ε' => "E",
@@ -5776,7 +6980,7 @@ fn latex_glyph(g: &Glyph) -> String {
         'Ρ' => "P",
         'Τ' => "T",
         'Χ' => "X",
-        _ => "",
+        _ => GREEK_LATEX.iter().find(|&&(g, _)| g == c).map_or("", |&(_, l)| l),
     };
     if !s.is_empty() {
         return s.to_string();
@@ -5822,7 +7026,13 @@ pub struct LayoutQuestion {
 pub struct LayoutMap {
     pub questions: Vec<LayoutQuestion>,
     pub anomalies: Vec<String>,
+    /// Questions printed as alternatives of which a candidate answers one
+    /// ("Answer EITHER Context 1 OR Context 2").
+    pub choice_groups: Vec<ChoiceGroup>,
 }
+
+/// One printed choice: for each alternative, the questions it covers.
+pub type ChoiceGroup = Vec<Vec<u32>>;
 
 /// Parsed leading question-number token of a line.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -5834,6 +7044,9 @@ struct HeadToken {
     zero_padded: bool,
     /// Two single digits in separate boxes ("1 0").
     spaced_pair: bool,
+    /// A star printed before the number ("*14"), left of the column (OCR
+    /// prints one after it: `HEAD_RE`'s `star`).
+    star_before: bool,
     /// Nothing but the number on the line.
     alone: bool,
 }
@@ -5841,16 +7054,21 @@ struct HeadToken {
 static HEAD_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
     regex::Regex::new(concat!(
         r"^(?:(?P<qword>Question|QUESTION|Q)\s*)?",
+        // Edexcel marks one before the number "*14".
+        r"(?P<star_before>\*)?",
         r"(?P<num>\d(?:[ \t]\d)?|\d{1,2})",
         r"(?P<dot>\.)?",
-        r"(?P<part>[ \t]*\.[ \t]*\d{1,2}|[ \t]+\((?:[a-h]|i{1,3}|iv|vi{0,3})\))?",
+        // OCR marks a question assessing extended response "2*".
+        r"(?P<star>\*)?",
+        r"(?P<part>[ \t]*\.[ \t]*\d{1,2}|[ \t]+\((?:[a-h]|i{1,3}|iv|vi{0,3})\)\*?)?",
         r"(?P<rest>[ \t].*|\(.*)?$"
     ))
     .unwrap()
 });
 
 static END_MARKER_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
-    regex::Regex::new(r"(?i)^\**\s*(?:end of (?:questions?|paper|examination|test)|total for paper is\s*\d+\s*marks?|total marks for (?:this )?paper\s*[:=]?\s*\d+)\s*\**\.?$").unwrap()
+    // ("TOTAL FOR PAPER = 90 MARKS", "END OF QUESTION PAPER")
+    regex::Regex::new(r"(?i)^\**\s*(?:end of (?:the )?(?:question paper|questions?|paper|examination|test)|total for paper\s*(?:is|=|:)?\s*\d+\s*marks?|total marks for (?:this )?paper\s*[:=]?\s*\d+)\s*\**\.?$").unwrap()
 });
 
 /// A section boundary: lines from here to the next question heading (section
@@ -5869,11 +7087,16 @@ static REFERENCE_FOR_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock
     regex::Regex::new(r"(?i)\bthis (?:table|figure|page|insert|information|data)\b.{0,40}?\bincluded\b.{0,40}?\banswer\b.{0,20}?\bquestions?(?:\s+parts?)?\s+0?(\d{1,2})").unwrap()
 });
 
+/// The notice over extra answer space ("Additional answer space if
+/// required."), on a spare page or within a question.
+static EXTRA_SPACE_RE: std::sync::LazyLock<regex::Regex> =
+    std::sync::LazyLock::new(|| regex::Regex::new(r"(?i)^additional answer space").unwrap());
+
 static TRAILING_PAGE_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
     regex::Regex::new(r"(?i)^(?:additional page|additional answer space|blank page|there are no questions printed on this page|copyright information|question number|for examiner.?s use only)").unwrap()
 });
 
-fn plain_line(t: &str) -> String {
+pub(crate) fn plain_line(t: &str) -> String {
     t.replace('$', "").replace("\\mathbf{", "").replace('}', "").trim().to_string()
 }
 
@@ -5892,7 +7115,11 @@ fn head_token(line: &LayoutLine) -> Option<HeadToken> {
     // "3 significant figures", "1 hour 45 minutes": a bare number followed by
     // lowercase prose is a quantity, not a heading (the column check is the
     // primary guard; this only removes the obvious cases).
-    if caps.name("qword").is_none() && caps.name("dot").is_none() && caps.name("part").is_none() {
+    // (A question opening with maths, "26  a² − b² ≡ (a + b)(a − b)", is
+    // no quantity.)
+    let lead = line.text.trim_start();
+    let maths_lead = lead.starts_with(|c: char| c.is_ascii_digit()) && lead.trim_start_matches(|c: char| c.is_ascii_digit() || c == ' ' || c == '\t').starts_with('$');
+    if caps.name("qword").is_none() && caps.name("dot").is_none() && caps.name("part").is_none() && !maths_lead {
         if let Some(c) = rest.chars().next() {
             if c.is_ascii_lowercase() && !rest.starts_with("(") && rest.split_whitespace().next().map(|w| w.len() > 1).unwrap_or(false) {
                 return None;
@@ -5904,8 +7131,75 @@ fn head_token(line: &LayoutLine) -> Option<HeadToken> {
         has_part: caps.name("part").is_some() || rest.starts_with('('),
         zero_padded,
         spaced_pair,
+        star_before: caps.name("star_before").is_some(),
         alone: rest.is_empty(),
     })
+}
+
+/// The alternatives of a paper that prints a choice ("Answer EITHER
+/// Context 1 OR Context 2", "answer ONE essay"): a bold "EITHER" opens a
+/// choice, each bold "OR" its next alternative, and a section heading (or
+/// the next "EITHER", or the paper's end) closes it. Each alternative holds
+/// the questions whose headings it covers. (The triage refuses alternatives
+/// that carry different marks.)
+fn choice_groups(pages: &[LayoutPage], heads: &[(usize, usize, u32)]) -> Vec<ChoiceGroup> {
+    static INSTRUCTION_RE: std::sync::LazyLock<regex::Regex> =
+        std::sync::LazyLock::new(|| regex::Regex::new(r"(?i)\banswer\s+(?:either\b|one\s+(?:essay|question|context|section)\b)").unwrap());
+    static SECTION_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| regex::Regex::new(r"(?i)^section\s+[a-z]$").unwrap());
+    let printed = |l: &LayoutLine| INSTRUCTION_RE.is_match(&plain_line(&l.text));
+    if !pages.iter().any(|p| p.lines.iter().chain(&p.furniture).any(printed)) {
+        return Vec::new();
+    }
+    enum Cue {
+        Either,
+        Or,
+        Section,
+        Head(u32),
+    }
+    let mut groups = Vec::new();
+    let mut open: Option<ChoiceGroup> = None;
+    let close = |open: &mut Option<ChoiceGroup>, groups: &mut Vec<ChoiceGroup>| {
+        if let Some(g) = open.take().filter(|g| g.len() >= 2 && g.iter().all(|a| !a.is_empty())) {
+            groups.push(g);
+        }
+    };
+    for (pi, page) in pages.iter().enumerate() {
+        let mut cues: Vec<(f32, Cue)> = page
+            .lines
+            .iter()
+            .chain(&page.furniture)
+            .filter(|l| l.bold_lead)
+            .filter_map(|l| match plain_line(&l.text).as_str() {
+                "EITHER" => Some((l.y0, Cue::Either)),
+                "OR" => Some((l.y0, Cue::Or)),
+                t if SECTION_RE.is_match(t) => Some((l.y0, Cue::Section)),
+                _ => None,
+            })
+            .collect();
+        cues.extend(heads.iter().filter(|h| h.0 == pi).map(|&(_, li, n)| (page.lines[li].y0, Cue::Head(n))));
+        cues.sort_by(|a, b| a.0.total_cmp(&b.0));
+        for (_, cue) in cues {
+            match cue {
+                Cue::Either => {
+                    close(&mut open, &mut groups);
+                    open = Some(vec![Vec::new()]);
+                }
+                Cue::Or => {
+                    if let Some(g) = open.as_mut() {
+                        g.push(Vec::new());
+                    }
+                }
+                Cue::Section => close(&mut open, &mut groups),
+                Cue::Head(n) => {
+                    if let Some(alt) = open.as_mut().and_then(|g| g.last_mut()) {
+                        alt.push(n);
+                    }
+                }
+            }
+        }
+    }
+    close(&mut open, &mut groups);
+    groups
 }
 
 /// Build the question map from laid-out pages.
@@ -5935,7 +7229,9 @@ pub fn build_layout_map(pages: &[LayoutPage]) -> LayoutMap {
         }
     }
     let body_x = starts.iter().max_by_key(|(_, n)| **n).map(|(k, _)| *k as f32 * 2.0).unwrap_or(0.0);
-    let min_cand = cands.iter().map(|c| c.3).fold(f32::MAX, f32::min);
+    // (A star before a number sits left of the column: "*14".)
+    let leftmost = |star_before: bool| cands.iter().filter(|c| c.2.star_before == star_before).map(|c| c.3).reduce(f32::min);
+    let min_cand = leftmost(false).or(leftmost(true)).unwrap_or(f32::MAX);
     let margin_limit = if body_x > min_cand + 12.0 { body_x - 8.0 } else { min_cand + 4.0 };
     let in_col: Vec<&(usize, usize, HeadToken, f32, bool)> = cands
         .iter()
@@ -5953,7 +7249,14 @@ pub fn build_layout_map(pages: &[LayoutPage]) -> LayoutMap {
     'pages: for (pi, page) in pages.iter().enumerate() {
         for (li, line) in page.lines.iter().enumerate() {
             let t = plain_line(&line.text);
-            if END_MARKER_RE.is_match(&t) && !heads.is_empty() {
+            // A bare "END" closes the paper only as its last text (never a
+            // line of code: pseudocode ends blocks with "END").
+            let last_text = || {
+                page.lines.iter().all(|o| o.y0 <= line.y1 || o.furniture.is_some() || o.text.trim().is_empty())
+                    && pages[pi + 1..].iter().all(|p| p.lines.iter().all(|o| o.furniture.is_some() || o.text.trim().is_empty()))
+            };
+            let bare_end = t.eq_ignore_ascii_case("end") && !line.code && line.furniture.is_none() && last_text();
+            if (END_MARKER_RE.is_match(&t) || bare_end) && !heads.is_empty() {
                 end_marker = Some((pi, li));
                 break 'pages;
             }
@@ -5988,6 +7291,7 @@ pub fn build_layout_map(pages: &[LayoutPage]) -> LayoutMap {
             }
         }
     }
+    map.choice_groups = choice_groups(pages, &heads);
     // Running text: a line repeated at the top or bottom edge of many pages
     // ("Created by T. Madas", a publisher banner) is furniture of no question.
     let running: std::collections::HashSet<String> = {
@@ -6007,9 +7311,15 @@ pub fn build_layout_map(pages: &[LayoutPage]) -> LayoutMap {
     // between two questions ("There are no questions printed on this page"
     // before a reference table) is skipped instead.
     let last_heading_page = heads.iter().map(|h| h.0).max().unwrap_or(0);
+    // (A page opening with extra answer space for the part before can go
+    // on with the question's next parts: OCR's "Additional answer space if
+    // required." above "(b) …".)
+    static PART_OPENING_RE: std::sync::LazyLock<regex::Regex> =
+        std::sync::LazyLock::new(|| regex::Regex::new(&format!(r"^\({PART_LABEL}\)\s")).unwrap());
     let non_question_page = |pi: usize| {
         let first = pages[pi].lines.first().map(|l| plain_line(&l.text)).unwrap_or_default();
-        TRAILING_PAGE_RE.is_match(&first)
+        let parts_follow = pages[pi].lines.iter().skip(1).any(|l| PART_OPENING_RE.is_match(&plain_line(&l.text)));
+        TRAILING_PAGE_RE.is_match(&first) && !(EXTRA_SPACE_RE.is_match(&first) && parts_follow)
     };
     let stop_at = |pi: usize, li: usize| -> bool {
         if let Some((ep, el)) = end_marker {
@@ -6172,6 +7482,9 @@ static QUESTION_FOOTER_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLo
     regex::Regex::new(r"(?i)^\(?\s*total\s+for\s+question\s*(\d{1,3})?\s*(?:is|=)\s*(\d{1,3})\s*marks?\s*\)?\.?$").unwrap()
 });
 
+static TRAILING_TOTAL_RE: std::sync::LazyLock<regex::Regex> =
+    std::sync::LazyLock::new(|| regex::Regex::new(r"(?i)[ \t]*\(\s*total\s+(\d{1,3})\s*marks?\s*\)\.?\s*$").unwrap());
+
 /// The body of one mapped question, ready for normalisation: the question's
 /// own lines with its printed "(Total for Question N is M marks)" footer
 /// removed and recorded.
@@ -6188,9 +7501,136 @@ pub struct QuestionBody {
     /// [`LayoutQuestion::reference_from`]), whose last line may carry no
     /// closing punctuation.
     pub ends_with_reference: bool,
+    /// The body closes on the question's own printed total ("(Total for
+    /// Question 3 is 1 mark)", "(Total 7 marks)"): the paper fixes its end,
+    /// punctuated or not ("Write down two factors of 12").
+    pub ends_at_footer: bool,
+    /// The body closes on a column of options beside drawn tick boxes
+    /// (`tick_box_options`): the boxes fix its end.
+    pub ends_on_tick_options: bool,
+    /// Some of the body was read from a scan by OCR: never a clean import.
+    pub ocr: bool,
+}
+
+impl QuestionBody {
+    /// The paper fixes where the body ends, punctuated or not: appended
+    /// reference material, the question's own printed total, or its tick
+    /// boxes.
+    pub fn end_is_printed(&self) -> bool {
+        self.ends_with_reference || self.ends_at_footer || self.ends_on_tick_options
+    }
 }
 
 static OPTION_HEAD_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| regex::Regex::new(r"^([A-E])[ \t]+\S").unwrap());
+
+/// The empty, roughly square box drawn to the right of `line` and spanning
+/// it, left of the margin strip: a tick box. AQA draws it as four strokes,
+/// 28 pt square; the size range (12–45 pt) admits other boards' boxes but
+/// no answer field, which is wider than it is tall.
+fn tick_box_beside(page: &LayoutPage, line: &LayoutLine) -> Option<[f32; 4]> {
+    let thin = |d: &[f32; 4]| (d[3] - d[1]).min(d[2] - d[0]) <= 1.5;
+    let cy = (line.y0 + line.y1) * 0.5;
+    let empty = |b: [f32; 4]| {
+        !page.lines.iter().chain(&page.furniture).any(|o| {
+            let (ox, oy) = ((o.x0 + o.x1) * 0.5, (o.y0 + o.y1) * 0.5);
+            ox > b[0] && ox < b[2] && oy > b[1] && oy < b[3]
+        })
+    };
+    let fits = |b: [f32; 4]| {
+        let (w, h) = (b[2] - b[0], b[3] - b[1]);
+        (12.0..=45.0).contains(&w) && h >= 0.6 * w && h <= 1.5 * w && b[0] >= line.x1 && b[2] <= 0.84 * page.width && cy > b[1] && cy < b[3] && empty(b)
+    };
+    // One drawn square, or a square of four strokes.
+    let tops: Vec<&[f32; 4]> = page.drawings.iter().filter(|d| thin(d) && d[2] - d[0] > d[3] - d[1]).collect();
+    let side = |x: f32, y0: f32, y1: f32| page.drawings.iter().any(|d| thin(d) && d[3] - d[1] > d[2] - d[0] && ((d[0] + d[2]) * 0.5 - x).abs() <= 2.0 && d[1] <= y0 + 2.0 && d[3] >= y1 - 2.0);
+    page.drawings.iter().find(|d| !thin(d) && fits(**d)).copied().or_else(|| {
+        tops.iter().find_map(|t| {
+            tops.iter()
+                .find(|b| b[1] > t[1] && (t[0] - b[0]).abs() <= 1.5 && (t[2] - b[2]).abs() <= 1.5 && side(t[0], t[3], b[1]) && side(t[2], t[3], b[1]) && fits([t[0], t[1], t[2], b[3]]))
+                .map(|b| [t[0], t[1], t[2], b[3]])
+        })
+    })
+}
+
+/// A one- or two-word label heading the answer space beneath it: answer
+/// space, not question text, as a label beside its rule is
+/// (`is_answer_prompt`). AQA Chemistry Jun 2017 prints "Mechanism" over an
+/// empty space to draw in and "Justification" over ruled lines. The ruled
+/// lines are at least two, stacked, with nothing printed between them (a
+/// table's borders and a box's edge are not answer lines). A command
+/// ("Explain why"), a tick-box option, or one of a column of such words (a
+/// list) is never one.
+fn answer_space_label(page: &LayoutPage, line: &LayoutLine) -> bool {
+    let plain = plain_line(&line.text);
+    let words: Vec<&str> = plain.split_whitespace().collect();
+    let label_like = |words: &[&str]| {
+        (1..=2).contains(&words.len())
+            && words.iter().all(|w| w.chars().all(|c| c.is_alphabetic() || c == '-'))
+            && words[0].chars().next().is_some_and(char::is_uppercase)
+    };
+    if !label_like(&words) || COMMAND_VERBS.contains(&words[0].to_lowercase().as_str()) || line.code || tick_box_beside(page, line).is_some() {
+        return false;
+    }
+    let s = line.size.max(4.0);
+    let right = 0.84 * page.width;
+    // One of a column of words ("Carbon / Oxygen / Nitrogen").
+    let in_list = page.lines.iter().any(|o| {
+        let gap = (o.y0 - line.y1).max(line.y0 - o.y1);
+        !std::ptr::eq(o, line) && (o.x0 - line.x0).abs() <= 2.0 && gap >= 0.0 && gap <= 2.5 * s && label_like(&plain_line(&o.text).split_whitespace().collect::<Vec<_>>())
+    });
+    if in_list {
+        return false;
+    }
+    // Ruled answer lines starting just beneath it, from its own left edge.
+    let rule_under = |d: &&[f32; 4]| d[3] - d[1] <= 1.5 && d[2] - d[0] >= 8.0 * s && d[0] >= line.x0 - 2.0 * s && d[0] <= line.x0 + 3.0 * s && d[1] > line.y1;
+    let mut rules: Vec<&[f32; 4]> = page.drawings.iter().filter(rule_under).collect();
+    rules.sort_by(|a, b| a[1].total_cmp(&b[1]));
+    let ruled = rules.len() >= 2 && rules[0][1] <= line.y1 + 3.0 * s && rules[1][1] - rules[0][1] <= 3.0 * s && {
+        let (top, bottom) = (rules[0][1], rules[1][1]);
+        !page.lines.iter().any(|o| o.y0 > top && o.y1 < bottom && o.x1 > rules[0][0] && o.x0 < rules[0][2])
+    };
+    // Or an empty space below it, down to the next line printed in its
+    // column (an answer prompt included; the page foot and margin not).
+    let foot = 0.915 * page.height;
+    let next = page.lines.iter().chain(&page.furniture).filter(|o| o.y0 > line.y1 && o.y0 < foot && o.x0 < right && o.x1 > line.x0 - 2.0 * s).map(|o| o.y0).fold(foot, f32::min);
+    let empty = next - line.y1 >= 6.0 * s
+        && !page.drawings.iter().chain(&page.figures).any(|d| d[0] < right && d[2] > line.x0 - 2.0 * s && d[3] > line.y1 && d[1] < next);
+    ruled || empty
+}
+
+/// Options answered by ticking a box: after "Tick (✓) one box.", a column
+/// of two to five lines, each with its own tick box and not a row of
+/// choices (a tabbed line). Two lines beside one box, or a line set at the
+/// options' indent just after them without a box (an option that wraps,
+/// or one printed unboxed), are no such column. Returns the option lines'
+/// positions in `lines`. (They stay as printed: the paper letters none of
+/// them, and a question may tick one of three or five.)
+fn tick_box_options(pages: &[LayoutPage], lines: &[(usize, usize)]) -> std::collections::HashSet<usize> {
+    static TICK_RE: std::sync::LazyLock<regex::Regex> =
+        std::sync::LazyLock::new(|| regex::Regex::new(r"(?i)^tick\s*\(?\s*✓?\s*\)?\s*(?:one|two|three) box(?:es)?\.?$").unwrap());
+    let mut options = std::collections::HashSet::new();
+    for (k, &(p, l)) in lines.iter().enumerate() {
+        if !TICK_RE.is_match(plain_line(&pages[p].lines[l].text).trim()) {
+            continue;
+        }
+        let line_at = |j: usize| &pages[lines[j].0].lines[lines[j].1];
+        let boxed: Vec<(usize, [f32; 4])> = (k + 1..lines.len())
+            .map_while(|j| (!line_at(j).text.contains('\t')).then(|| tick_box_beside(&pages[lines[j].0], line_at(j)).map(|b| (j, b))).flatten())
+            .collect();
+        let shared_box = boxed.windows(2).any(|w| w[0].1 == w[1].1);
+        let run: Vec<usize> = boxed.iter().map(|&(j, _)| j).collect();
+        let (Some(&first), Some(&last)) = (run.first(), run.last()) else { continue };
+        let pitch = if run.len() > 1 { (line_at(last).y0 - line_at(first).y0) / (run.len() - 1) as f32 } else { 0.0 };
+        let unboxed_after = lines.get(last + 1).is_some_and(|&(np, _)| {
+            let next = line_at(last + 1);
+            np == lines[last].0 && (next.x0 - line_at(first).x0).abs() <= 2.0 && next.y0 - line_at(last).y0 <= 1.6 * pitch.max(line_at(last).size)
+        });
+        if (2..=5).contains(&run.len()) && !shared_box && !unboxed_after {
+            options.extend(run);
+        }
+    }
+    options
+}
 
 /// Lines that wrap a multiple-choice option: for each bold option head
 /// ("B the charge stored on …"), the following lines set at the option's
@@ -6262,9 +7702,15 @@ pub fn question_body_with_figures(pages: &[LayoutPage], q: &LayoutQuestion, figu
             && !FIGURE_LABEL_KEEP_RE.is_match(plain.trim())
             && figures.iter().any(|&(fp, r)| fp == p && line.x0 >= r[0] - 1.0 && line.x1 <= r[2] + 1.0 && line.y0 >= r[1] - 1.0 && line.y1 <= r[3] + 1.0)
     };
+    let tick_options = tick_box_options(pages, &q.lines);
     // Consecutive code lines become one fenced block, indented from the
     // block's own left edge in the font's advance.
     let mut code_run: Vec<&LayoutLine> = Vec::new();
+    // The line holding the question's own printed total, and the last line
+    // that gave the body text: the total closes the body when nothing
+    // follows it.
+    let mut footer_line: Option<usize> = None;
+    let mut last_text_line: Option<usize> = None;
     fn flush_code(kept: &mut Vec<String>, run: &mut Vec<&LayoutLine>) {
         if run.is_empty() {
             return;
@@ -6303,14 +7749,38 @@ pub fn question_body_with_figures(pages: &[LayoutPage], q: &LayoutQuestion, figu
             flush_code(&mut kept, &mut code_run);
             kept.push(FIGURE_PLACEHOLDER.to_string());
         }
-        if in_figure(p, line) {
+        if in_figure(p, line) || answer_space_label(&pages[p], line) {
             continue;
         }
-        let t = line.text.as_str();
+        let mut t = line.text.as_str();
+        // Old Edexcel papers label the foot of a question with its number
+        // ("Q7" beside its total).
+        if plain_line(t) == format!("Q{}", q.number) {
+            continue;
+        }
+        // (The notice heading extra answer space within a question.)
+        if EXTRA_SPACE_RE.is_match(&plain_line(t)) {
+            continue;
+        }
         if let Some(c) = QUESTION_FOOTER_RE.captures(plain_line(t).as_str()) {
             if c.get(1).map_or(true, |n| n.as_str().parse::<u32>().ok() == Some(q.number)) {
                 footer_marks = c[2].parse().ok();
+                footer_line = Some(k);
                 continue;
+            }
+        }
+        // Older Edexcel papers close a question with "(Total 7 marks)" set
+        // after its text or its last part's allocation ("(7)(Total 7 marks)").
+        // (Only on its last line: a total inside the body is evidence of
+        // another question merged in, and stays.)
+        if footer_marks.is_none() && k + 1 == q.lines.len() {
+            if let Some(c) = TRAILING_TOTAL_RE.captures(t) {
+                footer_marks = c[1].parse().ok();
+                footer_line = Some(k);
+                t = t[..c.get(0).unwrap().start()].trim_end();
+                if t.is_empty() {
+                    continue;
+                }
             }
         }
         // A lone punctuation mark on its own line is typesetting debris.
@@ -6319,6 +7789,7 @@ pub fn question_body_with_figures(pages: &[LayoutPage], q: &LayoutQuestion, figu
         if bare.chars().count() == 1 && bare.chars().all(|c| matches!(c, ',' | '.' | ';' | ':')) {
             continue;
         }
+        last_text_line = Some(k);
         if line.code {
             code_run.push(line);
             continue;
@@ -6344,8 +7815,28 @@ pub fn question_body_with_figures(pages: &[LayoutPage], q: &LayoutQuestion, figu
             *k = k.replace(INLINE_IMAGE, FIGURE_PLACEHOLDER);
         }
     }
+    // Edexcel prints a data-response question's parts twice: as a list
+    // after its extracts, then each part above its answer space, word for
+    // word. From where the first part's line recurs, when every part printed
+    // there was printed before, a line already kept is not kept again
+    // (figures always are). A part of its own makes it no reprint.
+    static FIRST_PART_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| regex::Regex::new(r"^(?:\d{1,2}\s+)?\(a\)\s").unwrap());
+    static PART_LINE_RE: std::sync::LazyLock<regex::Regex> =
+        std::sync::LazyLock::new(|| regex::Regex::new(&format!(r"^(?:\d{{1,2}}\s+)?\({PART_LABEL}\)\s")).unwrap());
+    if let Some(first) = kept.iter().position(|l| FIRST_PART_RE.is_match(l)) {
+        if let Some(again) = kept.iter().skip(first + 1).position(|l| *l == kept[first]).map(|i| i + first + 1) {
+            let seen: std::collections::HashSet<String> = kept[..again].iter().cloned().collect();
+            if kept[again..].iter().filter(|l| PART_LINE_RE.is_match(l)).all(|l| seen.contains(l)) {
+                let repeated = kept.split_off(again);
+                kept.extend(repeated.into_iter().filter(|l| l == FIGURE_PLACEHOLDER || !seen.contains(l)));
+            }
+        }
+    }
     let undetected_figures = undetected_figure_captions(pages, q, figures);
-    QuestionBody { text: kept.join("\n"), footer_marks, pages: (q.start_page, q.end_page), undetected_figures, ends_with_reference: q.reference_from.is_some() }
+    let ocr = q.lines.iter().any(|&(p, _)| pages[p].ocr);
+    let ends_at_footer = footer_line.is_some_and(|f| last_text_line.is_some_and(|l| l <= f));
+    let ends_on_tick_options = last_text_line.is_some_and(|l| tick_options.contains(&l));
+    QuestionBody { text: kept.join("\n"), footer_marks, pages: (q.start_page, q.end_page), undetected_figures, ends_with_reference: q.reference_from.is_some(), ends_at_footer, ends_on_tick_options, ocr }
 }
 
 static FIGURE_CAPTION_RE: std::sync::LazyLock<regex::Regex> =
@@ -6403,7 +7894,11 @@ pub fn figure_crop_rect(lp: &LayoutPage, r: [f32; 4]) -> [f32; 4] {
     for _ in 0..4 {
         let mut grew = false;
         for (i, f) in lp.furniture.iter().enumerate() {
-            if taken[i] || f.furniture != Some(FurnitureKind::Figure) || dist(f, &out) > 18.0 || others.iter().any(|o| dist(f, o) < dist(f, &r)) {
+            // (An axis title set upright along its axis is rotated text.)
+            // (The page's outer margin strips are no titles.)
+            let margin_strip = f.x1 < 0.08 * lp.width || f.x0 > 0.92 * lp.width;
+            let label = f.furniture == Some(FurnitureKind::Figure) || f.furniture == Some(FurnitureKind::Rotated) && !margin_strip;
+            if taken[i] || !label || dist(f, &out) > 18.0 || others.iter().any(|o| dist(f, o) < dist(f, &r)) {
                 continue;
             }
             taken[i] = true;
@@ -6435,6 +7930,11 @@ mod tests {
         crate::pdf_render::load_layout_pages(&path)
     }
 
+    /// The allocations printed in a body ("[2]").
+    fn printed_allocations(body: &str) -> u32 {
+        regex::Regex::new(r"\[(\d{1,2})\]").unwrap().captures_iter(body).map(|c| c[1].parse::<u32>().unwrap()).sum()
+    }
+
     fn body(pages: &[LayoutPage], map: &LayoutMap, n: u32) -> String {
         let q = map.questions.iter().find(|q| q.number == n).unwrap_or_else(|| panic!("Q{n} not mapped"));
         question_body(pages, q).text
@@ -6443,7 +7943,7 @@ mod tests {
     #[test]
     fn aqa_gcse_further_maths_2024_bodies_are_isolated_and_source_faithful() {
         let _guard = crate::pdf_render::pdfium_test_lock();
-        let Some(pages) = corpus_pages("past papers for mergemark/aqa gcse further maths '24.pdf") else { return };
+        let Some(pages) = corpus_pages("papers/used/aqa gcse further maths '24.pdf") else { return };
         let map = build_layout_map(&pages);
         assert_eq!(map.questions.iter().map(|q| q.number).collect::<Vec<_>>(), (1..=23).collect::<Vec<_>>());
         // Q5's heading "5  y = …" has no capitalised word after the number.
@@ -6461,7 +7961,7 @@ mod tests {
     #[test]
     fn cie_2022_bodies_rebuild_maths_from_font_identities() {
         let _guard = crate::pdf_render::pdfium_test_lock();
-        let Some(pages) = corpus_pages("test_papers/04_cie_maths_9709_p1_qp.pdf") else { return };
+        let Some(pages) = corpus_pages("papers/used/04_cie_maths_9709_p1_qp.pdf") else { return };
         let map = build_layout_map(&pages);
         assert_eq!(map.questions.len(), 10);
         // The "ffi" ligature is one glyph expanded into three chars.
@@ -6489,7 +7989,7 @@ mod tests {
     #[test]
     fn physics_2024_nuclides_options_and_section_breaks() {
         let _guard = crate::pdf_render::pdfium_test_lock();
-        let Some(pages) = corpus_pages("past papers for mergemark/physics '24.pdf") else { return };
+        let Some(pages) = corpus_pages("papers/used/physics '24.pdf") else { return };
         let map = build_layout_map(&pages);
         assert_eq!(map.questions.len(), 32);
         // Full-size stacked numbers before a symbol are its prescripts.
@@ -6511,7 +8011,7 @@ mod tests {
     #[test]
     fn display_integral_limits_never_take_neighbouring_prose() {
         let _guard = crate::pdf_render::pdfium_test_lock();
-        let Some(pages) = corpus_pages("past papers for mergemark/core pure 1 '21.pdf") else { return };
+        let Some(pages) = corpus_pages("papers/used/core pure 1 '21.pdf") else { return };
         let map = build_layout_map(&pages);
         let q2 = body(&pages, &map, 2);
         assert!(q2.contains("(c) Use the integration function on your calculator to evaluate\n"), "{q2}");
@@ -6522,7 +8022,7 @@ mod tests {
     #[test]
     fn cs_options_bit_patterns_arrows_and_labelled_tables_are_source_faithful() {
         let _guard = crate::pdf_render::pdfium_test_lock();
-        let Some(pages) = corpus_pages("past papers for mergemark/computer science 2 '22.pdf") else { return };
+        let Some(pages) = corpus_pages("papers/used/computer science 2 '22.pdf") else { return };
         let map = build_layout_map(&pages);
         // A letter centred on its two-line option heads the option.
         let q2 = body(&pages, &map, 2);
@@ -6544,7 +8044,7 @@ mod tests {
         let q12 = body(&pages, &map, 12);
         assert!(q12.contains("temps = [50, 68, 95, 86]\n\nfu a = (a - 32) * 5 / 9\n"), "{q12}");
 
-        let Some(pages) = corpus_pages("past papers for mergemark/computer science 2 '23.pdf") else { return };
+        let Some(pages) = corpus_pages("papers/used/computer science 2 '23.pdf") else { return };
         let map = build_layout_map(&pages);
         // Word's "-->" arrows are Wingdings glyphs.
         let q5 = body(&pages, &map, 5);
@@ -6557,7 +8057,7 @@ mod tests {
         assert!(q7.contains("| `R1` | `0` | `1` | `0` | `0` | `0` | `1` | `1` | `0` |"), "{q7}");
         assert!(q7.contains("| `15` | `0` | `0` | `0` | `0` | `1` | `1` | `1` | `1` |"), "{q7}");
 
-        let Some(pages) = corpus_pages("past papers for mergemark/computer science 2 '24.pdf") else { return };
+        let Some(pages) = corpus_pages("papers/used/computer science 2 '24.pdf") else { return };
         let map = build_layout_map(&pages);
         // The examiner's page total in the margin is not option text.
         let q7 = body(&pages, &map, 7);
@@ -6565,9 +8065,72 @@ mod tests {
     }
 
     #[test]
+    fn word_subscripts_of_several_characters_stay_one_subscript() {
+        let _guard = crate::pdf_render::pdfium_test_lock();
+        let Some(pages) = corpus_pages("papers/used/Chemistry_GCSE_Past-Papers_AQA__June_2024_QP.pdf") else { return };
+        let map = build_layout_map(&pages);
+        // Word sets "14" of C6H14 at 7 pt, 0.6 pt below the line, each glyph
+        // advancing from the one before; the "1" inks well inside its advance.
+        let q1 = body(&pages, &map, 1);
+        assert!(q1.contains(r"$\mathrm{C}_6\mathrm{H}_{14}$") && !q1.contains(r"\mathrm{H}14"), "{q1}");
+        assert!(q1.contains(r"$(\mathrm{C}_{12}\mathrm{H}_{26})$"), "{q1}");
+        for option in [r"$\mathrm{C}_n\mathrm{H}_{2\mathrm{n}-2}$", r"$\mathrm{C}_n\mathrm{H}_{2\mathrm{n}}$", r"$\mathrm{C}_n\mathrm{H}_{2\mathrm{n}+2}$"] {
+            assert!(q1.contains(option), "{option}: {q1}");
+        }
+    }
+
+    #[test]
+    fn a_page_number_needs_half_a_line_clear_of_the_text() {
+        // Page 25's own number centred at the head of the page: 9 pt above
+        // the first line it is the page's number (OCR A); a line touching it
+        // makes it text.
+        let page = |gap: f32| {
+            let mut idx = 0;
+            let mut glyph = |ch: char, x0: f32, oy: f32| {
+                idx += 1;
+                Glyph { idx, ch, raw: ch as u32, font: "ArialMT".into(), italic: false, bold: false, mono: false, size: 11.0, x0, x1: x0 + 6.0, y0: oy - 8.0, y1: oy, ox: x0, oy, lx0: x0, lx1: x0 + 6.0, angle: 0.0 }
+            };
+            let mut glyphs = vec![glyph('2', 291.6, 54.5), glyph('5', 297.6, 54.5)];
+            glyphs.extend("Find the area of the shaded region in the diagram".chars().enumerate().filter(|(_, c)| *c != ' ').map(|(i, c)| glyph(c, 90.0 + 6.0 * i as f32, 54.5 + gap + 8.0)).collect::<Vec<_>>());
+            layout_page(&PageGlyphs { page: 24, width: 595.0, height: 842.0, glyphs, ..Default::default() })
+        };
+        assert!(!page(9.0).lines.iter().any(|l| l.text.trim() == "25"), "{:?}", page(9.0).lines.iter().map(|l| &l.text).collect::<Vec<_>>());
+        assert!(page(2.0).lines.iter().any(|l| l.text.trim() == "25"), "{:?}", page(2.0).lines.iter().map(|l| &l.text).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn a_decimal_point_inside_a_word_subscript_stays_in_it() {
+        // A Word subscript is set at 7 pt, 0.6 pt below the 12 pt line,
+        // each character advancing from the one before: "t₀.₅". A run of
+        // stops after a word is an answer line's leader instead.
+        let mut idx = 0;
+        let mut glyph = |ch: char, x0: f32, w: f32, size: f32, oy: f32| {
+            idx += 1;
+            Glyph { idx, ch, raw: ch as u32, font: "TimesNewRomanPSMT".into(), italic: false, bold: false, mono: false, size, x0, x1: x0 + w, y0: oy - 0.7 * size, y1: oy, ox: x0, oy, lx0: x0, lx1: x0 + w, angle: 0.0 }
+        };
+        let glyphs = vec![glyph('t', 100.0, 3.3, 12.0, 200.0), glyph('0', 103.3, 3.5, 7.0, 200.6), glyph('.', 106.8, 1.75, 7.0, 200.6), glyph('5', 108.55, 3.5, 7.0, 200.6)];
+        let lp = layout_page(&PageGlyphs { page: 0, width: 595.0, height: 842.0, glyphs, ..Default::default() });
+        let text: Vec<&str> = lp.lines.iter().map(|l| l.text.as_str()).collect();
+        assert!(text.iter().any(|t| t.contains(r"\mathrm{t}_{0.5}")), "{text:?}");
+    }
+
+    #[test]
+    fn leader_dots_set_small_after_a_word_are_no_subscript() {
+        let _guard = crate::pdf_render::pdfium_test_lock();
+        // Edexcel A Biology Jun 2021 sets the dots of its answer lines at
+        // 6 pt on the baseline, tight after the word ("Answer ………").
+        let Some(pages) = corpus_pages("papers/used/Biology_A-level_Past-Papers_Edexcel-A__June_2021_QP_-_Paper_1_Edexcel_(A)_Biology_AS-level.pdf") else { return };
+        let map = build_layout_map(&pages);
+        for (n, word) in [(7, "Answer"), (8, "shrimps")] {
+            let b = body(&pages, &map, n);
+            assert!(!b.contains(&format!("{word}}}_")), "Q{n}: {b}");
+        }
+    }
+
+    #[test]
     fn subscripts_brackets_and_outlined_symbols_follow_the_source() {
         let _guard = crate::pdf_render::pdfium_test_lock();
-        let Some(pages) = corpus_pages("past papers for mergemark/physics '21.pdf") else { return };
+        let Some(pages) = corpus_pages("papers/used/physics '21.pdf") else { return };
         let map = build_layout_map(&pages);
         // A reduced k set on E's baseline is its subscript, then raised.
         let q5 = body(&pages, &map, 5);
@@ -6577,7 +8140,7 @@ mod tests {
         let q2 = body(&pages, &map, 2);
         assert_eq!(q2.matches(UNKNOWN_GLYPH).count(), 2, "{q2}");
 
-        let Some(pages) = corpus_pages("past papers for mergemark/core pure 1 '23.pdf") else { return };
+        let Some(pages) = corpus_pages("papers/used/core pure 1 '23.pdf") else { return };
         let map = build_layout_map(&pages);
         // SymbolMT pieces under control codes assemble the matrix brackets.
         let q8 = body(&pages, &map, 8);
@@ -6591,7 +8154,7 @@ mod tests {
         let q3 = body(&pages, &map, 3);
         assert!(q3.contains(r"+ \mathrm{i} \sin \frac{17\pi}{12}\right)$"), "{q3}");
 
-        let Some(pages) = corpus_pages("past papers for mergemark/core pure 1 '21.pdf") else { return };
+        let Some(pages) = corpus_pages("papers/used/core pure 1 '21.pdf") else { return };
         let map = build_layout_map(&pages);
         // A short bracket's bottom piece overlapping its extension is one bracket.
         let q9 = body(&pages, &map, 9);
@@ -6601,7 +8164,7 @@ mod tests {
     #[test]
     fn legacy_cie_word_breaks_vector_arrows_and_small_print() {
         let _guard = crate::pdf_render::pdfium_test_lock();
-        let Some(pages) = corpus_pages("test_papers/07_legacy_c3_or_c4_qp.pdf") else { return };
+        let Some(pages) = corpus_pages("papers/used/07_legacy_c3_or_c4_qp.pdf") else { return };
         let map = build_layout_map(&pages);
         // Words positioned apart with no space character are still words.
         assert!(body(&pages, &map, 1).contains(r"graph of $y = a + b \sin x$"), "{}", body(&pages, &map, 1));
@@ -6628,13 +8191,13 @@ mod tests {
     fn spacing_and_vector_terms_follow_the_print() {
         let _guard = crate::pdf_render::pdfium_test_lock();
         // A generated space spanning glyphs drawn inside it is no gap.
-        if let Some(pages) = corpus_pages("past papers for mergemark/further mechanics 1 '23.pdf") {
+        if let Some(pages) = corpus_pages("papers/used/further mechanics 1 '23.pdf") {
             let map = build_layout_map(&pages);
             assert!(body(&pages, &map, 3).contains(r"$\frac{(4 + 10e)u}{3}$"), "{}", body(&pages, &map, 3));
         }
         // A number set a clear gap before its unit; a bold vector before a
         // full stop or comma.
-        if let Some(pages) = corpus_pages("past papers for mergemark/further mechanics 1 '22.pdf") {
+        if let Some(pages) = corpus_pages("papers/used/further mechanics 1 '22.pdf") {
             let map = build_layout_map(&pages);
             let q2 = body(&pages, &map, 2);
             assert!(q2.contains("constant force of magnitude 200 N."), "{q2}");
@@ -6643,12 +8206,12 @@ mod tests {
         }
         // An operator binds its operand; an upright i after maths is the
         // imaginary unit.
-        if let Some(pages) = corpus_pages("past papers for mergemark/core pure 1 '23.pdf") {
+        if let Some(pages) = corpus_pages("papers/used/core pure 1 '23.pdf") {
             let map = build_layout_map(&pages);
             assert!(body(&pages, &map, 3).contains(r"$z_1 = -4 + 4\mathrm{i}$"), "{}", body(&pages, &map, 3));
         }
         // The typed space under an italic f's swash is a word space.
-        if let Some(pages) = corpus_pages("test_papers/03_aqa_physics_p1_qp.pdf") {
+        if let Some(pages) = corpus_pages("papers/used/03_aqa_physics_p1_qp.pdf") {
             let map = build_layout_map(&pages);
             assert!(body(&pages, &map, 19).contains("on a string is $f$."), "{}", body(&pages, &map, 19));
         }
@@ -6657,7 +8220,7 @@ mod tests {
     #[test]
     fn axis_titles_beyond_the_tick_values_are_in_the_figure_crop() {
         let _guard = crate::pdf_render::pdfium_test_lock();
-        let Some(pages) = corpus_pages("past papers for mergemark/Nov 2024 QP.pdf") else { return };
+        let Some(pages) = corpus_pages("papers/used/Nov 2024 QP.pdf") else { return };
         // Q22's velocity-time graph: "Velocity (m/s)" left of the speed
         // values and "Time (s)" under the time values.
         let lp = &pages[19];
@@ -6673,7 +8236,7 @@ mod tests {
     #[test]
     fn a_question_closing_on_its_own_reference_table_ends_there() {
         let _guard = crate::pdf_render::pdfium_test_lock();
-        let Some(pages) = corpus_pages("past papers for mergemark/computer science 2 '23.pdf") else { return };
+        let Some(pages) = corpus_pages("papers/used/computer science 2 '23.pdf") else { return };
         let map = build_layout_map(&pages);
         // Table 3 "is included so that you can answer question parts 07.1,
         // 07.2 and 07.3" after 07.3's marks; its last line ends unpunctuated.
@@ -6688,7 +8251,7 @@ mod tests {
     #[test]
     fn page_qr_codes_are_furniture_not_figures() {
         let _guard = crate::pdf_render::pdfium_test_lock();
-        let Some(pages) = corpus_pages("past papers for mergemark/aea2024.pdf") else { return };
+        let Some(pages) = corpus_pages("papers/used/aea2024.pdf") else { return };
         // Each question's first page carries a QR code (an image inside
         // nested forms) at the top right, a point or two from the others.
         let qr = |lp: &LayoutPage| lp.furniture_images.iter().copied().find(|r| r[0] > 480.0 && r[3] < 100.0 && (r[2] - r[0] - 50.0).abs() < 5.0);
@@ -6704,7 +8267,7 @@ mod tests {
     #[test]
     fn big_operators_stay_in_the_sentence_they_are_printed_in() {
         let _guard = crate::pdf_render::pdfium_test_lock();
-        let Some(pages) = corpus_pages("test_papers/01_edexcel_maths_p1_qp.pdf") else { return };
+        let Some(pages) = corpus_pages("papers/used/01_edexcel_maths_p1_qp.pdf") else { return };
         let map = build_layout_map(&pages);
         // The enlarged Σ (with "lim" over "δx→0" before it) is set inside
         // the heading line of Q4, not on a line of its own above it.
@@ -6720,7 +8283,7 @@ mod tests {
     #[test]
     fn formula_pictures_stay_where_they_are_printed() {
         let _guard = crate::pdf_render::pdfium_test_lock();
-        let Some(pages) = corpus_pages("past papers for mergemark/naikermaths_paper_m16_pure.pdf") else { return };
+        let Some(pages) = corpus_pages("papers/used/naikermaths_paper_m16_pure.pdf") else { return };
         let map = build_layout_map(&pages);
         let q3 = body(&pages, &map, 3);
         assert!(q3.contains(&format!("(a) Find {}, writing your answer", FIGURE_PLACEHOLDER)), "{q3}");
@@ -6731,7 +8294,7 @@ mod tests {
     #[test]
     fn sheared_greek_and_stroked_bars_are_source_text() {
         let _guard = crate::pdf_render::pdfium_test_lock();
-        let Some(pages) = corpus_pages("past papers for mergemark/madas_paper_2_t.pdf") else { return };
+        let Some(pages) = corpus_pages("papers/used/madas_paper_2_t.pdf") else { return };
         let map = build_layout_map(&pages);
         let q3 = body(&pages, &map, 3);
         // α is drawn with a slant matrix (reported as an 18.9° "angle").
@@ -6740,5 +8303,839 @@ mod tests {
         assert!(q3.contains("|x|"), "{q3}");
         // The running banner is page furniture.
         assert!(!q3.contains("Created by T. Madas"), "{q3}");
+    }
+
+    #[test]
+    fn to_unicode_maps_parse_chars_ranges_and_packed_strings() {
+        let cmap = b"2 beginbfchar\n<0003><0020>\n<0044> <0061>\nendbfchar\n1 beginbfrange\n<0010> <0012> <0041>\n<0020> <0021> [<00E9> <D835DC00>]\nendbfrange\n1 beginbfchar <0050> <D800> endbfchar";
+        let e = to_unicode_entries(cmap);
+        for pair in [(0x03, 0x20), (0x44, 0x61), (0x10, 0x41), (0x11, 0x42), (0x12, 0x43), (0x20, 0xE9), (0x21, 0x1D400)] {
+            assert!(e.contains(&pair), "{pair:x?} in {e:x?}");
+        }
+        // A lone high surrogate is no character.
+        assert!(!e.iter().any(|(c, _)| *c == 0x50), "{e:x?}");
+    }
+
+    #[test]
+    fn glyph_ids_resolve_only_on_the_source_evidence() {
+        // Times New Roman's glyph 237 at its own advance is the minus; a
+        // wrong advance, or none stated, does not establish it.
+        assert_eq!(original_glyph("TimesNewRomanPSMT", 237, 564.0), Some('−'));
+        assert_eq!(original_glyph("TimesNewRomanPS-ItalicMT", 237, 564.0), None);
+        assert_eq!(original_glyph("TimesNewRomanPSMT", 17, 300.0), None);
+        assert_eq!(original_glyph("TimesNewRomanPSMT", 9999, 500.0), None);
+        assert_eq!(original_glyph("ArialMT", 20, 556.0), None);
+        // Euclid Math Two's ⩽ and ⩾ at their own advance; no other id.
+        assert_eq!(original_glyph("EuclidMathTwo", 45, 778.0), Some('⩽'));
+        assert_eq!(original_glyph("EuclidMathTwo", 46, 600.0), None);
+        assert_eq!(original_glyph("EuclidMathTwo", 47, 778.0), None);
+        // Monotype Symbol's glyph order is its encoding's from id 3 to 191:
+        // ≠ at 549; nothing before the space or after the last code.
+        assert_eq!(original_glyph("SymbolMT", 122, 549.0), Some('≠'));
+        assert_eq!(original_glyph("SymbolMT", 122, 600.0), None);
+        assert_eq!(original_glyph("SymbolMT", 1, 549.0), None);
+        assert_eq!(original_glyph("SymbolMT", 192, 549.0), None);
+        // Glyphs named by id: Times New Roman's g153 is ∑ at 713; the name
+        // establishes nothing for a font no fixture showed named this way.
+        assert_eq!(glyph_name_to_char("g153", "TimesNewRomanPSMT", 713.0), Some('∑'));
+        assert_eq!(glyph_name_to_char("g153", "TimesNewRomanPSMT", 500.0), None);
+        assert_eq!(glyph_name_to_char("g45", "EuclidMathTwo", 778.0), None);
+        assert_eq!(glyph_name_to_char("greaterthanorequalangled", "EuclidMathTwo", 778.0), None);
+        // On a page: an id another font of the family could also give ("a",
+        // a simple font's code) is not established either.
+        let font = "TimesNewRomanPSMT";
+        let mut cat = PageFontCatalog::default();
+        cat.unnamed_glyph_ids.insert(font.into(), [(237, Some(564.0)), (17, Some(300.0)), (25, None), (0x61, Some(444.0))].into_iter().collect());
+        cat.producible.insert(font.into(), [(0x61, vec![444.0])].into_iter().collect());
+        let glyph = |raw: u32| Glyph { idx: 0, ch: resolve_identity(raw, font), raw, font: font.into(), italic: false, bold: false, mono: false, size: 7.0, x0: 0.0, x1: 1.0, y0: 0.0, y1: 1.0, ox: 0.0, oy: 1.0, lx0: 0.0, lx1: 1.0, angle: 0.0 };
+        let mut g = vec![glyph(237), glyph(17), glyph(25), glyph(0x61), glyph(0x62)];
+        resolve_glyph_ids(&mut g, &cat);
+        let u = UNKNOWN_GLYPH;
+        assert_eq!(g.iter().map(|g| g.ch).collect::<String>(), format!("−{u}{u}{u}b"));
+        // The advance a glyph is set with tells the two apart when it fits
+        // one only: TNR glyph 97 ("~", 541) against a simple font's "a" (444).
+        cat.unnamed_glyph_ids.get_mut(font).unwrap().insert(0x61, Some(541.0));
+        let set_at = |advance: f32| Glyph { lx1: advance * 7.0 / 1000.0, ..glyph(0x61) };
+        let mut g = vec![set_at(541.0), set_at(444.0), set_at(700.0)];
+        resolve_glyph_ids(&mut g, &cat);
+        assert_eq!(g.iter().map(|g| g.ch).collect::<String>(), format!("~a{u}"));
+    }
+
+    #[test]
+    fn glyphs_set_at_the_tab_and_line_feed_codes_are_read() {
+        let _guard = crate::pdf_render::pdfium_test_lock();
+        // Edexcel S1 Jun 2012's Times New Roman subset numbers its glyphs in
+        // order of use, so "2" and "4" sit at codes 9 and 10, which the text
+        // layer reports as a tab and a line feed. Q2 prints
+        // "Σx = 477  Sxx = 5606.25  Σy = 480  Syy = 4244  Σxy = 23 070".
+        let Some(pages) = corpus_pages("papers/used/Maths_A-level_S1_Papers-Edexcel__June_2012_QP.pdf") else { return };
+        let map = build_layout_map(&pages);
+        let q2 = body(&pages, &map, 2);
+        assert!(q2.contains("5606.25") && q2.contains("4244"), "{q2}");
+    }
+
+    #[test]
+    fn symbol_font_codes_not_established_stay_unknown() {
+        assert_eq!(resolve_identity(0x27, "MMBinary"), '÷');
+        assert_eq!(resolve_identity(0x26, "MMBinary"), UNKNOWN_GLYPH);
+        assert_eq!(resolve_identity(0x41, "MMaScript-Regular"), UNKNOWN_GLYPH);
+        assert_eq!(resolve_identity(0x41, "MMTimesRoman"), 'A');
+        assert_eq!(resolve_identity(0xBC, "AdvP4C4E74"), '=');
+        assert_eq!(resolve_identity(0xBC, "AdvP4C4E99"), UNKNOWN_GLYPH);
+        assert_eq!(resolve_identity(0x70, "AdvPi10"), UNKNOWN_GLYPH);
+        assert_eq!(resolve_identity(0x61, "AdvPS2B42"), 'a');
+        assert_eq!(resolve_identity(0x48, "MMRelation"), '⩾');
+        assert_eq!(resolve_identity(0x49, "MMRelation"), UNKNOWN_GLYPH);
+        assert_eq!(resolve_identity(0x6D, "MMGreekItalic"), 'λ');
+        assert_eq!(resolve_identity(0x64, "MMGreekItalic"), UNKNOWN_GLYPH);
+    }
+
+    #[test]
+    fn symbol_fonts_read_as_the_symbols_they_draw() {
+        let _guard = crate::pdf_render::pdfium_test_lock();
+        // MathMagic (OCR): "÷" is "'", "×" is "#", "<" is "1" in the text layer.
+        if let Some(pages) = corpus_pages("papers/used/Maths_GCSE_Past-Papers_OCR__June_2024_QP.pdf") {
+            let map = build_layout_map(&pages);
+            assert!(body(&pages, &map, 2).contains("(b) $-42 \\div 6$"), "{}", body(&pages, &map, 2));
+            assert!(body(&pages, &map, 8).contains("symbols $<, >$ or $=$"), "{}", body(&pages, &map, 8));
+            assert!(body(&pages, &map, 10).contains("(b) $5a \\times 6b$"), "{}", body(&pages, &map, 10));
+        }
+        // MathMagic sized parentheses around a column vector, and its π (CIE).
+        if let Some(pages) = corpus_pages("papers/used/Maths_GCSE_Past-Papers_CIE__November_2022_(v1)_QP.pdf") {
+            let map = build_layout_map(&pages);
+            assert!(body(&pages, &map, 2).contains("by the vector $\\begin{pmatrix}-7 \\\\ 1\\end{pmatrix}$."), "{}", body(&pages, &map, 2));
+            assert!(pages[0].lines.iter().chain(pages[0].furniture.iter()).any(|l| l.text.contains("For $\\pi$, use either")));
+        }
+        if let Some(pages) = corpus_pages("papers/used/Maths_A-level_Papers_OCR-MEI__June_2025_QP.pdf") {
+            let map = build_layout_map(&pages);
+            assert!(body(&pages, &map, 6).contains("the interval $0^{\\circ} < x < 360^{\\circ}$."), "{}", body(&pages, &map, 6));
+        }
+        // Advent 3B2 (AQA): "¼" is "=", "þ" is "+", "X" is a hanging Σ set
+        // inside the sentence.
+        if let Some(pages) = corpus_pages("papers/used/Maths_A-level_Papers_AQA__June_2019_QP.pdf") {
+            let map = build_layout_map(&pages);
+            let q8 = body(&pages, &map, 8);
+            assert!(q8.contains(r"P(n) $= \sum_{\mathrm{k}=0}^{\mathrm{n}} \mathrm{k}^{3} - \sum_{\mathrm{k}=0}^{\mathrm{n}-1} \mathrm{k}^{3}$ where"), "{q8}");
+            assert!(q8.contains(r"P(n) $= 1.25 \times 10^{8}$"), "{q8}");
+            assert!(!body(&pages, &map, 7).contains(r"\sum"), "{}", body(&pages, &map, 7));
+        }
+        // Euclid Extra (Edexcel chemistry): equilibrium arrows, standard state.
+        if let Some(pages) = corpus_pages("papers/used/Chemistry_A-level_Past-Papers_Edexcel__June_2022_QP_-_Paper_1_Edexcel_Chemistry_A-level.pdf") {
+            let map = build_layout_map(&pages);
+            let q3 = body(&pages, &map, 3);
+            assert!(q3.contains(concat!(r"2\mathrm{e}^{-} \rightleftharpoons 2\text{Br}^{-}(\text{aq})$", "\t", r"$E^{\ominus} = +1.09$ V")), "{q3}");
+        }
+        // Times New Roman glyph ids the text layer reports as characters
+        // ("í" for the minus), and the sun sign drawn as a ring and a dot.
+        if let Some(pages) = corpus_pages("papers/used/edexcel '18 edexcel.pdf") {
+            let map = build_layout_map(&pages);
+            let q19 = body(&pages, &map, 19);
+            assert!(q19.contains(r"$3.25 \times 10^{-11} \mathrm{W} \mathrm{m}^{-2}$"), "{q19}");
+            assert!(q19.contains(r"The luminosity of the Sun is $L_{\odot}$."), "{q19}");
+        }
+        // Wingdings' tick.
+        if let Some(pages) = corpus_pages("papers/used/Biology_GCSE_Past-Papers_AQA__June_2022_QP.pdf") {
+            let map = build_layout_map(&pages);
+            assert!(body(&pages, &map, 1).contains("Tick (✓) one box."), "{}", body(&pages, &map, 1));
+        }
+        // Every glyph of the paper identified, and each symbol in its question.
+        let read_as_printed = |file: &str, printed: &[(u32, &str)]| {
+            let Some(pages) = corpus_pages(file) else { return };
+            let map = build_layout_map(&pages);
+            for q in &map.questions {
+                let b = question_body(&pages, q).text;
+                assert!(!b.contains(UNKNOWN_GLYPH), "{file} Q{}: {b}", q.number);
+            }
+            for &(n, p) in printed {
+                assert!(body(&pages, &map, n).contains(p), "{file} Q{n} lacks {p}: {}", body(&pages, &map, n));
+            }
+        };
+        // MathMagic MMRelation and MMGreekItalic (OCR).
+        read_as_printed("papers/used/Maths_A-level_Papers_OCR-Further__Nov_2021_QP.pdf", &[
+            (3, r"$\alpha, \beta$ and $\gamma"),
+            (5, r"\sin^{5}\theta \equiv A \sin \theta"),
+            (10, r"\geqslant 0.49"),
+            (11, r"+ \lambda\frac"),
+        ]);
+        // Euclid Math Two as a TrueType subset, glyph ids 45 and 46 (Edexcel).
+        read_as_printed("papers/used/Maths_A-level_C4_Papers-Edexcel__January_2006_QP.pdf", &[(7, r"t \geqslant 0"), (8, r"0 \leqslant t \leqslant 2\pi")]);
+        // Euclid Math Two as CFF ("lessthanorequalangled"), and Monotype
+        // Symbol as a TrueType subset, glyph ids 122, 123 and 151.
+        read_as_printed("papers/used/Maths_A-level_FP2_Papers-Edexcel__June_2014_(R)_QP.pdf", &[
+            (4, r"0 \leqslant \theta \leqslant"),
+            (6, r"z \neq \mathrm{i}"),
+            (7, r"\sin 5\theta \equiv 16 \sin^{5} \theta"),
+            (7, r"a\sqrt{2} + b"),
+        ]);
+        // Times New Roman converted to CFF, its glyphs named by id ("g153").
+        read_as_printed("papers/used/Maths_A-level_S1_Papers-Edexcel__June_2012_QP.pdf", &[(2, r"\sum x = 477"), (3, r"\sum p^{2} = 1967")]);
+    }
+
+    #[test]
+    fn scanned_pages_are_read_by_local_ocr_and_never_clean() {
+        let _guard = crate::pdf_render::pdfium_test_lock();
+        let rel = "papers/used/Maths_A-level_M3_Papers-Edexcel__June_2004_QP.pdf";
+        let Some(pages) = corpus_pages(rel) else { return };
+        if !crate::ocr::available() {
+            // Reported, never guessed.
+            assert!(pages.iter().all(|p| p.scan_unread && p.lines.is_empty()));
+            return;
+        }
+        assert!(pages.iter().all(|p| p.ocr));
+        let map = build_layout_map(&pages);
+        assert_eq!(map.questions.iter().map(|q| q.number).collect::<Vec<_>>(), (1..=7).collect::<Vec<_>>());
+        let q1 = question_body(&pages, &map.questions[0]);
+        assert!(q1.ocr && q1.text.contains("circular flywheel"), "{}", q1.text);
+        // The text layer the import is classified by comes from OCR too.
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join(rel);
+        let inputs = crate::pdf_render::render_pdf_pages(&path).unwrap();
+        assert!(inputs.iter().all(|p| !p.text.trim().is_empty()));
+    }
+
+    #[test]
+    fn headings_marked_for_extended_response_open_questions() {
+        let _guard = crate::pdf_render::pdfium_test_lock();
+        let Some(pages) = corpus_pages("papers/used/Economics_A-level_Past-Papers_OCR__June_2024_QP_-_Paper_1_OCR_Economics_A-level.pdf") else { return };
+        let map = build_layout_map(&pages);
+        // OCR's "2*" marks a question whose quality of extended response
+        // is assessed; Section A's question 1 has parts (a)-(e) only.
+        assert_eq!(map.questions.iter().map(|q| q.number).collect::<Vec<_>>(), vec![1, 2, 3, 4, 5]);
+        let q1 = body(&pages, &map, 1);
+        assert!(q1.contains("(e)* Evaluate") && !q1.contains("dog walkers"), "{q1}");
+        assert!(body(&pages, &map, 2).starts_with("2* There are more than 10 million dogs"), "{}", body(&pages, &map, 2));
+        // Section navigation, the "OR" between alternatives, the box for the
+        // chosen question's number and the footer under the answer lines
+        // belong to no question.
+        for n in [1, 2, 3] {
+            let b = body(&pages, &map, n);
+            for furniture in ["starts on the next page", "\nOR", "Question No.", "© OCR"] {
+                assert!(!b.contains(furniture), "Q{n} has {furniture:?}: {b}");
+            }
+        }
+    }
+
+    #[test]
+    fn an_axis_title_printed_upright_along_the_axis_is_in_the_figure_crop() {
+        let _guard = crate::pdf_render::pdfium_test_lock();
+        let Some(pages) = corpus_pages("papers/used/edexcel '18 edexcel.pdf") else { return };
+        // Q19's H-R diagram: "Luminosity / L☉" runs up the y-axis, left of
+        // the tick values; the page's margin strip stays out.
+        let lp = &pages[24];
+        let r = lp.figures.iter().copied().find(|r| r[0] > 170.0 && r[0] < 180.0).expect("H-R diagram region");
+        let crop = figure_crop_rect(lp, r);
+        assert!(crop[0] <= 127.0 && crop[0] > 30.0, "{crop:?}");
+    }
+
+    #[test]
+    fn a_limit_printed_as_several_glyphs_stays_one_limit() {
+        let _guard = crate::pdf_render::pdfium_test_lock();
+        // Edexcel Further Jun 2025 Q1: the upper limit "2.5" of both
+        // integrals is three glyphs, and its "5" starts beyond the space
+        // beside the sign where a limit begins.
+        let Some(pages) = corpus_pages("papers/used/Maths_A-level_Papers_Edexcel-Further__June_2025_QP.pdf") else { return };
+        let map = build_layout_map(&pages);
+        let q1 = body(&pages, &map, 1);
+        assert_eq!(q1.matches(r"\int_{1.5}^{2.5}").count(), 2, "{q1}");
+    }
+
+    #[test]
+    fn a_limit_letter_in_a_font_set_larger_than_the_text_stays_in_the_limit() {
+        let _guard = crate::pdf_render::pdfium_test_lock();
+        // AQA Further Jun 2025 Q8(c): the lower limit "r = c" sets its "c"
+        // at 9.6 pt, the script size of the italic maths font, which this
+        // paper sets at 12 pt beside 11 pt text.
+        let Some(pages) = corpus_pages("papers/used/Maths_A-level_Papers_AQA-Further__June_2025_QP.pdf") else { return };
+        let map = build_layout_map(&pages);
+        let q8 = body(&pages, &map, 8);
+        assert!(q8.contains(r"\sum_{r=c}^{2c}"), "{q8}");
+        assert!(q8.contains(r"\sum_{r=1}^{n}"), "{q8}");
+    }
+
+    #[test]
+    fn a_minus_drawn_in_a_maths_font_after_an_option_letter_is_maths() {
+        let _guard = crate::pdf_render::pdfium_test_lock();
+        // AQA Physics 2018 Q17 and Q22: options A and B open with a minus
+        // sign set in Cambria Math (the text layer calls it an en dash),
+        // after the option letter.
+        let Some(pages) = corpus_pages("papers/used/physics '18.pdf") else { return };
+        let map = build_layout_map(&pages);
+        let q17 = body(&pages, &map, 17);
+        assert!(q17.contains("A $-6.76 \\times 10^{14}$ J") && q17.contains("B $-3.38 \\times 10^{14}$ J"), "{q17}");
+        assert!(q17.contains("C $3.38 \\times 10^{14}$ J"), "{q17}");
+        let q22 = body(&pages, &map, 22);
+        assert!(q22.contains("A $-\\frac{7Q}{4}$"), "{q22}");
+    }
+
+    #[test]
+    fn a_dotted_answer_line_under_a_short_label_is_answer_space() {
+        // Lines printed in the fixtures below and in calibration fixtures
+        // (Edexcel Chemistry Jun 2022, OCR A Physics Jun 2017).
+        for space in [
+            "Total resistance $=$......................................................",
+            "Distance $=$...................................................... m",
+            "C–H bond enthalpy $=$........................................... kJ $\\text{mol}^{-1}$",
+            "Resistance $= ..................................................... \\text{Ω}$",
+            "Explanation ......................................................................................................",
+            "Mistake 1: ..........................................................................................................",
+            "Green solution ......................................................................................",
+            "$R_f =$...................",
+            "........................................ kilometres per hour",
+            // CIE Nov 2016 (v1) Q5: the currency is printed before the blank.
+            "Bills $= \\$$ ................................................",
+            "Colour in region E ......................................................................",
+            "work done $=$....................................................... J",
+            "$K_w$ at $45 ^{\\circ}\\mathrm{C} =$..............................................................",
+        ] {
+            assert_eq!(dotted_answer_prompt(space), Some(None), "{space}");
+        }
+        assert_eq!(dotted_answer_prompt("Energy $=$ ........................................ J [2]"), Some(Some("[2]".to_string())));
+        for question in [
+            "An atom has a ...................................... charged nucleus surrounded by .................................",
+            "The nucleus contains protons and ....................................... .",
+            "The nucleus contains protons and .......................................",
+            "........ $\\text{AgNO}_3 + ........ \\text{PH}_3$",
+            "Name the gas .............................................. [1]",
+            "Explain why the reading falls. ...................................................",
+            // OCR J560 Jun 24 Q13: the terms of a sequence beside its blank.
+            "1\t3\t6\t10\t...............\t[1]",
+            // Maths beside the blank, commands, a cloze, a nuclide to complete.
+            "$\\sqrt{x} =$ ........................................ [1]",
+            "Work out 3.5 $\\times$ 4 $=$ ........................................",
+            "Calculate 15% of 80 $=$ ........................................",
+            "The process is called ........................................",
+            "Energy is transferred ........................................",
+            "${}^{.....}_{.....}\\mathrm{K}$",
+        ] {
+            assert_eq!(dotted_answer_prompt(question), None, "{question}");
+        }
+    }
+
+    #[test]
+    fn dotted_answer_lines_leave_the_card_and_cloze_blanks_stay() {
+        let _guard = crate::pdf_render::pdfium_test_lock();
+        // Edexcel Physics AS Jun 2022 P1: "Total resistance = ……" closes Q9,
+        // "Light intensity = …… lux" closes Q11 after its allocation.
+        if let Some(pages) = corpus_pages("papers/used/Physics_A-level_Past-Papers_Edexcel__June_2022_QP_-_Paper_1_Edexcel_Physics_AS-level.pdf") {
+            let map = build_layout_map(&pages);
+            let q9 = body(&pages, &map, 9);
+            assert!(q9.ends_with("Calculate the total resistance of the resistors in the circuit."), "{q9}");
+            let q11 = body(&pages, &map, 11);
+            assert!(q11.ends_with("(3)") && !q11.contains("Light intensity $=$"), "{q11}");
+        }
+        // OCR A Chemistry Jun 2024: labelled lines go, the blanks of an
+        // equation to balance stay.
+        if let Some(pages) = corpus_pages("papers/used/Chemistry_A-level_Past-Papers_OCR-A__June_2024_QP.pdf") {
+            let map = build_layout_map(&pages);
+            let all: String = map.questions.iter().map(|q| question_body(&pages, q).text).collect::<Vec<_>>().join("\n");
+            assert!(!all.contains("bond enthalpy $=$....") && !all.contains("Explanation ...."), "{all}");
+            assert!(all.contains("........ $\\text{AgNO}_3"), "{all}");
+        }
+        // OCR A Physics GCSE Nov 2020: the cloze sentences stay.
+        if let Some(pages) = corpus_pages("papers/used/Physics_GCSE_Past-Papers_OCR-A__November_2020_QP_-_Paper_1_OCR_(A)_Physics_GCSE.pdf") {
+            let map = build_layout_map(&pages);
+            let q16 = body(&pages, &map, 16);
+            assert!(q16.contains("charged nucleus surrounded by") && q16.contains("The nucleus contains protons and"), "{q16}");
+            assert!(!q16.contains("Density $=$...."), "{q16}");
+        }
+        // CIE Nov 2016 (v1) Q5: "Bills = $ ……", "Leisure = $ ……" and
+        // "Other = $ …… [3]" go; their allocation stays.
+        if let Some(pages) = corpus_pages("papers/used/Maths_GCSE_Past-Papers_CIE__November_2016_(v1)_QP.pdf") {
+            let map = build_layout_map(&pages);
+            let q5 = body(&pages, &map, 5);
+            assert!(q5.contains("Work out how much she spends on each.\n[3]\n(c)"), "{q5}");
+        }
+    }
+
+    #[test]
+    fn a_heading_starred_for_extended_response_opens_its_question() {
+        let _guard = crate::pdf_render::pdfium_test_lock();
+        // Edexcel Physics AS Jun 2022 P1 prints Q14 as "*14": the star marks
+        // a question assessing extended response.
+        let Some(pages) = corpus_pages("papers/used/Physics_A-level_Past-Papers_Edexcel__June_2022_QP_-_Paper_1_Edexcel_Physics_AS-level.pdf") else { return };
+        let map = build_layout_map(&pages);
+        assert!(!body(&pages, &map, 13).contains("skateboard"), "{}", body(&pages, &map, 13));
+        assert!(body(&pages, &map, 14).starts_with("*14 A student is travelling forwards"), "{}", body(&pages, &map, 14));
+    }
+
+    #[test]
+    fn a_page_number_printed_below_the_header_zone_is_page_furniture() {
+        let _guard = crate::pdf_render::pdfium_test_lock();
+        // WJEC Further Unit 2 Jun 2024 prints each page's own number centred
+        // 72 pt from the top, below the running-header zone; Q1 runs to the
+        // foot of page 4, so pages 5 and 6 opened with "5" and "6".
+        let Some(pages) = corpus_pages("papers/used/Maths_A-level_Papers_WJEC-Further__June_2024_QP_-_Unit_2_WJEC_Further_Maths_AS-level.pdf") else { return };
+        let map = build_layout_map(&pages);
+        let q1 = body(&pages, &map, 1);
+        assert!(q1.ends_with("the distribution used in part (c).\t[2]"), "{q1}");
+        let q5 = body(&pages, &map, 5);
+        assert!(!q5.contains("\n19\n") && !q5.ends_with("20"), "{q5}");
+    }
+
+    #[test]
+    fn a_page_number_set_close_above_the_first_line_is_page_furniture() {
+        let _guard = crate::pdf_render::pdfium_test_lock();
+        // OCR A sets each page's own number centred at the head of the page,
+        // 9 pt above the first line, whose exponent rises towards it
+        // (Chemistry Jun 2022 page 25 over "(ii) 10 cm³ of dilute sulfuric
+        // acid"; Physics Jun 2019 page 18, the end of Q18, over "19 (a) A car
+        // is travelling … at 18 m s⁻¹").
+        for (file, n, page) in [
+            ("papers/used/Chemistry_A-level_Past-Papers_OCR-A__June_2022_QP.pdf", 21, "25"),
+            ("papers/used/Physics_A-level_Past-Papers_OCR-A__June_2019_QP.pdf", 18, "18"),
+        ] {
+            let Some(pages) = corpus_pages(file) else { continue };
+            let map = build_layout_map(&pages);
+            let b = body(&pages, &map, n);
+            assert!(!b.lines().any(|l| l.trim() == page), "{file} Q{n}: {b}");
+        }
+    }
+
+    #[test]
+    fn a_decimal_point_printed_raised_stays_in_its_number() {
+        let _guard = crate::pdf_render::pdfium_test_lock();
+        // WJEC Further Unit 2 Jun 2024 sets its decimal point as a full stop
+        // raised 3 pt above the digits' baseline ("2·5").
+        let Some(pages) = corpus_pages("papers/used/Maths_A-level_Papers_WJEC-Further__June_2024_QP_-_Unit_2_WJEC_Further_Maths_AS-level.pdf") else { return };
+        let map = build_layout_map(&pages);
+        let q1 = body(&pages, &map, 1);
+        assert!(q1.contains("Dave catches 4.3 fish per") && q1.contains("Llinos catches 3.8 fish per day"), "{q1}");
+        let q3 = body(&pages, &map, 3);
+        assert!(q3.contains("Poisson distribution with mean 2.5 is"), "{q3}");
+    }
+
+    #[test]
+    fn a_body_closed_by_its_printed_total_ends_there() {
+        let _guard = crate::pdf_render::pdfium_test_lock();
+        // Edexcel GCSE Jun 2022: "Write down two factors of 12" has no full
+        // stop; "(Total for Question 3 is 1 mark)" follows it (Q21 likewise).
+        let Some(pages) = corpus_pages("papers/used/Maths_GCSE_Past-Papers_Edexcel__June_2022_QP.pdf") else { return };
+        let map = build_layout_map(&pages);
+        for n in [2, 3, 21] {
+            let q = map.questions.iter().find(|q| q.number == n).unwrap();
+            assert!(question_body(&pages, q).ends_at_footer, "Q{n}");
+        }
+    }
+
+    #[test]
+    fn printed_instructions_and_section_totals_are_page_furniture() {
+        // Lines the papers print around their questions.
+        for line in [
+            "TOTAL FOR SECTION A $= \\mathbf{2}\\mathbf{0}$ MARKS",
+            "TOTAL FOR SECTION $\\mathbf{B} = \\mathbf{2}\\mathbf{0}$ MARKS",
+            "TOTAL FOR SECTION $\\mathbf{B}$ IS 50 MARKS",
+            "TOTAL FOR STATISTICS IS 50 MARKS",
+            "Turn over for the next section",
+            "© OCR 2018",
+            "© WJEC CBAC Ltd. (2300U10-1)",
+            "© WJEC CBAC Ltd. (B500U20-1) Turn over.",
+            "Source: News reports, 2019",
+            "Your answer",
+            "Start your answer here",
+            "Save your work for Question 1 as a word processed document named Answers.",
+            "Save your work for Question 2 in the word processed document named Answers.",
+            "Extra space is available on the next page if needed",
+            "QUESTION 20 IS THE",
+            "LAST QUESTION IN SECTION A",
+        ] {
+            assert!(NAVIGATION_RE.is_match(&plain_line(line)), "{line}");
+        }
+        for line in [
+            "Your answer should refer to the data in Figure 2.",
+            "The total for section A of the survey is 58.",
+            "Source: Table 1 shows the results.",
+            "Turn over the card and record its colour.",
+            "Question 20 is the hardest on the paper.",
+            "your answer",
+        ] {
+            assert!(!NAVIGATION_RE.is_match(&plain_line(line)), "{line}");
+        }
+        assert!(HEADER_FOOTER_RE.is_match("Typesetter code"));
+    }
+
+    #[test]
+    fn section_totals_and_typesetter_codes_leave_the_question() {
+        let _guard = crate::pdf_render::pdfium_test_lock();
+        // Edexcel A Economics Jun 2018: Q5 is followed by "TOTAL FOR SECTION
+        // A = 20 MARKS" after its own total.
+        if let Some(pages) = corpus_pages("papers/used/Economics_A-level_Past-Papers_Edexcel-A__June_2018_QP_-_Paper_2_Edexcel_(A)_Economics_AS-level.pdf") {
+            let map = build_layout_map(&pages);
+            let q5 = map.questions.iter().find(|q| q.number == 5).unwrap();
+            let b = question_body(&pages, q5);
+            assert!(!b.text.contains("TOTAL FOR SECTION") && b.ends_at_footer, "{}", b.text);
+        }
+        // AQA Chemistry Jun 2017 prints "Typesetter code" at the foot of a page.
+        if let Some(pages) = corpus_pages("papers/used/Chemistry_A-level_Past-Papers_AQA__June_2017_QP.pdf") {
+            let map = build_layout_map(&pages);
+            let all: String = map.questions.iter().map(|q| question_body(&pages, q).text).collect::<Vec<_>>().join("\n");
+            assert!(!all.contains("Typesetter code"), "{all}");
+        }
+    }
+
+    #[test]
+    fn a_closing_end_and_a_question_label_leave_the_question() {
+        let _guard = crate::pdf_render::pdfium_test_lock();
+        // Edexcel S1 Nov 2003 closes with "END", centred under Q6.
+        if let Some(pages) = corpus_pages("papers/used/Maths_A-level_S1_Papers-Edexcel__November_2003_QP.pdf") {
+            let map = build_layout_map(&pages);
+            assert!(body(&pages, &map, 6).ends_with("sales from the website.\n(2)"), "{}", body(&pages, &map, 6));
+        }
+        // Edexcel C4 Jan 2011 labels the foot of Q7 "Q7" beside its total.
+        if let Some(pages) = corpus_pages("papers/used/Maths_A-level_C4_Papers-Edexcel__January_2011_QP.pdf") {
+            let map = build_layout_map(&pages);
+            let q7 = body(&pages, &map, 7);
+            assert!(q7.ends_with("value of $I$.\n(8)"), "{q7}");
+        }
+    }
+
+    #[test]
+    fn options_beside_tick_boxes_fix_the_end_of_their_question() {
+        let _guard = crate::pdf_render::pdfium_test_lock();
+        // AQA Chemistry GCSE Jun 2022 Q3 ends on "Tick (✓) one box." over four
+        // options, each with an empty box drawn to its right; they stay as
+        // printed.
+        let question = |pages: &[LayoutPage], map: &LayoutMap, n: u32| question_body(pages, map.questions.iter().find(|q| q.number == n).unwrap());
+        if let Some(pages) = corpus_pages("papers/used/Chemistry_GCSE_Past-Papers_AQA__June_2022_QP.pdf") {
+            let map = build_layout_map(&pages);
+            let q3 = question(&pages, &map, 3);
+            assert!(q3.text.ends_with("Tick (✓) one box.\nBurette\nPipette\nSyringe\nTube") && q3.ends_on_tick_options, "{}", q3.text);
+        }
+        // AQA Biology GCSE Jun 2022 Q1 ends on such a list; a row of choices
+        // across the page ("25%  50%  75%  100%") is no column of options.
+        if let Some(pages) = corpus_pages("papers/used/Biology_GCSE_Past-Papers_AQA__June_2022_QP.pdf") {
+            let map = build_layout_map(&pages);
+            let q1 = question(&pages, &map, 1);
+            assert!(q1.text.ends_with("Carbohydrates\nMinerals\nProteins") && q1.ends_on_tick_options, "{}", q1.text);
+            assert!(q1.text.contains("Tick (✓) one box.\n25%\t50%\t75%\t100%"), "{}", q1.text);
+            assert!(!q1.text.contains("[MCQ:"), "{}", q1.text);
+        }
+    }
+
+    #[test]
+    fn a_label_over_answer_space_is_part_of_that_space() {
+        let _guard = crate::pdf_render::pdfium_test_lock();
+        // AQA Chemistry Jun 2017: "Mechanism" heads an empty space to draw
+        // in, "Justification" the ruled lines beneath it.
+        let Some(pages) = corpus_pages("papers/used/Chemistry_A-level_Past-Papers_AQA__June_2017_QP.pdf") else { return };
+        let map = build_layout_map(&pages);
+        for n in [1, 4, 6, 10] {
+            let b = body(&pages, &map, n);
+            assert!(!b.lines().any(|l| matches!(l.trim(), "Mechanism" | "Justification")), "Q{n}: {b}");
+        }
+        assert!(body(&pages, &map, 1).ends_with("Name and outline a mechanism for Reaction 3.\n[4 marks]"), "{}", body(&pages, &map, 1));
+    }
+
+    #[test]
+    fn an_answer_label_needs_answer_space_under_it_and_no_list_around_it() {
+        // The geometry of AQA Chemistry Jun 2017 page 9 ("Justification" over
+        // two ruled lines 29 pt apart), and shapes that only look like it.
+        let ln = |x0: f32, y0: f32, text: &str| LayoutLine { x0, x1: x0 + 60.0, y0, y1: y0 + 8.0, baseline: y0 + 8.0, size: 11.0, text: text.to_string(), glyphs: Vec::new(), furniture: None, bold_lead: false, unplaced: 0, code: false, char_width: 0.0 };
+        let page = |lines: Vec<LayoutLine>, drawings: Vec<[f32; 4]>| LayoutPage { width: 595.0, height: 842.0, lines, drawings, ..Default::default() };
+        let (label, next) = (ln(149.0, 389.0, "Justification"), ln(149.0, 600.0, "(b) The next part."));
+        let ruled = vec![[149.0, 428.0, 535.0, 428.5], [148.0, 457.0, 535.0, 457.5]];
+        let p = page(vec![label.clone(), next.clone()], ruled.clone());
+        assert!(answer_space_label(&p, &p.lines[0]));
+        // A box's lower edge is one line, not answer space.
+        let p = page(vec![label.clone(), next.clone()], vec![[140.0, 428.0, 535.0, 428.5]]);
+        assert!(!answer_space_label(&p, &p.lines[0]));
+        // Text between the lines: a table's rows.
+        let p = page(vec![label.clone(), ln(149.0, 435.0, "Carbon"), next.clone()], ruled);
+        assert!(!answer_space_label(&p, &p.lines[0]));
+        // One of a column of words above an empty space.
+        let p = page(vec![ln(149.0, 370.0, "Oxygen"), label, next], vec![]);
+        assert!(!answer_space_label(&p, &p.lines[1]));
+    }
+
+    #[test]
+    fn a_tick_list_with_an_unboxed_line_after_it_stays_as_printed() {
+        // As AQA Chemistry GCSE Jun 2022 Q3 (options at x 115, 28 pt boxes at
+        // x 248, 37 pt apart), but the third option wraps onto a line of its
+        // own with no box.
+        let ln = |y0: f32, text: &str| LayoutLine { x0: 115.0, x1: 175.0, y0, y1: y0 + 8.0, baseline: y0 + 8.0, size: 11.0, text: text.to_string(), glyphs: Vec::new(), furniture: None, bold_lead: false, unplaced: 0, code: false, char_width: 0.0 };
+        let boxes = vec![[248.0, 614.0, 277.0, 643.0], [248.0, 651.0, 277.0, 680.0], [248.0, 688.0, 277.0, 717.0]];
+        let order: Vec<(usize, usize)> = (0..5).map(|l| (0, l)).collect();
+        // The wrapped line beside the same box, and below it.
+        for wrapped in [710.0, 722.0] {
+            let lines = vec![ln(595.0, "Tick (✓) one box."), ln(625.0, "Burette"), ln(662.0, "Pipette"), ln(699.0, "Syringe with a"), ln(wrapped, "fixed plunger")];
+            let pages = vec![LayoutPage { width: 595.0, height: 842.0, lines, drawings: boxes.clone(), ..Default::default() }];
+            assert!(tick_box_options(&pages, &order).is_empty(), "{wrapped}");
+        }
+    }
+
+    #[test]
+    fn a_notice_where_a_question_begins_opens_no_question() {
+        let _guard = crate::pdf_render::pdfium_test_lock();
+        // OCR A Physics Jun 2019: page 9 carries only "Question 16 begins on
+        // page 10"; Q16 itself opens page 10 with "16 (a) …" and prints 11
+        // marks of allocations.
+        let Some(pages) = corpus_pages("papers/used/Physics_A-level_Past-Papers_OCR-A__June_2019_QP.pdf") else { return };
+        let map = build_layout_map(&pages);
+        let q16 = body(&pages, &map, 16);
+        assert!(q16.starts_with("16 (a) Explain what is meant by the ultimate tensile strength"), "{q16}");
+        let marks = printed_allocations(&q16);
+        assert_eq!(marks, 11, "{q16}");
+    }
+
+    #[test]
+    fn an_inequality_answer_line_keeps_its_allocation() {
+        let _guard = crate::pdf_render::pdfium_test_lock();
+        // CIE Nov 2016 (v1) Q1 prints 11 marks; (b)(ii)'s "……… ⩽ x < ……… [2]"
+        // is answer space whose allocation is the question's.
+        let Some(pages) = corpus_pages("papers/used/Maths_GCSE_Past-Papers_CIE__November_2016_(v1)_QP.pdf") else { return };
+        let map = build_layout_map(&pages);
+        let q1 = body(&pages, &map, 1);
+        let marks = printed_allocations(&q1);
+        assert_eq!(marks, 11, "{q1}");
+    }
+
+    #[test]
+    fn a_star_set_in_text_weight_leaves_its_heading_bold() {
+        let _guard = crate::pdf_render::pdfium_test_lock();
+        // Edexcel GCSE Jun 2016 1F sets the star of "*9" and "*24" in the
+        // text weight before the bold number.
+        let Some(pages) = corpus_pages("papers/used/Maths_GCSE_Past-Papers_Edexcel-A-Old__June_2016_QP_-_Paper_1_(F)_Edexcel_(A)_Maths_GCSE.pdf") else { return };
+        let map = build_layout_map(&pages);
+        assert!(body(&pages, &map, 9).starts_with("*9 Shape"), "{}", body(&pages, &map, 9));
+        assert!(body(&pages, &map, 24).starts_with("*24 The diagram shows the plan of a floor."), "{}", body(&pages, &map, 24));
+        assert!(!body(&pages, &map, 8).contains("Shape $\\mathbf{A}$ and shape") && !body(&pages, &map, 23).contains("plan of a floor"));
+    }
+
+    #[test]
+    fn a_page_opening_with_extra_answer_space_can_continue_its_question() {
+        let _guard = crate::pdf_render::pdfium_test_lock();
+        // OCR A Chemistry Jun 2022: page 23 opens "Additional answer space if
+        // required." under Q20(a), then prints Q20(b)(i) and (ii), [1] each.
+        let Some(pages) = corpus_pages("papers/used/Chemistry_A-level_Past-Papers_OCR-A__June_2022_QP.pdf") else { return };
+        let map = build_layout_map(&pages);
+        let q20 = body(&pages, &map, 20);
+        assert!(q20.contains("(b) In industry, hydrogen is also used") && q20.contains("Determine which student is correct."), "{q20}");
+        let marks = printed_allocations(&q20);
+        assert_eq!(marks, 8, "{q20}");
+        assert!(!q20.contains("Additional answer space"), "{q20}");
+    }
+
+    #[test]
+    fn a_choose_one_paper_records_its_alternatives() {
+        let _guard = crate::pdf_render::pdfium_test_lock();
+        // AQA Economics Jun 2021: "In Section A, answer EITHER Context 1 OR
+        // Context 2. In Section B, answer ONE essay."
+        let Some(pages) = corpus_pages("papers/used/Economics_A-level_Past-Papers_AQA__June_2021_QP.pdf") else { return };
+        let map = build_layout_map(&pages);
+        assert_eq!(map.choice_groups, vec![vec![vec![1, 2, 3, 4], vec![5, 6, 7, 8]], vec![vec![9, 10], vec![11, 12], vec![13, 14]]]);
+        // A paper with no choice instruction has none.
+        let Some(pages) = corpus_pages("papers/used/Chemistry_A-level_Past-Papers_OCR-A__June_2022_QP.pdf") else { return };
+        assert!(build_layout_map(&pages).choice_groups.is_empty());
+    }
+
+    #[test]
+    fn a_question_printed_twice_is_kept_once() {
+        let _guard = crate::pdf_render::pdfium_test_lock();
+        // Edexcel A Economics Jun 2018 prints Q6(a)–(g) as a list after its
+        // extracts, then each part again above its answer space; the answer
+        // form's "Chosen question number:" box closes it.
+        let Some(pages) = corpus_pages("papers/used/Economics_A-level_Past-Papers_Edexcel-A__June_2018_QP_-_Paper_2_Edexcel_(A)_Economics_AS-level.pdf") else { return };
+        let map = build_layout_map(&pages);
+        let q6 = body(&pages, &map, 6);
+        assert_eq!(q6.matches("With reference to Figure 1, explain one reason why the claimant count").count(), 1, "{q6}");
+        assert_eq!(q6.matches("EITHER").count(), 1, "{q6}");
+        assert!(!q6.contains("Chosen question number"), "{q6}");
+    }
+
+    #[test]
+    fn a_total_printed_under_graph_paper_is_the_questions() {
+        let _guard = crate::pdf_render::pdfium_test_lock();
+        // Edexcel GCSE Jun 2022 Q16 ("On the centimetre grid, draw …") prints
+        // "(Total for Question 16 is 2 marks)" just under the grid.
+        let Some(pages) = corpus_pages("papers/used/Maths_GCSE_Past-Papers_Edexcel__June_2022_QP.pdf") else { return };
+        let map = build_layout_map(&pages);
+        let q16 = map.questions.iter().find(|q| q.number == 16).unwrap();
+        assert_eq!(question_body(&pages, q16).footer_marks, Some(2));
+    }
+
+    #[test]
+    fn starred_questions_keep_the_papers_printed_total() {
+        let _guard = crate::pdf_render::pdfium_test_lock();
+        // Edexcel Physics AS Jun 2017 P2 ("TOTAL FOR PAPER = 80 MARKS") and
+        // edexcel '17 (90) star their extended-response questions ("*14");
+        // each question's printed total is its own.
+        for (file, questions, total) in [
+            ("papers/used/Physics_A-level_Past-Papers_Edexcel__June_2017_QP_-_Paper_2_Edexcel_Physics_AS-level.pdf", 17, 80),
+            ("papers/used/edexcel '17 edexcel.pdf", 20, 90),
+        ] {
+            let Some(pages) = corpus_pages(file) else { continue };
+            let map = build_layout_map(&pages);
+            assert_eq!(map.questions.iter().map(|q| q.number).collect::<Vec<_>>(), (1..=questions).collect::<Vec<_>>(), "{file}");
+            let footers: Vec<Option<u32>> = map.questions.iter().map(|q| question_body(&pages, q).footer_marks).collect();
+            assert!(footers.iter().all(Option::is_some), "{file}: {footers:?}");
+            assert_eq!(footers.iter().flatten().sum::<u32>(), total, "{file}");
+        }
+    }
+
+    #[test]
+    fn a_part_line_printed_again_drops_lines_only_from_a_reprint() {
+        // Edexcel prints a data-response question's parts twice. A body whose
+        // "(a)" line recurs above a part of its own is no reprint, and keeps
+        // every line.
+        let ln = |y0: f32, text: &str| LayoutLine { x0: 72.0, x1: 400.0, y0, y1: y0 + 8.0, baseline: y0 + 8.0, size: 11.0, text: text.to_string(), glyphs: Vec::new(), furniture: None, bold_lead: false, unplaced: 0, code: false, char_width: 0.0 };
+        let body_of = |texts: &[&str]| {
+            let lines: Vec<LayoutLine> = texts.iter().enumerate().map(|(i, t)| ln(100.0 + 30.0 * i as f32, t)).collect();
+            let q = LayoutQuestion { number: 6, lines: (0..lines.len()).map(|l| (0, l)).collect(), start_page: 0, end_page: 0, start_y: 100.0, end_y: None, reference_from: None };
+            let pages = vec![LayoutPage { width: 595.0, height: 842.0, lines, ..Default::default() }];
+            question_body(&pages, &q).text
+        };
+        let reprint = body_of(&["6 (a) Explain one cause of migration.", "(b) Assess one policy on migration.", "6 (a) Explain one cause of migration.", "(b) Assess one policy on migration."]);
+        assert_eq!(reprint.matches("Assess one policy on migration.").count(), 1, "{reprint}");
+        let own_part = body_of(&["6 (a) Explain one cause of migration.", "Explain your answer.", "(b) Assess one policy on migration.", "6 (a) Explain one cause of migration.", "(c) Evaluate a second policy.", "Explain your answer."]);
+        assert_eq!(own_part.matches("Explain your answer.").count(), 2, "{own_part}");
+    }
+
+    #[test]
+    fn every_greek_letter_the_engine_writes_names_a_quantity_on_an_answer_line() {
+        // The label of an answer line is read back from the LaTeX the engine
+        // writes for a Greek letter, plain or subscripted ("σ =", "λ₁ =").
+        let glyph = |ch: char| Glyph { idx: 0, ch, raw: ch as u32, font: String::new(), italic: false, bold: false, mono: false, size: 11.0, x0: 0.0, x1: 5.0, y0: 0.0, y1: 8.0, ox: 0.0, oy: 8.0, lx0: 0.0, lx1: 5.0, angle: 0.0 };
+        for ch in ('Α'..='Ω').chain('α'..='ω').chain(['ϑ', 'ϕ', 'ϖ', 'ϵ', 'µ']) {
+            let latex = latex_glyph(&glyph(ch));
+            if !latex.starts_with('\\') || latex.starts_with("\\text") {
+                continue;
+            }
+            for label in [format!("${latex} =$"), format!("${latex}_1 =$")] {
+                let words = answer_space_words(&label);
+                let greek = words.as_ref().is_some_and(|w| w.len() == 2 && w[0].chars().next().is_some_and(|c| c.is_alphabetic() && !c.is_ascii()));
+                assert!(greek, "{ch} {label}: {words:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn questions_end_at_the_paper_end_and_maths_led_headings_open_questions() {
+        let _guard = crate::pdf_render::pdfium_test_lock();
+        // "TOTAL FOR PAPER = 90 MARKS" ends the paper; the publisher's
+        // notice after it belongs to no question.
+        if let Some(pages) = corpus_pages("papers/used/edexcel '18 edexcel.pdf") {
+            let map = build_layout_map(&pages);
+            let q19 = body(&pages, &map, 19);
+            assert!(q19.ends_with("(3)") && !q19.contains("TOTAL FOR PAPER") && !q19.contains("copyright"), "{q19}");
+        }
+        if let Some(pages) = corpus_pages("papers/used/Chemistry_A-level_Past-Papers_Edexcel__June_2022_QP_-_Paper_1_Edexcel_Chemistry_A-level.pdf") {
+            let map = build_layout_map(&pages);
+            let q8 = body(&pages, &map, 8);
+            assert!(q8.ends_with("(7)"), "{q8}");
+        }
+        // "END OF QUESTION PAPER" (OCR) ends it before the extra answer
+        // space and the copyright page.
+        if let Some(pages) = corpus_pages("papers/used/Maths_GCSE_Past-Papers_OCR__June_2024_QP.pdf") {
+            let map = build_layout_map(&pages);
+            let q27 = body(&pages, &map, 27);
+            assert!(q27.ends_with("[1]") && !q27.contains("END OF") && !q27.contains("Copyright"), "{q27}");
+        }
+        // A heading whose question opens with maths: "26  a² − b² ≡ (a + b)(a − b)".
+        if let Some(pages) = corpus_pages("papers/used/Maths_GCSE_Past-Papers_AQA__November_2017_QP.pdf") {
+            let map = build_layout_map(&pages);
+            assert_eq!(map.questions.iter().map(|q| q.number).collect::<Vec<_>>(), (1..=30).collect::<Vec<_>>());
+            assert!(body(&pages, &map, 25).ends_with("[3 marks]"), "{}", body(&pages, &map, 25));
+            assert!(body(&pages, &map, 26).starts_with("26\t$a^{2} - b^{2}"), "{}", body(&pages, &map, 26));
+        }
+        // The footer under the last dotted answer line is no question text.
+        if let Some(pages) = corpus_pages("papers/used/Economics_A-level_Past-Papers_OCR__June_2024_QP_-_Paper_1_OCR_Economics_A-level.pdf") {
+            let map = build_layout_map(&pages);
+            for q in &map.questions {
+                assert!(!question_body(&pages, q).text.contains("© OCR"), "Q{}", q.number);
+            }
+        }
+        // WJEC's blank pages between questions.
+        if let Some(pages) = corpus_pages("papers/used/Maths_A-level_Papers_WJEC__June_2025_QP_-_Unit_1_WJEC_Maths_AS-level.pdf") {
+            let map = build_layout_map(&pages);
+            for q in &map.questions {
+                let b = question_body(&pages, q).text;
+                assert!(!b.contains("BLANK PAGE") && !b.contains("PLEASE DO NOT WRITE"), "Q{}: {b}", q.number);
+            }
+        }
+    }
+
+    #[test]
+    fn a_question_total_printed_after_its_last_allocation_is_the_footer() {
+        let _guard = crate::pdf_render::pdfium_test_lock();
+        let Some(pages) = corpus_pages("papers/used/Maths_A-level_FP2_Papers-Edexcel__June_2005_QP.pdf") else { return };
+        let map = build_layout_map(&pages);
+        // "(7)(Total 7 marks)": the part's allocation stays, the total is the footer.
+        let q5 = map.questions.iter().find(|q| q.number == 5).unwrap();
+        let b5 = question_body(&pages, q5);
+        assert_eq!(b5.footer_marks, Some(7), "{}", b5.text);
+        assert!(b5.text.ends_with("\n(7)") && !b5.text.contains("Total"), "{}", b5.text);
+        // A one-part question's total after its text.
+        let q2 = map.questions.iter().find(|q| q.number == 2).unwrap();
+        let b2 = question_body(&pages, q2);
+        assert_eq!(b2.footer_marks, Some(7), "{}", b2.text);
+        assert!(b2.text.ends_with("$y = \\mathrm{f}(x)$."), "{}", b2.text);
+    }
+
+    #[test]
+    fn answer_space_gives_its_allocation_only_beside_units_and_prompts() {
+        let dots = ".".repeat(30);
+        let mark = |s: String| answer_space_mark(&s);
+        assert_eq!(mark(format!("(a) {dots} [1]")), Some("[1]".into()));
+        assert_eq!(mark(format!("{dots} cm [1]")), Some("[1]".into()));
+        assert_eq!(mark(format!("{dots} $\\mathrm{{cm}}^{{2}}$ [3]")), Some("[3]".into()));
+        assert_eq!(mark(format!("(b)(i) $x =${dots} or $x =${dots} [3]")), Some("[3]".into()));
+        assert_eq!(mark(format!("{dots} m/s [3]")), Some("[3]".into()));
+        assert_eq!(mark(format!("{dots} days [2]")), Some("[2]".into()));
+        assert_eq!(mark(format!("$AB =${dots} cm [3]")), Some("[3]".into()));
+        // The printed allocation is kept as printed.
+        assert_eq!(mark(format!("{dots} [1 mark]")), Some("[1 mark]".into()));
+        // Question text beside the space.
+        assert_eq!(mark(format!("1\t3\t6\t10\t{dots}\t[1]")), None);
+        assert_eq!(mark(format!("(c) Find k {dots} [2]")), None);
+        assert_eq!(mark(format!("State the value of k {dots} [1]")), None);
+        assert_eq!(mark(format!("$\\sqrt{{x}} =$ {dots} [1]")), None);
+        // A Greek letter names the quantity (OCR A Physics Jun 2019 Q16(c));
+        // a relation spelt in LaTeX is the relation (CIE Nov 2016 Q1(b)(ii)).
+        assert_eq!(mark(format!("$\\sigma =${dots} Pa [2]")), Some("[2]".into()));
+        assert_eq!(mark(format!("${dots} \\leqslant x <${dots} [2]")), Some("[2]".into()));
+    }
+
+    #[test]
+    fn allocations_printed_at_the_end_of_answer_lines_stay_with_the_question() {
+        let _guard = crate::pdf_render::pdfium_test_lock();
+        if let Some(pages) = corpus_pages("papers/used/Maths_GCSE_Past-Papers_OCR__June_2024_QP.pdf") {
+            let map = build_layout_map(&pages);
+            // "......... [5]" closes the answer space.
+            let q26 = body(&pages, &map, 26);
+            assert!(q26.ends_with("You must show your working.\n[5]"), "{q26}");
+            // A part's answer line "(a) ...... [1]" gives its allocation; the
+            // label repeats the part's own.
+            let q1 = body(&pages, &map, 1);
+            assert_eq!(q1.matches("[1]").count(), 2, "{q1}");
+            assert_eq!(q1.matches("(b)").count(), 1, "{q1}");
+            assert!(!q1.contains("...."), "{q1}");
+            // A unit after the dots is part of the answer space.
+            let q4 = body(&pages, &map, 4);
+            assert!(q4.ends_with("diameter of the circle.\n[1]"), "{q4}");
+            assert!(body(&pages, &map, 14).ends_with("travelled is 8 m.\n[3]"), "{}", body(&pages, &map, 14));
+            // Terms printed beside an answer blank are question text.
+            let q13 = body(&pages, &map, 13);
+            assert!(q13.contains("1\t3\t6\t10"), "{q13}");
+            assert!(q13.contains("7\t10\t17"), "{q13}");
+        }
+        if let Some(pages) = corpus_pages("papers/used/Physics_A-level_Past-Papers_OCR-A__June_2017_QP.pdf") {
+            let map = build_layout_map(&pages);
+            let q22 = body(&pages, &map, 22);
+            assert!(q22.contains("internal energy of a substance.\n[1]\n(b)"), "{q22}");
+            assert!(q22.ends_with("as it melts.\n[4]"), "{q22}");
+        }
+        if let Some(pages) = corpus_pages("papers/used/Maths_GCSE_Past-Papers_CIE__November_2022_(v1)_QP.pdf") {
+            let map = build_layout_map(&pages);
+            let q3 = body(&pages, &map, 3);
+            assert!(q3.contains("write down the modal group.\n[1]"), "{q3}");
+        }
+        if let Some(pages) = corpus_pages("papers/used/Maths_A-level_Papers_WJEC__June_2025_QP_-_Unit_1_WJEC_Maths_AS-level.pdf") {
+            let map = build_layout_map(&pages);
+            // The allocation beside a formula is the same size as the
+            // formula's own type: no stretched delimiter.
+            let q3 = body(&pages, &map, 3);
+            assert!(q3.contains("\\sqrt{3}}$\t[3]"), "{q3}");
+            // The "Examiner only" column is margin furniture.
+            let q12 = body(&pages, &map, 12);
+            assert!(!q12.contains("only") && !q12.contains("Examiner"), "{q12}");
+        }
     }
 }

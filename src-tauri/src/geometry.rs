@@ -1,15 +1,15 @@
 // ── Deterministic diagram geometry ─────────────────────────────────────────
 //
-// The AI proposes bounding boxes; this module is the single authority that
-// turns a proposal into a crop. It:
+// Figure boxes come from the local detector and the layout map; this module
+// is the single authority that turns a box into a crop. It:
 //   * accepts relative (0..1), percent (0..100), or absolute pixel values
 //     and auto-detects which scale was used,
 //   * tolerates both [x, y, w, h] and [x1, y1, x2, y2] semantics,
 //   * clamps into image bounds with saturating math (never panics, never
 //     underflows u32),
 //   * rejects implausible boxes (degenerate specks, ~full-page misdetections),
-// so the crash class and the wrong-crop class are retired regardless of what
-// the model emits.
+// so the crash class and the wrong-crop class are retired whatever box it is
+// handed.
 
 /// A pixel-space rectangle guaranteed to lie fully inside the source image.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -31,8 +31,6 @@ pub struct CaptionHint {
     pub above: bool,
 }
 
-use std::sync::LazyLock;
-
 /// Minimum crop edge in pixels — anything smaller is a meaningless speck.
 const MIN_EDGE_PX: u32 = 12;
 /// Reject boxes covering more than this fraction of the page — that's a
@@ -41,349 +39,12 @@ const MAX_AREA_FRAC: f64 = 0.92;
 /// Reject boxes smaller than this fraction of the page — OCR noise.
 const MIN_AREA_FRAC: f64 = 0.0005;
 
-/// Boilerplate patterns that should never be included in image bounding boxes.
-/// These are matched against OCR text within or near the proposed crop region.
-const BOILERPLATE_PATTERNS: &[&str] = &[
-    r"(?i)do\s+not\s+write\s+(?:outside\s+the\s+box|in\s+this\s+area)",
-    r"(?i)turn\s+over",
-    r"(?i)question\s+\d+\s+continues\s+on\s+(?:the\s+)?next\s+page",
-    r"(?i)do\s+not\s+write\s+on\s+this\s+page",
-    r"(?i)blank\s+page",
-    r"(?i)end\s+of\s+questions?",
-    r"(?i)\[\s*\d+\s+marks?\s*\]",  // Mark allocations like [2 marks]
-    r"(?i)total\s+for\s+question\s+\d+\s+is\s+\d+\s+marks?",
-    r"(?i)page\s+\d+(\s*/\s*\d+)?",  // Page numbers
-    r"(?i)ib\s*/\s*[a-z]\s*/\s*[a-z]{3}\d{2}\s*/\s*\d+\s*/\s*\d+",  // Footer codes like IB/M/Jun21/7408/2
-];
-
-static BOILERPLATE_REGEXES: LazyLock<Vec<regex::Regex>> = LazyLock::new(|| {
-    BOILERPLATE_PATTERNS
-        .iter()
-        .map(|p| regex::Regex::new(p).unwrap())
-        .collect()
-});
-
-#[allow(dead_code)]
-static RE_MARKS: LazyLock<regex::Regex> = LazyLock::new(|| {
-    regex::Regex::new(r"(?i)\[\s*\d+\s+marks?\s*\]").unwrap()
-});
-
-#[allow(dead_code)]
-static RE_CONT: LazyLock<regex::Regex> = LazyLock::new(|| {
-    regex::Regex::new(r"(?i)question\s+\d+\s+continues\s+on\s+(?:the\s+)?next\s+page").unwrap()
-});
-
-static RE_MULTI_FIG: LazyLock<regex::Regex> = LazyLock::new(|| {
-    regex::Regex::new(r"(?i)(?:fig(?:ure)?\.?\s*\d+[\s,]*(?:and|,|-)\s*)+fig(?:ure)?\.?\s*\d+").unwrap()
-});
-
-static RE_FIG_NUM: LazyLock<regex::Regex> = LazyLock::new(|| {
-    regex::Regex::new(r"(?i)fig(?:ure)?\.?\s*(\d+)").unwrap()
-});
-
-/// Detect if a text region contains boilerplate that should be excluded from image crops.
-fn contains_boilerplate(text: &str) -> bool {
-    let lower = text.to_ascii_lowercase();
-    for re in BOILERPLATE_REGEXES.iter() {
-        if re.is_match(&lower) {
-            return true;
-        }
-    }
-    false
-}
-
-/// Conservatively clamp a proposed bounding box into the safe printable area,
-/// preventing accidental bleed into page headers, footers (Turn over, page numbers),
-/// and side margins without triggering expensive LLM repair loops.
-pub fn clamp_bbox_safe(bbox: &mut [f32]) {
-    if bbox.len() != 4 {
-        return;
-    }
-    const MIN_Y: f32 = 0.03;
-    const MAX_Y: f32 = 0.93;
-    const MIN_X: f32 = 0.03;
-    const MAX_X: f32 = 0.97;
-
-    let mut x = bbox[0].clamp(0.0, 1.0);
-    let mut y = bbox[1].clamp(0.0, 1.0);
-    let mut w = bbox[2].clamp(0.01, 1.0);
-    let mut h = bbox[3].clamp(0.01, 1.0);
-
-    // If y extends into header
-    if y < MIN_Y {
-        let diff = MIN_Y - y;
-        y = MIN_Y;
-        h = (h - diff).max(0.02);
-    }
-    // If y + h extends into footer
-    if y + h > MAX_Y {
-        h = (MAX_Y - y).max(0.02);
-    }
-
-    // If x extends into left margin
-    if x < MIN_X {
-        let diff = MIN_X - x;
-        x = MIN_X;
-        w = (w - diff).max(0.02);
-    }
-    // If x + w extends into right margin
-    if x + w > MAX_X {
-        w = (MAX_X - x).max(0.02);
-    }
-
-    bbox[0] = x;
-    bbox[1] = y;
-    bbox[2] = w;
-    bbox[3] = h;
-}
-
-/// Check if a proposed bounding box (in relative coordinates 0..1) lies entirely
-/// in a forbidden boilerplate zone (e.g. top header or bottom footer with page codes).
-pub fn bbox_contains_boilerplate(page_text: &str, bbox: &[f32]) -> bool {
-    if bbox.len() != 4 || page_text.trim().is_empty() {
-        return false;
-    }
-
-    let bbox_y = bbox[1];
-    let bbox_h = bbox[3];
-
-    // Check if the entire bbox sits inside the top margin header zone (< 0.04)
-    if bbox_y + bbox_h <= 0.04 && contains_boilerplate(page_text) {
-        return true;
-    }
-
-    // Check if the entire bbox sits inside the bottom footer zone (>= 0.94)
-    if bbox_y >= 0.94 && contains_boilerplate(page_text) {
-        return true;
-    }
-
-    false
-}
-
-/// Heuristic: detect student answer lines / blank working space within a proposed crop.
-/// Returns true if the crop appears to contain primarily answer lines (underscores,
-/// horizontal rules, dotted lines, empty grids) rather than a diagram.
-pub fn looks_like_answer_space(crop: &image::RgbaImage) -> bool {
-    let gray = image::DynamicImage::ImageRgba8(crop.clone()).to_luma8();
-    let (w, h) = gray.dimensions();
-    if w < 40 || h < 40 {
-        return false;
-    }
-
-    // Check for horizontal line patterns (answer lines)
-    let mut _horizontal_lines = 0;
-    let mut long_horizontal_lines = 0;
-    for y in 0..h {
-        let mut run = 0;
-        let mut max_run = 0;
-        for x in 0..w {
-            if gray.get_pixel(x, y)[0] < 128 {
-                run += 1;
-                max_run = max_run.max(run);
-            } else {
-                run = 0;
-            }
-        }
-        if max_run as f32 > w as f32 * 0.5 {
-            _horizontal_lines += 1;
-            if max_run as f32 > w as f32 * 0.8 {
-                long_horizontal_lines += 1;
-            }
-        }
-    }
-
-    // If we have multiple long horizontal lines spanning most of the width,
-    // it's likely answer lines / working space
-    long_horizontal_lines >= 3
-}
-
 /// Heuristic: detect if a crop contains MCQ option letters (A, B, C, D) that would be clipped.
 #[allow(dead_code)]
 fn contains_mcq_options(_crop: &image::RgbaImage) -> bool {
     // This is a cheap check - we'd need OCR to be certain, but we can
     // use the caption text from the model to detect this case
     false  // Placeholder - actual detection happens at a higher level
-}
-
-/// Result of splitting a compound figure into separate visual assets.
-#[derive(Debug, Clone)]
-pub struct SplitFigure {
-    pub bbox: Vec<f32>,           // [x, y, w, h] in relative coordinates
-    pub caption: Option<String>,  // Associated caption (e.g., "Figure 4")
-    pub kind: String,             // "graph", "schema", "diagram", etc.
-}
-
-/// Attempt to split a compound bounding box into separate visual assets.
-/// Detects multiple distinct captions (e.g., "Figure 4" and "Figure 5") and
-/// uses whitespace gutters to determine split boundaries.
-pub fn split_compound_figure(
-    bboxes: &[Vec<f32>],
-    captions: &[String],
-    kinds: &[String],
-    _page_texts: &[String],  // OCR text from each page for caption alignment
-) -> Vec<SplitFigure> {
-    if bboxes.is_empty() {
-        return Vec::new();
-    }
-
-    // If there's only one bbox and one caption, check if the caption indicates
-    // multiple figures (e.g., "Figure 4 and Figure 5" or "Figures 4-5")
-    if bboxes.len() == 1 && captions.len() == 1 {
-        let caption = &captions[0];
-        let bbox = &bboxes[0];
-
-        // Check for multiple figure references in caption
-        if let Some(split) = try_split_by_caption(bbox, caption) {
-            return split;
-        }
-    }
-
-    // If multiple bboxes already exist, try to merge very close ones that
-    // belong to the same figure, and split ones that have distinct captions
-    let mut figures = Vec::new();
-    for (i, bbox) in bboxes.iter().enumerate() {
-        let cap = captions.get(i).cloned();
-        let kind = kinds.get(i).cloned().unwrap_or_else(|| "diagram".to_string());
-        if let Some(split) = try_split_by_caption(bbox, cap.as_deref().unwrap_or("")) {
-            figures.extend(split);
-        } else {
-            figures.push(SplitFigure {
-                bbox: bbox.clone(),
-                caption: cap,
-                kind,
-            });
-        }
-    }
-
-    // Now try to merge figures that are close and have related captions
-    merge_related_figures(figures)
-}
-
-/// Try to split a single bbox by detecting multiple figure references in the caption.
-fn try_split_by_caption(bbox: &[f32], caption: &str) -> Option<Vec<SplitFigure>> {
-    // Pattern: "Figure 4 and Figure 5", "Figures 4-5", "Figure 4, Figure 5", etc.
-    if !RE_MULTI_FIG.is_match(caption) {
-        return None;
-    }
-
-    // Extract all figure numbers mentioned
-    let fig_nums: Vec<u32> = RE_FIG_NUM.captures_iter(caption)
-        .filter_map(|c| c[1].parse::<u32>().ok())
-        .collect();
-
-    if fig_nums.len() < 2 {
-        return None;
-    }
-
-    // Heuristic: if the bbox is tall, likely figures are stacked vertically
-    // If wide, likely side by side. Split proportionally.
-    let is_tall = bbox[3] > bbox[2];  // height > width
-    let num = fig_nums.len();
-
-    let mut result = Vec::new();
-    for (idx, &fig_num) in fig_nums.iter().enumerate() {
-        let (x, y, w, h) = if is_tall {
-            // Vertical split: each figure gets equal height portion
-            let x = bbox[0];
-            let y = bbox[1] + bbox[3] * (idx as f32 / num as f32);
-            let w = bbox[2];
-            let h = bbox[3] / num as f32;
-            (x, y, w, h)
-        } else {
-            // Horizontal split: side by side
-            let x = bbox[0] + bbox[2] * (idx as f32 / num as f32);
-            let y = bbox[1];
-            let w = bbox[2] / num as f32;
-            let h = bbox[3];
-            (x, y, w, h)
-        };
-        result.push(SplitFigure {
-            bbox: vec![x, y, w, h],
-            caption: Some(format!("Figure {}", fig_num)),
-            kind: "diagram".to_string(),
-        });
-    }
-
-    Some(result)
-}
-
-/// Merge related figures that are close together and likely part of the same visual asset.
-fn merge_related_figures(mut figures: Vec<SplitFigure>) -> Vec<SplitFigure> {
-    // Simple greedy merge: if two figures overlap significantly or touch,
-    // and have the same kind, merge them
-    let mut merged = true;
-    while merged {
-        merged = false;
-        for i in 0..figures.len() {
-            for j in (i + 1)..figures.len() {
-                if should_merge(&figures[i], &figures[j]) {
-                    figures[i] = merge_two(&figures[i], &figures[j]);
-                    figures.remove(j);
-                    merged = true;
-                    break;
-                }
-            }
-            if merged { break; }
-        }
-    }
-    figures
-}
-
-fn should_merge(a: &SplitFigure, b: &SplitFigure) -> bool {
-    if a.kind != b.kind {
-        return false;
-    }
-
-    // Check if bboxes overlap or are very close
-    let (ax, ay, aw, ah) = (a.bbox[0], a.bbox[1], a.bbox[2], a.bbox[3]);
-    let (bx, by, bw, bh) = (b.bbox[0], b.bbox[1], b.bbox[2], b.bbox[3]);
-
-    let a_right = ax + aw;
-    let a_bottom = ay + ah;
-    let b_right = bx + bw;
-    let b_bottom = by + bh;
-
-    // Check overlap
-    let overlap_x = (ax.min(b_right) - a_right.max(bx)).max(0.0);
-    let overlap_y = (ay.min(b_bottom) - a_bottom.max(by)).max(0.0);
-    let overlap_area = overlap_x * overlap_y;
-
-    let a_area = aw * ah;
-    let b_area = bw * bh;
-
-    // If significant overlap, merge
-    if overlap_area > 0.1 * a_area.min(b_area) {
-        return true;
-    }
-
-    // If touching (very close edges) and same caption prefix
-    let close_x = (ax - b_right).abs().min((bx - a_right).abs());
-    let close_y = (ay - b_bottom).abs().min((by - a_bottom).abs());
-
-    close_x < 0.02 && close_y < 0.02
-}
-
-fn merge_two(a: &SplitFigure, b: &SplitFigure) -> SplitFigure {
-    let (ax, ay, aw, ah) = (a.bbox[0], a.bbox[1], a.bbox[2], a.bbox[3]);
-    let (bx, by, bw, bh) = (b.bbox[0], b.bbox[1], b.bbox[2], b.bbox[3]);
-
-    let x = ax.min(bx);
-    let y = ay.min(by);
-    let right = (ax + aw).max(bx + bw);
-    let bottom = (ay + ah).max(by + bh);
-
-    let caption = match (&a.caption, &b.caption) {
-        (Some(ca), Some(cb)) if ca == cb => Some(ca.clone()),
-        (Some(ca), None) => Some(ca.clone()),
-        (None, Some(cb)) => Some(cb.clone()),
-        _ => a.caption.clone().or(b.caption.clone()),
-    };
-
-    SplitFigure {
-        bbox: vec![x, y, right - x, bottom - y],
-        caption,
-        kind: a.kind.clone(),
-    }
 }
 
 /// Normalize one proposed bbox of four values into an in-bounds pixel rect.
@@ -441,8 +102,7 @@ pub fn sanitize_bbox(b: &[f32], img_w: u32, img_h: u32) -> Option<PixelRect> {
     let primary = (fx, fy, fx + fv2, fy + fv3); // (x, y, w, h)
     let corners = (fx, fy, fv2, fv3); // (x1, y1, x2, y2)
     let corner_is_in_bounds = fv2 <= 1.0 && fv3 <= 1.0 && fv2 > fx && fv3 > fy;
-    // Some vision providers emit corner coordinates even though the schema
-    // requests width/height. If the width/height reading crosses the page
+    // A box may come as corner coordinates instead of width/height. If the width/height reading crosses the page
     // edge while the corner reading is fully in bounds, prefer the latter.
     // This preserves figures whose lower edge would otherwise be mistaken for
     // an exam footer and rejected after clamping.
@@ -833,41 +493,10 @@ pub fn crop_diagram(
     crop_diagram_with_options(img, bbox, padding, ignore_grid, false)
 }
 
-/// Return one normalized [x, y, width, height] box enclosing visual option
-/// boxes. Inputs are clamped to the normalized page and malformed entries are
-/// ignored; callers can therefore use this at the JSON boundary safely.
-pub fn union_relative_bboxes(boxes: &[Vec<f32>]) -> Option<Vec<f32>> {
-    let mut min_x = 1.0_f32;
-    let mut min_y = 1.0_f32;
-    let mut max_x = 0.0_f32;
-    let mut max_y = 0.0_f32;
-    let mut valid = false;
-
-    for bbox in boxes {
-        if bbox.len() != 4 || bbox.iter().any(|value| !value.is_finite()) {
-            continue;
-        }
-        let x = bbox[0].clamp(0.0, 1.0);
-        let y = bbox[1].clamp(0.0, 1.0);
-        let right = (bbox[0] + bbox[2]).clamp(0.0, 1.0);
-        let bottom = (bbox[1] + bbox[3]).clamp(0.0, 1.0);
-        if right <= x || bottom <= y {
-            continue;
-        }
-        min_x = min_x.min(x);
-        min_y = min_y.min(y);
-        max_x = max_x.max(right);
-        max_y = max_y.max(bottom);
-        valid = true;
-    }
-
-    valid.then(|| vec![min_x, min_y, max_x - min_x, max_y - min_y])
-}
-
 // ── Deterministic figure detection (PDF content stream) ────────────────────
 //
-// The vision model is replaced by a free, on-device pass over the PDF's vector
-// content: every Image/Path object has exact page-space bounds from pdfium.
+// An on-device pass over the PDF's vector content: every Image/Path object
+// has exact page-space bounds from pdfium.
 // This module contains the pure geometry: normalization, clustering, and the
 // filter predicates. `pdf_render::detect_pdf_figures` is the thin wrapper that
 // feeds it raw object bounds; these functions are unit-testable without pdfium.
@@ -950,9 +579,8 @@ pub fn is_probable_figure_box(
     text_density_in_box(b, text_rects) <= max_text_density
 }
 
-/// Infer a semantic kind from a figure caption (or nearby text), mirroring the
-/// vision prompt's `diagram_kinds` vocabulary closely enough for the `graph_like`
-/// crop flag and the report card.
+/// Infer a semantic kind from a figure caption (or nearby text), for the
+/// `graph_like` crop flag and the report card.
 pub fn caption_kind_from_text(caption: &str) -> Option<String> {
     let lower = caption.to_ascii_lowercase();
     if lower.contains("flow") {
@@ -1312,9 +940,9 @@ pub fn crop_diagram_with_options(
         return primary;
     }
 
-    // Vision providers sometimes return [x1, y1, x2, y2] despite the
-    // requested [x, y, width, height] schema. If the primary crop is rejected,
-    // retry the equivalent width/height reading before discarding the figure.
+    // A box given as [x1, y1, x2, y2] rather than [x, y, width, height]: if
+    // the primary crop is rejected, retry the other reading before discarding
+    // the figure.
     // This fallback is deliberately limited to rejected crops so valid
     // width/height proposals retain their existing interpretation.
     if bbox.len() == 4 && bbox[2] > bbox[0] && bbox[3] > bbox[1] {
@@ -1372,10 +1000,9 @@ fn crop_diagram_reading(
         return Err(CropReject::BadBox);
     }
 
-    // Scale padding proportionally to image resolution. The vision model
-    // returns bboxes based on a downsampled 1024px image, but we crop from
-    // the full 300-DPI page. A fixed 40px padding is too small for high-res
-    // images, causing truncation of labels and borders.
+    // Scale padding proportionally to image resolution: we crop from the
+    // full 300-DPI page, where a fixed 40px padding is too small, causing
+    // truncation of labels and borders.
     let scale_factor = (img_w.max(img_h) as f32 / 1024.0).max(1.0);
     let scaled_padding = (padding as f32 * scale_factor).round() as u32;
 
@@ -1546,62 +1173,6 @@ pub fn decode_page_image(b64: &str) -> Option<image::DynamicImage> {
     image::load_from_memory(&bytes).ok()
 }
 
-/// Default long-edge cap for images sent to vision APIs. The extraction path
-/// downscales every API-bound page/band to this size; the structure pass and
-/// mark-scheme windows use the same ceiling. For providers billed by pixels
-/// (Gemini, Anthropic) this is the dominant cost lever: 768 → 640 cuts image
-/// tiles ~26%, and 640 → 512 cuts them a further ~35%. Override at runtime
-/// with `MERGEMARK_VISION_MAX_DIM` (clamped to 256..=1024).
-pub const API_IMAGE_MAX_DIM: u32 = 640;
-
-/// Resolve the API long-edge cap, honouring the `MERGEMARK_VISION_MAX_DIM`
-/// environment override. Values outside 256..=1024 are rejected so a typo
-/// can't accidentally explode (or erase) the image payload.
-pub fn api_image_max_dim() -> u32 {
-    std::env::var("MERGEMARK_VISION_MAX_DIM")
-        .ok()
-        .and_then(|v| v.trim().parse::<u32>().ok())
-        .filter(|v| (256..=1024).contains(v))
-        .unwrap_or(API_IMAGE_MAX_DIM)
-}
-
-/// Downscale so the longest edge <= `max_dim`, then WebP-encode the result.
-/// Returns raw base64 (no data-URL prefix) so `chat_body` wraps it as
-/// `data:image/webp;base64,...`. Returns None if the encode fails.
-pub fn encode_webp_resized(img: &image::DynamicImage, max_dim: u32) -> Option<String> {
-    use base64::Engine;
-    use image::GenericImageView;
-    let (w, h) = img.dimensions();
-    let rgb = img.to_rgb8();
-    let final_img = if w > max_dim || h > max_dim {
-        let scale = max_dim as f32 / (w.max(h) as f32);
-        let new_w = (w as f32 * scale).round().max(1.0) as u32;
-        let new_h = (h as f32 * scale).round().max(1.0) as u32;
-        image::DynamicImage::ImageRgb8(image::imageops::resize(
-            &rgb,
-            new_w,
-            new_h,
-            image::imageops::FilterType::Triangle,
-        ))
-    } else {
-        image::DynamicImage::ImageRgb8(rgb)
-    };
-
-    let mut buf = std::io::Cursor::new(Vec::with_capacity(
-        (final_img.width() as usize * final_img.height() as usize) / 8,
-    ));
-    final_img.write_to(&mut buf, image::ImageFormat::WebP).ok()?;
-    Some(base64::engine::general_purpose::STANDARD.encode(buf.into_inner()))
-}
-
-/// Decode (data-URL or raw base64) an image and return it WebP-encoded and
-/// downscaled to a longest edge of `max_dim`. Returns None when the input
-/// cannot be decoded or the encode fails.
-pub fn resize_b64_to_max_dim(b64: &str, max_dim: u32) -> Option<String> {
-    let img = decode_page_image(b64)?;
-    encode_webp_resized(&img, max_dim)
-}
-
 // ── Vertical page band crop (Phase 1) ─────────────────────────────────────
 //
 // When a page contains multiple questions (MCQs, short-answer bands, or a
@@ -1611,132 +1182,6 @@ pub fn resize_b64_to_max_dim(b64: &str, max_dim: u32) -> Option<String> {
 // y-range validation instead, which avoids coordinate-shift complexity
 // across audit/save/dedupe). This helper is retained for a future Phase 2
 // optimization and is currently unused.
-#[allow(dead_code)]
-pub struct PageBand {
-    /// New base64 JPEG (no data-URL prefix) of the cropped region.
-    pub b64: String,
-    /// Pixel y-offset within the source image where the crop begins.
-    pub y_offset_px: u32,
-    /// Height of the cropped region in pixels.
-    pub height_px: u32,
-    /// Fractional y-offset within the source image (convenience).
-    pub y_offset_frac: f32,
-    /// Fractional height of the cropped region relative to source image.
-    pub height_frac: f32,
-}
-
-/// Crop a page image to a vertical band. Returns None if the band is
-/// degenerate (empty or outside the page). `start_frac`/`end_frac` are
-/// clamped to [0,1] and padded by a small margin to avoid chopping the
-/// top/bottom lines of the question.
-#[allow(dead_code)]
-pub fn crop_page_vertical(b64: &str, start_frac: f32, end_frac: f32) -> Option<PageBand> {
-    let img = decode_page_image(b64)?;
-    crop_page_vertical_from_image(&img, start_frac, end_frac)
-}
-
-/// Crop an already-decoded page image to a vertical band. This is the
-/// allocation-heavy half of `crop_page_vertical`; callers that also need the
-/// decoded full page can now decode once and retain it for diagram auditing.
-pub fn crop_page_vertical_from_image(
-    img: &image::DynamicImage,
-    start_frac: f32,
-    end_frac: f32,
-) -> Option<PageBand> {
-    use base64::Engine;
-    use image::GenericImageView;
-    let (w, h) = img.dimensions();
-    if w < 2 || h < 2 {
-        return None;
-    }
-    // Pad by ~0.005 of the page (a few lines) so descenders/headings aren't
-    // clipped, and clamp into [0,1].
-    let pad = 0.005_f32;
-    let s = (start_frac - pad).clamp(0.0, 1.0);
-    let e = (end_frac + pad).clamp(0.0, 1.0);
-    if e - s < 0.01 {
-        return None;
-    }
-    let y0 = (s * h as f32).round() as u32;
-    let y1 = (e * h as f32).round() as u32;
-    let y0 = y0.min(h.saturating_sub(1));
-    let y1 = y1.min(h).max(y0 + 1);
-    let band_h = y1 - y0;
-
-    let cropped_rgba = image::imageops::crop_imm(img, 0, y0, w, band_h).to_image();
-    let cropped = image::DynamicImage::ImageRgba8(cropped_rgba).to_rgb8();
-
-    // Scale to the API long-edge cap (default 640, env-overridable) to keep
-    // band crops within a few vision tiles.
-    let max_dim = api_image_max_dim();
-    let (cw, ch) = (cropped.width(), cropped.height());
-    let final_img = if cw > max_dim || ch > max_dim {
-        let scale = max_dim as f32 / (cw.max(ch) as f32);
-        let new_w = (cw as f32 * scale).round().max(1.0) as u32;
-        let new_h = (ch as f32 * scale).round().max(1.0) as u32;
-        image::DynamicImage::ImageRgb8(image::imageops::resize(
-            &cropped,
-            new_w,
-            new_h,
-            image::imageops::FilterType::Triangle,
-        ))
-    } else {
-        image::DynamicImage::ImageRgb8(cropped)
-    };
-
-    // Re-encode as WebP format.
-    // WebP is ~30% smaller than JPEG at equivalent fidelity, reducing payload
-    // size and upload time to vision APIs.
-    let mut buf = std::io::Cursor::new(Vec::with_capacity((final_img.width() as usize * final_img.height() as usize) / 8));
-    final_img.write_to(&mut buf, image::ImageFormat::WebP).ok()?;
-    let out_b64 = base64::engine::general_purpose::STANDARD.encode(buf.into_inner());
-
-    Some(PageBand {
-        b64: out_b64,
-        y_offset_px: y0,
-        height_px: band_h,
-        y_offset_frac: y0 as f32 / h as f32,
-        height_frac: band_h as f32 / h as f32,
-    })
-}
-
-/// Fast heuristic to check if a page image is completely blank or near-blank (e.g., blank exam page).
-/// Samples pixels on a regular grid; returns true if almost all pixels are white / background.
-pub fn is_image_blank(img: &image::DynamicImage) -> bool {
-    use image::GenericImageView;
-    let (w, h) = img.dimensions();
-    if w == 0 || h == 0 {
-        return true;
-    }
-    let step_x = (w / 100).max(4);
-    let step_y = (h / 100).max(4);
-    let mut total_samples = 0usize;
-    let mut dark_pixels = 0usize;
-
-    for y in (0..h).step_by(step_y as usize) {
-        for x in (0..w).step_by(step_x as usize) {
-            total_samples += 1;
-            let pixel = img.get_pixel(x, y);
-            let r = pixel[0] as u32;
-            let g = pixel[1] as u32;
-            let b = pixel[2] as u32;
-            let a = pixel[3];
-            if a > 32 {
-                let lum = (299 * r + 587 * g + 114 * b) / 1000;
-                if lum < 235 {
-                    dark_pixels += 1;
-                }
-            }
-        }
-    }
-
-    if total_samples == 0 {
-        return true;
-    }
-
-    let dark_ratio = dark_pixels as f32 / total_samples as f32;
-    dark_ratio < 0.0015
-}
 
 /// Strip a data-URL prefix, if present.
 pub fn strip_data_url(b64: &str) -> &str {
@@ -1750,8 +1195,6 @@ pub fn strip_data_url(b64: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use base64::Engine;
-    use image::GenericImageView;
 
     const W: u32 = 1654;
     const H: u32 = 2339;
@@ -1770,26 +1213,6 @@ mod tests {
             drawn.put_pixel(x, 200, image::Rgb([0, 0, 0]));
         }
         assert!(crop_exact(&image::DynamicImage::ImageRgb8(drawn), &[0.2, 0.2, 0.5, 0.5], true, 0.004).is_ok());
-    }
-
-    #[test]
-    fn decoded_vertical_crop_matches_base64_entry_point() {
-        let image = image::DynamicImage::ImageRgb8(image::RgbImage::from_fn(320, 480, |x, y| {
-            image::Rgb([(x % 255) as u8, (y % 255) as u8, 180])
-        }));
-        let mut png = std::io::Cursor::new(Vec::new());
-        image.write_to(&mut png, image::ImageFormat::Png).unwrap();
-        let b64 = base64::engine::general_purpose::STANDARD.encode(png.into_inner());
-
-        let from_b64 = crop_page_vertical(&b64, 0.2, 0.7).unwrap();
-        let decoded = decode_page_image(&b64).unwrap();
-        let from_decoded = crop_page_vertical_from_image(&decoded, 0.2, 0.7).unwrap();
-
-        assert_eq!(from_b64.y_offset_px, from_decoded.y_offset_px);
-        assert_eq!(from_b64.height_px, from_decoded.height_px);
-        assert_eq!(from_b64.y_offset_frac, from_decoded.y_offset_frac);
-        assert_eq!(from_b64.height_frac, from_decoded.height_frac);
-        assert_eq!(from_b64.b64, from_decoded.b64);
     }
 
     #[test]
@@ -1959,17 +1382,6 @@ mod tests {
         assert_eq!(edge.y + edge.h, 800);
     }
 
-    #[test]
-    fn union_relative_bboxes_encloses_visual_options_and_clamps() {
-        let union = union_relative_bboxes(&[
-            vec![0.10, 0.20, 0.30, 0.15],
-            vec![0.15, 0.40, 0.70, 0.20],
-            vec![0.05, 0.65, 0.90, 0.40],
-        ])
-        .unwrap();
-        assert_eq!(union, vec![0.05, 0.20, 0.90, 0.80]);
-    }
-
     // ── Synthetic fixtures for the answer-grid guard ────────────────────────
 
     fn blank(w: u32, h: u32) -> image::GrayImage {
@@ -2081,22 +1493,6 @@ mod tests {
     }
 
     #[test]
-    fn conservative_clamping_protects_margins_and_footers() {
-        let mut box_overshooting_footer = vec![0.1, 0.5, 0.8, 0.48]; // reaches y=0.98 (footer)
-        clamp_bbox_safe(&mut box_overshooting_footer);
-        assert!(box_overshooting_footer[1] + box_overshooting_footer[3] <= 0.93 + 0.001);
-        assert!(box_overshooting_footer[3] > 0.02);
-
-        let mut box_overshooting_header = vec![0.1, 0.01, 0.8, 0.4]; // reaches y=0.01 (header)
-        clamp_bbox_safe(&mut box_overshooting_header);
-        assert!(box_overshooting_header[1] >= 0.03 - 0.001);
-
-        let mut box_overshooting_left_margin = vec![0.005, 0.2, 0.5, 0.4];
-        clamp_bbox_safe(&mut box_overshooting_left_margin);
-        assert!(box_overshooting_left_margin[0] >= 0.03 - 0.001);
-    }
-
-    #[test]
     fn signature_dedupes_same_diagram_separates_distinct() {
         let t1 = image::DynamicImage::ImageLuma8(trace_table(602, 872)).to_rgba8();
         let t2 = image::DynamicImage::ImageLuma8(trace_table(600, 860)).to_rgba8();
@@ -2106,46 +1502,6 @@ mod tests {
         let sc = tile_signature(&chart);
         assert!(signature_distance(&s1, &s2) < 4, "same table, resized → duplicate");
         assert!(signature_distance(&s1, &sc) >= 6, "table vs chart → distinct");
-    }
-
-    #[test]
-    fn encode_webp_resized_caps_long_edge() {
-        let img = image::DynamicImage::ImageRgb8(image::RgbImage::from_fn(1600, 2000, |x, y| {
-            image::Rgb([(x % 255) as u8, (y % 255) as u8, 180])
-        }));
-        let b64 = encode_webp_resized(&img, API_IMAGE_MAX_DIM).expect("encode must succeed");
-        let decoded = decode_page_image(&b64).expect("result must decode");
-        let (w, h) = decoded.dimensions();
-        assert!(w <= API_IMAGE_MAX_DIM && h <= API_IMAGE_MAX_DIM);
-        assert!(!b64.starts_with("data:image/"), "must be raw base64, no prefix");
-    }
-
-    #[test]
-    fn encode_webp_resized_keeps_small_images_unchanged() {
-        let img = image::DynamicImage::ImageRgb8(image::RgbImage::from_fn(300, 200, |x, y| {
-            image::Rgb([(x % 255) as u8, (y % 255) as u8, 90])
-        }));
-        let b64 = encode_webp_resized(&img, API_IMAGE_MAX_DIM).expect("encode must succeed");
-        let decoded = decode_page_image(&b64).expect("result must decode");
-        let (w, h) = decoded.dimensions();
-        assert_eq!((w, h), (300, 200), "small image must not be upscaled");
-    }
-
-    #[test]
-    fn resize_b64_to_max_dim_handles_data_url() {
-        let img = image::DynamicImage::ImageRgb8(image::RgbImage::from_fn(1400, 1000, |x, y| {
-            image::Rgb([(x % 255) as u8, (y % 255) as u8, 40])
-        }));
-        let mut png = std::io::Cursor::new(Vec::new());
-        img.write_to(&mut png, image::ImageFormat::Png).unwrap();
-        let raw = base64::engine::general_purpose::STANDARD.encode(png.into_inner());
-        let data_url = format!("data:image/png;base64,{}", raw);
-
-        let b64 = resize_b64_to_max_dim(&data_url, API_IMAGE_MAX_DIM).expect("resize must succeed");
-        assert!(!b64.starts_with("data:image/"));
-        let decoded = decode_page_image(&b64).expect("result must decode");
-        let (w, h) = decoded.dimensions();
-        assert!(w <= API_IMAGE_MAX_DIM && h <= API_IMAGE_MAX_DIM);
     }
 
     // ── Deterministic figure detection geometry ────────────────────────────

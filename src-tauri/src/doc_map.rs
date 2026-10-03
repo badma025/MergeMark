@@ -1,23 +1,17 @@
 // ── Document Map ────────────────────────────────────────────────────────────
 //
-// The document's skeleton is derived BEFORE any transcription, from ground
-// truth the AI doesn't control:
-//   * `(Total for Question N is M marks)` footers — printed deterministically
-//     once per question (Edexcel/AQA); they give end-page + expected marks.
+// The text-layer map, used when the geometric layout map (`layout.rs`) finds
+// no questions. The document's skeleton is derived BEFORE any transcription,
+// from what the paper prints:
+//   * `(Total for Question N is M marks)` footers — printed once per question
+//     (Edexcel/AQA); they give end-page + expected marks.
 //   * `TOTAL FOR PAPER IS X MARKS` — the end-of-paper + paper checksum.
-// If the text layer is too corrupt (fewer than 2 usable footers), a cheap AI
-// *structure pass* (tiny schema, validated for monotonicity) builds the map
-// instead. The AI then transcribes against this map — it never invents
-// question numbers, merging, or continuations.
-//
-// PAGE/SPAN-LEVEL FALLBACK (Change 4):
-// Instead of document-wide fallback, we classify each page's text-layer
-// reliability independently:
+//   * question headings, for papers without footers.
+// Each page's text-layer reliability is classified independently:
 //   - Reliable: clear footer found, monotonic question numbers
 //   - Ambiguous: some text but no clear footer, or conflicting signals
 //   - Non-question: cover, instructions, blank, answer booklet, reference
-// We build spans from reliable pages, run vision only on ambiguous pages,
-// and merge monotonically.
+// Spans are built from reliable and ambiguous pages and merged monotonically.
 
 /// A regex-discovered "Total for Question …" footer.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -31,11 +25,10 @@ pub struct Footer {
     /// next question's start (e.g. Q2 begins mid-page below Q1's footer).
     /// For the text-layer scan we use a byte-offset-within-page proxy
     /// (good enough to decide "near the bottom / middle / near the top").
-    /// The vision structure pass returns an actual pixel fraction.
     pub y_frac: f32,
 }
 
-/// A question heading detected on a page (text layer or vision).
+/// A question heading detected on a page text.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct QuestionHeading {
     pub page: usize,
@@ -92,11 +85,9 @@ pub struct QuestionSpan {
 pub struct DocumentMap {
     pub spans: Vec<QuestionSpan>,
     pub paper_total_marks: Option<u32>,
-    /// Pages the structure pass determined to be non-question content
+    /// Pages the text scan determined to be non-question content
     /// (covers, instruction sheets, answer booklets, reference tables).
     pub non_question_pages: Vec<usize>,
-    /// Pages that required vision structure pass (for reporting)
-    pub vision_fallback_pages: Vec<usize>,
     /// Anomalies found while building the map (for the import report).
     pub anomalies: Vec<String>,
 }
@@ -274,51 +265,11 @@ pub struct TextScan {
     pub headings: Vec<QuestionHeading>,
 }
 
-/// Decide whether the deterministic text layer is rich enough to build the
-/// document map WITHOUT the vision structure pass (one AI call per page).
-/// Calibrated against all AQA physics papers ('17–'24): each passes with a
-/// complete ascending heading sequence, while scanned/garbled PDFs fail and
-/// fall back to the vision structure pass.
-pub fn text_layer_map_sufficient(scan: &TextScan, num_pages: usize) -> bool {
-    if num_pages == 0 {
-        return false;
-    }
-    let mut nums: Vec<u32> = scan.headings.iter().map(|h| h.number).collect();
-    nums.sort();
-    nums.dedup();
-    // Need a real paper's worth of questions, starting at Q1.
-    // Modular papers (Further Maths, Mechanics, Option modules) often have 4 or 5 questions.
-    if nums.len() < 4 || nums.first().copied() != Some(1) {
-        return false;
-    }
-    // At most 2 missing numbers inside 1..=max (or 1 gap for 4-5 question papers).
-    let max_q = *nums.last().unwrap();
-    let gaps = (max_q as usize).saturating_sub(nums.len());
-    let allowed_gaps = if nums.len() <= 5 { 1 } else { 2 };
-    if gaps > allowed_gaps {
-        return false;
-    }
-    // Headings must be spread across the document, not clumped on a single page
-    let pages_with_headings: std::collections::BTreeSet<usize> =
-        scan.headings.iter().map(|h| h.page).collect();
-    let coverage = pages_with_headings.len() as f32 / num_pages as f32;
-    pages_with_headings.len() >= 3 || coverage >= 0.30
-}
-
-/// How much machine-readable text a document's PDF text layer carries.
-///
-/// Two states only, because the production rule is binary and conservative:
-/// if ANY page carries extracted text, the WHOLE document is ingested locally
-/// (zero cloud requests) and pages without text are reported as unresolved.
-/// Only a document with no extracted text anywhere - a genuine scan or
-/// image-only file - keeps cloud compatibility.
-///
-/// This is deliberately INDEPENDENT of [`text_layer_map_sufficient`]. The
-/// map-sufficiency gate asks "can we place every question without the vision
-/// structure pass?"; a paper can fail that and still be born-digital (sparse
-/// headings, a modular 2-question paper, one un-placed span). Treating a
-/// failed map as "scanned" is what pushed digital papers onto the paid vision
-/// path, so the two questions get separate answers.
+/// How much machine-readable text a document's PDF text layer carries, for
+/// the import report: "digital" when ANY page carries extracted text (pages
+/// without text are reported as unresolved), "scanned" when none does - a
+/// genuine scan or image-only file. Every document is read on this machine
+/// either way.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TextLayerClass {
     /// Pages carrying extracted text.
@@ -330,7 +281,6 @@ pub struct TextLayerClass {
 
 impl TextLayerClass {
     /// True when the document carries extracted text on any page.
-    /// Digital documents permit zero cloud requests.
     pub fn is_digital(&self) -> bool {
         self.text_pages > 0
     }
@@ -345,35 +295,20 @@ impl TextLayerClass {
     pub fn unresolved_pages(&self) -> &[usize] {
         &self.unresolved_pages
     }
-
-    /// Every page unreadable: the scanned/image-only classification.
-    /// Constructors are explicit so no caller can forget the page bookkeeping.
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub fn scanned_only(total_pages: usize) -> Self {
-        Self {
-            text_pages: 0,
-            total_pages,
-            unresolved_pages: (0..total_pages).collect(),
-        }
-    }
 }
 
 /// A page carries extracted text when ANY non-whitespace character is present.
 ///
-/// There is deliberately NO threshold: a complete one-mark digital question
-/// such as "1. Solve x=2. [1]" - or a maths-only stem with no prose at all -
-/// must keep the whole import local. Watermark, furniture and OCR-noise pages
-/// therefore count as text too, which over-blocks (local-only) rather than
-/// risking a paid transcription of a digital paper. Cloud compatibility is
-/// available only when the extracted text is entirely absent (whitespace-only
-/// pages included in that test).
+/// There is deliberately NO threshold: a complete one-mark question such as
+/// "1. Solve x=2. [1]" - or a maths-only stem with no prose at all - is text.
+/// Watermark, furniture and OCR-noise pages count as text too.
 pub fn page_has_extracted_text(text: &str) -> bool {
     !text.trim().is_empty()
 }
 
-/// Classify the document's text layer from page text alone. No question
-/// mapping, no model calls, no PDF re-render, no threshold of any kind: one
-/// page with extracted text is enough to make the whole import local.
+/// Classify the document's text layer from page text alone (for the report).
+/// No question mapping, no PDF re-render, no threshold of any kind: one page
+/// with extracted text makes the document "digital".
 pub fn classify_text_layer(page_texts: &[String]) -> TextLayerClass {
     let mut text_pages = 0usize;
     let mut unresolved_pages = Vec::new();
@@ -494,10 +429,7 @@ pub fn scan_text_layer(page_texts: &[String]) -> TextScan {
     // all pages totals fewer than 100 characters, the PDF is almost certainly
     // a scanned/image-only document with no usable text layer. In that case,
     // pages with empty text must NOT be classified as NonQuestion — they are
-    // Ambiguous so the structure pass sends their images to the vision model.
-    // Without this, every page becomes NonQuestion, the structure pass
-    // short-circuits to synthetic BLANK responses, vision never runs, and the
-    // document map is empty — the "Blank Page Trap" that kills AQA Physics.
+    // unread scans, not blank pages, and are reported as Ambiguous.
     let total_text_len: usize = page_texts.iter().map(|t| t.trim().len()).sum();
     let is_image_only = total_text_len < 100;
 
@@ -1120,8 +1052,7 @@ fn build_spans_from_reliable_pages(
     // footers at all — they only use per-question [1 mark] tags. For
     // those papers the text layer still has question headings; we just
     // skip the footer-driven span building and rely on
-    // append_text_only_short_answer_spans below. The structure pass also
-    // fills in spans via vision when the text layer is corrupt.
+    // append_text_only_short_answer_spans below.
     if !reliable_footers.is_empty() {
         // Sort into reading order, then keep only the FIRST footer for each
         // question number. Exam papers that ship a separate answer booklet
@@ -1206,10 +1137,9 @@ fn build_spans_from_reliable_pages(
 ///   that page, as happens when Q1's footer and Q2's heading share a page).
 /// * `end_y_frac`: set to the footer's y when the footer is above the
 ///   bottom of the page (leaving room for a following question).
-/// The byte-offset proxy is rough but good enough for "don't send pixels
-/// from the *next* question to the model" — the Rust sanitizer will still
-/// reject content outside the span's number, so bleeding a few lines is
-/// not a correctness hazard.
+/// The byte-offset proxy is rough but good enough for "don't take lines from
+/// the *next* question" — the sanitizer still rejects content outside the
+/// span's number, so bleeding a few lines is not a correctness hazard.
 fn infer_y_clips(
     scan: &TextScan,
     question: u32,
@@ -1397,115 +1327,9 @@ fn estimate_first_question_start_reliable(
     start.min(first_footer_page)
 }
 
-/// Hybrid map building: use reliable text pages, vision for ambiguous pages.
-#[allow(dead_code)]
-pub fn build_hybrid_map(
-    page_texts: &[String],
-    structures: &[ValidatedPageStructure],
-    num_pages: usize,
-) -> DocumentMap {
-    let scan = scan_text_layer(page_texts);
-    build_hybrid_map_with_scan(page_texts, structures, num_pages, &scan)
-}
-
-/// Hybrid map building with a pre-computed TextScan to avoid redundant scanning.
-pub fn build_hybrid_map_with_scan(
-    page_texts: &[String],
-    structures: &[ValidatedPageStructure],
-    num_pages: usize,
-    scan: &TextScan,
-) -> DocumentMap {
-    let mut anomalies = Vec::new();
-    
-    // 1. Build spans from reliable text-layer pages
-    let text_headings_sufficient = text_layer_map_sufficient(scan, num_pages);
-    let (mut spans, _reliable_pages, text_anomalies) = build_spans_from_reliable_pages(scan, num_pages);
-    anomalies.extend(text_anomalies);
-
-    // A sufficient text layer is already the deterministic document map. Use
-    // its page-local headings directly, including ambiguous pages, instead of
-    // sending synthetic empty structures through the vision span builder.
-    if text_headings_sufficient {
-        append_text_only_short_answer_spans(scan, &mut spans, &mut anomalies, true);
-    }
-
-    // Phase 1b: when the text layer gave us NO reliable footers (common on
-    // MCQ-heavy papers, scanned PDFs with corrupt text layers, IB/CAIE papers
-    // that don't print "Total for Question N is M marks"), we can't trust
-    // the text-layer reliability classification — many pages that were
-    // marked Reliable/NonQuestion on the strength of a single stray word
-    // ("information", "formulae") are actually question pages. In that
-    // case feed ALL non-truly-blank pages into the vision span builder so
-    // the structure pass's (paid-for) output is not silently discarded.
-    let text_layer_trustworthy = text_headings_sufficient
-        || (!scan.footers.is_empty()
-            && scan.footers.iter().filter(|f| f.question > 0).count() >= 2);
-
-    // 2. Identify which pages to feed the vision builder. When the text
-    // layer is trustworthy, use only Ambiguous pages (the existing hybrid
-    // approach — saves us from merging against pages the text layer
-    // already placed). When not, feed every page that has structure data
-    // and is not a hard Blank/Cover/etc.
-    let vision_pages: Vec<usize> = if text_headings_sufficient {
-        Vec::new()
-    } else if text_layer_trustworthy {
-        (0..num_pages)
-            .filter(|&p| scan.page_reliability[p] == PageReliability::Ambiguous)
-            .collect()
-    } else {
-        (0..num_pages)
-            .filter(|&p| {
-                // Skip pages the AI itself classified as non-question.
-                if let Some(s) = structures.get(p) {
-                    if !s.role.is_question_content() {
-                        return false;
-                    }
-                }
-                // Also skip pages our text scan is confident are blank.
-                !matches!(scan.page_reliability[p], PageReliability::NonQuestion)
-            })
-            .collect()
-    };
-
-    // 3. Run vision structure on the selected pages (structures already computed).
-    if !vision_pages.is_empty() {
-        let vision_spans = build_spans_from_vision(structures, &vision_pages, num_pages, &scan.headings, page_texts);
-        spans = merge_spans(spans, vision_spans, &mut anomalies);
-    }
-    
-    // 4. Collect non-question pages (union of text-layer and structure-pass
-    // verdicts; trust either source when it marks a page as non-question).
-    let mut non_question_pages: Vec<usize> = (0..num_pages)
-        .filter(|&p| scan.page_reliability[p] == PageReliability::NonQuestion)
-        .collect();
-    for s in structures {
-        if !s.role.is_question_content() && !non_question_pages.contains(&s.page) {
-            non_question_pages.push(s.page);
-        }
-    }
-    non_question_pages.sort();
-    non_question_pages.dedup();
-
-    // 5. Vision-fallback pages are the ones we actually fed to build_spans_from_vision.
-    let vision_fallback_pages = vision_pages.clone();
-
-    let valid_spans = finalize_spans(spans, &mut anomalies);
-    
-    DocumentMap {
-        spans: valid_spans,
-        paper_total_marks: scan.paper_total,
-        non_question_pages,
-        vision_fallback_pages,
-        anomalies,
-    }
-}
-
 /// Validate final spans for monotonicity. Loose guard: backward = always bad;
 /// gap > 500 = almost certainly hallucinated outlier; everything else allowed.
 /// Dense MCQ pages (8, 9, 10, 11) must not trigger false jump alarms.
-/// Shared by the hybrid map and the text-only (digital) map so a document
-/// cannot get stricter or looser placement rules just because the cloud was
-/// switched off.
 fn finalize_spans(mut spans: Vec<QuestionSpan>, anomalies: &mut Vec<String>) -> Vec<QuestionSpan> {
     let mut valid_spans = Vec::new();
     let mut expected_max_q = 0u32;
@@ -1527,22 +1351,18 @@ fn finalize_spans(mut spans: Vec<QuestionSpan>, anomalies: &mut Vec<String>) -> 
     valid_spans
 }
 
-/// Build the document map using ONLY the PDF text layer — no vision structure
-/// pass, no synthetic structures, no cloud. This is the digital-document
-/// map: it reuses the same reliable-footer and heading-only span builders as
-/// the hybrid map (including ambiguous pages), then applies the identical
-/// monotonicity validation.
-///
-/// `vision_fallback_pages` is always empty by construction: every span here
-/// was derived from machine-readable text.
+/// Build the document map from the PDF text layer alone: the reliable-footer
+/// and heading-only span builders (including ambiguous pages), then the
+/// monotonicity validation. Used when the geometric layout map finds no
+/// questions.
 pub fn build_text_only_map(_page_texts: &[String], num_pages: usize, scan: &TextScan) -> DocumentMap {
     let mut anomalies = Vec::new();
     let (mut spans, _reliable_pages, text_anomalies) =
         build_spans_from_reliable_pages(scan, num_pages);
     anomalies.extend(text_anomalies);
-    // Ambiguous pages are included deliberately: without the vision structure
-    // pass there is no second opinion to defer to, and a page whose footer
-    // regex missed is still a page of a digital document.
+    // Ambiguous pages are included deliberately: there is no second opinion
+    // to defer to, and a page whose footer regex missed is still a page of
+    // the paper.
     append_text_only_short_answer_spans(scan, &mut spans, &mut anomalies, true);
 
     let non_question_pages: Vec<usize> = (0..num_pages)
@@ -1553,65 +1373,8 @@ pub fn build_text_only_map(_page_texts: &[String], num_pages: usize, scan: &Text
         spans: finalize_spans(spans, &mut anomalies),
         paper_total_marks: scan.paper_total,
         non_question_pages,
-        vision_fallback_pages: Vec::new(),
         anomalies,
     }
-}
-
-/// Per-question running bounds during vision span building.
-#[derive(Debug, Clone, Default)]
-struct VisionBounds {
-    first_page: usize,
-    last_page: usize,
-    /// Clip on the first page (top of the question).
-    first_y: Option<f32>,
-    /// Clip on the last page (bottom of the question, from footer_y).
-    last_y: Option<f32>,
-    marks: Option<u32>,
-}
-
-/// Build spans from vision structure for specific pages.
-///
-/// Phase 1: the structure pass now reports per-question y fractions on each
-/// page. We use those to tighten the first/last page clips when a question
-/// starts or ends mid-page (MCQ / short-answer pages).
-///
-/// Phase 1b: `eligible_pages` selects which pages contribute to vision
-/// bounds. When the text layer was trustworthy we pass only Ambiguous pages
-/// (existing hybrid behaviour); when it wasn't, we pass all question pages
-/// so the structure pass's paid-for output isn't discarded just because a
-/// regex false-positive labelled a page NonQuestion/Reliable.
-fn is_figure_hallucination(proposed_num: u32, page_text: &str) -> bool {
-    let num_str = proposed_num.to_string();
-    if !page_text.contains(&num_str) {
-        return false;
-    }
-    let num_pattern = format!(r"\b{}\b", proposed_num);
-    if let Ok(num_re) = regex::Regex::new(&num_pattern) {
-        let total_occurrences = num_re.find_iter(page_text).count();
-        if total_occurrences == 0 {
-            return false;
-        }
-        let veto_pattern = format!(
-            r"(?i)\b(?:figure|fig|table|graph|diagram)\.?\s*{}\b",
-            proposed_num
-        );
-        if let Ok(veto_re) = regex::Regex::new(&veto_pattern) {
-            let veto_occurrences = veto_re.find_iter(page_text).count();
-            return total_occurrences == veto_occurrences;
-        }
-    }
-    false
-}
-
-#[allow(dead_code)]
-fn is_isotope_hallucination(proposed_num: u32, page_text: &str) -> bool {
-    // Specifically looking for the pattern: `20 \n 10 Ne` or `20 Ne` or `20 \n Ne`.
-    let pattern = format!(r"(?i)\b{}\s*\d*\s*(?:He|Ne|Ar|Kr|Xe|Rn|F|Cl|Br|I|O|S|Se|Te|N|P|As|Sb|C|Si|Ge|Sn|B|Al|Ga|In|Be|Mg|Ca|Sr|Ba|Li|Na|K|Rb|Cs|U|Th|Pu)\b", proposed_num);
-    if let Ok(re) = regex::Regex::new(&pattern) {
-        return re.is_match(page_text);
-    }
-    false
 }
 
 /// Narrow isotope check used at heading-scan time: only fires when the
@@ -1628,340 +1391,6 @@ fn heading_is_isotope(number: u32, window: &str) -> bool {
         return re.is_match(window);
     }
     false
-}
-
-fn build_spans_from_vision(
-    structures: &[ValidatedPageStructure],
-    eligible_pages: &[usize],
-    _num_pages: usize,
-    headings: &[QuestionHeading],
-    page_texts: &[String],
-) -> Vec<QuestionSpan> {
-    let mut vision_bounds: BTreeMap<u32, VisionBounds> = BTreeMap::new();
-    // Phase 1c: the old `q + 5 < prev_max` global guard killed the entire
-    // map whenever a single page returned an outlier number (e.g. reading
-    // "30" from "[30 marks]" or a year on a cover page). Instead we do a
-    // two-pass per-page filter:
-    //   * collect plausible numbers for each page by rejecting numbers
-    //     that jump backward by more than 30 OR forward by more than 30
-    //     from the running maximum, AND are not adjacent to any number
-    //     on the same page (a lone "30" on a page whose other numbers
-    //     are 3,4,5 is almost certainly a misread).
-    //   * a page that produces zero plausible numbers doesn't blow up
-    //     the map — it's simply skipped.
-    let mut running_max = 0u32;
-    let mut raw_detections = Vec::new();
-    for p in structures {
-        if p.page == 0 {
-            continue;
-        }
-        if !eligible_pages.contains(&p.page) {
-            continue;
-        }
-        let mut page_detections = Vec::new();
-        for (qi, &q) in p.questions.iter().enumerate() {
-            if q == 0 || q > 1000 {
-                continue;
-            }
-            // Page-number heuristic removed here — rely on loose sequence filter
-            // and heading-level filters to reject false numbers, not page index.
-            let y_fracs = p.question_y.get(qi).copied().unwrap_or((None, None));
-            page_detections.push((p.page, qi, q, y_fracs));
-        }
-
-        // Ensure they are ordered by question number so expected_max_q evaluates correctly.
-        // We do NOT sort by y_frac on the same page because missing bounding boxes (or slightly inaccurate AI coordinates)
-        // could cause Q2 to sort before Q1, causing Q1 to be dropped by the monotonicity guard.
-        page_detections.sort_by(|a, b| {
-            a.2.cmp(&b.2)
-        });
-
-        raw_detections.extend(page_detections);
-    }
-
-    // --- HYBRID FALLBACK: INJECT TEXT LAYER HEADINGS (standalone pass) ---
-    // Text-layer headings are ground truth and must enter the map EVEN when
-    // the AI structure pass is missing, failed, or hallucinated-free but
-    // sparse. The injection used to live inside the per-structure loop,
-    // which meant a page with no AI structure (or an empty structures vec)
-    // silently lost every text heading on it.
-    for h in headings {
-        if h.number == 0 || h.number > 1000 {
-            continue;
-        }
-        if !eligible_pages.contains(&h.page) {
-            continue;
-        }
-        // Isotope numbers (e.g. 20 from "20 Ne") are already filtered at
-        // scan time via heading_is_isotope, which only inspects the heading
-        // site — no page-wide veto here.
-        // Skip if the AI already detected this number on this exact page —
-        // the vision_bounds merge would dedupe anyway, but skipping keeps
-        // the AI's (usually better) y coordinates authoritative.
-        let ai_has_it = raw_detections.iter().any(|d| d.0 == h.page && d.2 == h.number);
-        if ai_has_it {
-            continue;
-        }
-        // Inject with qi=999 to indicate it's from the text layer
-        raw_detections.push((h.page, 999, h.number, (Some(h.y_frac), Some(h.y_frac))));
-    }
-
-    let mut expected_max_q = 0u32;
-    let mut filtered_detections = Vec::new();
-    for det in raw_detections {
-        let page = det.0;
-        let qi = det.1;
-        let q = det.2;
-        let is_text_layer = qi == 999;
-
-        // --- HYBRID RUST VETO CHECK ---
-        if !is_text_layer && is_figure_hallucination(q, &page_texts[page]) {
-            continue;
-        }
-
-        // --- CROSS-PAGE TEXT CONFIRMATION ---
-        // If the deterministic text-layer scan found question q's heading
-        // ANYWHERE in the document, that placement is ground truth. An AI
-        // detection of the same q on a DIFFERENT page (where the text layer
-        // does not have q) is almost certainly a misread (e.g. the AI read
-        // the printed page number "10" as Q10 on a page where the text layer
-        // only finds Q3 margin markers). Reject it and let the text-layer
-        // placement stand. When the text layer has q NOWHERE (scanned PDF,
-        // OCR gap), the rule stays out of the way and the AI is trusted.
-        if !is_text_layer {
-            let text_has_q_here = headings.iter().any(|h| h.page == page && h.number == q);
-            if !text_has_q_here {
-                let text_has_q_elsewhere = headings.iter().any(|h| h.number == q);
-                if text_has_q_elsewhere {
-                    continue;
-                }
-            }
-        }
-
-        // Accept any ascending number up to 1000, allowing for ANY gap size.
-        // Text-layer injected headings (qi == 999) are always accepted — they
-        // come from the deterministic scanner which is our ground truth.
-        if q <= 1000 && (q >= expected_max_q || is_text_layer) {
-            // Veto page number hallucinations: if the AI proposed a number that equals the printed page number,
-            // we strictly require the text layer to confirm it. Since our text layer scanner robustly ignores 
-            // printed page numbers (by checking AQA padding conventions), it will only confirm real questions.
-            let is_likely_page_number = !is_text_layer && ((q as usize) == page + 1 || (q as usize) == page + 2);
-            if is_likely_page_number {
-                let ai_y = det.3.0; // The start y-fraction from the AI
-                let text_layer_confirmed = headings.iter().any(|h| {
-                    if h.page != page || h.number != q {
-                        return false;
-                    }
-                    if let Some(y) = ai_y {
-                        // AI bounding boxes for hallucinations can be wildly inaccurate, so we tolerate up to 0.15 diff
-                        (y - h.y_frac).abs() < 0.15
-                    } else {
-                        true
-                    }
-                });
-                if !text_layer_confirmed {
-                    continue;
-                }
-            }
-
-            filtered_detections.push(det);
-            if q > expected_max_q {
-                expected_max_q = q;
-            }
-        }
-    }
-
-    for (page, _qi, q, (y0, y1)) in filtered_detections {
-        running_max = running_max.max(q);
-        let e = vision_bounds.entry(q).or_insert_with(|| VisionBounds {
-            first_page: page,
-            last_page: page,
-            first_y: None,
-            last_y: None,
-            marks: None,
-        });
-        if page < e.first_page {
-            e.first_page = page;
-            e.first_y = y0;
-        } else if page == e.first_page {
-            e.first_y = match (e.first_y, y0) {
-                (Some(a), Some(b)) => Some(a.min(b)),
-                (a, b) => a.or(b),
-            };
-        }
-        if page > e.last_page {
-            e.last_page = page;
-            e.last_y = y1;
-        } else if page == e.last_page {
-            e.last_y = match (e.last_y, y1) {
-                (Some(a), Some(b)) => Some(a.max(b)),
-                (a, b) => a.or(b),
-            };
-        }
-    }
-    for p in structures {
-        if !eligible_pages.contains(&p.page) {
-            continue;
-        }
-        if let Some((q, m)) = p.footer {
-            // Phase 1c: only trust the footer if its question number is
-            // plausible (same guard as build_map_from_structure). A
-            // misread "30" from "[30 marks]" on a cover page otherwise
-            // poisons bounds for Q30.
-            if q > 0 && q <= 1000 {
-                // Page-number veto: an AI "footer" whose question number
-                // equals the printed page number is almost always the page
-                // number itself misread as a totals line. Require the text
-                // layer to confirm a heading for q on this page.
-                let is_likely_page_number = (q as usize) == p.page + 1
-                    || (q as usize) == p.page
-                    || (q as usize) == p.page + 2;
-                if is_likely_page_number {
-                    let confirmed = headings.iter().any(|h| h.page == p.page && h.number == q);
-                    if !confirmed {
-                        continue;
-                    }
-                }
-                // Cross-page confirmation: if the text layer placed question
-                // q on a DIFFERENT page, this footer placement is wrong.
-                let text_has_q_here = headings.iter().any(|h| h.page == p.page && h.number == q);
-                if !text_has_q_here && headings.iter().any(|h| h.number == q) {
-                    continue;
-                }
-                let e = vision_bounds.entry(q).or_insert_with(|| VisionBounds {
-                    first_page: p.page,
-                    last_page: p.page,
-                    first_y: None,
-                    last_y: None,
-                    marks: None,
-                });
-                e.last_page = p.page;
-                e.last_y = p.footer_y.or(e.last_y);
-                e.marks = Some(m);
-                running_max = running_max.max(q);
-            }
-        }
-    }
-
-    if vision_bounds.is_empty() {
-        return Vec::new();
-    }
-
-    let vision_bounds_vec: Vec<(u32, VisionBounds)> = vision_bounds.into_iter().collect();
-
-    let mut spans = Vec::new();
-    for i in 0..vision_bounds_vec.len() {
-        let (q, ref b) = vision_bounds_vec[i];
-        let start_page = b.first_page;
-        let next = vision_bounds_vec.get(i + 1);
-        let end_page = if let Some((_, nb)) = next {
-            let next_start_page = nb.first_page;
-            // Strict math clamp to prevent empty spans while preserving b.last_page overlap
-            std::cmp::max(start_page.max(b.last_page), next_start_page.saturating_sub(1))
-        } else {
-            std::cmp::max(start_page, b.last_page)
-        };
-
-        // y-band clips. Text-layer injected detections carry y0 == y1 ==
-        // heading y, so a naive (first_y, last_y) pair produces a DEGENERATE
-        // zero-height band for single-page questions ("transcribe between
-        // 9% and 9%"), which makes the extraction model return empty items.
-        // Rules:
-        //   * start_y = this question's topmost heading y on its first page
-        //     (nudged up slightly so the heading line itself is included).
-        //   * end_y = when the NEXT question starts on the same page as this
-        //     span's end_page, clip just above the next heading. Otherwise the
-        //     question runs to the bottom of its last page -> None ("to
-        //     bottom"), never the last detection's y (which for text-layer
-        //     detections is just the last margin marker, not the content end).
-        let start_y = b.first_y.map(|y| (y - 0.01).clamp(0.0, 1.0));
-        let end_y = match next {
-            Some((_, nb)) if nb.first_page <= end_page => {
-                nb.first_y.map(|y| (y - 0.005).clamp(0.0, 1.0))
-            }
-            _ => None,
-        };
-        let mut vision_covered = Vec::new();
-        for pg in start_page..=end_page {
-            if eligible_pages.contains(&pg) {
-                vision_covered.push(pg);
-            }
-        }
-        spans.push(QuestionSpan {
-            number: q,
-            start_page,
-            end_page,
-            start_y_frac: start_y,
-            end_y_frac: end_y,
-            expected_marks: b.marks,
-            reliable_pages: Vec::new(),
-            ambiguous_pages: vision_covered,
-        });
-    }
-    spans
-}
-
-/// Merge text-layer spans with vision spans, preferring text-layer for reliable pages
-fn merge_spans(
-    mut text_spans: Vec<QuestionSpan>,
-    vision_spans: Vec<QuestionSpan>,
-    anomalies: &mut Vec<String>,
-) -> Vec<QuestionSpan> {
-    for vspan in vision_spans {
-        if let Some(idx) = text_spans.iter().position(|s| s.number == vspan.number) {
-            let tspan = &mut text_spans[idx];
-            // Expand page range
-            let new_start = tspan.start_page.min(vspan.start_page);
-            let new_end = tspan.end_page.max(vspan.end_page);
-            // When the vision span starts earlier / ends later, take its
-            // y clips; otherwise keep the tighter (possibly text-derived) clips.
-            if vspan.start_page < tspan.start_page {
-                tspan.start_y_frac = vspan.start_y_frac;
-            } else if vspan.start_page == tspan.start_page {
-                // Same start page: take the highest (lowest-y) clip so we
-                // don't chop off the question heading.
-                tspan.start_y_frac = match (tspan.start_y_frac, vspan.start_y_frac) {
-                    (Some(a), Some(b)) => Some(a.min(b)),
-                    (a, b) => a.or(b),
-                };
-            }
-            if vspan.end_page > tspan.end_page {
-                tspan.end_y_frac = vspan.end_y_frac;
-            } else if vspan.end_page == tspan.end_page {
-                tspan.end_y_frac = match (tspan.end_y_frac, vspan.end_y_frac) {
-                    (Some(a), Some(b)) => Some(a.max(b)),
-                    (a, b) => a.or(b),
-                };
-            }
-            tspan.start_page = new_start;
-            tspan.end_page = new_end;
-            for p in vspan.ambiguous_pages {
-                if !tspan.ambiguous_pages.contains(&p) && !tspan.reliable_pages.contains(&p) {
-                    tspan.ambiguous_pages.push(p);
-                }
-            }
-            if tspan.expected_marks.is_none() && vspan.expected_marks.is_some() {
-                tspan.expected_marks = vspan.expected_marks;
-            }
-        } else {
-            anomalies.push(format!("vision-only question {} found", vspan.number));
-            text_spans.push(vspan);
-        }
-    }
-
-    // Sort first by (start_page, start_y_frac, number) so same-page MCQ spans
-    // appear in reading order rather than numeric-number order (which can be
-    // wrong when a multi-page question's number is lower than a short
-    // question later on the same page as its footer).
-    // Sort first by start_page, then by question number. 
-    // We no longer sort by y_frac because missing y_fracs (None) defaulted to 0.0, 
-    // causing questions with missing bounding boxes to incorrectly sort to the top of the page (e.g. Q2 before Q1).
-    text_spans.sort_by(|a, b| {
-        let p = a.start_page.cmp(&b.start_page);
-        if p != std::cmp::Ordering::Equal { return p; }
-        a.number.cmp(&b.number)
-    });
-    text_spans
 }
 
 /// Determine whether Question N starts on the same page where Question N-1 ended,
@@ -2003,367 +1432,6 @@ fn estimate_first_question_start(page_texts: &[String], first_footer_page: usize
 
 // ── AI structure pass (validated) ──────────────────────────────────────────
 
-/// What the cheap per-page structure call may return.
-#[derive(Debug, Clone, Default, serde::Deserialize)]
-pub struct PageStructureProposal {
-    /// Whole question numbers whose content is visible on this page.
-    #[serde(default)]
-    pub question_numbers_visible: Vec<serde_json::Value>,
-    /// Phase 1: optional per-question vertical bounds (0.0 top to 1.0 bottom).
-    /// When supplied, must be the same length as `question_numbers_visible`;
-    /// each entry is [y_start, y_end] in relative page coordinates. Lets
-    /// the model tell us exactly where each question sits on the page so we
-    /// can clip images to a single question on dense short-answer / MCQ
-    /// pages. Optional for backwards compatibility.
-    #[serde(default)]
-    pub question_y_fracs: Option<Vec<Vec<serde_json::Value>>>,
-    /// Footer marks if a "Total for Question …" line is visible:
-    /// [question_number, marks]. Absent otherwise.
-    #[serde(default)]
-    pub total_marks_footer: Option<Vec<serde_json::Value>>,
-    /// Phase 1: optional y position of the printed footer (0.0–1.0), used
-    /// to clip the question's end above the following question's heading.
-    #[serde(default)]
-    pub total_marks_footer_y: Option<f32>,
-    /// One of QUESTION / COVER / INSTRUCTIONS / BLANK / ANSWER_BOOKLET /
-    /// REFERENCE — page-only classification, no question content asked.
-    #[serde(default)]
-    pub page_role: Option<String>,
-}
-
-pub struct ValidatedPageStructure {
-    pub page: usize,
-    /// Per-question numbers on this page.
-    pub questions: Vec<u32>,
-    /// Per-question y_start/y_end pairs (parallel to `questions`), if the
-    /// structure pass supplied them. `None` entries mean "use the whole
-    /// page in that direction".
-    pub question_y: Vec<(Option<f32>, Option<f32>)>,
-    pub footer: Option<(u32, u32)>,
-    /// Y fraction of the footer on the page, if reported.
-    pub footer_y: Option<f32>,
-    pub role: PageRole,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PageRole {
-    Question,
-    Cover,
-    Instructions,
-    Blank,
-    AnswerBooklet,
-    Reference,
-    Unknown,
-}
-
-impl PageRole {
-    pub fn is_question_content(self) -> bool {
-        matches!(
-            self,
-            PageRole::Question | PageRole::Blank | PageRole::Unknown
-        )
-    }
-}
-
-/// Validate one structure proposal. Returns (normalized, list of violations).
-/// Violations are for the report; nothing here silently trusts bad data.
-pub fn validate_structure_proposal(
-    page: usize,
-    proposal: PageStructureProposal,
-    all_valid_page_count: usize,
-) -> (ValidatedPageStructure, Vec<String>) {
-    let mut violations = Vec::new();
-
-    // Parse question numbers in their ORIGINAL order (sorting destroys the
-    // top-to-bottom ordering we need to apply y fractions). We dedupe but
-    // preserve order of first occurrence.
-    let mut seen = std::collections::BTreeSet::new();
-    let mut questions: Vec<u32> = Vec::new();
-    let mut raw_to_valid: Vec<Option<u32>> = Vec::new();
-    for raw in &proposal.question_numbers_visible {
-        let n = crate::validate::value_to_question_number(raw);
-        raw_to_valid.push(n);
-        if let Some(n) = n {
-            if seen.insert(n) {
-                questions.push(n);
-            }
-        }
-    }
-    if raw_to_valid.iter().any(|o| o.is_none()) {
-        violations.push(format!(
-            "page {}: dropped implausible question number(s) from structure pass",
-            page + 1
-        ));
-    }
-
-    // Align y fractions with the valid question list. We zip raw→valid and
-    // only keep the y pair when the question number was accepted.
-    let mut question_y: Vec<(Option<f32>, Option<f32>)> = Vec::new();
-    if let Some(yfracs) = proposal.question_y_fracs {
-        if yfracs.len() == proposal.question_numbers_visible.len() {
-            for (raw_idx, pair) in yfracs.iter().enumerate() {
-                let Some(q) = raw_to_valid[raw_idx] else { continue };
-                // Find q's position in the deduplicated list.
-                let pos = match questions.iter().position(|x| *x == q) {
-                    Some(p) => p,
-                    None => continue,
-                };
-                if pos >= question_y.len() {
-                    question_y.resize(pos + 1, (None, None));
-                }
-                let y0 = pair.get(0).and_then(|v| v.as_f64()).map(|f| f.clamp(0.0, 1.0) as f32);
-                let y1 = pair.get(1).and_then(|v| v.as_f64()).map(|f| f.clamp(0.0, 1.0) as f32);
-                // Sanity: y0 < y1
-                let (y0, y1) = match (y0, y1) {
-                    (Some(a), Some(b)) if a < b => (Some(a), Some(b)),
-                    (Some(a), None) => (Some(a), None),
-                    (None, Some(b)) => (None, Some(b)),
-                    _ => (None, None),
-                };
-                question_y[pos] = (y0, y1);
-            }
-        } else {
-            violations.push(format!(
-                "page {}: question_y_fracs length mismatch (expected {}, got {}) — y-clips ignored",
-                page + 1,
-                proposal.question_numbers_visible.len(),
-                yfracs.len()
-            ));
-        }
-    }
-    // Pad to questions.len() with (None, None).
-    while question_y.len() < questions.len() {
-        question_y.push((None, None));
-    }
-
-    // Deterministic anti-merge pass: the structure prompt asks for
-    // non-overlapping, ascending bands, but a model that ignores that
-    // instruction would otherwise hand two questions crops that both
-    // contain the boundary — exactly the "subquestions muddled between
-    // main questions" failure. Repair overlaps here instead of trusting
-    // the prompt: questions are in top-to-bottom order, so band i must
-    // end no lower than band i+1 starts. On overlap we cut both at the
-    // midpoint of the disputed strip.
-    for i in 0..question_y.len().saturating_sub(1) {
-        let (_, end_i) = question_y[i];
-        let (start_next, _) = question_y[i + 1];
-        if let (Some(e), Some(s)) = (end_i, start_next) {
-            if e > s {
-                let mid = (e + s) / 2.0;
-                question_y[i].1 = Some(mid);
-                question_y[i + 1].0 = Some(mid);
-                violations.push(format!(
-                    "page {}: questions {} and {} had overlapping y-bands ({:.3} > {:.3}) — split at {:.3}",
-                    page + 1,
-                    questions.get(i).copied().unwrap_or(0),
-                    questions.get(i + 1).copied().unwrap_or(0),
-                    e,
-                    s,
-                    mid
-                ));
-            }
-        }
-    }
-
-    let footer = proposal.total_marks_footer.and_then(|pair| {
-        if pair.len() == 2 {
-            let q = crate::validate::value_to_question_number(&pair[0]);
-            let m = crate::validate::value_to_marks(&pair[1]);
-            if let (Some(q), Some(m)) = (q, m) {
-                return Some((q, m.max(0) as u32));
-            }
-        }
-        violations.push(format!(
-            "page {}: malformed total_marks_footer ignored",
-            page + 1
-        ));
-        None
-    });
-    let footer_y = proposal
-        .total_marks_footer_y
-        .map(|f| f.clamp(0.0, 1.0))
-        .filter(|_| footer.is_some());
-
-    let role = match proposal
-        .page_role
-        .as_deref()
-        .unwrap_or("")
-        .trim()
-        .to_uppercase()
-        .as_str()
-    {
-        "QUESTION" | "QUESTION_PAPER" => PageRole::Question,
-        "COVER" | "COVER_PAGE" => PageRole::Cover,
-        "INSTRUCTIONS" | "INSTRUCTION" => PageRole::Instructions,
-        "BLANK" => PageRole::Blank,
-        "ANSWER_BOOKLET" => PageRole::AnswerBooklet,
-        "REFERENCE" => PageRole::Reference,
-        other => {
-            if !other.is_empty() {
-                violations.push(format!("page {}: unknown page_role '{}'", page + 1, other));
-            }
-            PageRole::Unknown
-        }
-    };
-
-    let _ = all_valid_page_count;
-
-    (
-        ValidatedPageStructure {
-            page,
-            questions,
-            question_y,
-            footer,
-            footer_y,
-            role,
-        },
-        violations,
-    )
-}
-
-/// Fold validated per-page structure into a DocumentMap when the text-layer
-/// scan failed (corrupt PDFs). Numbers must form a non-decreasing sequence
-/// across pages — the single most effective anti-hallucination check there
-/// is for page-by-page proposals.
-#[allow(dead_code)]
-pub fn build_map_from_structure(
-    pages: &[ValidatedPageStructure],
-    num_pages: usize,
-) -> Option<DocumentMap> {
-    // Record per-question running bounds. Phase 1c: same per-page
-    // plausible-number filter as build_spans_from_vision, so an outlier
-    // on a single page can't kill the whole structure map.
-    let mut bounds: std::collections::BTreeMap<u32, VisionBounds> =
-        std::collections::BTreeMap::new();
-    let mut running_max = 0u32;
-    let mut raw_detections = Vec::new();
-    for p in pages {
-        if p.page == 0 {
-            continue;
-        }
-        if !p.role.is_question_content() {
-            continue;
-        }
-        for (qi, &q) in p.questions.iter().enumerate() {
-            if q == 0 || q > 1000 {
-                continue;
-            }
-            if q as usize == p.page + 1 {
-                continue; // Page Number Heuristic Filter
-            }
-            let y_fracs = p.question_y.get(qi).copied().unwrap_or((None, None));
-            raw_detections.push((p.page, qi, q, y_fracs));
-        }
-    }
-
-    let mut expected_max_q = 0u32;
-    let mut filtered_detections = Vec::new();
-    for det in raw_detections {
-        let q = det.2;
-        // Accept any ascending number up to 1000, allowing for ANY gap size 
-        if q >= expected_max_q && q <= 1000 {
-            filtered_detections.push(det);
-            expected_max_q = q;
-        }
-    }
-
-    for (page, _qi, q, (y0, y1)) in filtered_detections {
-        running_max = running_max.max(q);
-        let e = bounds.entry(q).or_insert_with(|| VisionBounds {
-            first_page: page,
-            last_page: page,
-            first_y: None,
-            last_y: None,
-            marks: None,
-        });
-        if page < e.first_page {
-            e.first_page = page;
-            e.first_y = y0;
-        } else if page == e.first_page {
-            e.first_y = match (e.first_y, y0) {
-                (Some(a), Some(b)) => Some(a.min(b)),
-                (a, b) => a.or(b),
-            };
-        }
-        if page > e.last_page {
-            e.last_page = page;
-            e.last_y = y1;
-        } else if page == e.last_page {
-            e.last_y = match (e.last_y, y1) {
-                (Some(a), Some(b)) => Some(a.max(b)),
-                (a, b) => a.or(b),
-            };
-        }
-    }
-    for p in pages {
-        if let Some((q, m)) = p.footer {
-            // Only trust the footer if its question number is plausible
-            // (within range of the running sequence or already in bounds).
-            if q > 0 && q <= 1000 {
-                let e = bounds.entry(q).or_insert_with(|| VisionBounds {
-                    first_page: p.page,
-                    last_page: p.page,
-                    first_y: None,
-                    last_y: None,
-                    marks: None,
-                });
-                e.last_page = p.page;
-                e.last_y = p.footer_y.or(e.last_y);
-                e.marks = Some(m);
-                running_max = running_max.max(q);
-            }
-        }
-    }
-    if bounds.len() < 2 {
-        return None;
-    }
-
-    let bounds_vec: Vec<(u32, VisionBounds)> = bounds.into_iter().collect();
-
-    let mut spans = Vec::new();
-    for i in 0..bounds_vec.len() {
-        let (q, ref b) = bounds_vec[i];
-        let start_page = b.first_page;
-        let end_page = if i + 1 < bounds_vec.len() {
-            let next_start_page = bounds_vec[i + 1].1.first_page;
-            // Strict math clamp to prevent empty spans while preserving b.last_page overlap
-            std::cmp::max(start_page.max(b.last_page), next_start_page.saturating_sub(1))
-        } else {
-            std::cmp::max(start_page, b.last_page)
-        };
-
-        let mut ambiguous = Vec::new();
-        for pg in start_page..=end_page {
-            ambiguous.push(pg);
-        }
-        spans.push(QuestionSpan {
-            number: q,
-            start_page,
-            end_page,
-            start_y_frac: b.first_y,
-            end_y_frac: b.last_y,
-            expected_marks: b.marks,
-            reliable_pages: Vec::new(),
-            ambiguous_pages: ambiguous,
-        });
-    }
-    let _ = num_pages;
-
-    let non_question_pages = pages
-        .iter()
-        .filter(|p| !p.role.is_question_content())
-        .map(|p| p.page)
-        .collect();
-
-    Some(DocumentMap {
-        spans,
-        paper_total_marks: None,
-        non_question_pages,
-        vision_fallback_pages: pages.iter().map(|p| p.page).collect(),
-        anomalies: Vec::new(),
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2381,7 +1449,7 @@ mod tests {
             "second continues (Total for Question 2 is 6 marks)",
             "TOTAL FOR PAPER IS 11 MARKS",
         ]);
-        let map = build_hybrid_map(&t, &[], 5);
+        let map = build_text_only_map(&t, 5, &scan_text_layer(&t));
         assert_eq!(map.spans.len(), 2);
         assert_eq!(map.spans[0].number, 1);
         assert_eq!(map.spans[0].expected_marks, Some(5));
@@ -2399,7 +1467,7 @@ mod tests {
             "1. first (Total for Question 1 is 3 marks)\n2. second (Total for Question 2 is 4 marks)",
             "3. third (Total for Question 3 is 2 marks)",
         ]);
-        let map = build_hybrid_map(&t, &[], 3);
+        let map = build_text_only_map(&t, 3, &scan_text_layer(&t));
         assert_eq!(map.spans.len(), 3);
         assert_eq!(map.spans[0].number, 1);
         assert_eq!(map.spans[0].start_page, 1);
@@ -2415,106 +1483,8 @@ mod tests {
     #[test]
     fn corrupt_text_layer_falls_back() {
         let t = texts(&["garbled !@#$%^", "more garbled"]);
-        let map = build_hybrid_map(&t, &[], 2);
+        let map = build_text_only_map(&t, 2, &scan_text_layer(&t));
         assert!(map.spans.is_empty());
-    }
-
-    #[test]
-    fn overlapping_y_bands_are_split_not_merged() {
-        // Model claims Q3 runs to 0.62 while Q4 starts at 0.55 — the
-        // disputed strip would put Q4's first sub-parts inside Q3's crop.
-        let proposal = PageStructureProposal {
-            question_numbers_visible: vec![serde_json::json!(3), serde_json::json!(4)],
-            question_y_fracs: Some(vec![
-                vec![serde_json::json!(0.05), serde_json::json!(0.62)],
-                vec![serde_json::json!(0.55), serde_json::json!(0.97)],
-            ]),
-            total_marks_footer: None,
-            total_marks_footer_y: None,
-            page_role: Some("QUESTION".to_string()),
-        };
-        let (v, violations) = validate_structure_proposal(0, proposal, 1);
-        assert_eq!(v.questions, vec![3, 4]);
-        let end_q3 = v.question_y[0].1.unwrap();
-        let start_q4 = v.question_y[1].0.unwrap();
-        assert!(end_q3 <= start_q4, "bands must not overlap: {end_q3} > {start_q4}");
-        assert!((end_q3 - 0.585).abs() < 1e-4, "expected midpoint split, got {end_q3}");
-        assert!(violations.iter().any(|s| s.contains("overlapping y-bands")));
-    }
-
-    #[test]
-    fn non_overlapping_y_bands_are_left_alone() {
-        let proposal = PageStructureProposal {
-            question_numbers_visible: vec![serde_json::json!(1), serde_json::json!(2)],
-            question_y_fracs: Some(vec![
-                vec![serde_json::json!(0.04), serde_json::json!(0.40)],
-                vec![serde_json::json!(0.45), serde_json::json!(0.96)],
-            ]),
-            total_marks_footer: None,
-            total_marks_footer_y: None,
-            page_role: Some("QUESTION".to_string()),
-        };
-        let (v, violations) = validate_structure_proposal(0, proposal, 1);
-        assert_eq!(v.question_y[0].1, Some(0.40));
-        assert_eq!(v.question_y[1].0, Some(0.45));
-        assert!(!violations.iter().any(|s| s.contains("overlapping")));
-    }
-
-    #[test]
-    fn structure_pass_validates_and_builds() {
-        let mk = |page, qs: Vec<u32>, foot: Option<(u32, u32)>, role| ValidatedPageStructure {
-            page,
-            questions: qs.clone(),
-            question_y: vec![(None, None); qs.len()],
-            footer: foot,
-            footer_y: None,
-            role,
-        };
-        let pages = vec![
-            mk(0, vec![], None, PageRole::Cover),
-            mk(2, vec![1], None, PageRole::Question),
-            mk(3, vec![1, 2], Some((1, 5)), PageRole::Question),
-            mk(4, vec![2], Some((2, 6)), PageRole::Question),
-        ];
-        let map = build_map_from_structure(&pages, 5).unwrap();
-        assert_eq!(map.spans.len(), 2);
-        assert_eq!(map.spans[0].number, 1);
-        assert_eq!(map.spans[0].end_page, 3);
-        assert_eq!(map.spans[0].expected_marks, Some(5));
-        assert_eq!(map.spans[1].start_page, 3);
-        assert_eq!(map.non_question_pages, vec![0]);
-    }
-
-    #[test]
-    fn structure_pass_rejects_massive_backwards_jumps() {
-        let mk = |page, qs: Vec<u32>| ValidatedPageStructure {
-            page,
-            questions: qs.clone(),
-            question_y: vec![(None, None); qs.len()],
-            footer: None,
-            footer_y: None,
-            role: PageRole::Question,
-        };
-        let pages = vec![mk(0, vec![40]), mk(1, vec![1])]; // 40 → 1 hallucination
-        assert!(build_map_from_structure(&pages, 2).is_none());
-    }
-
-    #[test]
-    fn proposal_validation_normalizes() {
-        let (v, violations) = validate_structure_proposal(
-            0,
-            PageStructureProposal {
-                question_numbers_visible: vec![serde_json::json!(3), serde_json::json!("03.1")],
-                total_marks_footer: Some(vec![serde_json::json!(3), serde_json::json!(8)]),
-                page_role: Some("question".into()),
-                ..Default::default()
-            },
-            5,
-        );
-        assert_eq!(v.questions, vec![3]); // "03.1" accepted as 3, duplicates are removed
-        assert_eq!(v.footer, Some((3, 8)));
-        assert_eq!(v.role, PageRole::Question);
-        assert_eq!(violations.len(), 0); // No longer a violation because 03.1 is parsed successfully
     }
 
     /// Extract page texts via the production pdfium path and build the
@@ -2534,7 +1504,7 @@ mod tests {
         };
         let pages: Vec<String> = page_inputs.into_iter().map(|p| p.text).collect();
         let num_pages = pages.len();
-        let map = build_hybrid_map(&pages, &[], num_pages);
+        let map = build_text_only_map(&pages, num_pages, &scan_text_layer(&pages));
         Some((pages, map))
     }
 
@@ -2559,8 +1529,8 @@ mod tests {
         assert!(class.is_digital(), "short papers must stay local");
         assert_eq!(class.text_pages, 2);
 
-        // A complete maths-only question with no prose clears the bar: NO
-        // threshold may hand a digital question to the cloud.
+        // A complete maths-only question with no prose clears the bar: no
+        // threshold of any kind.
         let maths_only = texts(&["1. Solve x=2. [1]"]);
         let class = classify_text_layer(&maths_only);
         assert!(class.is_digital(), "maths-only content must stay local");
@@ -2578,7 +1548,7 @@ mod tests {
         // whole import local and the gaps are reported.
         let gaps = texts(&[rich, "", "END OF QUESTIONS", "\u{200a}", "\t\n "]);
         let class = classify_text_layer(&gaps);
-        assert!(class.is_digital(), "a blank page must not enable cloud");
+        assert!(class.is_digital(), "a blank page does not make a paper a scan");
         assert_eq!(class.text_pages, 2);
         assert_eq!(class.total_pages, 5);
         assert_eq!(class.unresolved_pages(), &[1, 3, 4]);
@@ -2586,7 +1556,7 @@ mod tests {
         // Genuinely scanned-only: no extracted text anywhere (whitespace only).
         let scanned = texts(&["", "   ", "\u{200a}", "\t\n "]);
         let class = classify_text_layer(&scanned);
-        assert!(class.is_scanned_only(), "a real scan keeps cloud access");
+        assert!(class.is_scanned_only(), "a real scan has no text anywhere");
         assert!(!class.is_digital());
         assert_eq!(class.text_pages, 0);
         assert_eq!(class.unresolved_pages(), &[0, 1, 2, 3]);
@@ -2657,75 +1627,16 @@ mod tests {
                      spaces provided and show all of your working clearly.";
         let pages = texts(&[cover, q1, q2, filler.as_str()]);
         let scan = scan_text_layer(&pages);
-        assert!(
-            !text_layer_map_sufficient(&scan, pages.len()),
-            "two headings cannot satisfy the map gate"
-        );
         assert!(classify_text_layer(&pages).is_digital());
         let map = build_text_only_map(&pages, pages.len(), &scan);
         assert_eq!(
             map.spans.iter().map(|s| s.number).collect::<Vec<_>>(),
             vec![1, 2]
         );
-        assert!(map.vision_fallback_pages.is_empty());
     }
 
     #[test]
-    fn text_layer_sufficiency_gate() {
-        // Garbled / scanned: no headings at all -> insufficient.
-        let garbled = texts(&["garbled !@#$%^", "more garbled"]);
-        let scan = scan_text_layer(&garbled);
-        assert!(!text_layer_map_sufficient(&scan, 2));
-
-        // Sparse: only 3 questions -> insufficient (needs vision fallback).
-        let sparse = texts(&[
-            "Instructions",
-            "1. alpha text padding padding padding padding padding padding padding padding",
-            "2. beta text padding padding padding padding padding padding padding padding",
-            "3. gamma text padding padding padding padding padding padding padding padding",
-        ]);
-        let scan = scan_text_layer(&sparse);
-        assert!(!text_layer_map_sufficient(&scan, 4));
-
-        // Dense but missing Q1 -> insufficient.
-        let no_q1 = texts(&[
-            "Instructions",
-            "2. beta text padding padding padding padding padding padding padding padding",
-            "3. gamma text padding padding padding padding padding padding padding padding",
-            "4. delta text padding padding padding padding padding padding padding padding",
-            "5. epsilon text padding padding padding padding padding padding padding padding",
-            "6. zeta text padding padding padding padding padding padding padding padding",
-            "7. eta text padding padding padding padding padding padding padding padding",
-        ]);
-        let scan = scan_text_layer(&no_q1);
-        assert!(!text_layer_map_sufficient(&scan, 7));
-
-        // Complete ascending run 1..=8 across several pages -> sufficient.
-        let dense = texts(&[
-            "Instructions",
-            "1. alpha text padding padding padding padding padding padding padding padding",
-            "2. beta text padding padding padding padding padding padding padding padding",
-            "3. gamma text padding padding padding padding padding padding padding padding",
-            "4. delta text padding padding padding padding padding padding padding padding",
-            "5. epsilon text padding padding padding padding padding padding padding padding",
-            "6. zeta text padding padding padding padding padding padding padding padding",
-            "7. eta text padding padding padding padding padding padding padding padding",
-            "8. theta text padding padding padding padding padding padding padding padding",
-        ]);
-        let scan = scan_text_layer(&dense);
-        assert!(text_layer_map_sufficient(&scan, 9));
-
-        // 4-question modular paper run 1..=4 -> sufficient.
-        let modular = texts(&[
-            "Instructions",
-            "1 (a) alpha text padding padding padding padding padding padding padding padding",
-            "2 (a) beta text padding padding padding padding padding padding padding padding",
-            "3 (a) gamma text padding padding padding padding padding padding padding padding",
-            "4 (a) delta text padding padding padding padding padding padding padding padding",
-        ]);
-        let scan_mod = scan_text_layer(&modular);
-        assert!(text_layer_map_sufficient(&scan_mod, 5));
-
+    fn text_scan_reads_cie_and_ocr_footers() {
         // Cambridge CIE style headings & footers
         let cie = texts(&[
             "Instructions",
@@ -2735,7 +1646,6 @@ mod tests {
             "4 (a) Evaluate the definite integral padding padding padding padding padding [Total: 12]",
         ]);
         let scan_cie = scan_text_layer(&cie);
-        assert!(text_layer_map_sufficient(&scan_cie, 5));
         assert_eq!(scan_cie.footers.len(), 4);
 
         // OCR style uppercase headings & footers
@@ -2747,7 +1657,6 @@ mod tests {
             "QUESTION 4\nExplain the observed spectrum padding padding padding padding padding\n(Total for Question 4 = 9 marks)",
         ]);
         let scan_ocr = scan_text_layer(&ocr);
-        assert!(text_layer_map_sufficient(&scan_ocr, 5));
         assert_eq!(scan_ocr.footers.len(), 4);
     }
 
@@ -2761,7 +1670,6 @@ mod tests {
         let scan = scan_text_layer(&pages);
         let numbers: Vec<u32> = scan.headings.iter().map(|h| h.number).collect();
         assert_eq!(numbers, (1..=18).collect::<Vec<_>>());
-        assert!(text_layer_map_sufficient(&scan, pages.len()));
 
         let span_numbers: Vec<u32> = map.spans.iter().map(|s| s.number).collect();
         assert_eq!(span_numbers, (1..=18).collect::<Vec<_>>());
@@ -2783,7 +1691,12 @@ mod tests {
         let mut tested = 0usize;
 
         for year in years {
-            let path = format!("../edexcel/'{} edexcel.pdf", year);
+            // (A paper fixed against moves from papers/unused to papers/used.)
+            let path = ["../papers/unused", "../papers/used"]
+                .iter()
+                .map(|dir| format!("{dir}/edexcel '{year} edexcel.pdf"))
+                .find(|p| std::path::Path::new(p).exists())
+                .unwrap_or_else(|| format!("../papers/unused/edexcel '{year} edexcel.pdf"));
             assert!(
                 std::path::Path::new(&path).exists(),
                 "missing requested Edexcel fixture: {}",
@@ -2859,7 +1772,7 @@ mod tests {
             let page_texts: Vec<String> = page_inputs.iter().map(|page| page.text.clone()).collect();
             let scan = scan_text_layer(&page_texts);
             let heading_numbers: Vec<u32> = scan.headings.iter().map(|heading| heading.number).collect();
-            let map = build_hybrid_map(&page_texts, &[], page_inputs.len());
+            let map = build_text_only_map(&page_texts, page_inputs.len(), &scan);
             if text_rich {
                 assert!(
                     heading_numbers.len() >= 6,
@@ -2880,12 +1793,6 @@ mod tests {
                     path,
                     heading_numbers
                 );
-                assert!(
-                    text_layer_map_sufficient(&scan, page_inputs.len()),
-                    "{} text layer did not meet document-map sufficiency requirements: {:?}",
-                    path,
-                    heading_numbers
-                );
 
                 let span_numbers: Vec<u32> = map.spans.iter().map(|span| span.number).collect();
                 assert_eq!(
@@ -2897,16 +1804,6 @@ mod tests {
                 assert!(
                     text_bytes < 1000,
                     "{} was not classified consistently as image-dominant",
-                    path
-                );
-                assert!(
-                    !text_layer_map_sufficient(&scan, page_inputs.len()),
-                    "{} sparse text layer incorrectly claimed to be a complete map",
-                    path
-                );
-                assert!(
-                    map.vision_fallback_pages.len() > 0,
-                    "{} image-dominant paper did not retain vision fallback pages",
                     path
                 );
             }
@@ -2959,15 +1856,7 @@ mod tests {
         ];
         for (year, expected) in cases {
             let path = format!("../physics '{}.pdf", year);
-            let Some((pages, map)) = golden_map(&path) else { continue };
-            // The text layer alone must be judged sufficient to skip the
-            // vision structure pass for every one of these papers.
-            let scan = scan_text_layer(&pages);
-            assert!(
-                text_layer_map_sufficient(&scan, pages.len()),
-                "physics '{}: text layer should be sufficient to skip the structure pass",
-                year
-            );
+            let Some((_pages, map)) = golden_map(&path) else { continue };
             let span_nums: Vec<u32> = map.spans.iter().map(|s| s.number).collect();
             eprintln!("=== physics '{}: {} spans = {:?}", year, span_nums.len(), span_nums);
             for s in &map.spans {
@@ -3029,7 +1918,7 @@ mod tests {
         assert_eq!(heading_numbers.first().copied(), Some(1));
         assert_eq!(heading_numbers.last().copied(), Some(126));
 
-        let map = build_hybrid_map(&pages, &[], pages.len());
+        let map = build_text_only_map(&pages, pages.len(), &scan_text_layer(&pages));
         let span_numbers: Vec<u32> = map.spans.iter().map(|s| s.number).collect();
         assert_eq!(span_numbers.len(), 126, "All 126 question spans should be built in the document map");
         assert_eq!(span_numbers.first().copied(), Some(1));

@@ -2,8 +2,8 @@
 //
 // Every check here is pure, cheap, and testable. Validators either *clean*
 // (exact-string boilerplate removal), *measure* (marks sums, truncation), or
-// *gate* (structure proposals). The pipeline uses their verdicts to build
-// repair prompts and quarantine reports.
+// *gate* (a card passes or is flagged). The pipeline uses their verdicts for
+// its gates and quarantine reports.
 
 use std::sync::{LazyLock, OnceLock};
 
@@ -13,10 +13,6 @@ static INEQ_RE: LazyLock<regex::Regex> = LazyLock::new(|| {
 
 static EQ_RE: LazyLock<regex::Regex> = LazyLock::new(|| {
     regex::Regex::new(r"(?im)^[\s\.\$]*[a-zA-Z]\s*=\s*(.*?)\s*\$?\s*$").unwrap()
-});
-
-static RE_EXAMINER_CODES: LazyLock<regex::Regex> = LazyLock::new(|| {
-    regex::Regex::new(r"(?i)[\s,;]*(?:[\[(]?\b(?:d?(?:[mab]1?|ft|oe|cao|aef|awrt|dep|indep|allow|condone|ignore|accept|or\s+equivalent|award))[\](,)]*)+\s*$").unwrap()
 });
 
 fn re(pattern: &'static str) -> &'static regex::Regex {
@@ -43,11 +39,62 @@ fn re(pattern: &'static str) -> &'static regex::Regex {
 /// maths like `(4)` in equations are NOT counted.
 pub fn sum_inline_marks(content: &str) -> u32 {
     let re_marks = re(r"(?i)\*?\*?(?:\[|\()\s*(\d{1,2})\s*marks?\s*(?:\]|\))\*?\*?");
-    re_marks
-        .captures_iter(content)
-        .filter_map(|c| c[1].parse::<u32>().ok())
-        .filter(|&m| m <= 25) // per-part sanity bound
-        .sum()
+    let line_marks = |l: &str| -> u32 {
+        re_marks
+            .captures_iter(l)
+            .filter_map(|c| c[1].parse::<u32>().ok())
+            .filter(|&m| m <= 25) // per-part sanity bound
+            .sum()
+    };
+    // Parts printed "EITHER (f) … OR (g) …" are alternatives: a candidate
+    // answers one, so the largest counts. The choice ends at the next part
+    // of the alternatives' own kind ("(h)" after "(f)" and "(g)"); a
+    // sub-part ("(ii)" inside "(f)") stays in its alternative.
+    #[derive(PartialEq, Clone, Copy)]
+    enum Label {
+        Letter,
+        Roman,
+    }
+    let label = |t: &str| {
+        re(r"^\((?:([a-h])|i{1,3}|iv|vi{0,3}|ix|x)\)\s")
+            .captures(t)
+            .map(|c| if c.get(1).is_some() { Label::Letter } else { Label::Roman })
+    };
+    struct Choice {
+        answered: Vec<u32>,
+        current: u32,
+        kind: Option<Label>,
+        opening: bool,
+    }
+    let largest = |c: Choice| c.answered.into_iter().chain([c.current]).max().unwrap_or(0);
+    let mut total = 0;
+    let mut choice: Option<Choice> = None;
+    for line in content.lines() {
+        let t = line.trim();
+        if t == "EITHER" {
+            total += choice.take().map_or(0, largest);
+            choice = Some(Choice { answered: Vec::new(), current: 0, kind: None, opening: true });
+            continue;
+        }
+        let Some(c) = choice.as_mut() else {
+            total += line_marks(t);
+            continue;
+        };
+        if t == "OR" {
+            c.answered.push(c.current);
+            c.current = 0;
+            c.opening = true;
+        } else if c.opening && !t.is_empty() {
+            c.opening = false;
+            c.kind = c.kind.or(label(t));
+            c.current += line_marks(t);
+        } else if label(t).is_some_and(|k| c.kind.is_some_and(|a| k == a || a == Label::Roman && k == Label::Letter)) {
+            total += choice.take().map_or(0, largest) + line_marks(t);
+        } else {
+            c.current += line_marks(t);
+        }
+    }
+    total + choice.map_or(0, largest)
 }
 
 /// Style-and-clarity allocations printed as "(+S1)" / "(+S2)" (AEA papers):
@@ -55,187 +102,6 @@ pub fn sum_inline_marks(content: &str) -> u32 {
 pub fn sum_style_marks(content: &str) -> u32 {
     let re_style = re(r"\(\+\s*S\s*([1-9])\s*\)");
     re_style.captures_iter(content).filter_map(|c| c[1].parse::<u32>().ok()).sum()
-}
-
-/// Tolerant coercion of a model-supplied marks field (int, float, or string).
-pub fn value_to_marks(v: &serde_json::Value) -> Option<i32> {
-    match v {
-        serde_json::Value::Number(n) => n
-            .as_i64()
-            .or_else(|| n.as_f64().map(|f| f.round() as i64))
-            .map(|x| x.clamp(0, 100) as i32),
-        serde_json::Value::String(s) => {
-            let digits: String = s.chars().filter(|c| c.is_ascii_digit()).collect();
-            digits.parse::<i32>().ok().map(|x| x.clamp(0, 100))
-        }
-        _ => None,
-    }
-}
-
-/// Tolerant coercion of a model-supplied question number to a *plausible*
-/// whole question number.
-///
-/// Phase 1: accepts the many numbering styles boards use:
-///   * integer JSON numbers: 1, 2, 3
-///   * plain digit strings: "1", "12"
-///   * zero-padded / AQA spaced: "01", "0 1", "0 10"
-///   * suffixed: "1." "1)" "1]" "1–" (en-dash) "1-"
-///   * prefixed: "Q1" "Q.1" "Q 1" "Question 1" "QUESTION 3"
-///
-/// Still rejects:
-///   * zero, numbers > 1000 (raised to accommodate large multi-question worksheets and question bank compilations),
-///   * decimals like "03.1" / "3.5 V" / "1,2" (sub-parts and quantities),
-///   * floats (3.7).
-pub fn value_to_question_number(v: &serde_json::Value) -> Option<u32> {
-    let raw: Option<u64> = match v {
-        serde_json::Value::Number(n) => n
-            .as_u64()
-            .or_else(|| n.as_i64().and_then(|x| u64::try_from(x).ok()))
-            .or_else(|| {
-                n.as_f64().and_then(|f| {
-                    if f.fract() == 0.0 && f >= 0.0 {
-                        Some(f as u64)
-                    } else if f >= 1.0 && f < 1000.0 {
-                        // Phase 2: AQA sub-part encoded as decimal float.
-                        // The LLM sees "01 5" on the page and proposes 1.5.
-                        // The fractional part is a single digit (sub-part index),
-                        // not a true decimal quantity. Extract the integer part
-                        // as the whole question number. We guard against genuine
-                        // quantities (3.5 V) by requiring the fractional part to
-                        // be a clean single-digit tenth (0.1, 0.2, ..., 0.9) —
-                        // real physics quantities rarely land exactly on those.
-                        let frac = (f.fract() * 10.0).round();
-                        if (1.0..=9.0).contains(&frac) {
-                            if (f.fract() * 10.0 - frac).abs() < 1e-4 {
-                                Some(f.trunc() as u64)
-                            } else {
-                                None
-                            }
-                        } else {
-                            None
-                        }
-                    } else {
-                        None
-                    }
-                })
-            }),
-        serde_json::Value::String(s) => {
-            parse_question_number_string(s.trim())
-        }
-        _ => None,
-    };
-    match raw {
-        Some(n) if (1..=1000).contains(&n) => Some(n as u32),
-        _ => None,
-    }
-}
-
-/// Helper: parse a question-number string tolerantly. Returns None on any
-/// ambiguity that looks like a sub-part or a quantity rather than a whole
-/// question.
-fn parse_question_number_string(t: &str) -> Option<u64> {
-    // Phase 2: detect AQA spaced sub-part format BEFORE stripping whitespace.
-    // AQA prints "01 5" meaning Question 1, sub-part 5 (rendered as (e)).
-    // Without this check, whitespace stripping produces "015" → 15 (wrong).
-    // The pattern: exactly two whitespace-separated tokens, both all-digits,
-    // where the first token has length ≥ 2 (e.g. "01", "02", "10"). When the
-    // first token is just "0" (single zero), it's AQA spaced whole-question
-    // padding ("0 7" = question 7), handled by concatenation.
-    let parts: Vec<&str> = t.split_whitespace().collect();
-    if parts.len() == 2
-        && !parts[0].is_empty()
-        && parts[0].chars().all(|c| c.is_ascii_digit())
-        && !parts[1].is_empty()
-        && parts[1].chars().all(|c| c.is_ascii_digit())
-    {
-        if parts[0] == "0" {
-            // "0 7" → AQA spaced whole question: concatenate → "07" → 7
-            let combined = format!("{}{}", parts[0], parts[1]);
-            return combined.parse::<u64>().ok();
-        } else {
-            // "01 5" → AQA spaced sub-part: first token is the question number,
-            // second is the sub-part digit. Return the whole question number.
-            // E.g. "01 5" → Some(1), "02 3" → Some(2), "10 2" → Some(10)
-            return parts[0].parse::<u64>().ok();
-        }
-    }
-
-    // Fast path: all digits (possibly with whitespace) after stripping
-    // leading zeros. That preserves the existing AQA "0 1" → 1 behaviour.
-    let stripped_ws: String = t.chars().filter(|c| !c.is_whitespace()).collect();
-
-    // Strip a leading Q / Q. / Question / QUESTION prefix (case insensitive).
-    let lower = stripped_ws.to_ascii_lowercase();
-    let without_prefix = lower
-        .strip_prefix("question")
-        .map(|s| s.trim_start_matches('.'))
-        .unwrap_or(&lower)
-        .trim_start_matches('q')
-        .trim_start_matches('.');
-
-    // Strip a single trailing sentence / bracket / dash character.
-    // "1." → "1", "1)" → "1", "1]" → "1", "1–" → "1", "1-" → "1"
-    let mut chars: Vec<char> = without_prefix.chars().collect();
-    // Allow one trailing en-dash/em-dash/hyphen/closing-paren/bracket/full-stop.
-    while let Some(&last) = chars.last() {
-        if matches!(last, '.' | ')' | ']' | '-' | '–' | '—' | ':' | '}') {
-            chars.pop();
-        } else {
-            break;
-        }
-    }
-    let cleaned: String = chars.into_iter().collect();
-
-    // Reject if any internal non-digit character remains, UNLESS it's a single-digit decimal (e.g. "02.1")
-    // or a single letter sub-part (e.g. "2a"). This ensures the items are retained so the pipeline can
-    // properly trigger the "combine sub-parts" repair message.
-    if !cleaned.chars().all(|c| c.is_ascii_digit()) {
-        if let Some((int_part, frac_part)) = cleaned.split_once('.') {
-            if !int_part.is_empty() && int_part.chars().all(|c| c.is_ascii_digit()) 
-                && frac_part.len() == 1 && frac_part.chars().all(|c| c.is_ascii_digit()) {
-                return int_part.parse::<u64>().ok();
-            }
-        }
-        // Also tolerate "2a", "2b"
-        if let Some(pos) = cleaned.find(|c: char| !c.is_ascii_digit()) {
-            let int_part = &cleaned[..pos];
-            let rest = &cleaned[pos..];
-            if !int_part.is_empty() && int_part.chars().all(|c| c.is_ascii_digit()) 
-                && rest.len() == 1 && rest.chars().all(|c| c.is_ascii_alphabetic()) {
-                return int_part.parse::<u64>().ok();
-            }
-        }
-        return None;
-    }
-
-    // Reject strings that look like they started with a decimal part
-    // (e.g. original t was "03.1" — we stripped the trailing '.' above
-    // leaving "03.1" with an internal '.' → already rejected above; an
-    // additional belt-and-braces check on the original form: if the raw
-    // string had an interior '.' or ',' that wasn't a trailing sentence
-    // punctuation, refuse).
-    if t.contains('.') || t.contains(',') {
-        // Count how many '.'/',' appear inside the stripped (non-ws) form,
-        // ignoring trailing punctuation we already trimmed.
-        let interior = t.trim().trim_end_matches(|c: char| {
-            c.is_whitespace() || matches!(c, '.' | ')' | ']' | '-' | '–' | '—')
-        });
-        // If a '.' remains after trimming trailing punctuation and there
-        // are digits both sides (i.e. not "Q.1" which we already handled
-        // by stripping the leading 'q' + '.'), treat as sub-part.
-        let interior_stripped = interior.trim_start_matches(|c: char| {
-            c.is_whitespace()
-                || matches!(
-                    c,
-                    'q' | 'Q' | 'u' | 'e' | 's' | 't' | 'i' | 'o' | 'n' | '.'
-                )
-        });
-        if interior_stripped.contains('.') || interior_stripped.contains(',') {
-            return None;
-        }
-    }
-
-    cleaned.parse::<u64>().ok()
 }
 
 // ── Truncation detection ────────────────────────────────────────────────────
@@ -305,7 +171,7 @@ pub fn ends_with_complete_formula(content: &str) -> bool {
 
 /// True when the content ends like finished prose / math, not mid-word.
 ///
-/// Consistent at every seam (deterministic gate, assembly, LLM validation):
+/// Consistent at every seam (deterministic gate, assembly, validation):
 /// mark tags with or without the word "marks", balanced LaTeX groups, complete
 /// equations/answer lines, navigation markers ("END OF SECTION A",
 /// "Turn over ►"), code fences, tables and ordinary terminal punctuation.
@@ -967,7 +833,7 @@ fn push_balanced_segment(segment: &str, out: &mut String, in_display: &mut bool)
 }
 
 /// Validator: human-readable violations for unbalanced `$` / `$$` pairing.
-/// Quoted back to the model by the repair loop via `validate_span_items`.
+/// Any violation refuses a transcription at the Tier-0 seam.
 /// Code (fenced blocks and inline spans) is opaque: a `$` in code is literal.
 pub fn math_delimiter_balance_errors(content: &str) -> Vec<String> {
     let mut errors = Vec::new();
@@ -1751,8 +1617,7 @@ fn clean_table_cell(value: &str) -> Option<String> {
 // ── Figure/diagram referral consistency ─────────────────────────────────────
 //
 // If the paper says "Figure 6 shows...", that exhibit must reach the card as
-// an image — not vaporise into reflowed text. These checks make the model's
-// diagram choices auditable by the repair loop.
+// an image — not vaporise into reflowed text.
 
 /// Count "Figure N"-style references in the content.
 pub fn figure_references(content: &str) -> usize {
@@ -1762,8 +1627,7 @@ pub fn figure_references(content: &str) -> usize {
 
 /// Count [DIAGRAM_PLACEHOLDER] tokens.
 /// Textual evidence that a ruled area is a student-completion/trace table,
-/// not a paper figure. This is intentionally conservative and is used to
-/// suppress expensive diagram repair loops.
+/// not a paper figure. This is intentionally conservative.
 pub fn is_answer_grid_request(content: &str) -> bool {
     let s = content.to_ascii_lowercase();
     ["complete the trace table", "complete the table", "complete the grid",
@@ -1773,27 +1637,6 @@ pub fn is_answer_grid_request(content: &str) -> bool {
 
 pub fn diagram_placeholders(content: &str) -> usize {
     content.matches("[DIAGRAM_PLACEHOLDER]").count()
-}
-
-/// Every placeholder needs exactly one box (and vice versa), and any
-/// referenced Figure must be boxed. Quoted errors feed the repair loop.
-pub fn diagram_consistency_errors(content: &str, bbox_count: usize) -> Vec<String> {
-    let mut errors = Vec::new();
-    let placeholders = diagram_placeholders(content);
-    if placeholders != bbox_count {
-        errors.push(format!(
-            "{} [DIAGRAM_PLACEHOLDER] token(s) but {} diagram box(es) — every placeholder needs exactly one box and every box exactly one placeholder",
-            placeholders, bbox_count
-        ));
-    }
-    let figs = figure_references(content);
-    if bbox_count == 0 && figs > 0 {
-        errors.push(format!(
-            "content references {} figure(s) but proposes no diagram box — box each Figure's region (printed schemas and exhibits ARE figures: return boxes, not text). Exception: if the Figure is an EMPTY student answer/trace grid, transcribe it as a Markdown table instead",
-            figs
-        ));
-    }
-    errors
 }
 
 /// Extract figure numbers from "Figure N" references.
@@ -1809,8 +1652,7 @@ pub fn figure_reference_numbers(content: &str) -> Vec<u32> {
 //
 // Runs on the SANITIZED content of every assembled card. The sanitizer fixes
 // what is deterministically fixable; anything still failing here is a genuine
-// extraction defect that must go back to the model (repair round) or escalate
-// to vision. Every message is phrased as actionable feedback for the model.
+// extraction defect, and the card is not clean.
 
 /// Raw LaTeX commands sitting OUTSIDE any $...$ / $$...$$ math span.
 fn latex_outside_math(content: &str) -> Option<String> {
@@ -1896,6 +1738,159 @@ fn strip_math_spans(content: &str) -> String {
     re_span.replace_all(content, " ").to_string()
 }
 
+/// Math the renderer cannot typeset: a second superscript or subscript on
+/// one base (`\int_{1.5}^{2.}^{5}`), unbalanced braces, or a backslash that
+/// starts no command. One message per faulty math span; code is skipped.
+pub fn math_structure_errors(content: &str) -> Vec<String> {
+    static CODE_RE: LazyLock<regex::Regex> = LazyLock::new(|| regex::Regex::new(r"(?s)```.*?```|`[^`\n]*`").unwrap());
+    let prose = CODE_RE.replace_all(content, " ");
+    math_spans(&prose)
+        .into_iter()
+        .filter_map(|span| math_span_structure_error(span).map(|e| format!("math `{}`: {e}", span.chars().take(60).collect::<String>())))
+        .collect()
+}
+
+/// The math spans of `text` as the renderer reads them. In prose a dollar
+/// after an odd run of backslashes is a literal ("\$5"); inside maths
+/// nothing is escaped, so the next dollar closes it ("$= \$" is "= \").
+fn math_spans(text: &str) -> Vec<&str> {
+    static SPAN_RE: LazyLock<regex::Regex> = LazyLock::new(|| regex::Regex::new(r"(?s)\A(?:\$\$(.+?)\$\$|\$([^$\n]+?)\$)").unwrap());
+    let mut spans = Vec::new();
+    let mut backslashes = 0usize;
+    let mut k = 0;
+    while let Some(c) = text[k..].chars().next() {
+        if c == '$' && backslashes % 2 == 0 {
+            if let Some(m) = SPAN_RE.captures(&text[k..]) {
+                spans.extend(m.get(1).or_else(|| m.get(2)).map(|s| s.as_str()));
+                k += m[0].len();
+                backslashes = 0;
+                continue;
+            }
+        }
+        backslashes = if c == '\\' { backslashes + 1 } else { 0 };
+        k += c.len_utf8();
+    }
+    spans
+}
+
+/// The index after the script argument that starts at `k` (spaces skipped):
+/// a group, a command or a single character; or why there is none.
+fn script_argument_end(chars: &[char], mut k: usize) -> Result<usize, &'static str> {
+    while k < chars.len() && chars[k] == ' ' {
+        k += 1;
+    }
+    match chars.get(k) {
+        None => Err("a script has nothing to raise or lower"),
+        Some('}') => Err("a closing brace has no opening one"),
+        Some('{') => {
+            let mut d = 0usize;
+            while k < chars.len() {
+                match chars[k] {
+                    '\\' => k += 1,
+                    '{' => d += 1,
+                    '}' => {
+                        d -= 1;
+                        if d == 0 {
+                            return Ok(k + 1);
+                        }
+                    }
+                    _ => {}
+                }
+                k += 1;
+            }
+            Err("a group is never closed")
+        }
+        Some('\\') => match chars.get(k + 1) {
+            None => Err("a backslash ends the math"),
+            Some(c) if c.is_ascii_alphabetic() => {
+                k += 1;
+                while k < chars.len() && chars[k].is_ascii_alphabetic() {
+                    k += 1;
+                }
+                Ok(k)
+            }
+            Some(_) => Ok(k + 2),
+        },
+        Some(_) => Ok(k + 1),
+    }
+}
+
+/// The first structural fault in one math span's LaTeX, if any.
+fn math_span_structure_error(span: &str) -> Option<&'static str> {
+    let chars: Vec<char> = span.chars().collect();
+    // Per group nesting level: whether the current base already has a
+    // superscript / subscript.
+    let mut scripts: Vec<(bool, bool)> = vec![(false, false)];
+    let mut depth = 0usize;
+    let mut k = 0;
+    while k < chars.len() {
+        let c = chars[k];
+        match c {
+            '\\' => {
+                let Some(&next) = chars.get(k + 1) else { return Some("a backslash ends the math") };
+                if next.is_ascii_digit() || matches!(next, '(' | ')' | '[' | ']') {
+                    return Some("a backslash starts no command");
+                }
+                if next.is_ascii_alphabetic() {
+                    let mut j = k + 1;
+                    while j < chars.len() && chars[j].is_ascii_alphabetic() {
+                        j += 1;
+                    }
+                    let word: String = chars[k + 1..j].iter().collect();
+                    // A limits switch belongs to the operator before it.
+                    if !matches!(word.as_str(), "limits" | "nolimits") {
+                        *scripts.last_mut()? = (false, false);
+                    }
+                    k = j;
+                } else {
+                    *scripts.last_mut()? = (false, false);
+                    k += 2;
+                }
+                continue;
+            }
+            '{' => {
+                depth += 1;
+                scripts.push((false, false));
+            }
+            '}' => {
+                if depth == 0 {
+                    return Some("a closing brace has no opening one");
+                }
+                depth -= 1;
+                scripts.pop();
+                // The group just closed is the base of what follows.
+                *scripts.last_mut()? = (false, false);
+            }
+            '^' | '_' => {
+                let (sup, sub) = scripts.last_mut()?;
+                let used = if c == '^' { sup } else { sub };
+                if *used {
+                    return Some(if c == '^' { "a second superscript on one base" } else { "a second subscript on one base" });
+                }
+                *used = true;
+                let end = match script_argument_end(&chars, k + 1) {
+                    Ok(end) => end,
+                    Err(fault) => return Some(fault),
+                };
+                // The argument's own braces must balance too.
+                let arg: String = chars[k + 1..end].iter().collect();
+                if let Some(inner) = arg.trim().strip_prefix('{') {
+                    let Some(inner) = inner.strip_suffix('}') else { return Some("a group is never closed") };
+                    if let Some(e) = math_span_structure_error(inner) {
+                        return Some(e);
+                    }
+                }
+                k = end;
+                continue;
+            }
+            ' ' | '\'' => {}
+            _ => *scripts.last_mut()? = (false, false),
+        }
+        k += 1;
+    }
+    (depth > 0).then_some("a group is never closed")
+}
+
 /// Structural quality gate for a fully assembled card. Returns actionable
 /// error strings; an empty vec means the card is structurally sound.
 pub fn card_structure_errors(content: &str, _question_number: u32) -> Vec<String> {
@@ -1904,6 +1899,7 @@ pub fn card_structure_errors(content: &str, _question_number: u32) -> Vec<String
     if trimmed.is_empty() {
         return errors;
     }
+    errors.extend(math_structure_errors(trimmed));
 
     // 1. One-mark Section-B cards are MCQs: exactly four tagged options, in
     //    order. Cards carrying more marks (flow charts, extended questions)
@@ -2368,16 +2364,6 @@ pub fn is_duplicate_answer(existing: &str, new: &str) -> bool {
 
 // ── Mark Scheme Normalization (Task 2) ──────────────────────────────────────
 
-pub fn normalize_mark_scheme_chunk(chunk: &str) -> String {
-    let mut lines: Vec<String> = chunk.lines().map(|line| {
-        let cleaned = RE_EXAMINER_CODES.replace_all(line, "");
-        cleaned.trim().to_string()
-    }).collect();
-    
-    lines.retain(|line| !line.is_empty());
-    lines.join("\n")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2410,71 +2396,65 @@ mod tests {
     }
 
     #[test]
-    fn question_number_rejects_decimals_and_junk() {
-        assert_eq!(value_to_question_number(&serde_json::json!(7)), Some(7));
-        assert_eq!(value_to_question_number(&serde_json::json!("12")), Some(12));
-        assert_eq!(value_to_question_number(&serde_json::json!("03.1")), Some(3)); // extracts the integer part
-        assert_eq!(value_to_question_number(&serde_json::json!(0)), None);
-        assert_eq!(value_to_question_number(&serde_json::json!(1001)), None); // >1000
-        assert_eq!(value_to_question_number(&serde_json::json!(126)), Some(126));
-        assert_eq!(value_to_question_number(&serde_json::json!(3.7)), Some(3)); // AQA spaced sub-part
+    fn math_the_renderer_cannot_typeset_is_a_structure_error() {
+        // A limit split into two superscripts / subscripts (the fixtures
+        // Edexcel Further Jun 2025 Q1, "∫ from 1.5 to 2.5", and AQA Further
+        // Jun 2025 Q8, "∑ from r = c to 2c"), an unclosed group, a
+        // backslash that starts no command.
+        for bad in [
+            r"$\int_{1.5}^{2.}^{5}\mathrm{e}^{x} \, \mathrm{d}x$",
+            r"$\sum_{r=}^{2c}_c \frac{2r + 1}{r^{2} (r + 1)^{2}}$",
+            r"$\int_{0.}^{1.}_5^{2} x$",
+            r"$x^{y_\}$",
+            r"$x^}$",
+            r"$x^$",
+            r"$x^2^3$",
+            r"$\frac{a}{b$",
+            r"$a}$",
+            r"$2 \3$",
+        ] {
+            assert!(!math_structure_errors(bad).is_empty(), "{bad}");
+        }
+        for good in [
+            r"$\int_{1.5}^{2.5}\mathrm{e}^{\operatorname{cosec}{}^{2}x} \, \mathrm{d}x$",
+            r"$\sum\limits_{r=1}^{n} r^{2}$",
+            r"${}^{14}_{6}\text{C}$ and $\frac{a}{b}^{2}$",
+            r"$\left(\frac{x}{2}\right)^{2}$ and $x_{1}^{2}$",
+            r"$\begin{pmatrix} 1 & 2 \\ 3 & 4 \end{pmatrix}^{-1}$",
+            r"$a \, b \; c \{x\} \%$ and `x^2^3` in code",
+            r"$$\int_{0}^{1} x \, \mathrm{d}x$$",
+            r"$f'(x)$ costs \$5",
+            r"$$a \\$$ and $$\begin{matrix} 1 \\ 2 \\ \end{matrix}$$",
+        ] {
+            assert_eq!(math_structure_errors(good), Vec::<String>::new(), "{good}");
+        }
     }
 
     #[test]
-    fn question_number_aqa_spaced() {
-        // AQA prints "0 1", "0 2" — space between 0 and number.
-        assert_eq!(value_to_question_number(&serde_json::json!("0 1")), Some(1));
-        assert_eq!(value_to_question_number(&serde_json::json!("0 5")), Some(5));
-        assert_eq!(value_to_question_number(&serde_json::json!(" 0 10 ")), Some(10));
-        assert_eq!(value_to_question_number(&serde_json::json!("01")), Some(1));
-        // Now extracts integer part for single decimal sub-parts
-        assert_eq!(value_to_question_number(&serde_json::json!("0 1.1")), Some(1));
+    fn parts_printed_as_alternatives_count_once() {
+        // Edexcel A Economics Jun 2018 Q6: "(e) … (15) EITHER (f) … (20) OR
+        // (g) … (20)", a 35-mark tail; a lone "OR" between two questions
+        // is no choice inside a card.
+        let card = "(e) Discuss the likely impact of migration.\n**[15 marks]**\nEITHER\n(f) Evaluate government policies.\n**[20 marks]**\nOR\n(g) Evaluate the likely impact of high inflation.\n**[20 marks]**";
+        assert_eq!(sum_inline_marks(card), 35);
+        assert_eq!(sum_inline_marks("(a) State one cause.\n**[2 marks]**\nOR\n(b) Explain.\n**[4 marks]**"), 6);
+        // The choice ends at the next part of the alternatives' own kind; a
+        // sub-part inside an alternative stays in it.
+        let after = "EITHER\n(f) Evaluate.\n**[25 marks]**\nOR\n(g) Evaluate.\n**[20 marks]**\n(h) Explain.\n**[5 marks]**";
+        assert_eq!(sum_inline_marks(after), 30);
+        let inside = "EITHER\n(f) (i) Explain.\n**[10 marks]**\n(ii) Evaluate.\n**[10 marks]**\nOR\n(g) Evaluate.\n**[20 marks]**";
+        assert_eq!(sum_inline_marks(inside), 20);
     }
 
     #[test]
-    fn question_number_aqa_spaced_sub_parts() {
-        // Phase 2: AQA prints "01 5" meaning Q1 sub-part 5. The string form
-        // must return the WHOLE question number (1), not 15 (whitespace-strip bug).
-        assert_eq!(value_to_question_number(&serde_json::json!("01 5")), Some(1));
-        assert_eq!(value_to_question_number(&serde_json::json!("02 3")), Some(2));
-        assert_eq!(value_to_question_number(&serde_json::json!("10 2")), Some(10));
-        // The float form: LLM proposes 1.5 for "01 5" — extract integer part.
-        assert_eq!(value_to_question_number(&serde_json::json!(1.5)), Some(1));
-        assert_eq!(value_to_question_number(&serde_json::json!(2.3)), Some(2));
-        assert_eq!(value_to_question_number(&serde_json::json!(7.1)), Some(7));
-        // Genuine non-sub-part floats are still rejected (multi-digit fractional).
-        assert_eq!(value_to_question_number(&serde_json::json!(3.14)), None);
-        assert_eq!(value_to_question_number(&serde_json::json!(3.75)), None);
-        // 3.5 has frac*10 = 5.0, which is in 1..=9, so extracts 3. This is
-        // acceptable because the span validator will still reject it if it
-        // doesn't match the expected question number.
-        assert_eq!(value_to_question_number(&serde_json::json!(3.5)), Some(3));
-    }
-
-    #[test]
-    fn question_number_accepts_phase1_formats() {
-        // Dot/paren/bracket/dash suffixes used by every board.
-        assert_eq!(value_to_question_number(&serde_json::json!("1.")), Some(1));
-        assert_eq!(value_to_question_number(&serde_json::json!("1)")), Some(1));
-        assert_eq!(value_to_question_number(&serde_json::json!("5]")), Some(5));
-        assert_eq!(value_to_question_number(&serde_json::json!("12-")), Some(12));
-        // Q-prefixes.
-        assert_eq!(value_to_question_number(&serde_json::json!("Q1")), Some(1));
-        assert_eq!(value_to_question_number(&serde_json::json!("Q.3")), Some(3));
-        assert_eq!(value_to_question_number(&serde_json::json!("Q 7")), Some(7));
-        assert_eq!(value_to_question_number(&serde_json::json!("Question 4")), Some(4));
-        assert_eq!(value_to_question_number(&serde_json::json!("QUESTION 10")), Some(10));
-        // Quantities with units must still be rejected (the "3.5 V" case).
-        assert_eq!(value_to_question_number(&serde_json::json!("3.5 V")), None);
-        assert_eq!(value_to_question_number(&serde_json::json!("1,2")), None);
-    }
-
-    #[test]
-    fn marks_value_tolerant() {
-        assert_eq!(value_to_marks(&serde_json::json!(4)), Some(4));
-        assert_eq!(value_to_marks(&serde_json::json!("[5 marks]")), Some(5));
-        assert_eq!(value_to_marks(&serde_json::json!(3.0)), Some(3));
-        assert_eq!(value_to_marks(&serde_json::json!(null)), None);
+    fn a_dollar_inside_maths_closes_it_as_the_renderer_reads_it() {
+        // The fixture CIE Nov 2016 (v1) Q5 prints "Bills = $......": the
+        // card's "$= \$" is the maths "= \" to the renderer, which escapes
+        // dollars only in prose.
+        assert!(!math_structure_errors(r"Bills $= \$ ..........").is_empty());
+        for good in [r"costs \$5 and $x$", r"\$$x$ each", r"$x$ costs \\\$5"] {
+            assert_eq!(math_structure_errors(good), Vec::<String>::new(), "{good}");
+        }
     }
 
     #[test]
