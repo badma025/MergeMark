@@ -11,7 +11,7 @@
 //   * reported zero prompt/completion tokens and $0.0000 actual spend.
 //
 // Usage:
-//   node scripts/verify-zero-cost-offline.mjs "past papers for mergemark/fp2 '24.pdf" "fp2 24" [outDir]
+//   node scripts/verify-zero-cost-offline.mjs "papers/used/fp2 '24.pdf" "fp2 24" [outDir]
 //
 // Exit codes: 0 = certified, 1 = certification failure, 2 = harness/artifact problem.
 
@@ -42,6 +42,12 @@ export function runFailureMessage(status, signal, error) {
 /// attempted request means the digital circuit breaker did not hold.
 export function certificationFailures(cert) {
   const failures = [];
+  // MergeMark has no model client (see the Rust test
+  // mergemark_has_no_way_to_reach_an_ai_service); a certification written by
+  // a build that had one fails here.
+  if (cert.modelClient !== "none") {
+    failures.push(`modelClient=${cert.modelClient} (expected "none")`);
+  }
   if (cert.cloudAttempts !== 0) {
     failures.push(`cloudAttempts=${cert.cloudAttempts} (expected 0)`);
   }

@@ -33,6 +33,7 @@ function makePaper(root, name = "fake21") {
 function cleanCert(over = {}) {
   return {
     mode: "offline",
+    modelClient: "none",
     cloudAttempts: 0,
     imageAttempts: 0,
     textOnlyAttempts: 0,

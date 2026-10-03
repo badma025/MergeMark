@@ -1,5 +1,6 @@
 #!/usr/bin/env node
-// Fresh, trustworthy zero-cost calibration over the named 22-paper corpus.
+// Fresh, trustworthy zero-cost calibration over the named corpus (the 22
+// original papers plus the triage_fixtures cohort).
 //
 //   node scripts/run-zero-cost-calibration.mjs [--out <dir>] [--stamp <id>]
 //                                              [--only a,b] [--manifest <path>]

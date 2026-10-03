@@ -11,6 +11,7 @@ import {
 } from "./verify-zero-cost-offline.mjs";
 
 const cleanCert = {
+  modelClient: "none",
   costUsd: "0.0000",
   promptTokens: 0,
   completionTokens: 0,
@@ -33,6 +34,12 @@ test("an attempted request fails certification even at zero cost", () => {
     failures.some((f) => f.includes("zeroAttemptPolicyPassed")),
     failures.join("; "),
   );
+});
+
+test("a certification from a build with a model client fails", () => {
+  const { modelClient, ...older } = cleanCert;
+  assert.ok(certificationFailures(older).some((f) => f.includes("modelClient")));
+  assert.ok(certificationFailures({ ...cleanCert, modelClient: "openrouter" }).some((f) => f.includes("modelClient")));
 });
 
 test("nonzero tokens fail certification", () => {

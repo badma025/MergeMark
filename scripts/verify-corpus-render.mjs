@@ -62,13 +62,16 @@ for (const input of inputs) {
       const errors = [];
       warnings.length = 0;
       const content = preprocessExamMarkdown(card.content);
-      // The app renders the stem as Markdown and each tagged option body in
-      // its own option card (as verify-physics24-render.mjs does).
-      const options = [...content.matchAll(/^- \[MCQ:([A-E])\] (.*)$/gm)];
-      const stem = content.slice(0, options[0]?.index ?? content.length);
+      // The app renders the card as Markdown and each tagged option body in
+      // its own option card (as verify-physics24-render.mjs does). Everything
+      // that is not an option line is rendered, including what a multi-part
+      // card prints between and after its option lists.
+      const optionLine = /^- \[MCQ:([A-E])\] (.*)$/gm;
+      const options = [...content.matchAll(optionLine)];
+      const prose = content.replace(optionLine, '');
       let html = '';
       try {
-        html = render(stem) + options.map(m => render(m[2])).join('');
+        html = render(prose) + options.map(m => render(m[2])).join('');
       } catch (e) {
         errors.push(`render threw: ${e.message}`);
       }

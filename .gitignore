@@ -57,3 +57,4 @@ scratch_*.aux
 # Local import runs and exam-paper corpus (not source)
 output/
 past papers for mergemark/
+papers/
