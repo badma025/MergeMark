@@ -1,0 +1,62 @@
+name: Import problem
+description: A question card came out wrong, or a paper would not import
+title: "[import] "
+labels: ["needs-triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for testing MergeMark. Please don't attach whole exam papers —
+        the file name and question number are enough to find it.
+
+  - type: input
+    id: paper
+    attributes:
+      label: Paper
+      description: The PDF's file name, and the board/subject/year if the name doesn't say.
+      placeholder: "physics '21.pdf — AQA A-level Physics Paper 1, June 2021"
+    validations:
+      required: true
+
+  - type: input
+    id: question
+    attributes:
+      label: Question number
+      placeholder: "Q7(b)"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: badge
+    attributes:
+      label: Did the card show a REVIEW badge?
+      description: A wrong card with no REVIEW badge is the most useful report there is — nothing in the app catches those.
+      options:
+        - "No badge — the app thought this card was clean"
+        - "REVIEW badge"
+        - "No card was produced at all"
+        - "Not sure"
+    validations:
+      required: true
+
+  - type: textarea
+    id: wrong
+    attributes:
+      label: What is wrong
+      description: Missing text, a wrong symbol, marks that don't match, a diagram missing or badly cropped, text from the next question, and so on.
+    validations:
+      required: true
+
+  - type: textarea
+    id: screenshots
+    attributes:
+      label: Screenshots
+      description: A screenshot of the card, and of the page in the PDF if you can. Paste images directly into this box.
+
+  - type: input
+    id: version
+    attributes:
+      label: MergeMark version
+      placeholder: "0.9.4"
+    validations:
+      required: true

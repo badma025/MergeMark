@@ -58,3 +58,9 @@ scratch_*.aux
 output/
 past papers for mergemark/
 papers/
+
+# Secrets and local agent state
+.env
+.env.*
+!.env.example
+.claude/

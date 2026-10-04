@@ -246,7 +246,7 @@ export function runPaper({
   const args = [
     "run", "--quiet",
     "--manifest-path", manifestPath,
-    "--bin", "e2e_import",
+    "--example", "e2e_import",
     "--", paper.file, paper.name,
     "--offline",
     "--out", paperOutDir,

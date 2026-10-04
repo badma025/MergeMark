@@ -1,0 +1,53 @@
+MergeMark — Proprietary Software Licence
+
+Copyright (c) 2026 MergeMark. All Rights Reserved.
+
+This repository, the MergeMark application, and all accompanying source code,
+assets, documentation and installers (together, "the Software") are proprietary
+and confidential.
+
+PERMITTED
+
+1. You may view and read the source code in this repository for the purposes of
+   educational study and portfolio or technical evaluation.
+2. Where a beta installer has been distributed to you by the copyright holder,
+   you may install and use that build on your own devices for the purpose of
+   evaluating it and reporting problems.
+
+NOT PERMITTED
+
+Except as expressly stated above, and without the prior written permission of
+the copyright holder, you may not:
+
+1. copy, reproduce, publish or redistribute the Software, in source or binary
+   form, in whole or in part;
+2. modify the Software or create derivative works from it;
+3. use the Software, or any part of it, for any commercial or non-commercial
+   purpose beyond the evaluation described above;
+4. sublicense, sell, rent, lease or otherwise transfer rights in the Software;
+5. remove or obscure any copyright, licence or attribution notice.
+
+NO WARRANTY
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+COPYRIGHT HOLDER BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER
+IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
+CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+MergeMark is a tool for reformatting documents that you already have the right
+to use. It does not grant you any right in the examination papers, mark schemes
+or other third-party material you import with it. Copyright in those documents
+remains with their respective owners, and it is your responsibility to use them
+within the terms those owners allow.
+
+THIRD-PARTY COMPONENTS
+
+The Software is distributed with third-party components that carry their own
+licences, including PDFium (BSD 3-Clause) and its dependencies. Their licence
+texts are installed alongside the application in the `licenses` folder and are
+not covered by the terms above.
+
+For permissions beyond the scope of this licence, contact the copyright holder
+through the project's GitHub repository.

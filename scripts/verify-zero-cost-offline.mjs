@@ -96,7 +96,7 @@ function main() {
       "--quiet",
       "--manifest-path",
       manifest,
-      "--bin",
+      "--example",
       "e2e_import",
       "--",
       pdf,

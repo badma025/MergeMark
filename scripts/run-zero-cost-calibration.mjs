@@ -6,7 +6,7 @@
 //                                              [--only a,b] [--manifest <path>]
 //
 // For every paper this launches the REAL offline ingestion
-// (`cargo run --bin e2e_import -- <pdf> <name> --offline`) into a unique
+// (`cargo run --example e2e_import -- <pdf> <name> --offline`) into a unique
 // per-run/per-paper directory, captures the child exit code, requires freshly
 // written artifacts from that exact run, and validates the offline zero-attempt
 // policy against an independent source-ID fixture. Any failure makes the

@@ -2,6 +2,49 @@
 
 Everything a new conversation needs to continue the offline import fixes. Round 1 (clusters 1–5) is finished and written up in `docs/TRIAGE_FIX_REPORT.md`. This file covers round 2 (clusters 5b, 5c and 6–11), which is now done and written up in the same report; the plan below is kept as it was.
 
+## Tester release prep (4 Oct 2026)
+
+Release-plumbing work done on top of round 3, in the main tree. No pipeline code changed.
+- **Secret removed from the repo.** `.env` held a real `DATALAB_API_KEY` and
+  `LLAMAPARSE_API_KEY` and was committed on the **public** `origin/master`
+  (commit `ff9d9a5`). It is now untracked and gitignored, with a `.env.example`
+  in its place. Nothing in the app reads either key (no `reqwest`, no network
+  deps). **The keys still need revoking at Datalab and LlamaIndex, and they
+  remain in git history** unless the history is rewritten.
+- **Version:** `package.json` and `tauri.conf.json` 0.9.0 → **0.9.4** (the
+  published releases already reach v0.9.3, so 0.9.0 would have collided).
+  `src-tauri/Cargo.toml` is left at 1.0.0 on purpose: its version feeds the
+  `generator` field of the stroke-census artifacts that calibration diffs, so
+  changing it would perturb a verified baseline for no release benefit. Align
+  it during a 1.0 cycle, with a fresh calibration run.
+- **`release.yml` is Windows-only** and no longer injects the stale
+  `MERGEMARK_OPENROUTER_API_KEY`. macOS and Linux were building installers that
+  cannot import a paper: `Pdfium::bind_to_system_library()` only resolves
+  because `tauri.windows.conf.json` ships `pdfium.dll` beside the exe, and
+  there is no `libpdfium.dylib`/`.so` equivalent. macOS additionally needs a
+  Developer ID signature and notarisation. `macos-build.yml` is deleted (it
+  hardcoded the tag `mac-test-build`).
+- **NSIS only.** `bundle.targets` was `"all"`, so every build emitted both an
+  `.exe` and an `.msi` while the README and tester notes name only the `.exe`.
+  It is now `["nsis"]`, so the Releases page carries one download.
+- **The dev CLI no longer ships in the installer.** `src/bin/e2e_import.rs`
+  moved to `examples/e2e_import.rs`; Tauri enumerates cargo `bin` targets, not
+  `example` targets, so it can no longer be bundled. Every caller now uses
+  `cargo run --example e2e_import` (`scripts/lib/zero-cost-accounting.mjs`,
+  `scripts/verify-zero-cost-offline.mjs`, the README and this file). Historical
+  reports in `docs/agent-work/` still say `--bin`; they are records, left as they are.
+- **Added:** `LICENSE` (proprietary, matching the README's terms; replace the
+  holder "MergeMark" with the legal rights-holder's name). Removed the stray
+  tracked file `out`.
+- **README/BETA_TESTERS:** Windows-only install, v0.9.4 filename, the dead
+  Discord placeholder replaced with GitHub Issues, and the OCR claim narrowed to
+  "Windows verified; macOS compile-checked; Tesseract untested".
+
+Still to do for the tester release: revoke the two keys, run `cargo test` and a
+`tauri build`, confirm the installer no longer carries `e2e_import.exe`, then
+push, tag `v0.9.4` and publish. Not started: history rewrite, code signing,
+updater, mark schemes, the six wrong strict cards from round 3.
+
 ## Where things stand (4 Oct 2026, end of round 3)
 - **Round 3 is done and not committed.** It sits in the main tree on top of branch `import-fixes-rounds-1-2` (whose last commit, `c142a7d`, is the Windows beta). It fixed the six wrong strict cards the cluster 10 audit found, in three clusters, each written up in `docs/TRIAGE_FIX_REPORT.md` ("Round 3"):
   - cluster 12: fractions under a line of text (`build_fractions` drops a neighbouring line's words from a part);
@@ -246,7 +289,7 @@ The other under-total papers are Edexcel Chemistry Jun 2024 P3 (114/120), WJEC U
 - Recognise the printed choice instruction ("Answer EITHER… OR…", "Answer one question from…") in the question map, and record which questions are alternatives, so the triage total compares like with like.
 - No marks change. Where no instruction can be found, leave the paper listed with that cause.
 
-Diagnose every case from a dump before changing code: `cargo run --manifest-path src-tauri/Cargo.toml --offline --bin e2e_import -- "<pdf>" "<name>" --offline --dump-layout --out <dir>`. This writes `layout_pages.txt`, `layout_map.txt` and `unknown_glyphs.txt`.
+Diagnose every case from a dump before changing code: `cargo run --manifest-path src-tauri/Cargo.toml --offline --example e2e_import -- "<pdf>" "<name>" --offline --dump-layout --out <dir>`. This writes `layout_pages.txt`, `layout_map.txt` and `unknown_glyphs.txt`.
 
 ### Cluster 10: symbol fonts (54 papers, 137 cards with `�`)
 1. **Census.** Run the `--dump-layout` import on each paper with an unidentified glyph and count `unknown_glyphs.txt` by font family. This only picks the fixtures; don't tune against the results.

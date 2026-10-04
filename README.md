@@ -3,9 +3,9 @@
 
   **A privacy-first desktop engine that instantly transforms dense academic past papers into clean, customizable question cards.**
 
-  [![Version](https://img.shields.io/badge/version-0.9.0_Beta-blue.svg)]()
-  [![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20macOS-lightgrey.svg)]()
-  [![License](https://img.shields.io/badge/license-All%20Rights%20Reserved-red.svg)]()
+  [![Version](https://img.shields.io/badge/version-0.9.4_Beta-blue.svg)]()
+  [![Platform](https://img.shields.io/badge/platform-Windows-lightgrey.svg)]()
+  [![License](https://img.shields.io/badge/license-All%20Rights%20Reserved-red.svg)](LICENSE)
 </div>
 
 ---
@@ -27,12 +27,12 @@ This application is engineered for maximum performance and a minimal memory foot
 * **Frontend:** React & TypeScript
 * **Database:** SQLite (Local)
 * **PDF engine:** PDFium (via `pdfium-render`) for glyphs, fonts, vector paths and page rendering
-* **Intelligence:** A local geometry-first layout engine for digital papers and a local table reader for mark schemes; the operating system's own OCR engine (Windows, macOS) or Tesseract (Linux) for scanned papers. No AI models.
+* **Intelligence:** A local geometry-first layout engine for digital papers and a local table reader for mark schemes; the operating system's own OCR engine for scanned papers (Windows, verified; macOS and Linux backends exist but are not yet run-tested). No AI models.
 
 ## 🔍 How importing works
 Everything is imported **on this machine**. MergeMark has no AI service to send anything to: it makes no requests, needs no API key and costs nothing.
 * **Question papers with a text layer** (almost every board PDF) are rebuilt from the PDF itself, in the four stages below.
-* **Scanned papers** (pages printed as pictures or outlines, with no text layer or only a watermark) are read on this computer: on Windows by the operating system's own OCR engine, on macOS by Apple's Vision framework, and elsewhere by Tesseract when it is installed (`tesseract` on the PATH, for example `sudo apt install tesseract-ocr`). OCR reads words, not mathematics, so every question it produces is kept for review. Where no local OCR engine is available, a scanned paper is reported as not transcribed.
+* **Scanned papers** (pages printed as pictures or outlines, with no text layer or only a watermark) are read on this computer: on Windows by the operating system's own OCR engine, on macOS by Apple's Vision framework, and elsewhere by Tesseract when it is installed (`tesseract` on the PATH, for example `sudo apt install tesseract-ocr`). Only the Windows path has been run against real papers: the macOS backend is compile-checked and Tesseract is untested. OCR reads words, not mathematics, so every question it produces is kept for review. Where no local OCR engine is available, a scanned paper is reported as not transcribed.
 * **Mark schemes** are read by a local table reader (`src-tauri/src/mark_scheme_deterministic.rs`), which accepts a scheme only when it can account for every answer page. A scheme it cannot read is reported as not transcribed, with the reason.
 
 The Settings screens for API keys, models, usage, free parses and topic generation are still in the app, but those features are turned off: each one answers that MergeMark works offline.
@@ -63,15 +63,24 @@ The calibration imports every corpus paper offline. It fails if any artifact is 
 
 To see what the local reader makes of a mark scheme:
 ```bash
-cargo run --manifest-path src-tauri/Cargo.toml --bin e2e_import -- "<scheme>.pdf" "<name>" --mark-scheme --out <dir>
+cargo run --manifest-path src-tauri/Cargo.toml --example e2e_import -- "<scheme>.pdf" "<name>" --mark-scheme --out <dir>
 ```
 
 ## 🚀 Getting Started (Beta)
 
 ### Installation
+This beta is **Windows only**. The macOS and Linux code paths build, but PDFium is
+bundled for Windows alone, so they cannot yet import a paper.
+
 1. Navigate to the [Releases](../../releases) tab.
-2. Download the latest `v0.9.0` installer for your operating system (Windows `.exe` or macOS `.dmg`).
-3. Run the installer and launch MergeMark.
+2. Download the latest `v0.9.4` installer (`MergeMark_0.9.4_x64-setup.exe`).
+3. Run the installer and launch MergeMark. It installs for your own Windows account
+   and needs no administrator rights. The installer is not code-signed yet, so
+   SmartScreen may warn: choose **More info**, then **Run anyway**.
+
+Read [notes for testers](docs/BETA_TESTERS.md) before your first import — in
+particular, what the **REVIEW** badge means and why mark schemes are not yet
+supported.
 
 ### How to Use
 1. **Import:** Drag and drop a PDF past paper into the ingestion dropzone.
@@ -84,10 +93,13 @@ I am actively developing MergeMark toward a stable `v1.0.0` release. Upcoming fe
 - [ ] Expanded subject schemas (Chemistry, Biology), building on the Physics and Computer Science support.
 - [ ] Carry bold/italic emphasis in prose through to the cards.
 
-## 💬 Feedback & Community
-Since this is a `v0.9.0` beta, your feedback is critical. If you find a bug, encounter a PDF layout that breaks the parser, or want to request a new feature, please join the community:
+## 💬 Feedback
+Since this is a `v0.9.4` beta, your feedback is critical — especially a card that
+imports **without** a REVIEW badge and is still wrong, because no automated check
+catches those.
 
-👉 **[Join the MergeMark Discord Server](#)** *(Note: Add your Discord invite link here)*
+👉 **[Open an issue](../../issues/new)** with the paper's file name, the question
+number, what is wrong, and a screenshot of the card and the page if you can.
 
 ---
 

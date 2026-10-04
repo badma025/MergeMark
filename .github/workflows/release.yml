@@ -1,16 +1,23 @@
 name: Release
 
-# Builds MergeMark installers for macOS (universal), Windows, and Linux
-# whenever a version tag is pushed, then attaches them to a draft
-# GitHub Release for review.
+# Builds the MergeMark Windows installer whenever a version tag is pushed,
+# then attaches it to a draft GitHub Release for review.
 #
 # Usage:
-#   git tag v1.0.0 master
-#   git push origin v1.0.0
+#   git tag v0.9.4 master
+#   git push origin v0.9.4
 #
-# Builds are unsigned by default. To sign/notarize them, add the signing
-# secrets documented at https://v2.tauri.app/distribute/ and pass them as
-# env vars to the tauri-action step below.
+# Windows only, on purpose. MergeMark loads PDFium through
+# `Pdfium::bind_to_system_library()` and ships `pdfium.dll` beside the
+# executable via `src-tauri/tauri.windows.conf.json`. There is no equivalent
+# bundling for macOS or Linux yet, so those builds compile but fail at the
+# first import with "Failed to bind to pdfium". macOS also needs a Developer
+# ID signature and notarisation before Gatekeeper will open it at all.
+# Re-add those platforms once both are solved; see docs/ROUND2_HANDOFF.md.
+#
+# The installer is unsigned, so Windows SmartScreen warns on first run. To
+# sign it, add the signing secrets documented at
+# https://v2.tauri.app/distribute/ and pass them to the tauri-action step.
 
 on:
   push:
@@ -26,12 +33,6 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - platform: macos-latest
-            args: "--target universal-apple-darwin"
-            rustTargets: "aarch64-apple-darwin,x86_64-apple-darwin"
-          - platform: ubuntu-22.04
-            args: ""
-            rustTargets: ""
           - platform: windows-latest
             args: ""
             rustTargets: ""
@@ -58,12 +59,6 @@ jobs:
         with:
           workspaces: src-tauri
 
-      - name: Install Linux dependencies
-        if: matrix.platform == 'ubuntu-22.04'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf
-
       - name: Install frontend dependencies
         run: npm ci
 
@@ -71,11 +66,10 @@ jobs:
         uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          MERGEMARK_OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
         with:
           tagName: ${{ github.ref_name }}
           releaseName: "MergeMark ${{ github.ref_name }}"
-          releaseBody: "Download the installer for your platform below."
+          releaseBody: "Download the installer below. See docs/BETA_TESTERS.md before your first import."
           releaseDraft: true
-          prerelease: false
+          prerelease: true
           args: ${{ matrix.args }}

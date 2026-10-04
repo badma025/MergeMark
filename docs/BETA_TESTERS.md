@@ -3,7 +3,7 @@
 MergeMark turns past-paper PDFs into a bank of question cards you can filter, build worksheets from, and export. Everything runs on your computer: it sends nothing to any server or AI service.
 
 ## Install
-- Run `MergeMark_0.9.0_x64-setup.exe`. It installs for your Windows account only, so it needs no administrator rights.
+- Run `MergeMark_0.9.4_x64-setup.exe`. It installs for your Windows account only, so it needs no administrator rights.
 - The installer is not code-signed yet, so Windows SmartScreen may say "Windows protected your PC". Choose **More info**, then **Run anyway**.
 - Your library is stored in `%APPDATA%\com.mergemark.app`. Uninstall from **Settings → Apps** in Windows.
 
@@ -31,3 +31,10 @@ For each problem, please send:
 - the paper's file name and the question number;
 - what is wrong (missing text, wrong symbol, wrong marks, a diagram missing or cropped badly);
 - a screenshot of the card and, if you can, of the page in the PDF.
+
+The most valuable report is a card with **no REVIEW badge** that is still wrong,
+because nothing in the app catches those.
+
+Send reports by opening an issue at
+<https://github.com/badma025/MergeMark/issues/new>. Please don't attach whole
+exam papers — the file name and question number are enough.
