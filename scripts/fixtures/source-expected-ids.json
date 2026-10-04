@@ -3007,6 +3007,84 @@
         "10"
       ],
       "note": "Cluster 8 audit follow-up: tick-box options printed as bare numbers (01.2 '2 / 6 / 14 / 20') lost from strict cards; Q01-10 from the PDF."
+    },
+    "ocr_further_jun23": {
+      "file": "papers/used/Maths_A-level_Papers_OCR-Further__June_2023_QP.pdf",
+      "fileHash": "3926C46F98F5D152708D910BE5D17BD596F694E4DDB9E5E00CD8F5C4F15BA76F",
+      "cohort": "triage_fixtures",
+      "style": "numbered",
+      "confidence": "MEDIUM",
+      "expectedIds": [
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8
+      ],
+      "candidateIds": [
+        "1",
+        "2",
+        "3",
+        "4",
+        "5",
+        "6",
+        "7",
+        "8"
+      ],
+      "note": "Q1-Q8 read from the rendered pages; 75 marks; MathMagic stacked fractions (round 3, cluster 12)"
+    },
+    "cie_p2_jun17": {
+      "file": "papers/used/Maths_A-level_Papers_CIE__June_2017_(v1)_QP_-_P2.pdf",
+      "fileHash": "6416D5E825F5849E573375F0924623CB5B9C2D13FF63F6C6223F15D9295CF077",
+      "cohort": "triage_fixtures",
+      "style": "numbered",
+      "confidence": "MEDIUM",
+      "expectedIds": [
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8
+      ],
+      "candidateIds": [
+        "1",
+        "2",
+        "3",
+        "4",
+        "5",
+        "6",
+        "7",
+        "8"
+      ],
+      "note": "Q1-Q8 from the paper; 50 marks; dy/dx over a line of prose (round 3, cluster 12 regression)"
+    },
+    "mei_further_jun19": {
+      "file": "papers/used/Maths_A-level_Papers_OCR-MEI-Further__June_2019_QP.pdf",
+      "fileHash": "19BEFF8B2C75D2A098DB9354B63370E5DB272FB7BC7180B50BB2C0E37B41C85E",
+      "cohort": "triage_fixtures",
+      "style": "numbered",
+      "confidence": "MEDIUM",
+      "expectedIds": [
+        1,
+        2,
+        3,
+        4,
+        5
+      ],
+      "candidateIds": [
+        "1",
+        "2",
+        "3",
+        "4",
+        "5"
+      ],
+      "note": "Q1-Q5 from the paper; 60 marks; back-page OCR logo after the last question (round 3, cluster 13)"
     }
   }
 }

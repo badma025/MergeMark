@@ -2,7 +2,19 @@
 
 Everything a new conversation needs to continue the offline import fixes. Round 1 (clusters 1–5) is finished and written up in `docs/TRIAGE_FIX_REPORT.md`. This file covers round 2 (clusters 5b, 5c and 6–11), which is now done and written up in the same report; the plan below is kept as it was.
 
-## Where things stand (3 Oct 2026, end of round 2)
+## Where things stand (4 Oct 2026, end of round 3)
+- **Round 3 is done and not committed.** It sits in the main tree on top of branch `import-fixes-rounds-1-2` (whose last commit, `c142a7d`, is the Windows beta). It fixed the six wrong strict cards the cluster 10 audit found, in three clusters, each written up in `docs/TRIAGE_FIX_REPORT.md` ("Round 3"):
+  - cluster 12: fractions under a line of text (`build_fractions` drops a neighbouring line's words from a part);
+  - cluster 14: a drawing on graph paper takes the whole sheet (`is_graph_paper` in `figure_regions`);
+  - cluster 13: the last question ends at the paper's end marker (`end_y`), so the back page's logo is no figure of it.
+- **Numbers:** cargo test 378 passed, 0 failed. Calibration c13: 67/67 OK, the 22 originals unchanged (243/244, 69/69, zero attempts). Triage unused-c13 on the 123 papers left: PASS 31, FAIL 42, FLAGGED 43, REVIEW 7, unchanged from c11b on the same papers; 17 cards changed, with no regression in the targeted audits.
+- **Workflow notes from round 3:**
+  - Code review ran before each cluster's verify chain (on the dev copy's diff), so its corrections were verified once.
+  - A verify chain is `bash output/fix-log/verify.sh <stamp>`; `verify.sh` has no `set -e`, so killing its cargo test moves it on to calibration. To stop one, stop the background task, then end the `bash verify.sh`, `node` calibration/triage and `cargo`/`e2e_import` processes.
+  - The seeded blinded sample is the same for the same paper set, and moves only when a card changes stratum.
+- **Baseline for a round 4:** run `unused-c13` and calibration run `c13`. Still open: "What is left" in the report (new strict cards found wrong in round 3 come first), Tesseract in WSL, macOS Vision run on a Mac, and nine tests that read the deleted root PDFs and so check nothing.
+
+## Where things stood (3 Oct 2026, end of round 2)
 - **Committed on branch `import-fixes-rounds-1-2`** (3 Oct 2026, at the user's request), not pushed. See "Windows beta" below for what followed.
   - `git status` also shows old paper PDFs deleted from the repo root (`edexcel/'17 edexcel.pdf`, `physics '17.pdf` and others). Those deletions predate this work and were left out of the commits; leave them out unless the user confirms they were intended.
 - **The main tree holds the final round-2 code:** clusters 5b–11, each with its review corrections, on top of the seam session's refactor (`output/fix-log/seam/`, which changes no card). Each cluster is reported in `docs/TRIAGE_FIX_REPORT.md`.

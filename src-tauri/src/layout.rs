@@ -3800,6 +3800,22 @@ fn figure_regions(pg: &PageGlyphs, shapes: &[RadicalShape]) -> Vec<[f32; 4]> {
         }
     };
     merge(&mut boxes, 12.0);
+    // A drawing on graph paper takes the whole sheet: "Reflect shape P in
+    // the line x = −1" needs the grid (old Edexcel GCSE Jun 2016 Q22). The
+    // sheet is one path too large for the strokes absorbed below.
+    let sheets: Vec<&VPath> = pg.paths.iter().filter(|p| is_graph_paper(p)).collect();
+    for &paper in &sheets {
+        for r in boxes.iter_mut() {
+            let (cx, cy) = ((r[0] + r[2]) * 0.5, (r[1] + r[3]) * 0.5);
+            if cx >= paper.x0 && cx <= paper.x1 && cy >= paper.y0 && cy <= paper.y1 {
+                r[0] = r[0].min(paper.x0);
+                r[1] = r[1].min(paper.y0);
+                r[2] = r[2].max(paper.x1);
+                r[3] = r[3].max(paper.y1);
+            }
+        }
+    }
+    merge(&mut boxes, 12.0);
     // A long stroke ending in an arrowhead is an axis, however far it runs
     // (aea '24's x-axis spans the page under two small circles).
     let arrow_tipped = |p: &VPath| {
@@ -3878,10 +3894,50 @@ fn figure_regions(pg: &PageGlyphs, shapes: &[RadicalShape]) -> Vec<[f32; 4]> {
         let area = ((r[2] - r[0]) * (r[3] - r[1])).max(1.0);
         let on_page = (r[2].min(w) - r[0].max(0.0)).max(0.0) * (r[3].min(h) - r[1].max(0.0)).max(0.0);
         let strip = r[2] - r[0] < 0.06 * w && r[3] - r[1] > 0.5 * h && (r[2] < 0.08 * w || r[0] > 0.92 * w);
-        let page_sized = area >= 0.55 * w * h;
+        // (Graph paper with a drawing on it may cover most of a page.)
+        let holds_sheet = sheets.iter().any(|s| s.x0 >= r[0] - 0.5 && s.y0 >= r[1] - 0.5 && s.x1 <= r[2] + 0.5 && s.y1 <= r[3] + 0.5);
+        let page_sized = area >= 0.55 * w * h && !holds_sheet;
         on_page >= 0.5 * area && !strip && !page_sized
     });
     out
+}
+
+/// Graph paper: one stroked path drawn only in axis-aligned segments (the
+/// lines, and the sheet's frame), at least four lines each way on one square
+/// lattice. Lines may be missing from the lattice where they are drawn on
+/// their own (an axis, the bolder line every centimetre).
+fn is_graph_paper(p: &VPath) -> bool {
+    if !p.stroked || p.filled {
+        return false;
+    }
+    let (mut xs, mut ys) = (Vec::new(), Vec::new());
+    for w in p.pts.windows(2) {
+        let ((_, a), (move_to, b)) = (w[0], w[1]);
+        if move_to {
+            continue;
+        }
+        let (dx, dy) = ((b[0] - a[0]).abs(), (b[1] - a[1]).abs());
+        if dx < 0.5 && dy > 1.0 {
+            xs.push(a[0]);
+        } else if dy < 0.5 && dx > 1.0 {
+            ys.push(a[1]);
+        } else if dx >= 0.5 || dy >= 0.5 {
+            return false;
+        }
+    }
+    let lattice = |v: Vec<f32>| -> Option<f32> {
+        let v = levels(v);
+        if v.len() < 4 {
+            return None;
+        }
+        let gaps: Vec<f32> = v.windows(2).map(|w| w[1] - w[0]).collect();
+        let pitch = gaps.iter().copied().fold(f32::MAX, f32::min);
+        gaps.iter().all(|g| ((g / pitch) - (g / pitch).round()).abs() < 0.1).then_some(pitch)
+    };
+    match (lattice(xs), lattice(ys)) {
+        (Some(px), Some(py)) => (px - py).abs() <= 0.2 * px.max(py),
+        _ => false,
+    }
 }
 
 /// A pair of long arrow-tipped axes crossing with nothing drawn between them
@@ -4382,6 +4438,26 @@ fn build_fractions(pg: &PageGlyphs, mut items: Vec<Item>, rule_used: &mut [bool]
             };
             let above = if above.is_empty() { above } else { grow(above, true) };
             let below = if below.is_empty() { below } else { grow(below, false) };
+            // A part never holds a word of the line above or below it: a row
+            // of its glyphs that runs on into letters outside the part is a
+            // line of text reaching into the band ("portion" over cos θ = 4/5,
+            // "constants" under dy/dx). The line's raised and lowered glyphs,
+            // level with its letters, go with it.
+            let without_text_lines = |set: Vec<usize>| -> Vec<usize> {
+                let mut rows: Vec<Vec<usize>> = Vec::new();
+                for &k in &set {
+                    match rows.iter_mut().find(|row| same_line(items[row[0]].base, items[row[0]].size, &items[k])) {
+                        Some(row) => row.push(k),
+                        None => rows.push(vec![k]),
+                    }
+                }
+                let (lines, kept): (Vec<Vec<usize>>, Vec<Vec<usize>>) =
+                    rows.into_iter().partition(|row| touches_word(pg, &items, row, &set));
+                let level_with_line = |k: usize| lines.iter().flatten().any(|&j| items[k].y0 <= items[j].y1 && items[k].y1 >= items[j].y0);
+                kept.into_iter().flatten().filter(|&k| !level_with_line(k)).collect()
+            };
+            let above = without_text_lines(above);
+            let below = without_text_lines(below);
             if above.is_empty() || below.is_empty() {
                 continue;
             }
@@ -4400,6 +4476,8 @@ fn build_fractions(pg: &PageGlyphs, mut items: Vec<Item>, rule_used: &mut [bool]
             // A numerator stands clear of other text on its baseline: letters
             // touching it there make it part of a word on the line above
             // (the "c" of "decays" over the bar of an antineutrino's v̄).
+            // Each row passed alone above; this tests the rows together, on
+            // the numerator's main baseline and its outer edges.
             if inside_word(pg, &items, &above) {
                 continue;
             }
@@ -5195,18 +5273,28 @@ fn attach_option_letters(pg: &PageGlyphs, built: &mut Vec<LayoutLine>) {
 /// The items `set` are letters inside a longer word on their own baseline:
 /// another letter or digit of their size touches them there.
 fn inside_word(pg: &PageGlyphs, items: &[Item], set: &[usize]) -> bool {
-    if set.is_empty() {
+    touches_word(pg, items, set, set)
+}
+
+/// `item` is set on the line of text at `base` in type of `size`.
+fn same_line(base: f32, size: f32, item: &Item) -> bool {
+    (item.base - base).abs() < 0.1 * size && (item.size - size).abs() < 0.15 * size
+}
+
+/// A letter or digit outside `part`, on the baseline and in the size of the
+/// items `row`, touches them: they are letters of a longer word.
+fn touches_word(pg: &PageGlyphs, items: &[Item], row: &[usize], part: &[usize]) -> bool {
+    if row.is_empty() {
         return false;
     }
-    let members: Vec<Item> = set.iter().map(|&k| items[k].clone()).collect();
+    let members: Vec<Item> = row.iter().map(|&k| items[k].clone()).collect();
     let base = main_baseline(&members).0;
     let size = members.iter().map(|o| o.size).fold(0.0, f32::max).max(1.0);
     let (l, r) = members.iter().fold((f32::MAX, f32::MIN), |e, o| (e.0.min(o.lx0), e.1.max(o.lx1)));
     items.iter().enumerate().any(|(k, o)| {
-        !set.contains(&k)
+        !part.contains(&k)
             && matches!(o.node, Node::G(g) if pg.glyphs[g].ch.is_alphanumeric())
-            && (o.base - base).abs() < 0.1 * size
-            && (o.size - size).abs() < 0.15 * size
+            && same_line(base, size, o)
             && ((o.lx1 - l).abs() < 0.08 * size || (o.lx0 - r).abs() < 0.08 * size)
     })
 }
@@ -7436,7 +7524,15 @@ pub fn build_layout_map(pages: &[LayoutPage]) -> LayoutMap {
                 }
             }
         }
-        let end_y = next.and_then(|(np, nl, _)| if np == end_page { pages[np].lines.get(nl).map(|x| x.y0) } else { None });
+        // A question ends where the next one starts; the last ends where the
+        // questions end (the paper's end marker, or numbering that restarts
+        // in an answer booklet). Below it the page prints no question: OCR
+        // MEI Further Jun 2019 sets its logo and copyright notice under Q5's
+        // "END OF QUESTION PAPER".
+        let end_y = next
+            .map(|(np, nl, _)| (np, nl))
+            .or(end_marker)
+            .and_then(|(bp, bl)| if bp == end_page { pages[bp].lines.get(bl).map(|x| x.y0) } else { None });
         let marked = |&(p, l): &(usize, usize)| plain_line(&pages[p].lines[l].text).split_whitespace().any(|w| MARK_TOKEN_RE.is_match(w));
         let reference_from = own_reference.filter(|&i| i > 0 && lines[..i].iter().any(marked) && !lines[i..].iter().any(marked));
         map.questions.push(LayoutQuestion {
@@ -8006,6 +8102,105 @@ mod tests {
         // An option letter beside a tall fraction shares its line.
         let q21 = body(&pages, &map, 21);
         assert!(q21.contains(r"A $\frac{R}{\sqrt[3]{2}}$"), "{q21}");
+    }
+
+    #[test]
+    fn a_small_fraction_under_a_line_of_text_is_still_a_fraction() {
+        let _guard = crate::pdf_render::pdfium_test_lock();
+        let Some(pages) = corpus_pages("papers/used/Maths_A-level_Papers_OCR-Further__June_2023_QP.pdf") else { return };
+        let map = build_layout_map(&pages);
+        assert_eq!(map.questions.iter().map(|q| q.number).collect::<Vec<_>>(), (1..=8).collect::<Vec<_>>());
+        // Q7 prints "cos θ = 4/5" with "portion" on the line just above the
+        // 4: the letters of that line are not part of the numerator.
+        let q7 = body(&pages, &map, 7);
+        assert!(q7.contains(r"where $\cos \theta = \frac{4}{5}$ (see diagram)."), "{q7}");
+        assert!(q7.contains("the portion of string below"), "{q7}");
+        // Q8's "sin θ = 3/5" ends its line and was already read.
+        let q8 = body(&pages, &map, 8);
+        assert!(q8.contains(r"is $\theta$ where $\sin \theta = \frac{3}{5}$."), "{q8}");
+
+        // CIE P2 Jun 2017 Q7: a body-size dy/dx with "constants" on the next
+        // line, 13pt under the bar: that line is no part of the denominator.
+        let Some(pages) = corpus_pages("papers/used/Maths_A-level_Papers_CIE__June_2017_(v1)_QP_-_P2.pdf") else { return };
+        let map = build_layout_map(&pages);
+        assert_eq!(map.questions.iter().map(|q| q.number).collect::<Vec<_>>(), (1..=8).collect::<Vec<_>>());
+        let q7 = body(&pages, &map, 7);
+        assert!(q7.contains(r"(i) Find $\frac{\mathrm{d}y}{\mathrm{d}x}$ and use division to show that $\frac{\mathrm{d}y}{\mathrm{d}x}$ can be written"), "{q7}");
+        assert!(q7.contains("constants to be found."), "{q7}");
+    }
+
+    #[test]
+    fn a_dropped_line_takes_its_raised_glyphs_with_it() {
+        // OCR Further Jun 2023 Q7's geometry: a 4/5 set small in a 12 pt
+        // line, the line above reaching into the numerator's band. Here that
+        // line's word also carries a superscript over the bar ("eli²th"):
+        // the 2 goes with its line, never into the numerator.
+        let mut idx = 0;
+        let mut glyph = |ch: char, x0: f32, w: f32, size: f32, oy: f32| {
+            idx += 1;
+            Glyph { idx, ch, raw: ch as u32, font: "TimesNewRomanPSMT".into(), italic: false, bold: false, mono: false, size, x0, x1: x0 + w, y0: oy - 0.7 * size, y1: oy, ox: x0, oy, lx0: x0, lx1: x0 + w, angle: 0.0 }
+        };
+        let glyphs = vec![
+            glyph('e', 428.0, 5.0, 12.0, 113.3),
+            glyph('l', 433.0, 3.0, 12.0, 113.3),
+            glyph('i', 436.0, 3.0, 12.0, 113.3),
+            glyph('2', 439.0, 3.0, 8.0, 108.0),
+            glyph('t', 442.0, 3.0, 12.0, 113.3),
+            glyph('h', 445.0, 6.0, 12.0, 113.3),
+            glyph('=', 425.0, 7.0, 12.0, 127.3),
+            glyph('4', 438.0, 4.0, 8.2, 121.7),
+            glyph('5', 438.0, 4.0, 8.2, 131.2),
+            glyph('(', 447.0, 3.0, 12.0, 127.3),
+        ];
+        let rules = vec![Rule { x0: 435.0, x1: 445.0, y0: 123.5, y1: 123.9 }];
+        let lp = layout_page(&PageGlyphs { page: 0, width: 595.0, height: 842.0, glyphs, rules, ..Default::default() });
+        let text: Vec<&str> = lp.lines.iter().map(|l| l.text.as_str()).collect();
+        assert!(text.iter().any(|t| t.contains(r"= \frac{4}{5}")), "{text:?}");
+    }
+
+    #[test]
+    fn a_shape_drawn_on_graph_paper_is_cropped_with_the_grid_and_its_axes() {
+        let _guard = crate::pdf_render::pdfium_test_lock();
+        let Some(pages) = corpus_pages("papers/used/Maths_GCSE_Past-Papers_Edexcel-A-Old__June_2016_QP_-_Paper_1_(F)_Edexcel_(A)_Maths_GCSE.pdf") else { return };
+        // Q22 draws shape P on a coordinate grid (x from -8 to 8, y from -9
+        // to 9), once for each part, on pages 28 and 29. "Reflect shape P in
+        // the line x = −1" needs the grid and its axes, not P alone. The grid
+        // is one path spanning x 62-516, y 109-619; the axes reach past it.
+        for index in [27, 28] {
+            let figures = &pages[index].figures;
+            assert!(
+                figures.iter().any(|r| r[0] < 63.0 && r[2] > 515.0 && r[1] < 109.0 && r[3] > 619.0),
+                "page {}: the figure must hold the whole grid: {figures:?}", index + 1
+            );
+        }
+        // The axis numbers are part of the figure, not lines of the card.
+        let map = build_layout_map(&pages);
+        let q22 = body(&pages, &map, 22);
+        assert!(q22.contains(r"(a) Reflect shape $\mathbf{P}$ in the line $x = -1$"), "{q22}");
+        assert!(!q22.contains("-8") && !q22.contains('−'), "{q22}");
+        assert!(!q22.lines().any(|l| l.trim() == "9"), "{q22}");
+    }
+
+    #[test]
+    fn a_shape_on_graph_paper_most_of_a_page_keeps_its_figure() {
+        // Graph paper a little larger than Jun 2016 Q22's: 30 pt squares over
+        // 480 × 660 pt (63% of the page), a shaded parallelogram drawn on it.
+        // The sheet is the figure, however much of the page it covers.
+        let mut pts = vec![(true, [50.0, 60.0]), (false, [530.0, 60.0]), (false, [530.0, 720.0]), (false, [50.0, 720.0]), (false, [50.0, 60.0])];
+        for k in 1..16 {
+            let x = 50.0 + 30.0 * k as f32;
+            pts.extend([(true, [x, 60.0]), (false, [x, 720.0])]);
+        }
+        for k in 1..22 {
+            let y = 60.0 + 30.0 * k as f32;
+            pts.extend([(true, [50.0, y]), (false, [530.0, y])]);
+        }
+        let sheet = VPath { x0: 50.0, x1: 530.0, y0: 60.0, y1: 720.0, pts, filled: false, stroked: true };
+        let shape_pts = vec![(true, [300.0, 300.0]), (false, [360.0, 330.0]), (false, [360.0, 400.0]), (false, [300.0, 370.0]), (false, [300.0, 300.0])];
+        let shape = VPath { x0: 300.0, x1: 360.0, y0: 300.0, y1: 400.0, pts: shape_pts, filled: true, stroked: true };
+        let pg = PageGlyphs { page: 0, width: 595.0, height: 842.0, paths: vec![sheet, shape], ..Default::default() };
+        let regions = figure_regions(&pg, &[]);
+        assert!(regions.iter().any(|r| r[0] <= 50.5 && r[2] >= 529.5 && r[1] <= 60.5 && r[3] >= 719.5), "{regions:?}");
     }
 
     #[test]

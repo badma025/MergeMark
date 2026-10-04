@@ -273,7 +273,11 @@ pub async fn init_db(app_data_dir: PathBuf) -> Result<SqlitePool, sqlx::Error> {
 /// v4: imports are local only; entries cached from AI-model runs are dropped.
 /// v5: import fixes round 2 (question ends, marks, symbol fonts, numbers
 /// as options): a cached v4 card can lack options, allocations or parts.
-pub const EXTRACTION_CACHE_VERSION: u32 = 5;
+/// v6: import fixes round 3 (fractions under a line of text, drawings on
+/// graph paper, the end of the last question): a cached v5 card can hold a
+/// stacked fraction read as scripts, a grid cropped to its drawing without
+/// the axes, or the back page's logo as the last question's figure.
+pub const EXTRACTION_CACHE_VERSION: u32 = 6;
 
 /// Compute a deterministic cache key from file content + parameters.
 /// Uses a fast FNV-1a hash of the file bytes (not cryptographic, just

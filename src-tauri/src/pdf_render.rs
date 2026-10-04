@@ -2569,7 +2569,7 @@ mod tests {
     fn detect_figures_on_real_fixture() {
         let _guard = pdfium_test_lock();
         let manifest = env!("CARGO_MANIFEST_DIR");
-        for name in ["../physics '24.pdf", "../physics '21.pdf"] {
+        for name in ["../papers/used/physics '24.pdf", "../papers/used/physics '21.pdf"] {
             let path = std::path::Path::new(manifest).join(name);
             if !path.exists() {
                 eprintln!("[DETECT_TEST] fixture missing: {}", path.display());
@@ -2651,7 +2651,7 @@ mod tests {
         // calls corrupts the library's state for every test after it.
         let _guard = pdfium_test_lock();
         let manifest = env!("CARGO_MANIFEST_DIR");
-        let path = std::path::Path::new(manifest).join("../physics '24.pdf");
+        let path = std::path::Path::new(manifest).join("../papers/used/physics '24.pdf");
         if !path.exists() {
             eprintln!("[RENDER_TEST] fixture missing: {}", path.display());
             return;
@@ -2687,7 +2687,7 @@ mod tests {
     fn render_page_from_document_smoke() {
         let _guard = pdfium_test_lock();
         let manifest = env!("CARGO_MANIFEST_DIR");
-        let path = std::path::Path::new(manifest).join("../physics '24.pdf");
+        let path = std::path::Path::new(manifest).join("../papers/used/physics '24.pdf");
         if !path.exists() {
             eprintln!("[RENDER_TEST] fixture missing: {}", path.display());
             return;
@@ -2717,7 +2717,7 @@ mod tests {
     fn dpi_knob_shrinks_renders() {
         let _guard = pdfium_test_lock();
         let manifest = env!("CARGO_MANIFEST_DIR");
-        let path = std::path::Path::new(manifest).join("../physics '24.pdf");
+        let path = std::path::Path::new(manifest).join("../papers/used/physics '24.pdf");
         if !path.exists() {
             eprintln!("[RENDER_TEST] fixture missing: {}", path.display());
             return;

@@ -1833,7 +1833,7 @@ mod tests {
         assert_eq!(tested, years.len());
     }
 
-    /// Golden test against every real AQA physics paper in the repo root.
+    /// Golden test against every real AQA physics paper in papers/.
     /// Exercises the text-layer heading scan + hybrid map with NO AI
     /// structures — the text layer alone must place every question.
     /// One single test over all papers: pdfium is not thread-safe, so the
@@ -1855,7 +1855,12 @@ mod tests {
             ("24", 32),
         ];
         for (year, expected) in cases {
-            let path = format!("../physics '{}.pdf", year);
+            // (A paper fixed against moves from papers/unused to papers/used.)
+            let path = ["../papers/unused", "../papers/used"]
+                .iter()
+                .map(|dir| format!("{dir}/physics '{year}.pdf"))
+                .find(|p| std::path::Path::new(p).exists())
+                .unwrap_or_else(|| format!("../papers/used/physics '{year}.pdf"));
             let Some((_pages, map)) = golden_map(&path) else { continue };
             let span_nums: Vec<u32> = map.spans.iter().map(|s| s.number).collect();
             eprintln!("=== physics '{}: {} spans = {:?}", year, span_nums.len(), span_nums);

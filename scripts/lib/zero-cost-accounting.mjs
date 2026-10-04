@@ -106,6 +106,9 @@ export const PAPERS = [
   { name: "edx_fp2_jun14r", file: "papers/used/Maths_A-level_FP2_Papers-Edexcel__June_2014_(R)_QP.pdf", subject: "Mathematics", module: "Further Pure 2", cohort: "triage_fixtures" },
   { name: "edx_s1_jun12", file: "papers/used/Maths_A-level_S1_Papers-Edexcel__June_2012_QP.pdf", subject: "Mathematics", module: "Statistics 1", cohort: "triage_fixtures" },
   { name: "aqa_chem_gcse_jun24", file: "papers/used/Chemistry_GCSE_Past-Papers_AQA__June_2024_QP.pdf", subject: "Chemistry", module: "GCSE Chemistry", cohort: "triage_fixtures" },
+  { name: "ocr_further_jun23", file: "papers/used/Maths_A-level_Papers_OCR-Further__June_2023_QP.pdf", subject: "Mathematics", module: "Further Mechanics", cohort: "triage_fixtures" },
+  { name: "cie_p2_jun17", file: "papers/used/Maths_A-level_Papers_CIE__June_2017_(v1)_QP_-_P2.pdf", subject: "Mathematics", module: "Pure Mathematics 2", cohort: "triage_fixtures" },
+  { name: "mei_further_jun19", file: "papers/used/Maths_A-level_Papers_OCR-MEI-Further__June_2019_QP.pdf", subject: "Mathematics", module: "Modelling with Algorithms", cohort: "triage_fixtures" },
 ];
 
 export function slugFor(paperName) {

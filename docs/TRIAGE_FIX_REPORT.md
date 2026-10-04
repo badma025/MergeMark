@@ -1,6 +1,6 @@
-# Fixing unseen-paper imports: clusters 1 to 5, and round 2
+# Fixing unseen-paper imports: clusters 1 to 5, round 2 and round 3
 
-Follow-up to [TRIAGE_AUDIT_UNUSED_001.md](TRIAGE_AUDIT_UNUSED_001.md). Every run here was local: zero network attempts, zero tokens, $0. Nothing was committed.
+Follow-up to [TRIAGE_AUDIT_UNUSED_001.md](TRIAGE_AUDIT_UNUSED_001.md). Every run here was local: zero network attempts, zero tokens, $0. Rounds 1 and 2 (and the Windows beta that followed) are committed on branch `import-fixes-rounds-1-2`; round 3 is not committed.
 
 ## How it was measured
 
@@ -560,13 +560,103 @@ Unchanged: `pdf_render.rs` and `pipeline.rs` still call `ocr::available()`, OCR 
   - calibration 64/64 OK, historical 243/244, test papers 69/69, zero attempts;
   - no card differs from c11, in calibration or in triage. The corrections concern cases the corpus does not print, which their tests cover.
 
+## Round 3: strict cards that were wrong
+
+Round 3 takes the strict cards the targeted audit after cluster 10 found wrong (cluster 10, "Targeted audit"): garbled fractions (cluster 12), the back-page logo as a figure (cluster 13), and a grid cropped without its axes (cluster 14). The round started from the beta commit (`c142a7d`, branch `import-fixes-rounds-1-2`); triage runs compare with unused-c11b on the papers both runs hold.
+
+## Cluster 12: fractions under a line of text
+
+**Root cause.** `build_fractions` collects a numerator from a band 1.15 × the fraction's size above its bar, and a denominator from a band below it. When a fraction sits in a line of body text, the neighbouring line reaches into that band.
+- OCR Further Jun 2023 Q7 prints "cos θ = 4/5" in 8.2 pt digits with "portion" on the line just above. The 12 pt letters "t" and "i" of "portion" tipped the fraction's size estimate (the median of everything within 14 pt of the bar) from 8.2 to 12, the band grew to 13.8 pt, and "ti" joined the numerator. `inside_word` then rejected the whole fraction, and the digits were left to the script pass: `\cos \theta =_5^{4}`. Q8's "sin θ = 3/5", on the same page with nothing above it, was read correctly.
+- CIE P2 Jun 2017 Q7 sets dy/dx at body size with "constants" on the next line, 13.1 pt under the bar. The old estimate kept "constants" out of the denominator by 0.45 pt.
+
+**Fix.** After a part is collected, it is split into baseline rows. A row that runs on into letters outside the part (a letter or digit of its size touches it on its baseline) is a word of the neighbouring line and is dropped, with every glyph level with it (that line's superscripts and subscripts). What remains is collected exactly as before, and the size estimate is unchanged.
+- Where the old code rejected a fraction because its numerator touched a word, the word's row is now removed first, and the fraction is built from what is left.
+- Two earlier forms were reverted, each after a regression found in triage: sizing the fraction from the parts nearest the bar (CIE P2 Jun 2017 Q7 took "a n t" of "constants", run c12), and keeping only glyphs that overlap the part nearest the bar (`a^{-1/3}`, `a_n` and `n_g` lost their scripts, run c12b). CIE P2 Jun 2017 became the second fixture for the first of these.
+- `EXTRACTION_CACHE_VERSION` 5 → 6.
+
+**Code review.** It found that the row test repeated `inside_word`'s, that rows were checked against letters outside the row rather than the whole part, and that a dropped line left its superscripts in the part (a "3x²" line above a 4/5 gave `\frac{42}{5}`). The row test and `inside_word` now share `same_line` and `touches_word`, neighbours are looked for outside the whole part, and a dropped line takes its raised and lowered glyphs with it.
+
+**Tests.**
+- `a_small_fraction_under_a_line_of_text_is_still_a_fraction`: OCR Further Jun 2023 Q7 reads `\cos \theta = \frac{4}{5}` with "portion" intact, Q8 is unchanged, and CIE P2 Jun 2017 Q7 reads `\frac{\mathrm{d}y}{\mathrm{d}x}` with "constants to be found." intact. Red on the old code.
+- `a_dropped_line_takes_its_raised_glyphs_with_it`: the review's case, on a synthetic page with OCR Further Jun 2023's geometry. Red (`\frac{42}{5}`), then green.
+
+**Fixtures:** OCR Further Jun 2023 (Q1–Q8) and CIE P2 Jun 2017 (Q1–Q8). Holdouts: OCR Further Jun 2025, OCR MEI Further Jun 2022. Cluster 13's fixture (OCR MEI Further Jun 2019) was moved during this cluster, so runs c12b and c12d triage 123 papers.
+
+**Numbers** (run c12d):
+- **cargo test:** 375 passed, 0 failed.
+- **Calibration c12d:** 67/67 OK. Historical 243/244 strict, test papers 69/69, zero attempts and tokens. One card changed: Edexcel C4 Jan 2006 Q2's limit `\bar{4}\pi` now reads `\frac{\pi}{4}`. The fixtures: OCR Further Jun 2023 7 of 8 strict, CIE P2 Jun 2017 5 of 8.
+- **Triage unused-c12d** (123 papers, compared with c11b): no paper changes status (PASS 31, FAIL 42, FLAGGED 43, REVIEW 7), and flagged cards stay at 238. Eight cards changed:
+  - five fractions now read as printed: OCR Further Jun 2025 Q7 "½π" and Q2 "⅓Ah" (with "relative" whole again), OCR MEI Further Jun 2022 Q7 "1/z", CIE S1 Jun 2019 Q2 "is ¼", CIE Nov 2023 Q2 "¼π" (flagged for its modulus bars);
+  - Eduqas CS Jun 2023 Q7 no longer reads an underlined key as a fraction over the next line, but loses the underline that marks it as the primary key;
+  - WJEC Physics Jun 2022 U3 Q2 has "the product of the pressure" whole again, but its "⅓Nm c̄²" now reads `\frac{1}{3}Nm^{\bar{2}}c` (before: `\frac{of}{c^{2}}`);
+  - Edexcel M2 Jan 2009 Q2 builds 11/25 but hangs it on "is" as an exponent (before: `\text{is}_{25}^{11}`).
+- **Targeted audit** of every changed strict card, against its pages (10 cards): CLEAN for both fixtures' Q7 and OCR Further Jun 2025 Q2 and Q7. MAJOR for WJEC Physics Jun 2022 Q2 (the bar of c̄² on the 2), Eduqas CS Jun 2023 Q7 (the lost key underline, low confidence) and C4 Jan 2006 Q2 (its table is flattened, unchanged by this cluster). MINOR for M2 Jan 2009 Q2, CIE S1 Jun 2019 Q2 (the word "box" is missing, as in c11b) and OCR MEI Further Jun 2022 Q7 (lost bold). The three MAJOR cards were MAJOR before the change too.
+- **Blinded audit c12d (seeded sample of 46):** 16 MAJOR. Cards from passing papers: 1 MAJOR of 14 (Edexcel-A Economics Jun 2021 Q8 carries the answer booklet's "Indicate which question you are answering…" after its total). The sample holds one card this cluster changed (CIE Nov 2023 Q2, flagged); no MAJOR comes from a change of this cluster.
+
+## Cluster 14: a drawing on graph paper
+
+**Root cause.** Old Edexcel GCSE Jun 2016 F Q22 draws shape P on a coordinate grid (x −8 to 8, y −9 to 9), once for each part. The figure was cropped to P alone, so "Reflect shape P in the line x = −1" could not be answered, and the axis numbers fell into the card as lines of text.
+- `figure_regions` seeds a region from a drawing with oblique strokes (P), then grows it with axis-aligned strokes that reach into it. It skips any path wider or taller than 0.6 of the page, a guard against the page's border box.
+- On this paper the whole grid is one compound path: 453 × 510 pt, 33 sub-paths (its frame and its lines). The guard skipped it, and the arrow-tipped axes, 57 pt and more from P, never touched the region.
+
+**Fix.** `is_graph_paper` recognises one stroked, unfilled path drawn only in axis-aligned segments, with at least four lines each way, each set on a lattice of square cells (every gap a whole multiple of the smallest, the two pitches within 20%). Lines may be missing from the lattice where they are drawn on their own: on this paper the axes are separate paths, so the grid path skips x = 0 and y = 0.
+- A region whose centre lies on such a sheet takes the sheet's whole extent. The existing growth then adds the arrow-tipped axes, and the glyphs inside (axis numbers, x, y, O) become figure furniture, out of the card text.
+- **Code review:** a larger sheet grown with its axes could reach the filter that drops a region of 0.55 of the page or more (meant for a page crossed through as not for answers), and lose its figure silently. A region holding a graph-paper sheet is now exempt from it. The lattice reuses `levels()`.
+
+**Tests.**
+- `a_shape_drawn_on_graph_paper_is_cropped_with_the_grid_and_its_axes`: on pages 28 and 29 a figure holds the whole grid, and Q22's body keeps "(a) Reflect shape P in the line x = −1" with no axis number left in it. Red on the old code (the figure was 57 pt wide).
+- `a_shape_on_graph_paper_most_of_a_page_keeps_its_figure`: the review's case, a synthetic 480 × 660 pt sheet. Red (no figure), then green.
+
+**Fixture:** old Edexcel GCSE Jun 2016 F (already a fixture). Holdout: old Edexcel GCSE Mar 2013 P1 H.
+
+**Numbers** (run c14, compared with c12d):
+- **cargo test:** 377 passed, 0 failed.
+- **Calibration c14:** 67/67 OK. Historical 243/244 strict, test papers 69/69, zero attempts and tokens. One card changed: Jun 2016 Q22, both grids whole and the 44 lines of axis numbers gone from its text.
+- **Triage unused-c14** (123 papers): no paper changes status, flagged cards unchanged. Four cards changed: Mar 2013 Q21 and Q22 (the holdout's grid now cropped with its axes, its numbers out of the text), Edexcel IGCSE Jun 2018 Q3 (its grid, never cropped before, is now the card's figure) and CIE GCSE Jun 2007 Q7 (its grid now takes in the line's label l and the margin word "Examiner's", which shared a stray text line).
+- **Targeted audit** of the five changed cards: no MAJOR. CLEAN for Mar 2013 Q21 and Q22 and IGCSE Jun 2018 Q3; MINOR for CIE Jun 2007 Q7 (the margin's "For Examiner's Use" as two stray words, as before) and Jun 2016 Q22 ("P 90°" set as one maths span).
+- **Blinded audit c14:** the same seeded sample as c12d, as the paper set is the same. 17 MAJOR (c12d: 16); cards from passing papers 1 MAJOR of 14. The six verdicts that differ from c12d are all on cards this cluster did not change (auditor variance); the sample holds none of its changed cards.
+
+## Cluster 13: the end of the last question
+
+**Root cause.** OCR MEI Further Jun 2019 prints its last question, Q5, on page 8, then "END OF QUESTION PAPER", then the OCR logo over its copyright notice. The figure detector found the logo, and it was embedded as Q5's figure.
+- `build_layout_map` closes a question's figure window on its last page (`end_y`, used by `question_figure_window`) only at the next question's heading on that page. The last question has no next heading, so its window ran to the foot of its last page.
+- The question's text already stopped at the end marker (`stop_at`); only its figures did not.
+
+**Fix.** A question with no next heading ends where the questions end: at the paper's end marker ("END OF QUESTION PAPER", "TOTAL FOR PAPER = … MARKS", …) or where an answer booklet's numbering restarts, when that line is on its last page.
+- **Code review:** no defect. The comment now cites the paper and both ways the questions end. Reading `end_y_frac` through the pipeline, the reviewer found that no layout question's text is sliced by it.
+
+**Test.** `the_back_page_logo_is_no_figure_of_the_last_question` imports the fixture: Q5 ends at its "[8 marks]" with no figure, and Q2 keeps its network (Fig. 2.1). Red on the old code.
+
+**Fixture:** OCR MEI Further Jun 2019 (Q1–Q5). Holdout: OCR MEI Further Jun 2022.
+
+**Numbers** (run c13, compared with c14):
+- **cargo test:** 378 passed, 0 failed.
+- **Calibration c13:** 67/67 OK. Historical 243/244 strict, test papers 69/69, zero attempts and tokens. One card changed: the fixture's Q5 no longer holds the logo (4 of the fixture's 5 cards strict).
+- **Triage unused-c13** (123 papers): no paper changes status. Five cards changed:
+  - four lost the back page's logo: OCR MEI Further Jun 2022 Q8 (the holdout), OCR GCSE Nov 2021 Q20, OCR Further Jun 2019 Q9 and OCR GCSE Jun 2018 Q21, which keeps its own semicircle diagram;
+  - AQA GCSE Jun 2022 Q29 turned strict. It had been flagged because "required figure could not be attached": the material under "END OF QUESTIONS" lay in its window. Flagged cards 238 → 237.
+- **Targeted audit** of the six changed cards: CLEAN for five, including AQA Jun 2022 Q29 (all four options, no figure of its own). OCR Further Jun 2019 Q9 is MAJOR for its piecewise function's brace (an unidentified glyph; the card is flagged), not for this cluster.
+- **Blinded audit c13:** 16 MAJOR of 46, 14 of them flagged; cards from passing papers 1 MAJOR of 14 (the same Economics card). Q29's change of stratum redrew 11 of the 46 cards; none of this cluster's changed cards is in the sample.
+
+## Round 3 overall
+
+On the 123 papers in both runs (c11b → c13):
+- **17 cards changed, 0 regressions found** in the targeted audits of every changed strict card. Of the six wrong strict cards the cluster 10 audit listed:
+  - the three still in the holdouts read correctly: OCR Further Jun 2025 Q7 and OCR MEI Further Jun 2022 Q8 are CLEAN, and OCR MEI Further Jun 2022 Q7 is MINOR for lost bold only;
+  - the two that became fixtures, OCR Further Jun 2023 Q7 and OCR MEI Further Jun 2019 Q5, are CLEAN;
+  - the fixture old Edexcel GCSE Jun 2016 Q22 is MINOR ("P 90°" set as one maths span).
+- **Triage status:** unchanged (PASS 31, FAIL 42, FLAGGED 43, REVIEW 7). These papers fail or are flagged for other reasons (101 cards with an unidentified glyph, 47 with a leftover answer line).
+- **Calibration:** 22 originals unchanged in every run (243/244, 69/69, zero attempts). Fixtures: 3 added (OCR Further Jun 2023, CIE P2 Jun 2017, OCR MEI Further Jun 2019), 45 in all.
+- **cargo test:** 371 → 378 (7 tests added: 2 in the beta, 5 in round 3).
+
 ## What is left
 
-On the 126 holdout papers after round 2 (run unused-c11):
+On the 123 holdout papers after round 3 (run unused-c13). Round 3 changed none of these findings; the unidentified-glyph counts are lower than after round 2 (37 papers, 106 cards on 126 papers) only because three papers became fixtures.
 
 | remaining hard finding | papers | cards | cause |
 |---|---|---|---|
-| unidentified glyph | 37 | 106 cards, all flagged (87 findings) | symbol-font glyphs no fixture established (each is `�`, never a guess): symbols drawn as curves (VectorOutline) and font families of one or two papers each (Advent variants, MathExtn, NewMathExtn, CIDFont) |
+| unidentified glyph | 35 | 101 cards, all flagged (83 findings) | symbol-font glyphs no fixture established (each is `�`, never a guess): symbols drawn as curves (VectorOutline) and font families of one or two papers each (Advent variants, MathExtn, NewMathExtn, CIDFont) |
 | card marks below printed total | 3 | flagged | holdouts, not debugged: OCR A Chemistry Jun 2017 (97 of 100), WJEC Unit 1 Jun 2023 (114 of 120), Edexcel GCSE Jun 2018 (78 of 80) |
 | card marks above printed total | 4 | | choose-one papers whose instruction the question map does not recognise, so no alternatives are recorded: the CS/decision paper (125 vs 100), AQA Further Jun 2021 (58 vs 40), AQA GCSE Jun 2024 (85 vs 80), mp1_t (129 vs 125). Not debugged |
 | marks tags exceed the card's marks | 3 | 3 of 3 flagged | 06_community_pmt_pack Q9 (48 vs 7), Edexcel Jun 2024 (13 vs 11), Edexcel IGCSE Jun 2022 Q14 (14 vs 4). Holdouts, not investigated |
@@ -589,11 +679,15 @@ Known gaps outside these numbers:
   Holdouts, not debugged. Until cluster 9, the sanitizer deleted the lone "2" and the cards looked clean.
 - The text-layer carve, used only when a question has no layout body, still drops every line that holds only a number (its page-number rule cannot tell a page number from an option without geometry).
 - Two flagged holdout cards end on what may be a page number (OCR B Physics Jun 2024 Q2 "6", WJEC Physics Jun 2017 Q2 "3"); OCR A's is handled (cluster 9).
-- Axis scales of drawn graphs and grids appear as lines of numbers in the card text, as their titles already did.
-- **Strict cards wrong for reasons no gate sees.** The targeted audit after cluster 10 found six among the 40 cards that cluster made strict. These come first for the next round:
-  - fractions from MathMagic papers garbled (OCR Further Jun 2023 Q7, Jun 2025 Q7, OCR MEI Further Jun 2022 Q7);
-  - the OCR logo from the back page embedded as the last question's figure (OCR MEI Further Jun 2019 Q5, Jun 2022 Q8);
-  - a coordinate grid cropped to the shape without its axes (old Edexcel GCSE Jun 2016 Q22, a fixture).
+- Axis scales of drawn graphs and grids appear as lines of numbers in the card text, as their titles already did, except on graph paper drawn as one path (cluster 14).
+- The six wrong strict cards the cluster 10 audit found are fixed (round 3). **Strict cards still wrong for reasons no gate sees**, found by round 3's audits (holdouts unless marked; not debugged):
+  - Edexcel M2 Jan 2009 Q2: "is 11/25" reads `\text{is}^{\frac{11}{25}}`. The fraction is built (cluster 12) but hung on "is" as an exponent (before: `\text{is}_{25}^{11}`).
+  - WJEC Physics Jun 2022 U3 Q2: "⅓Nm c̄²" reads `\frac{1}{3}Nm^{\bar{2}}c`. The bar over c is set on the square (before: the bar was read as a fraction over "of").
+  - Eduqas CS Jun 2023 Q7: the underline that marks destinationCode as the relation's primary key is lost (before: it was read as a fraction bar over the next line).
+  - Edexcel-A Economics Jun 2021 Q8 (a PASS paper): the answer booklet's "Indicate which question you are answering…" and "Write your answer here:" follow its total.
+  - CIE S1 Jun 2019 Q2: "from Rosa's box." loses "box" (MINOR; so in round 2 too).
+  - Edexcel C4 Jan 2006 Q2 (fixture): the x/y table with blank cells to complete is flattened into lines, so the task can't be read.
+- Nine tests read papers from the repository root (`../physics '21.pdf`, `../physics '24.pdf`, in `deterministic.rs`, `doc_map.rs`, `pdf_render.rs` and `stroke_census.rs`). Those copies are among the old paper PDFs deleted from the working tree before round 1, so the tests return early and check nothing. The same papers are fixtures in `papers/used/`.
 - Monotype Symbol glyph ids are read in the installed font's order, checked by advance. A subset that renumbered its glyphs would not keep that order, and the advance cannot tell apart symbols of equal width. Of the 34 SymbolMT programs in the fixtures, only one did (2 glyphs), and its ids fall outside those read this way.
 
 ## Files
@@ -619,3 +713,8 @@ Round 2:
   - calibration `output/zero-cost-orchestration/c-calibration/run-c5` … `run-c11`;
   - snapshots `output/fix-log/snap-c5` … `snap-c11` and `snap-seam`;
   - tools in `output/fix-log/`: `compare.mjs`, `trajectory.mjs`, `card-changes.mjs`, `bare-numbers.mjs`, `cal-results.mjs`, `inked-spaces.py`, `blind.mjs` and the glyph tools.
+
+Round 3:
+- **Pipeline:** `layout.rs` (`build_fractions` with `same_line` and `touches_word`, cluster 12; `figure_regions` and `is_graph_paper`, cluster 14; `build_layout_map`'s `end_y`, cluster 13), `commands.rs` (the back-page import test), `db.rs` (`EXTRACTION_CACHE_VERSION` 6).
+- **Fixtures:** 3 more papers moved to `papers/used/` (68 in all): OCR Further Jun 2023, CIE P2 Jun 2017, OCR MEI Further Jun 2019, registered as above. 123 question papers are left in `papers/unused/`.
+- **Run outputs** (gitignored): triage `run-unused-c12`, `c12b`, `c12d`, `c14`, `c13`; calibration `run-c12` … `run-c13`; snapshots `snap-c12`, `snap-c13`, `snap-c14`; review diffs and specs `output/fix-log/review-c12.diff`, `review-c13c14.diff`, `spec-c12.md`, `spec-c13c14.md`; the stopped run c12c in `output/fix-log/aborted/`.

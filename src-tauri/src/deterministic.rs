@@ -3039,7 +3039,7 @@ mod tests {
         for path in [
             "../papers/used/madas_paper_2_t.pdf",
             "../papers/used/core pure 1 '21.pdf",
-            "../physics '21.pdf",
+            "../papers/used/physics '21.pdf",
         ] {
             if !std::path::Path::new(path).exists() {
                 eprintln!("== {path}: MISSING");

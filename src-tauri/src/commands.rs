@@ -2652,6 +2652,35 @@ mod tests {
         assert!(q1.content.contains("Tick (✓) one box.\n2\n6\n14\n20\n"), "{}", q1.content);
     }
 
+    /// What the last page prints after "END OF QUESTION PAPER" (the board's
+    /// logo over its copyright notice) is no figure of the last question.
+    #[tokio::test]
+    async fn the_back_page_logo_is_no_figure_of_the_last_question() {
+        let _pdfium = crate::pdf_render::pdfium_test_lock();
+        let Some(file_path) = fixture("papers/used/Maths_A-level_Papers_OCR-MEI-Further__June_2019_QP.pdf") else { return };
+        let (state, host) = app_with_a_provider_key().await;
+        let questions = import_question_paper(
+            &state,
+            &host,
+            QuestionImportRequest {
+                file_path,
+                pdf_base64_pages: None,
+                subject: "offline-subject".into(),
+                module_override: Some("offline-module".into()),
+                paper_name: "OCR MEI Further Modelling with Algorithms June 2019".into(),
+            },
+        )
+        .await
+        .expect("the paper is read locally");
+        // Q5 is the last question, on the page that ends with the logo.
+        let q5 = questions.iter().find(|q| q.question_number == Some(5)).expect("Q5 imported");
+        assert!(q5.content.trim_end().ends_with("**[8 marks]**"), "{}", q5.content);
+        assert!(!q5.content.contains("![Diagram]"), "{}", q5.content);
+        // Q2's network (Fig. 2.1) is still its figure.
+        let q2 = questions.iter().find(|q| q.question_number == Some(2)).expect("Q2 imported");
+        assert!(q2.content.contains("![Diagram]"), "{}", q2.content);
+    }
+
     /// A question printed twice, ending "EITHER (f) … OR (g) …", is imported
     /// once, and its tags agree with the total it prints.
     #[tokio::test]

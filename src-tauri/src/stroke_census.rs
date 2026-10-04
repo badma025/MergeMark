@@ -1147,7 +1147,7 @@ mod tests {
     #[test]
     fn physics24_large_captioned_composite_is_detected() {
         let _guard = crate::pdf_render::pdfium_test_lock();
-        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../physics '24.pdf");
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../papers/used/physics '24.pdf");
         if !path.exists() { return; }
         let pdfium = crate::pdf_render::get_pdfium().unwrap();
         let document = pdfium.load_pdf_from_file(&path, None).unwrap();
@@ -1165,7 +1165,7 @@ mod tests {
         // letter from positional text evidence, so the assembler can bind each
         // crop to its own option rather than guessing an order.
         let _guard = crate::pdf_render::pdfium_test_lock();
-        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../physics '24.pdf");
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../papers/used/physics '24.pdf");
         if !path.exists() { return; }
         let pdfium = crate::pdf_render::get_pdfium().unwrap();
         let document = pdfium.load_pdf_from_file(&path, None).unwrap();
@@ -1606,7 +1606,7 @@ mod tests {
         use pdfium_render::prelude::*;
         let _guard = crate::pdf_render::pdfium_test_lock();
         let manifest = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        let path = manifest.join("..").join("physics '24.pdf");
+        let path = manifest.join("../papers/used/physics '24.pdf");
         if !path.exists() {
             eprintln!("[CAPDIAG] fixture missing");
             return;
