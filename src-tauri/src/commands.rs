@@ -34,9 +34,6 @@ fn not_transcribed_message(report: &ImportReport, file: &std::path::Path) -> Str
     }
 }
 
-/// The model name the local import history records: no AI model ran.
-const LOCAL_IMPORT_MODEL: &str = "local (no AI)";
-
 // ── Shared data model ─────────────────────────────────────────────────────────
 
 #[derive(Debug, Serialize, Deserialize, sqlx::FromRow)]
@@ -459,59 +456,15 @@ pub async fn add_question(question: Question, state: State<'_, AppState>) -> Res
 }
 
 /// Permanently removes a single question from the database by its UUID.
-/// Permanently removes a single question from the database by its UUID.
 #[tauri::command]
 pub async fn delete_question(id: String, state: State<'_, AppState>) -> Result<(), String> {
     let pool = state.db.lock().await;
-
-    // Fetch paper_name before deletion to check if this was the last question
-    let paper_info: Option<(Option<String>,)> =
-        sqlx::query_as("SELECT paper_name FROM questions WHERE id = ?")
-            .bind(&id)
-            .fetch_optional(&*pool)
-            .await
-            .unwrap_or(None);
 
     sqlx::query("DELETE FROM questions WHERE id = ?")
         .bind(&id)
         .execute(&*pool)
         .await
         .map_err(|e| e.to_string())?;
-
-    // If this paper has no questions remaining, clean up its import cost logs
-    if let Some((Some(paper_name),)) = paper_info {
-        let trimmed = paper_name.trim();
-        if !trimmed.is_empty() {
-            let (remaining,): (i64,) = sqlx::query_as(
-                "SELECT COUNT(*) FROM questions WHERE paper_name = ?",
-            )
-            .bind(trimmed)
-            .fetch_one(&*pool)
-            .await
-            .unwrap_or((0,));
-
-            if remaining == 0 {
-                let _ = sqlx::query(
-                    "DELETE FROM import_cost_logs WHERE paper_name = ? OR paper_name = ?",
-                )
-                .bind(trimmed)
-                .bind(format!("MS:{}", trimmed))
-                .execute(&*pool)
-                .await;
-            }
-        }
-    }
-
-    // If the entire repository is now empty, wipe all remaining import logs
-    let (total_q,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM questions")
-        .fetch_one(&*pool)
-        .await
-        .unwrap_or((0,));
-    if total_q == 0 {
-        let _ = sqlx::query("DELETE FROM import_cost_logs")
-            .execute(&*pool)
-            .await;
-    }
 
     Ok(())
 }
@@ -1035,11 +988,6 @@ pub async fn compile_worksheet(
 
     let download_dir = app.path().download_dir().map_err(|e| e.to_string())?;
 
-    // Embed MergeMark logo for LaTeX compilation
-    let logo_bytes = include_bytes!("../icons/128x128@2x.png");
-    let logo_path = download_dir.join("mergemark_logo.png");
-    let _ = std::fs::write(&logo_path, logo_bytes);
-
     // Sanitize file name: keep alphanumeric, spaces, hyphens, underscores
     let effective_name = opts
         .file_name
@@ -1081,105 +1029,90 @@ pub async fn compile_worksheet(
         candidate
     };
 
-    let worksheet_stem = format!("{}", base_name);
+    let worksheet_stem = base_name.clone();
     let answer_stem = format!("{}_answers", base_name);
 
-    let worksheet_tex = download_dir.join(format!("{}.tex", worksheet_stem));
-    let answer_key_tex = download_dir.join(format!("{}.tex", answer_stem));
-
-    std::fs::write(&worksheet_tex, &latex)
-        .map_err(|e| format!("Failed to write worksheet file: {}", e))?;
-    std::fs::write(&answer_key_tex, &answer_latex)
-        .map_err(|e| format!("Failed to write answer key file: {}", e))?;
-
-    let pdflatex_cmd = if std::process::Command::new("pdflatex")
-        .arg("--version")
-        .output()
-        .is_ok()
-    {
-        "pdflatex".to_string()
-    } else if let Some(local_app_data) = std::env::var_os("LOCALAPPDATA") {
-        let miktex_path = std::path::PathBuf::from(local_app_data)
-            .join("Programs\\MiKTeX\\miktex\\bin\\x64\\pdflatex.exe");
-        if miktex_path.exists() {
-            miktex_path.to_string_lossy().to_string()
-        } else {
-            "pdflatex".to_string()
-        }
-    } else {
-        "pdflatex".to_string()
-    };
-
-    // 2-Pass Compilation for Worksheet: Pass 1 generates .aux, Pass 2 resolves Page X of Y
-    let _ = std::process::Command::new(&pdflatex_cmd)
-        .current_dir(&download_dir)
-        .arg("-interaction=nonstopmode")
-        .arg("-output-directory")
-        .arg(&download_dir)
-        .arg(&worksheet_tex)
-        .output();
-
-    let output_worksheet = std::process::Command::new(&pdflatex_cmd)
-        .current_dir(&download_dir)
-        .arg("-interaction=nonstopmode")
-        .arg("-output-directory")
-        .arg(&download_dir)
-        .arg(&worksheet_tex)
-        .output()
-        .map_err(|e| format!("Failed to execute pdflatex for worksheet: {}", e))?;
+    // pdflatex leaves its .tex, .aux and .log (and the logo it reads) beside
+    // what it writes: it works in a folder of its own, and only the two PDFs
+    // come out. After a failure the folder stays, with the log the error names.
+    let pdflatex = find_pdflatex().ok_or_else(|| PDFLATEX_NOT_FOUND.to_string())?;
+    let work = std::env::temp_dir().join(format!("mergemark-compile-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&work).map_err(|e| format!("Failed to create a folder to compile in: {}", e))?;
+    // Embed MergeMark logo for LaTeX compilation
+    std::fs::write(work.join("mergemark_logo.png"), include_bytes!("../icons/128x128@2x.png"))
+        .map_err(|e| format!("Failed to write the logo: {}", e))?;
+    let worksheet = compile_latex(&pdflatex, &work, &worksheet_stem, &latex, "worksheet")?;
+    let answers = compile_latex(&pdflatex, &work, &answer_stem, &answer_latex, "answer key")?;
 
     let worksheet_pdf = download_dir.join(format!("{}.pdf", worksheet_stem));
-    if !worksheet_pdf.exists() {
-        let stdout = String::from_utf8_lossy(&output_worksheet.stdout);
-        let stderr = String::from_utf8_lossy(&output_worksheet.stderr);
-        return Err(format!(
-            "pdflatex failed to generate worksheet PDF:\n{}\n{}",
-            stdout, stderr
-        ));
-    }
-    reject_unfinished_pdf(&worksheet_pdf, &download_dir, &worksheet_stem)?;
-
-    // 2-Pass Compilation for Answer Key
-    let _ = std::process::Command::new(&pdflatex_cmd)
-        .current_dir(&download_dir)
-        .arg("-interaction=nonstopmode")
-        .arg("-output-directory")
-        .arg(&download_dir)
-        .arg(&answer_key_tex)
-        .output();
-
-    let output_answer_key = std::process::Command::new(&pdflatex_cmd)
-        .current_dir(&download_dir)
-        .arg("-interaction=nonstopmode")
-        .arg("-output-directory")
-        .arg(&download_dir)
-        .arg(&answer_key_tex)
-        .output()
-        .map_err(|e| format!("Failed to execute pdflatex for answer key: {}", e))?;
-
     let answer_key_pdf = download_dir.join(format!("{}.pdf", answer_stem));
-    if !answer_key_pdf.exists() {
-        let stdout = String::from_utf8_lossy(&output_answer_key.stdout);
-        let stderr = String::from_utf8_lossy(&output_answer_key.stderr);
-        return Err(format!(
-            "pdflatex failed to generate answer key PDF:\n{}\n{}",
-            stdout, stderr
-        ));
-    }
-    reject_unfinished_pdf(&answer_key_pdf, &download_dir, &answer_stem)?;
-
-    // Clean up all intermediary files
-    let _ = std::fs::remove_file(download_dir.join(format!("{}.tex", worksheet_stem)));
-    let _ = std::fs::remove_file(download_dir.join(format!("{}.aux", worksheet_stem)));
-    let _ = std::fs::remove_file(download_dir.join(format!("{}.log", worksheet_stem)));
-    let _ = std::fs::remove_file(download_dir.join(format!("{}.tex", answer_stem)));
-    let _ = std::fs::remove_file(download_dir.join(format!("{}.aux", answer_stem)));
-    let _ = std::fs::remove_file(download_dir.join(format!("{}.log", answer_stem)));
+    std::fs::copy(&worksheet, &worksheet_pdf).map_err(|e| format!("Failed to save {}: {}", worksheet_pdf.display(), e))?;
+    std::fs::copy(&answers, &answer_key_pdf).map_err(|e| format!("Failed to save {}: {}", answer_key_pdf.display(), e))?;
+    let _ = std::fs::remove_dir_all(&work);
 
     Ok(vec![
         worksheet_pdf.to_string_lossy().to_string(),
         answer_key_pdf.to_string_lossy().to_string(),
     ])
+}
+
+/// What compiling answers when no pdflatex can run: the worksheet screen
+/// then offers to install MiKTeX.
+const PDFLATEX_NOT_FOUND: &str = "PDFLATEX_NOT_FOUND";
+
+/// pdflatex on the PATH, or where MiKTeX (for this user or all users) or
+/// MacTeX installs it, since an app started from the desktop may not have
+/// TeX on its PATH; `None` when none runs.
+fn find_pdflatex() -> Option<std::path::PathBuf> {
+    let runs = |exe: &std::path::Path| pdflatex_command(exe).arg("--version").output().is_ok_and(|o| o.status.success());
+    let on_path = std::path::PathBuf::from("pdflatex");
+    if runs(&on_path) {
+        return Some(on_path);
+    }
+    let mut installed = Vec::new();
+    if let Some(local) = std::env::var_os("LOCALAPPDATA") {
+        installed.push(std::path::PathBuf::from(local).join("Programs\\MiKTeX\\miktex\\bin\\x64\\pdflatex.exe"));
+    }
+    if let Some(programs) = std::env::var_os("ProgramFiles") {
+        installed.push(std::path::PathBuf::from(programs).join("MiKTeX\\miktex\\bin\\x64\\pdflatex.exe"));
+    }
+    installed.push(std::path::PathBuf::from("/Library/TeX/texbin/pdflatex"));
+    installed.into_iter().find(|exe| exe.exists() && runs(exe))
+}
+
+/// A pdflatex command that opens no console window: a release build has none
+/// of its own, so Windows would flash one for every run.
+fn pdflatex_command(exe: &std::path::Path) -> std::process::Command {
+    #[allow(unused_mut)]
+    let mut command = std::process::Command::new(exe);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+    command
+}
+
+/// Two pdflatex passes over `source` in `work` (the second resolves "Page X
+/// of Y"): the finished PDF there, or why there is none.
+fn compile_latex(pdflatex: &std::path::Path, work: &std::path::Path, stem: &str, source: &str, what: &str) -> Result<std::path::PathBuf, String> {
+    let tex = work.join(format!("{}.tex", stem));
+    std::fs::write(&tex, source).map_err(|e| format!("Failed to write {} file: {}", what, e))?;
+    let run = || pdflatex_command(pdflatex).current_dir(work).arg("-interaction=nonstopmode").arg("-output-directory").arg(work).arg(&tex).output();
+    let _ = run();
+    let output = run().map_err(|e| format!("Failed to execute pdflatex for {}: {}", what, e))?;
+    let pdf = work.join(format!("{}.pdf", stem));
+    if !pdf.exists() {
+        return Err(format!(
+            "pdflatex failed to generate {} PDF:\n{}\n{}",
+            what,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+    reject_unfinished_pdf(&pdf, work, stem)?;
+    Ok(pdf)
 }
 
 /// A PDF pdflatex finished writing ends with `%%EOF`. pdflatex's exit code
@@ -1239,8 +1172,9 @@ pub(crate) fn extract_page_texts(file_path: &str, num_pages: usize) -> Vec<Strin
 
 // ── Question-paper import ─────────────────────────────────────────────────────
 
+/// The import screen's question-paper import, read on this machine.
 #[tauri::command]
-pub async fn parse_pdf_vision(
+pub async fn import_paper(
     app: tauri::AppHandle,
     file_path: String,
     pdf_base64_pages: Option<Vec<String>>,
@@ -1691,16 +1625,6 @@ pub(crate) async fn import_question_paper<H: ImportHost>(
         }
     }
 
-    // ── Log the import to the local history (no tokens, no cost) ─────────
-    let _ = crate::db::record_import_cost(
-        &pool,
-        &config.paper_name,
-        LOCAL_IMPORT_MODEL,
-        "question_paper",
-        final_questions.len() as i64,
-    )
-    .await;
-
     Ok(final_questions)
 }
 
@@ -1734,9 +1658,6 @@ pub async fn delete_all_questions(state: State<'_, AppState>) -> Result<bool, St
     let _ = sqlx::query("DELETE FROM extraction_cache")
         .execute(&*pool)
         .await;
-    let _ = sqlx::query("DELETE FROM import_cost_logs")
-        .execute(&*pool)
-        .await;
     Ok(true)
 }
 
@@ -1759,13 +1680,6 @@ pub async fn delete_questions_by_paper(
             .map_err(|e| e.to_string())?;
 
     let _ = sqlx::query("DELETE FROM extraction_cache")
-        .execute(&*pool)
-        .await;
-
-    // Cascade-delete import cost log entries for this paper (both QP and MS records)
-    let _ = sqlx::query("DELETE FROM import_cost_logs WHERE paper_name = ? OR paper_name = ?")
-        .bind(name)
-        .bind(format!("MS:{}", name))
         .execute(&*pool)
         .await;
 
@@ -1798,8 +1712,9 @@ pub async fn update_question(
     Ok(())
 }
 
+/// The import screen's mark-scheme import, read on this machine.
 #[tauri::command]
-pub async fn parse_mark_scheme_vision(
+pub async fn import_scheme(
     app: tauri::AppHandle,
     file_path: String,
     pdf_base64_pages: Option<Vec<String>>,
@@ -2047,17 +1962,6 @@ pub(crate) async fn import_mark_scheme<H: ImportHost>(
         }
     }
 
-    // ── Log the import to the local history (no tokens, no cost) ─────────
-    let pool = state.db.lock().await;
-    let _ = crate::db::record_import_cost(
-        &pool,
-        &format!("MS:{}", paper_name.trim()),
-        LOCAL_IMPORT_MODEL,
-        "mark_scheme",
-        proposed_mappings.len() as i64,
-    )
-    .await;
-
     Ok(proposed_mappings)
 }
 
@@ -2209,52 +2113,6 @@ impl pdf_extract::OutputDev for HybridTextOutput {
     }
 }
 
-// ── Features that needed an AI service ──────────────────────────────────────
-//
-// MergeMark makes no AI requests of any kind: every import is read on this
-// machine. The screens for API keys, models, usage, free parses, worksheet
-// generation and topic generation stay in the app, and each of their commands
-// answers with this message. None reads a stored key or opens a connection.
-
-/// What every feature that needed an AI service answers.
-pub(crate) const WORKS_OFFLINE: &str =
-    "MergeMark works offline: it sends nothing to AI services, so this feature is turned off.";
-
-#[tauri::command]
-pub async fn fetch_models() -> Result<Vec<String>, String> {
-    Err(WORKS_OFFLINE.into())
-}
-
-#[tauri::command]
-pub async fn generate_worksheet_from_pdf() -> Result<(), String> {
-    Err(WORKS_OFFLINE.into())
-}
-
-#[tauri::command]
-pub async fn get_usage_status() -> Result<(), String> {
-    Err(WORKS_OFFLINE.into())
-}
-
-#[tauri::command]
-pub async fn set_byok_key() -> Result<(), String> {
-    Err(WORKS_OFFLINE.into())
-}
-
-#[tauri::command]
-pub async fn generate_topics_for_module() -> Result<Vec<String>, String> {
-    Err(WORKS_OFFLINE.into())
-}
-
-#[tauri::command]
-pub async fn get_openrouter_usage() -> Result<(), String> {
-    Err(WORKS_OFFLINE.into())
-}
-
-#[tauri::command]
-pub async fn get_generation_cost() -> Result<(), String> {
-    Err(WORKS_OFFLINE.into())
-}
-
 // ── Flashcards Export & Import ────────────────────────────────────────────────
 
 #[tauri::command]
@@ -2316,11 +2174,13 @@ pub async fn export_flashcards(
             .map_err(|e| e.to_string())?;
 
         if let Some(q) = q {
-            let mut front = crate::validate::format_markdown_for_latex(&q.content);
+            // A card file carries the card's own Markdown, never the
+            // worksheet's print layout or this computer's file paths.
+            let mut front = crate::validate::format_markdown_for_card(&q.content);
             if !q.math_snippet.is_empty() {
-                front = format!("{}\n\n{}", front, crate::validate::format_markdown_for_latex(&q.math_snippet));
+                front = format!("{}\n\n{}", front, crate::validate::format_markdown_for_card(&q.math_snippet));
             }
-            let back = crate::validate::format_markdown_for_latex(&q.answer_content.unwrap_or_default());
+            let back = crate::validate::format_markdown_for_card(&q.answer_content.unwrap_or_default());
 
             let mut tags = vec![q.subject.clone()];
             if let Some(m) = &q.module {
@@ -2420,54 +2280,29 @@ pub async fn import_flashcards(app: tauri::AppHandle, file_path: String) -> Resu
     Ok(count)
 }
 
-// ── Local import history ─────────────────────────────────────────────────────
-
-#[tauri::command]
-pub async fn get_import_cost_history(
-    state: State<'_, AppState>,
-) -> Result<Vec<crate::db::ImportCostRecord>, String> {
-    let pool = state.db.lock().await;
-    crate::db::get_import_cost_history(&pool)
-        .await
-        .map_err(|e| format!("Failed to read import cost history: {}", e))
-}
-
-#[tauri::command]
-pub async fn clear_import_cost_history(
-    state: State<'_, AppState>,
-) -> Result<u64, String> {
-    let pool = state.db.lock().await;
-    crate::db::clear_import_cost_history(&pool)
-        .await
-        .map_err(|e| format!("Failed to clear import cost history: {}", e))
-}
-
-#[tauri::command]
-pub async fn delete_import_cost_log(
-    id: String,
-    state: State<'_, AppState>,
-) -> Result<bool, String> {
-    let pool = state.db.lock().await;
-    crate::db::delete_import_cost_log(&pool, &id)
-        .await
-        .map_err(|e| format!("Failed to delete import log: {}", e))
-}
-
-#[tauri::command]
-pub async fn prune_orphaned_import_logs(
-    state: State<'_, AppState>,
-) -> Result<u64, String> {
-    let pool = state.db.lock().await;
-    crate::db::prune_orphaned_import_logs(&pool)
-        .await
-        .map_err(|e| format!("Failed to prune import logs: {}", e))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     // ── Worksheet compile ───────────────────────────────────────────────────
+
+    /// A worksheet compiles in a folder of its own, which holds the PDF and
+    /// pdflatex's other files. (Runs where pdflatex is installed.)
+    #[test]
+    fn a_worksheet_compiles_in_a_folder_of_its_own() {
+        let Some(pdflatex) = find_pdflatex() else {
+            eprintln!("[COMPILE] pdflatex is not installed: test skipped");
+            return;
+        };
+        let work = std::env::temp_dir().join(format!("mm_compile_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&work).unwrap();
+        let source = "\\documentclass{article}\n\\begin{document}\nPage one.\n\\end{document}\n";
+        let pdf = compile_latex(&pdflatex, &work, "sheet", source, "worksheet").expect("a plain document compiles");
+        assert_eq!(pdf, work.join("sheet.pdf"));
+        assert!(pdf_is_complete(&std::fs::read(&pdf).unwrap()));
+        assert!(work.join("sheet.log").exists() && work.join("sheet.tex").exists());
+        let _ = std::fs::remove_dir_all(&work);
+    }
 
     #[test]
     fn a_pdf_pdflatex_stopped_writing_is_not_complete() {
@@ -2693,28 +2528,6 @@ mod tests {
         assert_eq!(crate::validate::sum_inline_marks(&q6.content), 60, "{}", q6.content);
     }
 
-    /// Every feature that only worked through an AI service answers that
-    /// MergeMark works offline. None sends anything, even with a key saved.
-    #[tokio::test]
-    async fn ai_only_features_answer_that_mergemark_works_offline() {
-        let trap = NetworkTrap::start();
-        let (_state, _host) = app_with_a_provider_key().await;
-        let errors = [
-            fetch_models().await.err(),
-            generate_topics_for_module().await.err(),
-            generate_worksheet_from_pdf().await.err(),
-            get_usage_status().await.err(),
-            set_byok_key().await.err(),
-            get_openrouter_usage().await.err(),
-            get_generation_cost().await.err(),
-        ];
-        assert_eq!(trap.connections(), 0, "no request may leave the machine");
-        for (i, error) in errors.iter().enumerate() {
-            let error = error.as_deref().unwrap_or_else(|| panic!("feature {i} must refuse"));
-            assert!(error.contains("MergeMark works offline"), "feature {i}: {error}");
-        }
-    }
-
     /// A scheme the local reader accepts is mapped onto the paper's imported
     /// questions, offline, and the import finishes (it once locked the
     /// database twice and never returned).
@@ -2748,6 +2561,17 @@ mod tests {
         assert!(mappings[0].proposed_answer.contains("The force increases."), "{}", mappings[0].proposed_answer);
     }
 
+    /// The app has one version: Cargo.toml's. The bundle takes it (the Tauri
+    /// config names none), the updater compares it, and package.json agrees.
+    #[test]
+    fn the_app_has_one_version() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let config: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(dir.join("tauri.conf.json")).unwrap()).unwrap();
+        assert!(config.get("version").is_none(), "tauri.conf.json names its own version: {}", config["version"]);
+        let package: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(dir.join("../package.json")).unwrap()).unwrap();
+        assert_eq!(package["version"], env!("CARGO_PKG_VERSION"));
+    }
+
     /// MergeMark has no HTTP client of its own, and its window may connect to
     /// nothing outside the app: there is no way left to reach an AI service.
     #[test]
@@ -2770,6 +2594,10 @@ mod tests {
         for source in csp.split(|c: char| c.is_whitespace() || c == ';').filter(|s| s.contains("://")) {
             assert!(tauri_protocols.contains(&source), "the window may connect to an outside host: {source}");
         }
+        // The one request the app makes is the update check, to the
+        // project's own GitHub releases (Tauri's updater, not the window).
+        let endpoints: Vec<&str> = config["plugins"]["updater"]["endpoints"].as_array().unwrap().iter().map(|e| e.as_str().unwrap()).collect();
+        assert_eq!(endpoints, ["https://github.com/badma025/MergeMark/releases/latest/download/latest.json"]);
     }
 
     /// A mark scheme the local reader cannot read is reported as not

@@ -1,16 +1,45 @@
 use sqlx::{sqlite::SqliteConnectOptions, SqlitePool};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
-pub async fn init_db(app_data_dir: PathBuf) -> Result<SqlitePool, sqlx::Error> {
-    // 1. Ensure the app data directory exists
-    if !app_data_dir.exists() {
-        std::fs::create_dir_all(&app_data_dir).expect("Failed to create app data directory");
-    }
+/// Why the library could not be opened, and the newest backup of it there is
+/// (`mergemark.db.bak-<version>`, written when a version first opens it).
+#[derive(Debug)]
+pub struct InitFailure {
+    pub message: String,
+    pub backup: Option<PathBuf>,
+}
 
-    // 2. Define the path to the database file
+/// The library's schema version (`PRAGMA user_version`). Version 1 ran the
+/// one-off repairs of libraries written before 1.0 (`repair_old_library`):
+/// they run once, so a card edited by hand is never rewritten at a later
+/// launch.
+const SCHEMA_VERSION: i64 = 1;
+
+pub async fn init_db(app_data_dir: PathBuf) -> Result<SqlitePool, InitFailure> {
+    let fail = |message: String| InitFailure { message, backup: newest_backup(&app_data_dir) };
+    std::fs::create_dir_all(&app_data_dir).map_err(|e| fail(format!("its folder {} could not be created: {e}", app_data_dir.display())))?;
     let db_path = app_data_dir.join("mergemark.db");
-    
+    let existed = db_path.exists();
+    open_library(&db_path, existed).await.map_err(|e| fail(e.to_string()))
+}
+
+/// The newest backup beside the library (`mergemark.db.bak-*`).
+pub fn newest_backup(app_data_dir: &Path) -> Option<PathBuf> {
+    std::fs::read_dir(app_data_dir)
+        .ok()?
+        .flatten()
+        .filter(|e| e.file_name().to_string_lossy().starts_with("mergemark.db.bak-"))
+        .max_by_key(|e| e.metadata().and_then(|m| m.modified()).ok())
+        .map(|e| e.path())
+}
+
+/// The backup a version writes when it first opens a library.
+pub fn backup_path(db_path: &Path) -> PathBuf {
+    db_path.with_file_name(format!("mergemark.db.bak-{}", env!("CARGO_PKG_VERSION")))
+}
+
+async fn open_library(db_path: &Path, existed: bool) -> Result<SqlitePool, sqlx::Error> {
     // Using `mode=rwc` ensures the file is created if it doesn't exist
     let db_url = format!("sqlite://{}?mode=rwc", db_path.display());
 
@@ -18,12 +47,32 @@ pub async fn init_db(app_data_dir: PathBuf) -> Result<SqlitePool, sqlx::Error> {
         .create_if_missing(true)
         .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal)
         .synchronous(sqlx::sqlite::SqliteSynchronous::Normal)
-        .busy_timeout(std::time::Duration::from_secs(5));
-
-    // 3. Connect to the SQLite database
+        .busy_timeout(std::time::Duration::from_secs(5))
+        // What is deleted is overwritten, not left in free pages.
+        .pragma("secure_delete", "ON");
     let pool = SqlitePool::connect_with(options).await?;
 
-    // 4. Run the migration to create the questions table if it doesn't exist
+    // Earlier versions kept an AI provider's API key here in plain text
+    // (usage_config) and a log of AI spend (import_cost_logs). Nothing reads
+    // either: both are erased, before any backup can copy them.
+    sqlx::query("DROP TABLE IF EXISTS usage_config").execute(&pool).await?;
+    sqlx::query("DROP TABLE IF EXISTS import_cost_logs").execute(&pool).await?;
+    sqlx::query("PRAGMA wal_checkpoint(TRUNCATE)").execute(&pool).await?;
+
+    // A copy of the library as it was before this version first changed it.
+    // (A failed copy is reported and the library still opens: every change
+    // below adds, or sets aside, and deletes nothing.)
+    if existed {
+        let backup = backup_path(db_path);
+        if !backup.exists() {
+            if let Err(e) = sqlx::query("VACUUM INTO ?").bind(backup.to_string_lossy().into_owned()).execute(&pool).await {
+                eprintln!("[DB] could not back up the library to {}: {e}", backup.display());
+            }
+        }
+    }
+    let version: i64 = sqlx::query_scalar("PRAGMA user_version").fetch_one(&pool).await?;
+
+    // Run the migration to create the questions table if it doesn't exist
     sqlx::query(
         r#"
         CREATE TABLE IF NOT EXISTS questions (
@@ -70,10 +119,7 @@ pub async fn init_db(app_data_dir: PathBuf) -> Result<SqlitePool, sqlx::Error> {
         .execute(&pool)
         .await;
 
-    // Task 4: Legacy cleanup & NULL sanitization
-    let _ = sqlx::query("UPDATE questions SET math_snippet = '' WHERE math_snippet IS NULL OR math_snippet != ''")
-        .execute(&pool)
-        .await;
+    // NULL sanitization
     let _ = sqlx::query("UPDATE questions SET subject = 'Mathematics' WHERE subject IS NULL")
         .execute(&pool)
         .await;
@@ -99,45 +145,9 @@ pub async fn init_db(app_data_dir: PathBuf) -> Result<SqlitePool, sqlx::Error> {
         .execute(&pool)
         .await;
 
-    // Heal existing polar equations and unbalanced delimiters directly in SQLite
-    if let Ok(rows) = sqlx::query("SELECT id, content FROM questions WHERE content LIKE '%polar%' OR content LIKE '%cardioid%' OR content LIKE '%theta%' OR content LIKE '%cos%' OR content LIKE '%sin%'")
-        .fetch_all(&pool)
-        .await
-    {
-        use sqlx::Row;
-        for row in rows {
-            if let (Ok(id), Ok(content)) = (row.try_get::<String, _>("id"), row.try_get::<String, _>("content")) {
-                let healed = crate::validate::heal_polar_equations(&content);
-                if healed != content {
-                    let _ = sqlx::query("UPDATE questions SET content = ? WHERE id = ?")
-                        .bind(healed)
-                        .bind(id)
-                        .execute(&pool)
-                        .await;
-                }
-            }
-        }
+    if version < 1 {
+        repair_old_library(&pool).await?;
     }
-
-    // ── Idempotency migration ────────────────────────────────────────────────
-    // Before the unique index can exist, collapse any duplicate
-    // (paper_name, question_number) rows produced by older builds, keeping
-    // the most recently written row.
-    let _ = sqlx::query(
-        r#"
-        DELETE FROM questions
-        WHERE trim(COALESCE(paper_name, '')) != ''
-          AND question_number IS NOT NULL
-          AND rowid NOT IN (
-              SELECT MAX(rowid) FROM questions
-              WHERE trim(COALESCE(paper_name, '')) != ''
-                AND question_number IS NOT NULL
-              GROUP BY paper_name, question_number
-          );
-        "#,
-    )
-    .execute(&pool)
-    .await;
 
     // Composite-key uniqueness — the old architecture's invariant, now
     // enforced by the database itself so re-imports upsert instead of
@@ -212,40 +222,16 @@ pub async fn init_db(app_data_dir: PathBuf) -> Result<SqlitePool, sqlx::Error> {
     .execute(&pool)
     .await?;
 
-    // ── Import Cost & Spend Audit Log ─────────────────────────────────────
-    sqlx::query(
-        r#"
-        CREATE TABLE IF NOT EXISTS import_cost_logs (
-            id                  TEXT PRIMARY KEY,
-            paper_name          TEXT NOT NULL,
-            model_name          TEXT NOT NULL,
-            paper_type          TEXT NOT NULL DEFAULT 'question_paper',
-            questions_count     INTEGER NOT NULL DEFAULT 0,
-            prompt_tokens       INTEGER NOT NULL DEFAULT 0,
-            completion_tokens   INTEGER NOT NULL DEFAULT 0,
-            total_tokens        INTEGER NOT NULL DEFAULT 0,
-            cost_usd            REAL NOT NULL DEFAULT 0.0,
-            duration_ms         INTEGER NOT NULL DEFAULT 0,
-            created_at          INTEGER NOT NULL DEFAULT 0
-        );
-        "#,
-    )
-    .execute(&pool)
-    .await?;
-
-    // Phase 2: per-stage token breakdown (JSON array of
-    // {stage, promptTokens, completionTokens}). Idempotent — the ALTER
-    // fails with "duplicate column" on databases that already have it.
-    if let Err(e) = sqlx::query(
-        "ALTER TABLE import_cost_logs ADD COLUMN stage_breakdown TEXT",
-    )
-    .execute(&pool)
-    .await
-    {
-        let msg = e.to_string();
-        if !msg.contains("duplicate column") {
-            return Err(e);
-        }
+    // Cached imports of an earlier extraction version are never read again
+    // (the version is part of their key): they go when the version changes.
+    sqlx::query("CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)").execute(&pool).await?;
+    let cached: Option<String> = sqlx::query_scalar("SELECT value FROM meta WHERE key = 'extraction_cache_version'").fetch_optional(&pool).await?;
+    if cached.as_deref() != Some(EXTRACTION_CACHE_VERSION.to_string().as_str()) {
+        sqlx::query("DELETE FROM extraction_cache").execute(&pool).await?;
+        sqlx::query("INSERT OR REPLACE INTO meta (key, value) VALUES ('extraction_cache_version', ?)")
+            .bind(EXTRACTION_CACHE_VERSION.to_string())
+            .execute(&pool)
+            .await?;
     }
 
     // Seed taxonomy if completely empty
@@ -254,7 +240,48 @@ pub async fn init_db(app_data_dir: PathBuf) -> Result<SqlitePool, sqlx::Error> {
         seed_taxonomy(&pool).await?;
     }
 
+    sqlx::query(&format!("PRAGMA user_version = {SCHEMA_VERSION}")).execute(&pool).await?;
     Ok(pool)
+}
+
+/// The one-off repairs of a library written before 1.0 (schema version 0).
+async fn repair_old_library(pool: &SqlitePool) -> Result<(), sqlx::Error> {
+    // The math snippet is no longer kept: the card's content holds it all.
+    sqlx::query("UPDATE questions SET math_snippet = '' WHERE math_snippet IS NULL OR math_snippet != ''").execute(pool).await?;
+
+    // Heal polar equations and unbalanced delimiters written by the old
+    // AI pipeline.
+    let rows = sqlx::query("SELECT id, content FROM questions WHERE content LIKE '%polar%' OR content LIKE '%cardioid%' OR content LIKE '%theta%' OR content LIKE '%cos%' OR content LIKE '%sin%'")
+        .fetch_all(pool)
+        .await?;
+    {
+        use sqlx::Row;
+        for row in rows {
+            if let (Ok(id), Ok(content)) = (row.try_get::<String, _>("id"), row.try_get::<String, _>("content")) {
+                let healed = crate::validate::heal_polar_equations(&content);
+                if healed != content {
+                    sqlx::query("UPDATE questions SET content = ? WHERE id = ?").bind(healed).bind(id).execute(pool).await?;
+                }
+            }
+        }
+    }
+
+    // Before the unique index can exist, duplicate (paper_name,
+    // question_number) rows from older builds collapse to the most recently
+    // written one. The others are set aside in questions_superseded, not
+    // deleted: one may hold a user's edits (and the backup holds them all).
+    let duplicate = "trim(COALESCE(paper_name, '')) != '' AND question_number IS NOT NULL AND rowid NOT IN (\
+        SELECT MAX(rowid) FROM questions WHERE trim(COALESCE(paper_name, '')) != '' AND question_number IS NOT NULL \
+        GROUP BY paper_name, question_number)";
+    let mut tx = pool.begin().await?;
+    sqlx::query("CREATE TABLE IF NOT EXISTS questions_superseded AS SELECT * FROM questions WHERE 0").execute(&mut *tx).await?;
+    let set_aside = sqlx::query(&format!("INSERT INTO questions_superseded SELECT * FROM questions WHERE {duplicate}")).execute(&mut *tx).await?;
+    sqlx::query(&format!("DELETE FROM questions WHERE {duplicate}")).execute(&mut *tx).await?;
+    tx.commit().await?;
+    if set_aside.rows_affected() > 0 {
+        eprintln!("[DB] {} duplicate question rows set aside in questions_superseded", set_aside.rows_affected());
+    }
+    Ok(())
 }
 
 // ── Extraction cache helpers ─────────────────────────────────────────────
@@ -450,156 +477,124 @@ async fn seed_taxonomy(pool: &SqlitePool) -> Result<(), sqlx::Error> {
     Ok(())
 }
 
-// ── Import Cost Log Helpers ──────────────────────────────────────────────────
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, sqlx::FromRow)]
-#[serde(rename_all = "camelCase")]
-pub struct ImportCostRecord {
-    pub id: String,
-    pub paper_name: String,
-    pub model_name: String,
-    pub paper_type: String,
-    pub questions_count: i64,
-    pub prompt_tokens: i64,
-    pub completion_tokens: i64,
-    pub total_tokens: i64,
-    pub cost_usd: f64,
-    pub duration_ms: i64,
-    pub created_at: i64,
-    /// JSON array of per-stage {stage, promptTokens, completionTokens};
-    /// `None` for rows logged before Phase 2.
-    #[sqlx(default)]
-    pub stage_breakdown: Option<String>,
-}
-
-pub async fn record_import_cost(
-    pool: &SqlitePool,
-    paper_name: &str,
-    model_name: &str,
-    paper_type: &str,
-    questions_count: i64,
-) -> Result<ImportCostRecord, sqlx::Error> {
-    // A local import: no tokens, no cost (the columns stay for the records
-    // earlier versions wrote).
-    let (prompt_tokens, completion_tokens, cost_usd, duration_ms, stage_breakdown): (i64, i64, f64, i64, Option<&str>) =
-        (0, 0, 0.0, 0, None);
-    let id = uuid::Uuid::new_v4().to_string();
-    let total_tokens = prompt_tokens + completion_tokens;
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0);
-
-    sqlx::query(
-        r#"
-        INSERT INTO import_cost_logs (
-            id, paper_name, model_name, paper_type,
-            questions_count, prompt_tokens, completion_tokens, total_tokens,
-            cost_usd, duration_ms, created_at, stage_breakdown
-        )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        "#,
-    )
-    .bind(&id)
-    .bind(paper_name)
-    .bind(model_name)
-    .bind(paper_type)
-    .bind(questions_count)
-    .bind(prompt_tokens)
-    .bind(completion_tokens)
-    .bind(total_tokens)
-    .bind(cost_usd)
-    .bind(duration_ms)
-    .bind(now)
-    .bind(stage_breakdown)
-    .execute(pool)
-    .await?;
-
-    Ok(ImportCostRecord {
-        id,
-        paper_name: paper_name.to_string(),
-        model_name: model_name.to_string(),
-        paper_type: paper_type.to_string(),
-        questions_count,
-        prompt_tokens,
-        completion_tokens,
-        total_tokens,
-        cost_usd,
-        duration_ms,
-        created_at: now,
-        stage_breakdown: stage_breakdown.map(str::to_string),
-    })
-}
-
-pub async fn prune_orphaned_import_logs(pool: &SqlitePool) -> Result<u64, sqlx::Error> {
-    // If no questions exist in the repository at all, clear all import logs
-    let (total_q,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM questions")
-        .fetch_one(pool)
-        .await?;
-
-    if total_q == 0 {
-        let res = sqlx::query("DELETE FROM import_cost_logs")
-            .execute(pool)
-            .await?;
-        return Ok(res.rows_affected());
+    fn scratch_dir() -> PathBuf {
+        std::env::temp_dir().join(format!("mm_db_{}", uuid::Uuid::new_v4()))
     }
 
-    // Delete logs for papers that have no questions remaining in the repository.
-    // Handles both standard paper names and mark scheme prefix "MS:".
-    let res = sqlx::query(
-        r#"
-        DELETE FROM import_cost_logs
-        WHERE id IN (
-            SELECT l.id FROM import_cost_logs l
-            WHERE NOT EXISTS (
-                SELECT 1 FROM questions q
-                WHERE q.paper_name = l.paper_name
-                   OR (l.paper_name LIKE 'MS:%' AND q.paper_name = SUBSTR(l.paper_name, 4))
-            )
-        )
-        "#,
-    )
-    .execute(pool)
-    .await?;
+    const OLD_KEY: &str = "sk-or-v1-plain-text-key-0123456789abcdef";
 
-    Ok(res.rows_affected())
+    /// A library written before 1.0: an AI provider key in plain text, a log
+    /// of AI spend, and one question imported twice (the older row edited).
+    async fn old_library(dir: &Path) {
+        std::fs::create_dir_all(dir).unwrap();
+        let url = format!("sqlite://{}?mode=rwc", dir.join("mergemark.db").display());
+        let pool = SqlitePool::connect(&url).await.unwrap();
+        for sql in [
+            "CREATE TABLE questions (id TEXT PRIMARY KEY, subject TEXT DEFAULT 'Mathematics' NOT NULL, subtopic TEXT NOT NULL, marks INTEGER NOT NULL, content TEXT NOT NULL, math_snippet TEXT NOT NULL, is_code BOOLEAN NOT NULL, paper_name TEXT DEFAULT '', question_number INTEGER)",
+            "INSERT INTO questions VALUES ('edited', 'Physics', '', 3, 'Edited by hand.', '', 0, 'Paper', 1)",
+            "INSERT INTO questions VALUES ('again', 'Physics', '', 3, 'Imported again.', '', 0, 'Paper', 1)",
+            "CREATE TABLE usage_config (id INTEGER PRIMARY KEY, byok_api_key TEXT)",
+            "CREATE TABLE import_cost_logs (id TEXT PRIMARY KEY, paper_name TEXT)",
+        ] {
+            sqlx::query(sql).execute(&pool).await.unwrap();
+        }
+        sqlx::query("INSERT INTO usage_config VALUES (1, ?)").bind(OLD_KEY).execute(&pool).await.unwrap();
+        pool.close().await;
+    }
+
+    fn file_holds(path: &Path, needle: &str) -> bool {
+        std::fs::read(path).is_ok_and(|bytes| bytes.windows(needle.len()).any(|w| w == needle.as_bytes()))
+    }
+
+    /// The first launch of a version backs the library up, once, after
+    /// erasing the old AI key, and sets aside (never deletes) a duplicate.
+    #[tokio::test]
+    async fn an_old_library_is_backed_up_once_without_its_ai_key() {
+        let dir = scratch_dir();
+        old_library(&dir).await;
+        let db_path = dir.join("mergemark.db");
+        let pool = init_db(dir.clone()).await.unwrap();
+        let tables: i64 = sqlx::query_scalar("SELECT count(*) FROM sqlite_master WHERE name IN ('usage_config', 'import_cost_logs')").fetch_one(&pool).await.unwrap();
+        assert_eq!(tables, 0);
+        let kept: Vec<String> = sqlx::query_scalar("SELECT id FROM questions").fetch_all(&pool).await.unwrap();
+        assert_eq!(kept, ["again"]);
+        let aside: Vec<String> = sqlx::query_scalar("SELECT content FROM questions_superseded").fetch_all(&pool).await.unwrap();
+        assert_eq!(aside, ["Edited by hand."]);
+        let version: i64 = sqlx::query_scalar("PRAGMA user_version").fetch_one(&pool).await.unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+        pool.close().await;
+
+        let backup = backup_path(&db_path);
+        assert!(backup.exists(), "no backup at {}", backup.display());
+        assert_eq!(newest_backup(&dir).as_deref(), Some(backup.as_path()));
+        for file in [db_path.clone(), backup.clone(), dir.join("mergemark.db-wal")] {
+            assert!(!file_holds(&file, OLD_KEY), "{} still holds the old key", file.display());
+        }
+        // The backup is the library before this version changed it.
+        let copy = SqlitePool::connect(&format!("sqlite://{}?mode=ro", backup.display())).await.unwrap();
+        let ids: Vec<String> = sqlx::query_scalar("SELECT id FROM questions ORDER BY id").fetch_all(&copy).await.unwrap();
+        assert_eq!(ids, ["again", "edited"]);
+        copy.close().await;
+
+        // A later launch of the same version writes no second backup.
+        let written = std::fs::metadata(&backup).unwrap().modified().unwrap();
+        init_db(dir.clone()).await.unwrap().close().await;
+        assert_eq!(std::fs::metadata(&backup).unwrap().modified().unwrap(), written);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The one-off repairs of old libraries run once: a card edited by hand
+    /// afterwards is never rewritten at a later launch.
+    #[tokio::test]
+    async fn a_card_is_not_rewritten_at_a_later_launch() {
+        let content = "The curve C has polar equation\n2\\cos\\theta + 1$.";
+        assert_ne!(crate::validate::heal_polar_equations(content), content, "the old repair would rewrite this card");
+        let dir = scratch_dir();
+        let pool = init_db(dir.clone()).await.unwrap();
+        sqlx::query("INSERT INTO questions (id, subtopic, marks, content, math_snippet, is_code, paper_name, question_number) VALUES ('q', '', 2, ?, '', 0, 'Paper', 1)")
+            .bind(content)
+            .execute(&pool)
+            .await
+            .unwrap();
+        pool.close().await;
+        let pool = init_db(dir.clone()).await.unwrap();
+        let stored: String = sqlx::query_scalar("SELECT content FROM questions WHERE id = 'q'").fetch_one(&pool).await.unwrap();
+        assert_eq!(stored, content);
+        pool.close().await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A library that cannot be opened is reported with its newest backup.
+    #[tokio::test]
+    async fn a_library_that_cannot_be_opened_names_its_backup() {
+        let dir = scratch_dir();
+        std::fs::create_dir_all(dir.join("mergemark.db")).unwrap(); // a folder where the file should be
+        std::fs::write(dir.join("mergemark.db.bak-0.9.4"), b"").unwrap();
+        let failure = init_db(dir.clone()).await.expect_err("a folder is no library");
+        assert_eq!(failure.backup, Some(dir.join("mergemark.db.bak-0.9.4")));
+        assert!(!failure.message.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Cached imports of an earlier extraction version go when it changes.
+    #[tokio::test]
+    async fn cached_imports_of_an_earlier_version_are_swept() {
+        let dir = scratch_dir();
+        let pool = init_db(dir.clone()).await.unwrap();
+        store_cached_extraction(&pool, "old-key", "[]").await.unwrap();
+        sqlx::query("UPDATE meta SET value = '1' WHERE key = 'extraction_cache_version'").execute(&pool).await.unwrap();
+        pool.close().await;
+        let pool = init_db(dir.clone()).await.unwrap();
+        assert_eq!(get_cached_extraction(&pool, "old-key").await.unwrap(), None);
+        store_cached_extraction(&pool, "new-key", "[]").await.unwrap();
+        pool.close().await;
+        let pool = init_db(dir.clone()).await.unwrap();
+        assert_eq!(get_cached_extraction(&pool, "new-key").await.unwrap().as_deref(), Some("[]"));
+        pool.close().await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
-
-pub async fn clear_import_cost_history(pool: &SqlitePool) -> Result<u64, sqlx::Error> {
-    let res = sqlx::query("DELETE FROM import_cost_logs")
-        .execute(pool)
-        .await?;
-    Ok(res.rows_affected())
-}
-
-pub async fn delete_import_cost_log(pool: &SqlitePool, id: &str) -> Result<bool, sqlx::Error> {
-    let res = sqlx::query("DELETE FROM import_cost_logs WHERE id = ?")
-        .bind(id)
-        .execute(pool)
-        .await?;
-    Ok(res.rows_affected() > 0)
-}
-
-pub async fn get_import_cost_history(
-    pool: &SqlitePool,
-) -> Result<Vec<ImportCostRecord>, sqlx::Error> {
-    // Always prune logs of deleted papers / empty repo first
-    let _ = prune_orphaned_import_logs(pool).await;
-
-    let rows = sqlx::query_as::<_, ImportCostRecord>(
-        r#"
-        SELECT
-            id, paper_name, model_name, paper_type,
-            questions_count, prompt_tokens, completion_tokens, total_tokens,
-            cost_usd, duration_ms, created_at, stage_breakdown
-        FROM import_cost_logs
-        ORDER BY created_at DESC
-        LIMIT 100
-        "#,
-    )
-    .fetch_all(pool)
-    .await?;
-
-    Ok(rows)
-}
-

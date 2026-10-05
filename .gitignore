@@ -64,3 +64,6 @@ papers/
 .env.*
 !.env.example
 .claude/
+
+# PDFium for macOS, fetched by scripts/fetch-pdfium-macos.sh (not committed)
+src-tauri/libpdfium.dylib

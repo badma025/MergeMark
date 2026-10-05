@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { Toaster, toast } from "sonner";
 import { LayoutGrid, UploadCloud, Settings as SettingsIcon, BookOpen, FileText } from "lucide-react";
 import { RepositoryFeed } from "@/components/repository/RepositoryFeed";
@@ -11,6 +11,7 @@ import { TaxonomyProvider } from "@/lib/TaxonomyContext";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
 import { FlashcardsTab } from "@/components/flashcards/FlashcardsTab";
+import { checkForUpdatesAtStart } from "@/lib/updates";
 
 export type SelectedQuestion = Omit<QuestionCardProps, "onAddToWorksheet">;
 
@@ -27,6 +28,12 @@ function App() {
   const [activeTab, setActiveTab] = useState<Tab>("repository");
   const [selectedQuestions, setSelectedQuestions] = useState<WorksheetItemData[]>([]);
   const [isWorksheetDrawerOpen, setIsWorksheetDrawerOpen] = useState(false);
+
+  // Offer a newer release, if there is one, once the app has settled.
+  useEffect(() => {
+    const timer = window.setTimeout(() => void checkForUpdatesAtStart(), 4000);
+    return () => window.clearTimeout(timer);
+  }, []);
 
   function handleAddQuestion(question: SelectedQuestion) {
     setSelectedQuestions((prev) => {

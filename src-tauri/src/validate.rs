@@ -1207,10 +1207,42 @@ static RE_COLLAPSE_SPACES: LazyLock<regex::Regex> = LazyLock::new(|| {
     regex::Regex::new(r"[ \t]{2,}").unwrap()
 });
 
-/// Comprehensive sanitization for LaTeX & Math export:
-/// Repairs fractions, flattened powers (x 2 -> x^2), degree signs (90◦ -> 90^\circ),
-/// large bracket artifacts, and unicode math symbols using \ensuremath.
+/// Comprehensive sanitization for LaTeX & Math export: the content repair
+/// of `repair_card_text`, then unicode math symbols as \ensuremath commands.
 pub fn sanitize_for_latex(content: &str) -> String {
+    if content.trim().is_empty() {
+        return String::new();
+    }
+    let text = repair_card_text(content);
+
+    // 8. Unicode Math Symbols to standard LaTeX using \ensuremath (safe in text AND math mode)
+    text.replace("∈", r"\ensuremath{\in}")
+        .replace("ℝ", r"\ensuremath{\mathbb{R}}")
+        .replace("ℕ", r"\ensuremath{\mathbb{N}}")
+        .replace("≤", r"\ensuremath{\le}")
+        .replace("≥", r"\ensuremath{\ge}")
+        .replace("≠", r"\ensuremath{\ne}")
+        .replace("×", r"\ensuremath{\times}")
+        .replace("·", r"\ensuremath{\cdot}")
+        .replace("√", r"\ensuremath{\sqrt}")
+        .replace("α", r"\ensuremath{\alpha}")
+        .replace("β", r"\ensuremath{\beta}")
+        .replace("γ", r"\ensuremath{\gamma}")
+        .replace("θ", r"\ensuremath{\theta}")
+        .replace("λ", r"\ensuremath{\lambda}")
+        .replace("μ", r"\ensuremath{\mu}")
+        .replace("π", r"\ensuremath{\pi}")
+        .replace("σ", r"\ensuremath{\sigma}")
+        .replace("ω", r"\ensuremath{\omega}")
+        .replace("φ", r"\ensuremath{\phi}")
+        .replace("ϕ", r"\ensuremath{\phi}")
+}
+
+/// The content repair a card needs wherever it goes (print or file): OCR
+/// kerning splits, degree signs (90◦ -> 90^\circ), large bracket artifacts,
+/// shattered calculus, collapsed fractions, mashed units, flattened powers
+/// (x 2 -> x^2) and ratio fractions. It writes no LaTeX layout.
+pub fn repair_card_text(content: &str) -> String {
     if content.trim().is_empty() {
         return String::new();
     }
@@ -1282,29 +1314,22 @@ pub fn sanitize_for_latex(content: &str) -> String {
         format!("\\frac{{{}}}{{{}}} = \\frac{{{}}}{{{}}}", &caps[1], &caps[2], &caps[3], &caps[4])
     }).to_string();
 
-    // 8. Unicode Math Symbols to standard LaTeX using \ensuremath (safe in text AND math mode)
-    text = text.replace("∈", r"\ensuremath{\in}")
-               .replace("ℝ", r"\ensuremath{\mathbb{R}}")
-               .replace("ℕ", r"\ensuremath{\mathbb{N}}")
-               .replace("≤", r"\ensuremath{\le}")
-               .replace("≥", r"\ensuremath{\ge}")
-               .replace("≠", r"\ensuremath{\ne}")
-               .replace("×", r"\ensuremath{\times}")
-               .replace("·", r"\ensuremath{\cdot}")
-               .replace("√", r"\ensuremath{\sqrt}")
-               .replace("α", r"\ensuremath{\alpha}")
-               .replace("β", r"\ensuremath{\beta}")
-               .replace("γ", r"\ensuremath{\gamma}")
-               .replace("θ", r"\ensuremath{\theta}")
-               .replace("λ", r"\ensuremath{\lambda}")
-               .replace("μ", r"\ensuremath{\mu}")
-               .replace("π", r"\ensuremath{\pi}")
-               .replace("σ", r"\ensuremath{\sigma}")
-               .replace("ω", r"\ensuremath{\omega}")
-               .replace("φ", r"\ensuremath{\phi}")
-               .replace("ϕ", r"\ensuremath{\phi}");
-
     text
+}
+
+/// A card's text for a flashcard file: its own Markdown and maths, repaired
+/// (`repair_card_text`), with its mark tags where they belong. A diagram is
+/// named, not linked: its file is on this computer. No print layout.
+pub fn format_markdown_for_card(raw_content: &str) -> String {
+    static RE_CARD_MARK_TAG: LazyLock<regex::Regex> = LazyLock::new(|| regex::Regex::new(r"\*{0,2}\[(\d{1,3}) marks?\]\*{0,2}").unwrap());
+    let relocated = relocate_misplaced_marks(raw_content);
+    let repaired = repair_card_text(&relocated);
+    let pictures_named = RE_MARKDOWN_IMG_SAFE.replace_all(&repaired, "[Diagram]");
+    // The repair spells every tag "[N marks]" for print: a card keeps its own.
+    RE_CARD_MARK_TAG
+        .replace_all(&pictures_named, |c: &regex::Captures| if &c[1] == "1" { "**[1 mark]**".to_string() } else { format!("**[{} marks]**", &c[1]) })
+        .trim()
+        .to_string()
 }
 
 /// Helper function to format non-math text segments for LaTeX export
@@ -2977,6 +3002,23 @@ mod tests {
         assert!(output.contains("\\par\\textbullet\\hspace{0.5em}the value of $\\lambda$"));
         assert!(output.contains("\\null\\hfill\\textbf{[2 marks]}"));
         assert!(output.contains("\\needspace{2.5cm}"));
+    }
+
+    /// A flashcard file holds the card's own Markdown, repaired: none of the
+    /// worksheet's print layout, and no path to a file on this computer.
+    #[test]
+    fn a_flashcard_carries_its_card_not_the_worksheets_layout() {
+        let raw = "(a) Show that $\\theta = 90◦$ when x 2 = 4. **[2 marks]**\n\n![Diagram](C:\\Users\\student\\AppData\\Roaming\\com.mergemark.app\\diagrams\\q1.png)\n\n(b) Hence find θ. **[1 mark]**";
+        let card = format_markdown_for_card(raw);
+        for print_only in ["\\needspace", "\\hfill", "\\includegraphics", "\\ensuremath", "\\textbf", "\\par", "C:\\Users", "q1.png"] {
+            assert!(!card.contains(print_only), "{print_only} in {card}");
+        }
+        assert!(card.contains("90^\\circ") && card.contains("x^2"), "{card}");
+        assert!(card.contains("[Diagram]") && card.contains("Hence find θ."), "{card}");
+        assert!(card.contains("**[2 marks]**") && card.contains("**[1 mark]**"), "{card}");
+        // The print path is unchanged: the worksheet still gets its layout.
+        let print = format_markdown_for_latex(raw);
+        assert!(print.contains("\\includegraphics") && print.contains("\\ensuremath{\\theta}"), "{print}");
     }
 
     #[test]

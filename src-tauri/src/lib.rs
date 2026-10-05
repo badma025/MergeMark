@@ -39,9 +39,13 @@ pub struct AppState {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    tauri::Builder::default()
+    let builder = tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
-        .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_dialog::init());
+    // Updates from the project's GitHub releases, and the restart into one.
+    #[cfg(desktop)]
+    let builder = builder.plugin(tauri_plugin_updater::Builder::new().build()).plugin(tauri_plugin_process::init());
+    builder
         .setup(|app| {
             let app_handle = app.handle().clone();
 
@@ -52,11 +56,32 @@ pub fn run() {
                 .expect("Failed to resolve app data directory");
 
             // Initialise the connection pool and run migrations on a blocking thread
-            let pool = tauri::async_runtime::block_on(async {
-                db::init_db(data_dir)
-                    .await
-                    .expect("Failed to initialize SQLite database")
-            });
+            let pool = match tauri::async_runtime::block_on(db::init_db(data_dir.clone())) {
+                Ok(pool) => pool,
+                Err(failure) => {
+                    // Say why, and where the backup is, instead of panicking.
+                    // (Blocking on the dialog here would deadlock: it runs on
+                    // this thread's event loop.)
+                    use tauri_plugin_dialog::{DialogExt, MessageDialogKind};
+                    if let Some(window) = app.get_webview_window("main") {
+                        let _ = window.hide();
+                    }
+                    let mut message = format!(
+                        "MergeMark could not open your library at {}:\n\n{}",
+                        data_dir.join("mergemark.db").display(),
+                        failure.message
+                    );
+                    if let Some(backup) = &failure.backup {
+                        message.push_str(&format!("\n\nA copy of your library from before this version first opened it is at {}.", backup.display()));
+                    }
+                    app.dialog()
+                        .message(message)
+                        .title("MergeMark could not start")
+                        .kind(MessageDialogKind::Error)
+                        .show(|_| std::process::exit(1));
+                    return Ok(());
+                }
+            };
 
             app.manage(AppState {
                 db: Arc::new(Mutex::new(pool)),
@@ -78,18 +103,14 @@ pub fn run() {
             commands::import_questions,
             commands::compile_worksheet,
             commands::parse_pdf,
-            commands::parse_pdf_vision,
-            commands::parse_mark_scheme_vision,
-            commands::fetch_models,
+            commands::import_paper,
+            commands::import_scheme,
             commands::update_question,
             commands::commit_mark_schemes,
             commands::mark_question_verified,
             commands::get_paper_names,
             commands::cancel_import,
-            commands::generate_worksheet_from_pdf,
             commands::export_worksheet_markdown,
-            commands::get_usage_status,
-            commands::set_byok_key,
             commands::export_flashcards,
             commands::import_flashcards,
             taxonomy::get_taxonomy_tree,
@@ -102,13 +123,6 @@ pub fn run() {
             taxonomy::add_topic,
             taxonomy::rename_topic,
             taxonomy::delete_topic,
-            commands::generate_topics_for_module,
-            commands::get_openrouter_usage,
-            commands::get_import_cost_history,
-            commands::clear_import_cost_history,
-            commands::delete_import_cost_log,
-            commands::prune_orphaned_import_logs,
-            commands::get_generation_cost
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

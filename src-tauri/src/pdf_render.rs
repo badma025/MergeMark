@@ -138,10 +138,24 @@ impl PageRenderCache {
 
 pub(crate) fn get_pdfium() -> Result<&'static Pdfium, String> {
     PDFIUM_INSTANCE.get_or_init(|| {
-        let bindings = Pdfium::bind_to_system_library()
+        let bindings = bind_pdfium()
             .map_err(|e| format!("Failed to bind to pdfium: {:?}", e))?;
         Ok(Pdfium::new(bindings))
     }).as_ref().map_err(|e| e.clone())
+}
+
+/// PDFium as the app ships it. Windows finds `pdfium.dll` beside the
+/// executable (`tauri.windows.conf.json`); a macOS app carries
+/// `libpdfium.dylib` in its bundle's Frameworks (`tauri.macos.conf.json`),
+/// which no system search looks in. Otherwise, the system's own copy.
+fn bind_pdfium() -> Result<Box<dyn PdfiumLibraryBindings>, PdfiumError> {
+    #[cfg(target_os = "macos")]
+    if let Some(frameworks) = std::env::current_exe().ok().and_then(|exe| exe.parent().map(|macos| macos.join("../Frameworks"))) {
+        if let Ok(bindings) = Pdfium::bind_to_library(Pdfium::pdfium_platform_library_name_at_path(&frameworks)) {
+            return Ok(bindings);
+        }
+    }
+    Pdfium::bind_to_system_library()
 }
 
 pub const MAX_PAGES_PER_IMPORT: usize = 100;

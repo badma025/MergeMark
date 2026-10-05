@@ -15,6 +15,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { open, save } from "@tauri-apps/plugin-dialog";
 import { toast } from "sonner";
 import { TaxonomyManager } from "./TaxonomyManager";
+import { UpdatesCard } from "./UpdatesCard";
 import { SplashScreen } from "@/components/common/SplashScreen";
 import { cn } from "@/lib/utils";
 
@@ -43,8 +44,6 @@ interface PendingImport {
 }
 
 export function Settings() {
-  // MergeMark works offline, so the AI-only settings (API credentials and
-  // OpenRouter spend) are not shown.
   const [activeTab, setActiveTab] = useState<"taxonomy" | "backup_danger">("taxonomy");
 
   const [confirmingClear, setConfirmingClear] = useState(false);
@@ -202,6 +201,8 @@ export function Settings() {
         {/* ════════════════ TAB 2: BACKUP & MAINTENANCE ════════════════ */}
         {activeTab === "backup_danger" && (
           <div className="flex flex-col gap-6 animate-in fade-in-50 duration-150">
+            <UpdatesCard />
+
             {/* Backup & Restore */}
             <div className="flex flex-col gap-4 rounded-xl border border-border/70 bg-card p-6 shadow-xs">
               <div className="border-b border-border/60 pb-3">

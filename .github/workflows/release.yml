@@ -4,8 +4,15 @@ name: Release
 # then attaches it to a draft GitHub Release for review.
 #
 # Usage:
-#   git tag v0.9.4 master
-#   git push origin v0.9.4
+#   git tag v1.0.0 master
+#   git push origin v1.0.0
+#
+# Updates: the build signs its updater artifacts with the key whose public
+# half is in tauri.conf.json (secrets TAURI_SIGNING_PRIVATE_KEY and
+# TAURI_SIGNING_PRIVATE_KEY_PASSWORD; v0.9.1 and v0.9.2 shipped the same key)
+# and attaches latest.json. Installed copies read
+# /releases/latest/download/latest.json, which is served only for the newest
+# PUBLISHED, non-prerelease release: the draft reaches them when you publish it.
 #
 # Windows only, on purpose. MergeMark loads PDFium through
 # `Pdfium::bind_to_system_library()` and ships `pdfium.dll` beside the
@@ -89,10 +96,13 @@ jobs:
         uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         with:
           tagName: ${{ github.ref_name }}
           releaseName: "MergeMark ${{ github.ref_name }}"
-          releaseBody: "Download the installer below. See docs/BETA_TESTERS.md before your first import."
+          releaseBody: "Download the installer below. Copies already installed update themselves once this release is published."
           releaseDraft: true
-          prerelease: true
+          prerelease: false
+          includeUpdaterJson: true
           args: ${{ matrix.args }}

@@ -187,7 +187,7 @@ export function IngestionDropzone({ isActive = false, onSuccess }: IngestionDrop
         if (!effectivePaperName) {
           throw new Error("Please select which question paper this mark scheme belongs to before importing.");
         }
-        const mappings = await invoke<ProposedMapping[]>("parse_mark_scheme_vision", {
+        const mappings = await invoke<ProposedMapping[]>("import_scheme", {
           filePath,
           paperName: effectivePaperName,
         });
@@ -197,7 +197,7 @@ export function IngestionDropzone({ isActive = false, onSuccess }: IngestionDrop
         if (moduleOverride.trim() === "") {
           throw new Error(NO_MODULE_MESSAGE);
         }
-        const questions = await invoke<any[]>("parse_pdf_vision", {
+        const questions = await invoke<any[]>("import_paper", {
           filePath,
           subject,
           moduleOverride: moduleOverride.trim() !== "" ? moduleOverride.trim() : null,

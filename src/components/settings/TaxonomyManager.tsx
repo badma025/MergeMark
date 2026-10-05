@@ -591,7 +591,7 @@ export function TaxonomyManager() {
 
                               {(!module.topics || module.topics.length === 0) && addingTopicFor !== module.id ? (
                                 <p className="text-[11px] text-muted-foreground italic py-1">
-                                  No topics in this module. Click "+ Topic" or "Auto-Topics" to populate.
+                                  No topics in this module. Click "+ Topic" to add one.
                                 </p>
                               ) : (
                                 <div className="flex flex-wrap gap-1.5">
