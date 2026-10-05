@@ -4,7 +4,9 @@
     "targets": ["app", "dmg"],
     "macOS": {
       "frameworks": ["./libpdfium.dylib"],
-      "minimumSystemVersion": "11.0"
+      "minimumSystemVersion": "11.0",
+      "signingIdentity": "-",
+      "hardenedRuntime": false
     },
     "resources": {
       "licenses/*": "licenses/"
