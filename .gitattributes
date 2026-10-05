@@ -1,2 +1,4 @@
 # Sealed test papers (scripts/fixtures.mjs): never convert line endings.
 *.enc binary
+# Shell scripts run under bash, which reads a CR as part of the command.
+*.sh text eol=lf
