@@ -3,8 +3,8 @@
 
   **A privacy-first desktop engine that instantly transforms dense academic past papers into clean, customizable question cards.**
 
-  [![Version](https://img.shields.io/badge/version-0.9.4_Beta-blue.svg)]()
-  [![Platform](https://img.shields.io/badge/platform-Windows-lightgrey.svg)]()
+  [![Version](https://img.shields.io/badge/version-1.0.0-blue.svg)]()
+  [![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20macOS-lightgrey.svg)]()
   [![License](https://img.shields.io/badge/license-All%20Rights%20Reserved-red.svg)](LICENSE)
 </div>
 
@@ -17,8 +17,9 @@ Currently optimized for **GCSE and A-Level Mathematics & Further Mathematics**, 
 
 ## ✨ Key Features
 * **Zero-Friction Parsing:** Drag and drop full exam papers or question booklets. The engine automatically isolates distinct questions from the layout.
-* **Fully Offline Import:** Every paper and mark scheme is read on your machine. MergeMark makes no AI requests of any kind, needs no API key and costs nothing. See [How importing works](#-how-importing-works).
-* **100% Local & Private:** Built on a local SQLite database. Your files, extractions, and data live strictly on your machine and are never uploaded anywhere.
+* **Fully Offline Import:** Every paper is read on your machine. MergeMark makes no AI requests of any kind, needs no API key and costs nothing. See [How importing works](#-how-importing-works).
+* **Check any card against its paper:** each card records the PDF and the pages it came from. Its source button shows those pages, so a card can always be compared with what the paper prints.
+* **100% Local & Private:** Built on a local SQLite database. Your files, extractions, and data live strictly on your machine and are never uploaded anywhere. The one request MergeMark makes is the [update check](#updates).
 * **Markdown & LaTeX Ready:** Export extractions instantly into your preferred knowledge management workflows (like Obsidian) or use them to compile targeted topic tests.
 
 ## 🛠️ Tech Stack
@@ -27,15 +28,13 @@ This application is engineered for maximum performance and a minimal memory foot
 * **Frontend:** React & TypeScript
 * **Database:** SQLite (Local)
 * **PDF engine:** PDFium (via `pdfium-render`) for glyphs, fonts, vector paths and page rendering
-* **Intelligence:** A local geometry-first layout engine for digital papers and a local table reader for mark schemes; the operating system's own OCR engine for scanned papers (Windows, verified; macOS and Linux backends exist but are not yet run-tested). No AI models.
+* **Intelligence:** A local geometry-first layout engine for digital papers; the operating system's own OCR engine for scanned papers (Windows, verified; macOS and Linux backends exist but are not yet run-tested). No AI models.
 
 ## 🔍 How importing works
-Everything is imported **on this machine**. MergeMark has no AI service to send anything to: it makes no requests, needs no API key and costs nothing.
+Everything is imported **on this machine**. MergeMark has no AI service to send anything to: imports make no requests, need no API key and cost nothing.
 * **Question papers with a text layer** (almost every board PDF) are rebuilt from the PDF itself, in the four stages below.
 * **Scanned papers** (pages printed as pictures or outlines, with no text layer or only a watermark) are read on this computer: on Windows by the operating system's own OCR engine, on macOS by Apple's Vision framework, and elsewhere by Tesseract when it is installed (`tesseract` on the PATH, for example `sudo apt install tesseract-ocr`). Only the Windows path has been run against real papers: the macOS backend is compile-checked and Tesseract is untested. OCR reads words, not mathematics, so every question it produces is kept for review. Where no local OCR engine is available, a scanned paper is reported as not transcribed.
-* **Mark schemes** are read by a local table reader (`src-tauri/src/mark_scheme_deterministic.rs`), which accepts a scheme only when it can account for every answer page. A scheme it cannot read is reported as not transcribed, with the reason.
-
-The Settings screens for API keys, models, usage, free parses and topic generation are still in the app, but those features are turned off: each one answers that MergeMark works offline.
+* **Mark schemes are not imported in 1.0.** The local reader could not read the schemes it was measured on ([`docs/MARK_SCHEME_CENSUS.md`](docs/MARK_SCHEME_CENSUS.md)), so the feature is left out rather than shipped half-working. A question's answer can be typed into its card.
 
 A local import runs in four stages:
 1. **Layout** (`src-tauri/src/layout.rs`). Reads every glyph's position, baseline, font and size from PDFium, together with the page's rules and vector paths. From these it rebuilds reading-order lines and the maths itself: fractions, radicals, scripts, sums and integrals with limits, matrices, piecewise definitions, vector arrows. It also rebuilds tables and code listings, and sets aside page furniture (headers, footers, margin text, barcodes, repeated QR codes). Font codes with no usable Unicode are resolved from the font's own tables; anything it can't identify is kept as `�` and flagged, never guessed.
@@ -46,12 +45,14 @@ A local import runs in four stages:
 On the 18 historical papers used for testing (Edexcel, AQA, Cambridge and practice papers across maths, physics and computer science), 243 of 244 questions import cleanly, and all 69 test-paper questions do. The one exception is flagged because its source draws a symbol as an outline with no character behind it. All of this runs with zero AI requests and zero cost.
 
 ### Verifying the pipeline (developers)
-The corpus papers are not in the repository (`papers/` is local: `papers/used/` holds the calibration papers: the 22 originals and the triage fixtures moved there after being fixed against; `papers/unused/` the papers not yet tuned against), and outputs go to the gitignored `output/`.
+The exam papers are the boards' copyright, so `papers/` is not in the repository (`papers/used/` holds the calibration papers: the 22 originals and the triage fixtures moved there after being fixed against; `papers/unused/` the papers not yet tuned against). The papers the tests read are committed encrypted in [`src-tauri/fixtures/corpus/`](src-tauri/fixtures/corpus/README.md); with the key, `node scripts/fixtures.mjs unpack` restores them. Outputs go to the gitignored `output/`.
 ```bash
-cargo test --manifest-path src-tauri/Cargo.toml
+MERGEMARK_REQUIRE_FIXTURES=1 cargo test --manifest-path src-tauri/Cargo.toml
 node scripts/run-zero-cost-calibration.mjs --stamp <run-id>
 node scripts/verify-corpus-render.mjs output/zero-cost-orchestration/c-calibration/run-<run-id>
 ```
+With `MERGEMARK_REQUIRE_FIXTURES=1`, a test whose paper is missing fails instead of passing unchecked. `bash scripts/verify.sh <stamp>` runs the tests, the calibration and the triage below in one go (1.5–2 hours).
+
 To find problems on papers the engine has not been tuned against, triage everything in `papers/unused/` (offline, no hand-made expected IDs; it checks printed mark totals, ID gaps, unidentified glyphs, missing figures and KaTeX rendering) and read `output/triage/run-<stamp>/summary.md`:
 ```bash
 node scripts/triage-papers.mjs --stamp <run-id>            # resumable
@@ -61,45 +62,44 @@ A paper that is fixed against moves from `papers/unused/` to `papers/used/` and 
 
 The calibration imports every corpus paper offline. It fails if any artifact is stale or the question IDs differ from the independent list in `scripts/fixtures/source-expected-ids.json` (MergeMark has no model client, so a request cannot be attempted at all). The render check passes every card through the app's Markdown/KaTeX pipeline.
 
-To see what the local reader makes of a mark scheme:
+The mark-scheme reader is kept outside the app, for measuring a rebuild. To see what it makes of a scheme, and every reason it refuses one:
 ```bash
-cargo run --manifest-path src-tauri/Cargo.toml --example e2e_import -- "<scheme>.pdf" "<name>" --mark-scheme --out <dir>
+cargo run --manifest-path src-tauri/Cargo.toml --example e2e_import -- "<scheme>.pdf" "<name>" --mark-scheme --census --out <dir>
 ```
 
-## 🚀 Getting Started (Beta)
+## 🚀 Getting Started
 
 ### Installation
-This beta is **Windows only**. The macOS and Linux code paths build, but PDFium is
-bundled for Windows alone, so they cannot yet import a paper.
+Download the installer for your computer from the [Releases](../../releases) tab. Neither build is code-signed yet, so the first launch needs one extra step.
 
-1. Navigate to the [Releases](../../releases) tab.
-2. Download the latest `v0.9.4` installer (`MergeMark_0.9.4_x64-setup.exe`).
-3. Run the installer and launch MergeMark. It installs for your own Windows account
-   and needs no administrator rights. The installer is not code-signed yet, so
-   SmartScreen may warn: choose **More info**, then **Run anyway**.
+**Windows** (`MergeMark_1.0.0_x64-setup.exe`): run the installer. It installs for your own Windows account and needs no administrator rights. SmartScreen may say "Windows protected your PC": choose **More info**, then **Run anyway**.
 
-Read [notes for testers](docs/BETA_TESTERS.md) before your first import — in
-particular, what the **REVIEW** badge means and why mark schemes are not yet
-supported.
+**macOS** (`MergeMark_1.0.0_universal.dmg`, Apple Silicon and Intel, macOS 11 or later): open the disk image and drag MergeMark into Applications. The first time you open it, macOS refuses, because the app is not notarised by Apple. This is not a warning you can click through:
+1. Open MergeMark once, and choose **Done** (or **OK**) when macOS says it cannot be opened.
+2. Open **System Settings → Privacy & Security** and scroll down to **Security**.
+3. Next to "MergeMark was blocked to protect your Mac", choose **Open Anyway**, then confirm with your password.
+
+MergeMark then opens normally from then on.
+
+Read [notes for users](docs/BETA_TESTERS.md) before your first import — in particular, what the **REVIEW** badge means and how to check a card against its paper.
+
+### Updates
+MergeMark checks for a newer version when it starts, and from **Settings → Backup & Maintenance → Updates**, where the check at start-up can be turned off. To check, it asks this repository's GitHub releases for the newest version's details: an ordinary web request that carries nothing about your library or your papers. An update installs only if it is signed with MergeMark's key, and only when you choose **Install and restart**. Your library is backed up when a new version first opens it.
 
 ### How to Use
 1. **Import:** Drag and drop a PDF past paper into the ingestion dropzone.
-2. **Review:** Once parsed, review the extracted questions in the interface. You can manually tweak any highly complex typographical edge-cases.
+2. **Review:** Check the extracted questions, against their pages with each card's source button. You can edit any card to correct it.
 3. **Export:** Copy the isolated question blocks as clean markdown/LaTeX to use in your notes, active recall templates, or custom worksheets.
 
 ## 🗺️ Roadmap
-I am actively developing MergeMark toward a stable `v1.0.0` release. Upcoming features include:
-- [ ] Direct export pipelines to **Anki** and **Quizlet** for automated flashcard generation.
+- [ ] Mark schemes, rebuilt on the layout engine's tables and glyph reading.
 - [ ] Expanded subject schemas (Chemistry, Biology), building on the Physics and Computer Science support.
 - [ ] Carry bold/italic emphasis in prose through to the cards.
 
 ## 💬 Feedback
-Since this is a `v0.9.4` beta, your feedback is critical — especially a card that
-imports **without** a REVIEW badge and is still wrong, because no automated check
-catches those.
+Your feedback is critical — especially a card that imports **without** a REVIEW badge and is still wrong, because no automated check catches those.
 
-👉 **[Open an issue](../../issues/new)** with the paper's file name, the question
-number, what is wrong, and a screenshot of the card and the page if you can.
+👉 **[Open an issue](../../issues/new)** with the paper's file name, the question number, what is wrong, and a screenshot of the card and the page if you can.
 
 ---
 
