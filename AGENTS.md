@@ -1,5 +1,19 @@
 # MergeMark
 
+## Current work
+
+The active plan is [docs/RELEASE_1_0_PLAN.md](docs/RELEASE_1_0_PLAN.md) — MergeMark 1.0,
+approved 5 October 2026. Read it before starting work on the import engine, the
+desktop app or the release. It records the scope decisions already taken, so do
+not re-litigate them; it also corrects two things `ROUND2_HANDOFF.md` and
+`TRIAGE_FIX_REPORT.md` now get wrong.
+
+The work is sequenced W0 → W4 step 1 → W1 rounds, with W2, W3 and W5 interleaved.
+Run it end to end, reporting at each workstream boundary; the plan's "Where to
+stop" section lists the few points that need the user. Do not delegate
+implementation to another agent runner (this overrides the Flash section below
+for this work).
+
 ## Agent skills
 
 ### Issue tracker
