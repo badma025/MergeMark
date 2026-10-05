@@ -2521,19 +2521,8 @@ mod tests {
     #[test]
     fn core_pure_2021_matrix_is_reconstructed_from_source_paths() {
         let _guard = pdfium_test_lock();
-        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../papers/used/core pure 1 '21.pdf");
-        if !path.exists() {
-            eprintln!("[MX] fixture missing");
-            return;
-        }
-        let ev = match pdf_layout_evidence(&path) {
-            Ok(e) => e,
-            Err(e) => {
-                eprintln!("[MX] pdfium unavailable: {e}");
-                return;
-            }
-        };
+        let Some(path) = crate::test_support::corpus_paper("papers/used/core pure 1 '21.pdf") else { return };
+        let Some(ev) = crate::test_support::pdfium(pdf_layout_evidence(&path), "core pure 1 '21") else { return };
         let edits = reconstruct_matrices(&ev[1]);
         assert!(
             edits.iter().any(|(_, _, s)| s.contains(
@@ -2560,28 +2549,14 @@ mod tests {
         assert!(!fraction_bar_between(&lower, &upper, &[rule(0.135, 0.38, 0.10)]));
     }
 
-    /// Real-fixture smoke test for deterministic detection. Environment-
-    /// dependent: needs the repo's physics fixtures and a system pdfium
-    /// binding. Skips (with a note) when either is absent so the suite stays
-    /// green on machines without the DLL or fixtures, while still asserting
-    /// real behaviour on dev machines.
+    /// Real-fixture smoke test for deterministic detection. Needs the
+    /// physics fixtures and a pdfium binding (see `test_support`).
     #[test]
     fn detect_figures_on_real_fixture() {
         let _guard = pdfium_test_lock();
-        let manifest = env!("CARGO_MANIFEST_DIR");
-        for name in ["../papers/used/physics '24.pdf", "../papers/used/physics '21.pdf"] {
-            let path = std::path::Path::new(manifest).join(name);
-            if !path.exists() {
-                eprintln!("[DETECT_TEST] fixture missing: {}", path.display());
-                continue;
-            }
-            let per_page = match detect_pdf_figures(&path) {
-                Ok(v) => v,
-                Err(e) => {
-                    eprintln!("[DETECT_TEST] pdfium unavailable, skipping: {}", e);
-                    return;
-                }
-            };
+        for name in ["papers/used/physics '24.pdf", "papers/used/physics '21.pdf"] {
+            let Some(path) = crate::test_support::corpus_paper(name) else { continue };
+            let Some(per_page) = crate::test_support::pdfium(detect_pdf_figures(&path), name) else { return };
             let total: usize = per_page.iter().map(Vec::len).sum();
             eprintln!(
                 "[DETECT_TEST] {}: {} figures across {} pages",
@@ -2644,26 +2619,15 @@ mod tests {
 
     /// Fixture-gated regression for the load-once document cache: one cache
     /// must parse the PDF exactly once and serve every page render from that
-    /// single document. Skips cleanly when pdfium/fixture are absent.
+    /// single document (see `test_support` for a missing fixture).
     #[test]
     fn cache_reuses_loaded_document() {
         // Pdfium is not thread-safe: a render beside another test's pdfium
         // calls corrupts the library's state for every test after it.
         let _guard = pdfium_test_lock();
-        let manifest = env!("CARGO_MANIFEST_DIR");
-        let path = std::path::Path::new(manifest).join("../papers/used/physics '24.pdf");
-        if !path.exists() {
-            eprintln!("[RENDER_TEST] fixture missing: {}", path.display());
-            return;
-        }
+        let Some(path) = crate::test_support::corpus_paper("papers/used/physics '24.pdf") else { return };
         let cache = PageRenderCache::new(2);
-        let page0 = match cache.get_or_render(&path, 0) {
-            Ok(img) => img,
-            Err(e) => {
-                eprintln!("[RENDER_TEST] pdfium unavailable, skipping: {}", e);
-                return;
-            }
-        };
+        let Some(page0) = crate::test_support::pdfium(cache.get_or_render(&path, 0), "physics '24") else { return };
         assert!(page0.width() > 0 && page0.height() > 0);
         let page1 = cache
             .get_or_render(&path, 1)
@@ -2686,26 +2650,9 @@ mod tests {
     #[test]
     fn render_page_from_document_smoke() {
         let _guard = pdfium_test_lock();
-        let manifest = env!("CARGO_MANIFEST_DIR");
-        let path = std::path::Path::new(manifest).join("../papers/used/physics '24.pdf");
-        if !path.exists() {
-            eprintln!("[RENDER_TEST] fixture missing: {}", path.display());
-            return;
-        }
-        let pdfium = match get_pdfium() {
-            Ok(p) => p,
-            Err(e) => {
-                eprintln!("[RENDER_TEST] pdfium unavailable, skipping: {}", e);
-                return;
-            }
-        };
-        let document = match pdfium.load_pdf_from_file(&path, None) {
-            Ok(d) => d,
-            Err(e) => {
-                eprintln!("[RENDER_TEST] pdfium load failed, skipping: {}", e);
-                return;
-            }
-        };
+        let Some(path) = crate::test_support::corpus_paper("papers/used/physics '24.pdf") else { return };
+        let Some(pdfium) = crate::test_support::pdfium(get_pdfium(), "physics '24") else { return };
+        let Some(document) = crate::test_support::pdfium(pdfium.load_pdf_from_file(&path, None), "physics '24") else { return };
         let img = render_page_from_document(&document, 0, DEFAULT_FIGURE_RENDER_DPI)
             .expect("render page 0 at default DPI");
         assert!(img.width() > 0 && img.height() > 0);
@@ -2716,26 +2663,9 @@ mod tests {
     #[test]
     fn dpi_knob_shrinks_renders() {
         let _guard = pdfium_test_lock();
-        let manifest = env!("CARGO_MANIFEST_DIR");
-        let path = std::path::Path::new(manifest).join("../papers/used/physics '24.pdf");
-        if !path.exists() {
-            eprintln!("[RENDER_TEST] fixture missing: {}", path.display());
-            return;
-        }
-        let pdfium = match get_pdfium() {
-            Ok(p) => p,
-            Err(e) => {
-                eprintln!("[RENDER_TEST] pdfium unavailable, skipping: {}", e);
-                return;
-            }
-        };
-        let document = match pdfium.load_pdf_from_file(&path, None) {
-            Ok(d) => d,
-            Err(e) => {
-                eprintln!("[RENDER_TEST] pdfium load failed, skipping: {}", e);
-                return;
-            }
-        };
+        let Some(path) = crate::test_support::corpus_paper("papers/used/physics '24.pdf") else { return };
+        let Some(pdfium) = crate::test_support::pdfium(get_pdfium(), "physics '24") else { return };
+        let Some(document) = crate::test_support::pdfium(pdfium.load_pdf_from_file(&path, None), "physics '24") else { return };
         let high = render_page_from_document(&document, 0, DEFAULT_FIGURE_RENDER_DPI)
             .expect("300-DPI render");
         let low = render_page_from_document(&document, 0, 150).expect("150-DPI render");

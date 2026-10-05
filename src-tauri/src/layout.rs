@@ -8016,14 +8016,10 @@ mod tests {
     use super::*;
 
     /// Laid-out pages of a corpus paper; `None` when the fixture or PDFium is
-    /// unavailable on this machine.
+    /// unavailable on this machine (see `test_support`).
     fn corpus_pages(rel: &str) -> Option<Vec<LayoutPage>> {
-        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join(rel);
-        if !path.exists() {
-            eprintln!("[LAYOUT] fixture missing: {rel}");
-            return None;
-        }
-        crate::pdf_render::load_layout_pages(&path)
+        let path = crate::test_support::corpus_paper(rel)?;
+        crate::pdf_render::load_layout_pages(&path).or_else(|| crate::test_support::unavailable(&format!("PDFium could not lay out {rel}")))
     }
 
     /// The allocations printed in a body ("[2]").

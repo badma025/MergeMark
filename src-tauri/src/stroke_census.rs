@@ -1147,9 +1147,8 @@ mod tests {
     #[test]
     fn physics24_large_captioned_composite_is_detected() {
         let _guard = crate::pdf_render::pdfium_test_lock();
-        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../papers/used/physics '24.pdf");
-        if !path.exists() { return; }
-        let pdfium = crate::pdf_render::get_pdfium().unwrap();
+        let Some(path) = crate::test_support::corpus_paper("papers/used/physics '24.pdf") else { return };
+        let Some(pdfium) = crate::test_support::pdfium(crate::pdf_render::get_pdfium(), "physics '24") else { return };
         let document = pdfium.load_pdf_from_file(&path, None).unwrap();
         let page = document.pages().get(15).unwrap();
         let figures = detect_page_figures(&page);
@@ -1165,9 +1164,8 @@ mod tests {
         // letter from positional text evidence, so the assembler can bind each
         // crop to its own option rather than guessing an order.
         let _guard = crate::pdf_render::pdfium_test_lock();
-        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../papers/used/physics '24.pdf");
-        if !path.exists() { return; }
-        let pdfium = crate::pdf_render::get_pdfium().unwrap();
+        let Some(path) = crate::test_support::corpus_paper("papers/used/physics '24.pdf") else { return };
+        let Some(pdfium) = crate::test_support::pdfium(crate::pdf_render::get_pdfium(), "physics '24") else { return };
         let document = pdfium.load_pdf_from_file(&path, None).unwrap();
         let page = document.pages().get(31).unwrap();
         let figures = detect_page_figures(&page);
@@ -1499,17 +1497,14 @@ mod tests {
 
     /// Curated-golden gate: every `fixtures/figure_golden/*.json` pins the
     /// exact figure count per page and requires each detected box to match
-    /// its golden counterpart at IoU ≥ 0.85. Skips cleanly when the fixture
-    /// PDFs or pdfium are unavailable (same pattern as the smoke test).
+    /// its golden counterpart at IoU ≥ 0.85. A golden whose paper or pdfium
+    /// is unavailable checks nothing (see `test_support`).
     #[test]
     fn golden_fixture_boxes_match_curated_ground_truth() {
         let _guard = crate::pdf_render::pdfium_test_lock();
         let manifest = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
         let golden_dir = manifest.join("fixtures").join("figure_golden");
-        let Ok(entries) = std::fs::read_dir(&golden_dir) else {
-            eprintln!("[GOLDEN] no fixtures/figure_golden directory — nothing to verify yet");
-            return;
-        };
+        let entries = std::fs::read_dir(&golden_dir).unwrap_or_else(|e| panic!("{} unreadable: {e}", golden_dir.display()));
         let mut checked_any = false;
         for entry in entries.flatten() {
             let path = entry.path();
@@ -1534,18 +1529,8 @@ mod tests {
             if source.is_empty() {
                 panic!("golden {} missing source_pdf", path.display());
             }
-            let pdf_path = manifest.join("..").join(source);
-            if !pdf_path.exists() {
-                eprintln!("[GOLDEN] fixture missing: {} — skipping", pdf_path.display());
-                continue;
-            }
-            let per_page = match crate::pdf_render::detect_pdf_figures(&pdf_path) {
-                Ok(v) => v,
-                Err(e) => {
-                    eprintln!("[GOLDEN] pdfium unavailable, skipping: {}", e);
-                    return;
-                }
-            };
+            let Some(pdf_path) = crate::test_support::corpus_paper(source) else { continue };
+            let Some(per_page) = crate::test_support::pdfium(crate::pdf_render::detect_pdf_figures(&pdf_path), source) else { return };
             let pages = doc["pages"].as_object().unwrap_or_else(|| {
                 panic!("golden {} missing pages object", path.display())
             });
@@ -1593,7 +1578,9 @@ mod tests {
             }
             checked_any = true;
         }
-        let _ = checked_any; // zero goldens committed yet → silent no-op gate
+        if !checked_any {
+            crate::test_support::unavailable::<()>("no curated golden in fixtures/figure_golden could be checked");
+        }
     }
 
     /// Caption-binding diagnostics: for each page, print every
@@ -1726,13 +1713,16 @@ mod tests {
         let manifest = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
         let out_dir = manifest.join("fixtures").join("figure_golden");
         std::fs::create_dir_all(&out_dir).expect("create fixtures dir");
-        for name in ["physics '21.pdf", "physics '24.pdf"] {
+        for name in ["papers/used/physics '21.pdf", "papers/used/physics '24.pdf"] {
             let pdf_path = manifest.join("..").join(name);
             if !pdf_path.exists() {
                 eprintln!("[CANDIDATE] fixture missing: {}", pdf_path.display());
                 continue;
             }
-            let stem: String = name
+            let stem: String = pdf_path
+                .file_stem()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_default()
                 .chars()
                 .map(|c| if c.is_alphanumeric() { c } else { '_' })
                 .collect();

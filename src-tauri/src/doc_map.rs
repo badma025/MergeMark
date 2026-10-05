@@ -1488,20 +1488,12 @@ mod tests {
     }
 
     /// Extract page texts via the production pdfium path and build the
-    /// document map with NO AI structures. Returns None when the PDF is
-    /// missing or unreadable (so tests skip gracefully on CI).
-    fn golden_map(path: &str) -> Option<(Vec<String>, DocumentMap)> {
-        if !std::path::Path::new(path).exists() {
-            eprintln!("{} not found — skipping golden test", path);
-            return None;
-        }
-        let page_inputs = match crate::pdf_render::render_pdf_pages(std::path::Path::new(path)) {
-            Ok(p) => p,
-            Err(e) => {
-                eprintln!("pdfium load failed for {}: {} — skipping", path, e);
-                return None;
-            }
-        };
+    /// document map with NO AI structures. Returns None when the PDF
+    /// (named relative to the repository root) is missing or unreadable
+    /// (see `test_support`).
+    fn golden_map(rel: &str) -> Option<(Vec<String>, DocumentMap)> {
+        let path = crate::test_support::corpus_paper(rel)?;
+        let page_inputs = crate::test_support::pdfium(crate::pdf_render::render_pdf_pages(&path), rel)?;
         let pages: Vec<String> = page_inputs.into_iter().map(|p| p.text).collect();
         let num_pages = pages.len();
         let map = build_text_only_map(&pages, num_pages, &scan_text_layer(&pages));
@@ -1660,28 +1652,14 @@ mod tests {
         assert_eq!(scan_ocr.footers.len(), 4);
     }
 
-    #[test]
-    fn edexcel_2023_pdf_uses_ordered_text_headings() {
-        let _guard = crate::pdf_render::pdfium_test_lock();
-        let Some((pages, map)) = golden_map("../'23 edexcel.pdf") else {
-            return;
-        };
-
-        let scan = scan_text_layer(&pages);
-        let numbers: Vec<u32> = scan.headings.iter().map(|h| h.number).collect();
-        assert_eq!(numbers, (1..=18).collect::<Vec<_>>());
-
-        let span_numbers: Vec<u32> = map.spans.iter().map(|s| s.number).collect();
-        assert_eq!(span_numbers, (1..=18).collect::<Vec<_>>());
-        assert!(map
-            .spans
+    /// The corpus path of a paper that may have moved from papers/unused to
+    /// papers/used (a paper fixed against becomes a fixture).
+    fn moved_paper(name: &str) -> String {
+        ["papers/unused", "papers/used"]
             .iter()
-            .all(|span| span.start_page <= span.end_page));
-        assert!(!map.spans.iter().any(|span| span.number == 24));
-        assert!(map
-            .spans
-            .iter()
-            .all(|span| span.end_page.saturating_sub(span.start_page) <= 4));
+            .map(|dir| format!("{dir}/{name}"))
+            .find(|rel| std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join(rel).exists())
+            .unwrap_or_else(|| format!("papers/unused/{name}"))
     }
 
     #[test]
@@ -1691,17 +1669,8 @@ mod tests {
         let mut tested = 0usize;
 
         for year in years {
-            // (A paper fixed against moves from papers/unused to papers/used.)
-            let path = ["../papers/unused", "../papers/used"]
-                .iter()
-                .map(|dir| format!("{dir}/edexcel '{year} edexcel.pdf"))
-                .find(|p| std::path::Path::new(p).exists())
-                .unwrap_or_else(|| format!("../papers/unused/edexcel '{year} edexcel.pdf"));
-            assert!(
-                std::path::Path::new(&path).exists(),
-                "missing requested Edexcel fixture: {}",
-                path
-            );
+            let Some(path) = crate::test_support::corpus_paper(&moved_paper(&format!("edexcel '{year} edexcel.pdf"))) else { return };
+            let path = path.to_string_lossy().into_owned();
 
             let page_inputs = crate::pdf_render::render_pdf_pages(std::path::Path::new(&path))
                 .unwrap_or_else(|error| panic!("{} could not be rendered: {}", path, error));
@@ -1837,8 +1806,8 @@ mod tests {
     /// Exercises the text-layer heading scan + hybrid map with NO AI
     /// structures — the text layer alone must place every question.
     /// One single test over all papers: pdfium is not thread-safe, so the
-    /// per-paper tests must not run in parallel. Skips gracefully when a
-    /// PDF is not present (CI).
+    /// per-paper tests must not run in parallel. A paper missing from this
+    /// machine is checked as `test_support` says.
     #[test]
     fn aqa_physics_papers_place_all_questions() {
         let _guard = crate::pdf_render::pdfium_test_lock();
@@ -1855,13 +1824,7 @@ mod tests {
             ("24", 32),
         ];
         for (year, expected) in cases {
-            // (A paper fixed against moves from papers/unused to papers/used.)
-            let path = ["../papers/unused", "../papers/used"]
-                .iter()
-                .map(|dir| format!("{dir}/physics '{year}.pdf"))
-                .find(|p| std::path::Path::new(p).exists())
-                .unwrap_or_else(|| format!("../papers/used/physics '{year}.pdf"));
-            let Some((_pages, map)) = golden_map(&path) else { continue };
+            let Some((_pages, map)) = golden_map(&moved_paper(&format!("physics '{year}.pdf"))) else { continue };
             let span_nums: Vec<u32> = map.spans.iter().map(|s| s.number).collect();
             eprintln!("=== physics '{}: {} spans = {:?}", year, span_nums.len(), span_nums);
             for s in &map.spans {

@@ -2591,12 +2591,7 @@ mod tests {
     }
 
     fn fixture(rel: &str) -> Option<String> {
-        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join(rel);
-        if !path.exists() {
-            eprintln!("[OFFLINE] fixture missing: {rel}");
-            return None;
-        }
-        Some(path.to_string_lossy().into_owned())
+        crate::test_support::corpus_paper(rel).map(|path| path.to_string_lossy().into_owned())
     }
 
     /// A scanned paper on a computer with no local OCR engine is reported as

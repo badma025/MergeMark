@@ -20,6 +20,8 @@ pub mod pipeline;
 pub mod sanitize;
 pub(crate) mod stroke_census;
 mod taxonomy;
+#[cfg(test)]
+mod test_support;
 pub mod validate;
 pub mod marker_client;
 

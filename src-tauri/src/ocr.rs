@@ -336,11 +336,7 @@ mod tests {
         let _guard = crate::pdf_render::pdfium_test_lock();
         // The scanned fixture Edexcel M3 Jun 2004: Q1 is about a circular
         // flywheel.
-        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../papers/used/Maths_A-level_M3_Papers-Edexcel__June_2004_QP.pdf");
-        if !path.exists() {
-            eprintln!("[OCR] fixture missing: live test skipped");
-            return;
-        }
+        let Some(path) = crate::test_support::corpus_paper("papers/used/Maths_A-level_M3_Papers-Edexcel__June_2004_QP.pdf") else { return };
         let page = crate::pdf_render::render_pdf_page_at_300dpi(&path, 1).expect("the scanned page renders");
         let lines = tesseract::recognize(&page.to_rgba8()).expect("tesseract ran");
         let words: Vec<&str> = lines.iter().flat_map(|l| l.words.iter().map(|w| w.text.as_str())).collect();

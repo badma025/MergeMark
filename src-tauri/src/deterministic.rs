@@ -3690,11 +3690,8 @@ mod tests {
         // are the ones printed in the source (stacked fractions, radicals,
         // powers and nuclide prescripts rebuilt from glyph geometry).
         let _guard = crate::pdf_render::pdfium_test_lock();
-        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../papers/used/physics '24.pdf");
-        let Some(pages) = path.exists().then(|| crate::pdf_render::load_layout_pages(&path)).flatten() else {
-            eprintln!("[P24] fixture or PDFium unavailable");
-            return;
-        };
+        let Some(path) = crate::test_support::corpus_paper("papers/used/physics '24.pdf") else { return };
+        let Some(pages) = crate::pdf_render::load_layout_pages(&path).or_else(|| crate::test_support::unavailable("PDFium could not lay out physics '24")) else { return };
         let map = crate::layout::build_layout_map(&pages);
         let mut cfg = PipelineConfig::new("p".into(), "Physics".into(), "Mod".into(), None);
         let bodies: std::collections::HashMap<u32, crate::layout::QuestionBody> =
@@ -4245,7 +4242,8 @@ mod tests {
         assert!(sanitized.contains("(c)"), "{sanitized}");
     }
 
-#[test]
+    #[test]
+    #[ignore = "manual corpus diagnostic: prints accept rates for every paper in papers/, asserts nothing"]
     fn diagnostic_tier0_accept_rate_on_fixtures() {
         let _guard = crate::pdf_render::pdfium_test_lock();
         let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).to_path_buf();
