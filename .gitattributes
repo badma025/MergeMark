@@ -1,0 +1,2 @@
+# Sealed test papers (scripts/fixtures.mjs): never convert line endings.
+*.enc binary
