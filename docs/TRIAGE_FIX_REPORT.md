@@ -650,6 +650,56 @@ On the 123 papers in both runs (c11b → c13):
 - **Calibration:** 22 originals unchanged in every run (243/244, 69/69, zero attempts). Fixtures: 3 added (OCR Further Jun 2023, CIE P2 Jun 2017, OCR MEI Further Jun 2019), 45 in all.
 - **cargo test:** 371 → 378 (7 tests added: 2 in the beta, 5 in round 3).
 
+## 1.0, W1 round 1: the six wrong strict cards
+
+The six strict cards round 3's audits found wrong ("What is left", below), fixed under the 1.0 plan (`docs/RELEASE_1_0_PLAN.md`, W1). Five of the six papers became fixtures; the sixth (Edexcel C4 Jan 2006) already was. Run w1r1 compares with c13. The spec, with each cause, is `output/fix-log/spec-w1r1.md`.
+
+**Causes and fixes** (all in `layout.rs` unless stated):
+- **Edexcel M2 Jan 2009 Q2**, "is 11/25" read `\text{is}^{\frac{11}{25}}`; the same in WJEC Physics Jun 2022 U3 Q2, "is ³⁄₂kT". A stacked fraction in smaller type, set on a line of text, gets its baseline estimated from its bar (bar + 0.27 × the parts' size), 1.8 pt above the line: past `parse_box`'s superscript threshold. A fraction whose box spans the line's baseline, with its bar at the line's maths axis, is now a base. An exponent fraction stands clear above the baseline (OCR MEI Jun 2025 Q9 `x^{\frac{5}{2}}`, legacy C3/C4 Q12 `x^{\frac{1}{2}}`, both guarded by the test).
+- **WJEC Physics Jun 2022 U3 Q2**, "⅓Nm c̄²" read `\frac{1}{3}Nm^{\bar{2}}c`. The bar covers c and its square; set high to clear the square, only the 2 touches it, and the group took only items whose centre lies in the touching band. The group under a bar is now every item whose box overlaps that band: `\overline{c^{2}}`.
+- **Eduqas CS Jun 2023 Q7**, the underline marking destinationCode as the primary key was lost. The underline pass refuses a rule with anything within 0.35 em below it, and the next line's ascenders come 2.9 pt under the rule. The set below the rule now drops rows that are a line of text running on past it: cluster 12's `without_text_lines`, now shared by fractions and underlines.
+- **Edexcel-A Economics Jun 2021 Q8** (a PASS paper), the answer booklet's "Indicate which question you are answering…" and "Write your answer here:" followed its total. The body now ends at the question's own printed total when that is the last question total among its lines. If another question's total follows (a heading the map missed), nothing is cut, so the merged-question gate still sees it.
+- **CIE S1 Jun 2019 Q2**, "from Rosa's box." lost "box" (`sanitize.rs`). `INLINE_BOX_RE` deletes "box" before a full stop unless a determiner precedes it; a possessive ('s, ’s, s', s’) now counts as one. Contractions ("it’s box.") and quoted words ("‘isotopes’ box.") do not.
+- **Edexcel C4 Jan 2006 Q2** (fixture), the x/y table with blank cells to complete was flattened into lines. The table is drawn as one stroked rectangle per cell, and borders came only from thin rules, so the grid was never found. Rectangle sub-paths that tile a grid (at least two cells and three column edges, every cell covered once) are now a table whose cells are the rectangles. Such a grid is used only when it reads as a table; otherwise its items are put back untouched.
+- `EXTRACTION_CACHE_VERSION` 6 → 7 (`db.rs`).
+
+**Code review.** Changes made after the review:
+- The body is cut only at the question's own total, never at a later question's (the synthetic test below).
+- Contractions and quoted words are no possessives.
+- Rectangles become borders only inside a tiled grid that reads as a table; `border_segments` is as it was.
+- The underline pass and `build_fractions` share `without_text_lines`.
+- The import tests' five copies of the import call are one helper, `import_offline`.
+
+**Tests**, each red on the old code:
+- `a_small_fraction_on_a_line_of_text_is_no_exponent` (M2 Q1, Q2 and Q7, WJEC Q2; the two exponent guards above);
+- `a_bar_over_a_letter_and_its_square_covers_both`;
+- `a_key_underlined_above_a_close_line_of_text_stays_underlined`;
+- `a_question_ends_at_its_own_printed_total`, and the review's synthetic case `a_body_merged_past_its_own_total_keeps_the_merged_text`;
+- `a_table_drawn_as_cell_rectangles_keeps_its_blank_cells`;
+- `box_after_a_possessive_is_question_text` and, through the import, `a_box_after_a_possessive_survives_the_import`.
+
+**Fixtures:** Edexcel M2 Jan 2009, WJEC Physics Jun 2022 U3, Eduqas CS Jun 2023 C2, Edexcel-A Economics Jun 2021 P2 and CIE S1 Jun 2019 moved to `papers/used/` (73 in all), registered in `zero-cost-accounting.mjs` and `source-expected-ids.json`, and sealed into the encrypted fixture set. 118 question papers are left in `papers/unused/`.
+
+**Numbers** (run w1r1):
+- **cargo test:** 385 passed, 0 failed, 4 ignored (with `MERGEMARK_REQUIRE_FIXTURES=1`: no test skipped a paper), plus 41 script tests.
+- **Calibration w1r1:** 72/72 OK. Historical 243/244 strict, test papers 69/69, zero attempts and tokens. The 45 earlier fixtures hold 504 of 609 strict as in c13. The five new ones hold 37 of 41.
+- **Calibration cards changed:** 19.
+  - Fifteen edexcel '19 (outlined) cards, all flagged, lost page furniture after their totals (the paper code "P 58360 A 0428", stray margin letters).
+  - The C4 Jan 2006 Q2 table is now a table.
+  - Edexcel Further Jun 2025 Q3 lost a line after its total (Q4's stem, see below).
+  - physics '24 Q31 and AQA Physics Q2: the antineutrino now reads `\overline{\mathrm{v}_e}` for `\bar{\mathrm{v}}_e`. Measured on the pages, both bars span the v and its subscript e (physics '24: bar 336.6–346.9 pt, v 336.7–342.5, e 343.3–345.9), so the new reading follows the drawn extent.
+- **Triage unused-w1r1** (118 papers in both runs, compared with c13): PASS 28 → 27, FLAGGED 42 → 43, FAIL 41 and REVIEW 7 unchanged. Flagged cards 233 → 234. Eight cards changed:
+  - OCR-B Physics Nov 2021 Q8 now reads "approximately ¼λ" (before: `\text{approximately}^{\frac{1}{4}}\lambda`);
+  - furniture after a total is gone from Edexcel IGCSE Jan 2014 Q5 and Q16 ("Do NOT write in this space") and from Edexcel Jun 2018 Q5 (the next section's header and instructions);
+  - Edexcel-A Economics Jun 2024 Q8 lost the answer booklet's furniture. Its card is now complete but short (308 characters for 25 marks), and `too_short_for_marks` flags it: this is the PASS → FLAGGED paper. The gate is unchanged;
+  - edexcel '21 Q2 and Edexcel Physics AS Jun 2025 Q6 lost the shared stem printed after their totals ("Questions 3 and 4 refer to the following information…"), see below;
+  - CIE Nov 2023 Q8 (flagged): a radical's vinculum, drawn as a rule over xₙ, now covers the subscript. The radical and its brackets are unidentified NewMathExtn glyphs (W3).
+- **Targeted audit** of every changed card against its pages: no regression. Three defects that the old wrong placement hid are now visible (the memory rule "resolved defects hide others"). All three are on strict cards wrong since c13, unseen because the text sat in the previous card:
+  - **Shared stems.** "Questions 3 and 4 refer to the following information. A horizontal force F is applied to a horizontal spring…", and its spring diagram, belong to Q3 and Q4 (edexcel '21). Q3 and Q4 lack them, and Q2 still carries the diagram after its total. The same holds for Edexcel Physics AS Jun 2025 Q7 and Q8. The text was wrongly in Q2 (Q6) before. It is now in no card.
+  - **Edexcel Further Jun 2025 Q4's stem** "y = √(15 + e²ˣ)" is set 2.9 pt above the baseline of the "4." label. It sorts before the heading, so it fell into Q3. It is now cut with Q3's furniture, and Q4 still lacks it.
+  - The same line reads `y \sqrt[=]{…}`: the "=" left of the radical is taken as its index.
+- **Blinded audit w1r1:** pack built (`output/triage/run-unused-w1r1/audit-pack/`), judged in a separate session.
+
 ## What is left
 
 On the 123 holdout papers after round 3 (run unused-c13). Round 3 changed none of these findings; the unidentified-glyph counts are lower than after round 2 (37 papers, 106 cards on 126 papers) only because three papers became fixtures.

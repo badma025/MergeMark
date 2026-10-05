@@ -109,6 +109,12 @@ export const PAPERS = [
   { name: "ocr_further_jun23", file: "papers/used/Maths_A-level_Papers_OCR-Further__June_2023_QP.pdf", subject: "Mathematics", module: "Further Mechanics", cohort: "triage_fixtures" },
   { name: "cie_p2_jun17", file: "papers/used/Maths_A-level_Papers_CIE__June_2017_(v1)_QP_-_P2.pdf", subject: "Mathematics", module: "Pure Mathematics 2", cohort: "triage_fixtures" },
   { name: "mei_further_jun19", file: "papers/used/Maths_A-level_Papers_OCR-MEI-Further__June_2019_QP.pdf", subject: "Mathematics", module: "Modelling with Algorithms", cohort: "triage_fixtures" },
+  // 1.0 W1 round 1: the strict cards round 3's audits found wrong.
+  { name: "edx_m2_jan09", file: "papers/used/Maths_A-level_M2_Papers-Edexcel__January_2009_QP.pdf", subject: "Mathematics", module: "Mechanics 2", cohort: "triage_fixtures" },
+  { name: "wjec_phys_u3_jun22", file: "papers/used/Physics_A-level_Past-Papers_WJEC-Wales__June_2022_QP_-_Unit_3_WJEC_Physics_A-Level.pdf", subject: "Physics", module: "A-Level Physics", cohort: "triage_fixtures" },
+  { name: "eduqas_cs_c2_jun23", file: "papers/used/Computer-Science_A-level_Past-Papers_Eduqas__June_2023_QP_-_Component_2_Eduqas_Computer_Science_A-level.pdf", subject: "Computer Science", module: "Computer Science", cohort: "triage_fixtures" },
+  { name: "edxa_econ_p2_jun21", file: "papers/used/Economics_A-level_Past-Papers_Edexcel-A__June_2021_QP_-_Paper_2_Edexcel_(A)_Economics_A-level.pdf", subject: "Economics", module: "A-Level Economics", cohort: "triage_fixtures" },
+  { name: "cie_s1_jun19", file: "papers/used/Maths_A-level_Papers_CIE__June_2019_(v1)_QP_-_S1.pdf", subject: "Mathematics", module: "Statistics 1", cohort: "triage_fixtures" },
 ];
 
 export function slugFor(paperName) {

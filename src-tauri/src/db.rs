@@ -277,7 +277,11 @@ pub async fn init_db(app_data_dir: PathBuf) -> Result<SqlitePool, sqlx::Error> {
 /// graph paper, the end of the last question): a cached v5 card can hold a
 /// stacked fraction read as scripts, a grid cropped to its drawing without
 /// the axes, or the back page's logo as the last question's figure.
-pub const EXTRACTION_CACHE_VERSION: u32 = 6;
+/// v7: 1.0 W1 round 1 (small fractions on a line of text, a bar over a
+/// letter and its square, a key underlined above close text, a question
+/// ending at its own total, "box" after a possessive, tables drawn cell by
+/// cell): a cached v6 card can hold one of those defects.
+pub const EXTRACTION_CACHE_VERSION: u32 = 7;
 
 /// Compute a deterministic cache key from file content + parameters.
 /// Uses a fast FNV-1a hash of the file bytes (not cryptographic, just

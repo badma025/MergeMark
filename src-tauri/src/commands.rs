@@ -2590,6 +2590,23 @@ mod tests {
         (state, TestHost { dir, reports: Default::default() })
     }
 
+    /// Imports a paper as the app does, into the offline test subject and
+    /// module.
+    async fn import_offline(state: &AppState, host: &TestHost, file_path: String, paper_name: &str) -> Result<Vec<Question>, String> {
+        import_question_paper(
+            state,
+            host,
+            QuestionImportRequest {
+                file_path,
+                pdf_base64_pages: None,
+                subject: "offline-subject".into(),
+                module_override: Some("offline-module".into()),
+                paper_name: paper_name.into(),
+            },
+        )
+        .await
+    }
+
     fn fixture(rel: &str) -> Option<String> {
         crate::test_support::corpus_paper(rel).map(|path| path.to_string_lossy().into_owned())
     }
@@ -2603,17 +2620,7 @@ mod tests {
         let _no_ocr = crate::ocr::unavailable_for_test::guard();
         let trap = NetworkTrap::start();
         let (state, host) = app_with_a_provider_key().await;
-        let result = import_question_paper(
-            &state,
-            &host,
-            QuestionImportRequest {
-                file_path,
-                pdf_base64_pages: None,
-                subject: "offline-subject".into(),
-                module_override: Some("offline-module".into()),
-                paper_name: "Edexcel M3 June 2004".into(),
-            },
-        )
+        let result = import_offline(&state, &host, file_path, "Edexcel M3 June 2004")
         .await;
         assert_eq!(trap.connections(), 0, "no request may leave the machine");
         let error = result.expect_err("a paper nobody transcribed is not an import");
@@ -2630,21 +2637,25 @@ mod tests {
         let _pdfium = crate::pdf_render::pdfium_test_lock();
         let Some(file_path) = fixture("papers/used/Chemistry_GCSE_Past-Papers_AQA__June_2024_QP.pdf") else { return };
         let (state, host) = app_with_a_provider_key().await;
-        let questions = import_question_paper(
-            &state,
-            &host,
-            QuestionImportRequest {
-                file_path,
-                pdf_base64_pages: None,
-                subject: "offline-subject".into(),
-                module_override: Some("offline-module".into()),
-                paper_name: "AQA GCSE Chemistry June 2024".into(),
-            },
-        )
+        let questions = import_offline(&state, &host, file_path, "AQA GCSE Chemistry June 2024")
         .await
         .expect("the paper is read locally");
         let q1 = questions.iter().find(|q| q.question_number == Some(1)).expect("Q1 imported");
         assert!(q1.content.contains("Tick (✓) one box.\n2\n6\n14\n20\n"), "{}", q1.content);
+    }
+
+    /// "box" after a possessive is the noun of its sentence, through the
+    /// whole import (CIE S1 Jun 2019 Q2: "… at random from Rosa’s box.").
+    #[tokio::test]
+    async fn a_box_after_a_possessive_survives_the_import() {
+        let _pdfium = crate::pdf_render::pdfium_test_lock();
+        let Some(file_path) = fixture("papers/used/Maths_A-level_Papers_CIE__June_2019_(v1)_QP_-_S1.pdf") else { return };
+        let (state, host) = app_with_a_provider_key().await;
+        let questions = import_offline(&state, &host, file_path, "CIE S1 June 2019")
+        .await
+        .expect("the paper is read locally");
+        let q2 = questions.iter().find(|q| q.question_number == Some(2)).expect("Q2 imported");
+        assert!(q2.content.contains("at random from Rosa’s box."), "{}", q2.content);
     }
 
     /// What the last page prints after "END OF QUESTION PAPER" (the board's
@@ -2654,17 +2665,7 @@ mod tests {
         let _pdfium = crate::pdf_render::pdfium_test_lock();
         let Some(file_path) = fixture("papers/used/Maths_A-level_Papers_OCR-MEI-Further__June_2019_QP.pdf") else { return };
         let (state, host) = app_with_a_provider_key().await;
-        let questions = import_question_paper(
-            &state,
-            &host,
-            QuestionImportRequest {
-                file_path,
-                pdf_base64_pages: None,
-                subject: "offline-subject".into(),
-                module_override: Some("offline-module".into()),
-                paper_name: "OCR MEI Further Modelling with Algorithms June 2019".into(),
-            },
-        )
+        let questions = import_offline(&state, &host, file_path, "OCR MEI Further Modelling with Algorithms June 2019")
         .await
         .expect("the paper is read locally");
         // Q5 is the last question, on the page that ends with the logo.
@@ -2683,17 +2684,7 @@ mod tests {
         let _pdfium = crate::pdf_render::pdfium_test_lock();
         let Some(file_path) = fixture("papers/used/Economics_A-level_Past-Papers_Edexcel-A__June_2018_QP_-_Paper_2_Edexcel_(A)_Economics_AS-level.pdf") else { return };
         let (state, host) = app_with_a_provider_key().await;
-        let questions = import_question_paper(
-            &state,
-            &host,
-            QuestionImportRequest {
-                file_path,
-                pdf_base64_pages: None,
-                subject: "offline-subject".into(),
-                module_override: Some("offline-module".into()),
-                paper_name: "Edexcel A Economics June 2018 Paper 2".into(),
-            },
-        )
+        let questions = import_offline(&state, &host, file_path, "Edexcel A Economics June 2018 Paper 2")
         .await
         .expect("the paper is read locally");
         // "(Total for Question 6 = 60 marks)": (a)-(e) 40, then EITHER (f) OR (g), 20 each.

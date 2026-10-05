@@ -258,13 +258,7 @@ fn walk_objects(objects: &[PdfPageObject], parent: PdfMatrix, frame: &Frame, out
                 // draws every fraction bar of an equation as sub-paths of a
                 // single path): each thin horizontal sub-path is its own rule.
                 if filled || stroked {
-                    let mut start = 0;
-                    while start < pts.len() {
-                        let mut end = start + 1;
-                        while end < pts.len() && !pts[end].0 {
-                            end += 1;
-                        }
-                        let sub = &pts[start..end];
+                    for sub in sub_paths(&pts) {
                         let (mut sx0, mut sy0, mut sx1, mut sy1) = (f32::MAX, f32::MAX, f32::MIN, f32::MIN);
                         for (_, q) in sub {
                             sx0 = sx0.min(q[0]);
@@ -275,7 +269,6 @@ fn walk_objects(objects: &[PdfPageObject], parent: PdfMatrix, frame: &Frame, out
                         if sy1 - sy0 <= 1.6 && sx1 - sx0 >= 2.0 {
                             out.rules.push(Rule { x0: sx0, x1: sx1, y0: sy0, y1: sy1 });
                         }
-                        start = end;
                     }
                 }
                 out.paths.push(VPath { x0, x1, y0, y1, pts, filled, stroked });
@@ -3118,17 +3111,8 @@ pub fn layout_page(pg: &PageGlyphs) -> LayoutPage {
             rule_used[ri] = true;
         }
     }
-    let in_grid = |b: [f32; 4]| {
-        grids.iter().any(|g| b[0] >= g.xs[0] - 2.0 && b[2] <= g.xs[g.xs.len() - 1] + 2.0 && b[1] >= g.ys[0] - 2.0 && b[3] <= g.ys[g.ys.len() - 1] + 2.0)
-    };
-    // (A frame around the whole page is no drawing.)
-    lp.drawings = pg
-        .paths
-        .iter()
-        .map(|p| [p.x0, p.y0, p.x1, p.y1])
-        .filter(|b| (b[2] - b[0]).max(b[3] - b[1]) >= 3.0 && !in_grid(*b) && (b[2] - b[0]) * (b[3] - b[1]) < 0.55 * pg.width * pg.height)
-        .chain(pg.images.iter().copied())
-        .collect();
+    // (Tables drawn cell by cell give no rules.)
+    let cell_grids = cell_rectangle_grids(pg);
     let mut shape_used = vec![false; shapes.len()];
     items = build_bracket_pieces(pg, items);
     loop {
@@ -3152,7 +3136,10 @@ pub fn layout_page(pg: &PageGlyphs) -> LayoutPage {
     let mut table_lines: Vec<LayoutLine> = Vec::new();
     // Blank axes to sketch on are answer space, like graph paper.
     let mut answer_grids: Vec<[f32; 4]> = blank_answer_axes(pg, &regions);
-    for grid in &grids {
+    // A grid drawn cell by cell is a table only when it holds one; otherwise
+    // its rectangles stay drawings, as before (a bitmap to read, a box).
+    let mut cell_tables: Vec<[f32; 4]> = Vec::new();
+    for (grid, drawn_as_cells) in grids.iter().map(|g| (g, false)).chain(cell_grids.iter().map(|g| (g, true))) {
         // Row labels set just left of the grid, one per row ("R1", "15",
         // "R0" beside three rows of bit cells), are the table's first column.
         let labelled = with_row_labels(grid, &items);
@@ -3162,9 +3149,13 @@ pub fn layout_page(pg: &PageGlyphs) -> LayoutPage {
         let empty = inside.is_empty();
         match table_line(pg, grid, inside) {
             Ok(line) => {
+                if drawn_as_cells {
+                    cell_tables.push([line.x0, line.y0, line.x1, line.y1]);
+                }
                 lp.tables.push([line.x0, line.y0, line.x1, line.y1]);
                 table_lines.push(line);
             }
+            Err(back) if drawn_as_cells => items.extend(back),
             Err(back) => {
                 let rect = [grid.xs[0], grid.ys[0], grid.xs[grid.xs.len() - 1], grid.ys[grid.ys.len() - 1]];
                 // An empty fine grid is graph paper to draw on; a grid with
@@ -3180,6 +3171,21 @@ pub fn layout_page(pg: &PageGlyphs) -> LayoutPage {
             }
         }
     }
+    let in_grid = |b: [f32; 4]| {
+        grids
+            .iter()
+            .map(|g| [g.xs[0], g.ys[0], g.xs[g.xs.len() - 1], g.ys[g.ys.len() - 1]])
+            .chain(cell_tables.iter().copied())
+            .any(|g| b[0] >= g[0] - 2.0 && b[2] <= g[2] + 2.0 && b[1] >= g[1] - 2.0 && b[3] <= g[3] + 2.0)
+    };
+    // (A frame around the whole page is no drawing.)
+    lp.drawings = pg
+        .paths
+        .iter()
+        .map(|p| [p.x0, p.y0, p.x1, p.y1])
+        .filter(|b| (b[2] - b[0]).max(b[3] - b[1]) >= 3.0 && !in_grid(*b) && (b[2] - b[0]) * (b[3] - b[1]) < 0.55 * pg.width * pg.height)
+        .chain(pg.images.iter().copied())
+        .collect();
 
     // ── Lines ────────────────────────────────────────────────────────────
     let lines = group_lines(pg, items);
@@ -4086,19 +4092,7 @@ struct RadicalShape {
 /// Polylines of a page: each path's sub-paths, plus 2-point stroked segments
 /// chained end-to-end (some producers draw the sign as separate strokes).
 fn page_polylines(pg: &PageGlyphs) -> Vec<Vec<[f32; 2]>> {
-    let mut lines: Vec<Vec<[f32; 2]>> = Vec::new();
-    for p in &pg.paths {
-        let mut cur: Vec<[f32; 2]> = Vec::new();
-        for (mv, q) in &p.pts {
-            if *mv && !cur.is_empty() {
-                lines.push(std::mem::take(&mut cur));
-            }
-            cur.push(*q);
-        }
-        if !cur.is_empty() {
-            lines.push(cur);
-        }
-    }
+    let mut lines: Vec<Vec<[f32; 2]>> = pg.paths.iter().flat_map(|p| sub_paths(&p.pts).map(|sub| sub.iter().map(|&(_, q)| q).collect())).collect();
     // Chain short segments whose endpoints meet.
     let close = |a: [f32; 2], b: [f32; 2]| (a[0] - b[0]).abs() <= 0.6 && (a[1] - b[1]).abs() <= 0.6;
     let mut segs: Vec<Vec<[f32; 2]>> = lines.iter().filter(|l| l.len() == 2).cloned().collect();
@@ -4438,26 +4432,10 @@ fn build_fractions(pg: &PageGlyphs, mut items: Vec<Item>, rule_used: &mut [bool]
             };
             let above = if above.is_empty() { above } else { grow(above, true) };
             let below = if below.is_empty() { below } else { grow(below, false) };
-            // A part never holds a word of the line above or below it: a row
-            // of its glyphs that runs on into letters outside the part is a
-            // line of text reaching into the band ("portion" over cos θ = 4/5,
-            // "constants" under dy/dx). The line's raised and lowered glyphs,
-            // level with its letters, go with it.
-            let without_text_lines = |set: Vec<usize>| -> Vec<usize> {
-                let mut rows: Vec<Vec<usize>> = Vec::new();
-                for &k in &set {
-                    match rows.iter_mut().find(|row| same_line(items[row[0]].base, items[row[0]].size, &items[k])) {
-                        Some(row) => row.push(k),
-                        None => rows.push(vec![k]),
-                    }
-                }
-                let (lines, kept): (Vec<Vec<usize>>, Vec<Vec<usize>>) =
-                    rows.into_iter().partition(|row| touches_word(pg, &items, row, &set));
-                let level_with_line = |k: usize| lines.iter().flatten().any(|&j| items[k].y0 <= items[j].y1 && items[k].y1 >= items[j].y0);
-                kept.into_iter().flatten().filter(|&k| !level_with_line(k)).collect()
-            };
-            let above = without_text_lines(above);
-            let below = without_text_lines(below);
+            // A part never holds a word of the line above or below it
+            // ("portion" over cos θ = 4/5, "constants" under dy/dx).
+            let above = without_text_lines(pg, &items, above);
+            let below = without_text_lines(pg, &items, below);
             if above.is_empty() || below.is_empty() {
                 continue;
             }
@@ -4664,11 +4642,13 @@ fn build_accents(pg: &PageGlyphs, mut items: Vec<Item>, rule_used: &mut [bool]) 
         if touching.is_empty() || !above.is_empty() && !inside_word(pg, &items, &above) {
             continue;
         }
-        // Everything under the bar within the touching items' band belongs
-        // to the decorated group (an operator between two barred letters).
+        // Everything under the bar reaching into the touching items' band
+        // belongs to the decorated group: an operator between two barred
+        // letters, or the letter under a bar set high to clear its square
+        // (the mean square c̄² in WJEC Physics Jun 2022: only the 2 touches).
         let band_top = touching.iter().map(|&k| items[k].y0).fold(f32::MAX, f32::min);
         let band_bot = touching.iter().map(|&k| items[k].y1).fold(f32::MIN, f32::max);
-        let below = items_in(&items, |o| span(o) && o.cy() >= band_top - 0.5 && o.cy() <= band_bot + 0.5 && o.x0 >= r.x0 - 2.0 && o.x1 <= r.x1 + 2.0);
+        let below = items_in(&items, |o| span(o) && o.y0 <= band_bot + 0.5 && o.y1 >= band_top - 0.5 && o.x0 >= r.x0 - 2.0 && o.x1 <= r.x1 + 2.0);
         let parts: Vec<Item> = below.iter().map(|&k| items[k].clone()).collect();
         let (bx0, bx1, _, _) = union_box(&parts);
         let s = parts.iter().map(|p| p.size).fold(0.0, f32::max);
@@ -4701,7 +4681,9 @@ fn build_accents(pg: &PageGlyphs, mut items: Vec<Item>, rule_used: &mut [bool]) 
         let parts: Vec<Item> = resting.iter().map(|&k| items[k].clone()).collect();
         let (bx0, bx1, _, _) = union_box(&parts);
         let s = parts.iter().map(|p| p.size).fold(0.0, f32::max).max(4.0);
-        let below = items_in(&items, |o| span(o) && o.y0 >= r.y1 - 0.5 && o.y0 <= r.y1 + 0.35 * s);
+        // (The next line of text set close under the rule is no part below
+        // it: Eduqas Computer Science Jun 2023 Q7's underlined key.)
+        let below = without_text_lines(pg, &items, items_in(&items, |o| span(o) && o.y0 >= r.y1 - 0.5 && o.y0 <= r.y1 + 0.35 * s));
         if !below.is_empty() || r.w() > (bx1 - bx0) + 1.0 * s || r.w() < 0.8 * (bx1 - bx0) {
             continue;
         }
@@ -5270,6 +5252,22 @@ fn attach_option_letters(pg: &PageGlyphs, built: &mut Vec<LayoutLine>) {
     }
 }
 
+/// `set` less every row of it that is a line of text reaching into it: a row
+/// running on into letters outside `set` (see `touches_word`). The line's
+/// raised and lowered glyphs, level with its letters, go with it.
+fn without_text_lines(pg: &PageGlyphs, items: &[Item], set: Vec<usize>) -> Vec<usize> {
+    let mut rows: Vec<Vec<usize>> = Vec::new();
+    for &k in &set {
+        match rows.iter_mut().find(|row| same_line(items[row[0]].base, items[row[0]].size, &items[k])) {
+            Some(row) => row.push(k),
+            None => rows.push(vec![k]),
+        }
+    }
+    let (lines, kept): (Vec<Vec<usize>>, Vec<Vec<usize>>) = rows.into_iter().partition(|row| touches_word(pg, items, row, &set));
+    let level_with_line = |k: usize| lines.iter().flatten().any(|&j| items[k].y0 <= items[j].y1 && items[k].y1 >= items[j].y0);
+    kept.into_iter().flatten().filter(|&k| !level_with_line(k)).collect()
+}
+
 /// The items `set` are letters inside a longer word on their own baseline:
 /// another letter or digit of their size touches them there.
 fn inside_word(pg: &PageGlyphs, items: &[Item], set: &[usize]) -> bool {
@@ -5636,6 +5634,18 @@ fn parse_box(pg: &PageGlyphs, items: Vec<Item>) -> (Vec<Node>, f32, f32, usize) 
             if it.force_base {
                 return Role::Base;
             }
+            // A stacked fraction whose parts span the line's baseline, its bar
+            // on the text's maths axis, stands on the line however small its
+            // parts ("is 11/25" in Edexcel M2 Jan 2009). An exponent fraction
+            // stands clear above the baseline, its bar higher; a subscript
+            // fraction's bar is lower. (`build_fractions` sets a fraction's
+            // base 0.27 of its size below its bar.)
+            if matches!(it.node, Node::Frac(..)) {
+                let bar = it.base - 0.27 * it.size;
+                if it.y0 < b - 0.4 * s && it.y1 > b + 0.1 * s && (b - 0.5 * s..=b - 0.15 * s).contains(&bar) {
+                    return Role::Base;
+                }
+            }
             let d = it.base - b;
             let small = it.size < 0.9 * s;
             // Full-size stacked numbers (see group_lines) sit at least
@@ -5936,6 +5946,102 @@ fn border_segments(pg: &PageGlyphs) -> Vec<BorderSeg> {
         }
     }
     out
+}
+
+/// A path's sub-paths: each runs from a move to just before the next one.
+fn sub_paths(pts: &[(bool, [f32; 2])]) -> impl Iterator<Item = &[(bool, [f32; 2])]> {
+    pts.chunk_by(|_, next| !next.0)
+}
+
+/// The axis-aligned rectangles among a path's sub-paths, `[x0, y0, x1, y1]`:
+/// four corners in turn (a fifth back at the first allowed), each side
+/// horizontal or vertical, at least 3 pt each way (a thinner one is a rule).
+fn axis_rectangles(pts: &[(bool, [f32; 2])]) -> Vec<[f32; 4]> {
+    let mut out = Vec::new();
+    for sub in sub_paths(pts) {
+        let mut c: Vec<[f32; 2]> = sub.iter().map(|&(_, q)| q).collect();
+        if c.len() == 5 && (c[4][0] - c[0][0]).abs() <= 0.5 && (c[4][1] - c[0][1]).abs() <= 0.5 {
+            c.pop();
+        }
+        if c.len() != 4 {
+            continue;
+        }
+        let sides_on_axes = (0..4).all(|i| {
+            let (a, b) = (c[i], c[(i + 1) % 4]);
+            ((a[0] - b[0]).abs() <= 0.5) != ((a[1] - b[1]).abs() <= 0.5)
+        });
+        let (x0, x1) = c.iter().fold((f32::MAX, f32::MIN), |e, q| (e.0.min(q[0]), e.1.max(q[0])));
+        let (y0, y1) = c.iter().fold((f32::MAX, f32::MIN), |e, q| (e.0.min(q[1]), e.1.max(q[1])));
+        if sides_on_axes && x1 - x0 >= 3.0 && y1 - y0 >= 3.0 {
+            out.push([x0, y0, x1, y1]);
+        }
+    }
+    out
+}
+
+/// Tables drawn as one stroked rectangle per cell, which give no rules
+/// (Edexcel C4 Jan 2006 Q2's table of x and y to complete). Rectangles that
+/// share sides make a grid of the levels of their sides, and are a table's
+/// cells only when together they cover each cell of that grid exactly once
+/// (a merged cell spans several). A lone box, a frame, a metre rule drawn as
+/// a box with ticks, or overlapping boxes make none.
+fn cell_rectangle_grids(pg: &PageGlyphs) -> Vec<TableGrid> {
+    const T: f32 = 1.5;
+    let rects: Vec<[f32; 4]> = pg.paths.iter().filter(|p| p.stroked).flat_map(|p| axis_rectangles(&p.pts)).collect();
+    let n = rects.len();
+    let overlap = |a0: f32, a1: f32, b0: f32, b1: f32| a0.max(b0) < a1.min(b1) - T;
+    let share_side = |a: &[f32; 4], b: &[f32; 4]| {
+        ((a[2] - b[0]).abs() <= T || (b[2] - a[0]).abs() <= T) && overlap(a[1], a[3], b[1], b[3])
+            || ((a[3] - b[1]).abs() <= T || (b[3] - a[1]).abs() <= T) && overlap(a[0], a[2], b[0], b[2])
+    };
+    let mut group: Vec<usize> = (0..n).collect();
+    fn root(g: &mut [usize], i: usize) -> usize {
+        let mut r = i;
+        while g[r] != r {
+            r = g[r];
+        }
+        g[i] = r;
+        r
+    }
+    for i in 0..n {
+        for j in (i + 1)..n {
+            if share_side(&rects[i], &rects[j]) {
+                let (a, b) = (root(&mut group, i), root(&mut group, j));
+                group[a] = b;
+            }
+        }
+    }
+    let mut members: std::collections::HashMap<usize, Vec<[f32; 4]>> = std::collections::HashMap::new();
+    for i in 0..n {
+        let r = root(&mut group, i);
+        members.entry(r).or_default().push(rects[i]);
+    }
+    let mut grids = Vec::new();
+    for cells in members.into_values().filter(|c| c.len() >= 2) {
+        let xs = levels(cells.iter().flat_map(|c| [c[0], c[2]]).collect());
+        let ys = levels(cells.iter().flat_map(|c| [c[1], c[3]]).collect());
+        if xs.len() < 3 || ys.len() < 2 || xs[xs.len() - 1] - xs[0] > 0.95 * pg.width {
+            continue;
+        }
+        let level = |v: &[f32], at: f32| v.iter().position(|&l| (l - at).abs() <= T);
+        let mut cover = vec![0u32; (xs.len() - 1) * (ys.len() - 1)];
+        let tiled = cells.iter().all(|c| {
+            let (Some(c0), Some(c1), Some(r0), Some(r1)) = (level(&xs, c[0]), level(&xs, c[2]), level(&ys, c[1]), level(&ys, c[3])) else { return false };
+            for r in r0..r1 {
+                for k in c0..c1 {
+                    cover[r * (xs.len() - 1) + k] += 1;
+                }
+            }
+            true
+        }) && cover.iter().all(|&k| k == 1);
+        if !tiled {
+            continue;
+        }
+        let verticals = cells.iter().flat_map(|c| [(c[0], c[1], c[3]), (c[2], c[1], c[3])]).collect();
+        grids.push(TableGrid { xs, ys, rules: Vec::new(), verticals });
+    }
+    grids.sort_by(|a, b| (a.ys[0], a.xs[0]).partial_cmp(&(b.ys[0], b.xs[0])).unwrap_or(std::cmp::Ordering::Equal));
+    grids
 }
 
 fn segments_touch(a: &BorderSeg, b: &BorderSeg) -> bool {
@@ -7581,6 +7687,15 @@ static QUESTION_FOOTER_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLo
 static TRAILING_TOTAL_RE: std::sync::LazyLock<regex::Regex> =
     std::sync::LazyLock::new(|| regex::Regex::new(r"(?i)[ \t]*\(\s*total\s+(\d{1,3})\s*marks?\s*\)\.?\s*$").unwrap());
 
+/// A question's printed total line ("(Total for Question 3 is 1 mark)"):
+/// whether it is question `number`'s own (an unnumbered total is), and its
+/// marks.
+fn printed_total(text: &str, number: u32) -> Option<(bool, Option<u32>)> {
+    let plain = plain_line(text);
+    let c = QUESTION_FOOTER_RE.captures(&plain)?;
+    Some((c.get(1).map_or(true, |n| n.as_str().parse::<u32>().ok() == Some(number)), c[2].parse().ok()))
+}
+
 /// The body of one mapped question, ready for normalisation: the question's
 /// own lines with its printed "(Total for Question N is M marks)" footer
 /// removed and recorded.
@@ -7807,6 +7922,19 @@ pub fn question_body_with_figures(pages: &[LayoutPage], q: &LayoutQuestion, figu
     // follows it.
     let mut footer_line: Option<usize> = None;
     let mut last_text_line: Option<usize> = None;
+    // A question ends at its own printed total ("(Total for Question 8 = 25
+    // marks)"): what follows it on the page, such as an answer booklet's
+    // "Indicate which question you are answering…" (Edexcel A Economics Jun
+    // 2021), is no part of it, figures included. Unless another question's
+    // total follows: a heading was missed, and the merged text stays for the
+    // gates to see. (Reference material appended to the question is kept.)
+    let line_at = |k: usize| &pages[q.lines[k].0].lines[q.lines[k].1];
+    let ends_at = (0..q.lines.len())
+        .rev()
+        .find_map(|k| printed_total(&line_at(k).text, q.number).map(|(own, _)| (k, own)))
+        .filter(|&(k, own)| own && q.reference_from.map_or(true, |r| k >= r))
+        .map(|(k, _)| k);
+    let after_total = |fp: usize, r: &[f32; 4]| ends_at.is_some_and(|f| fp > q.lines[f].0 || fp == q.lines[f].0 && r[1] >= line_at(f).y1);
     fn flush_code(kept: &mut Vec<String>, run: &mut Vec<&LayoutLine>) {
         if run.is_empty() {
             return;
@@ -7830,6 +7958,9 @@ pub fn question_body_with_figures(pages: &[LayoutPage], q: &LayoutQuestion, figu
         run.clear();
     }
     for (k, &(p, l)) in q.lines.iter().enumerate() {
+        if ends_at.is_some_and(|f| k > f) {
+            break;
+        }
         let line = &pages[p].lines[l];
         // Figures drawn above this line come first (never ahead of the
         // heading: a figure beside "5." follows it).
@@ -7858,12 +7989,10 @@ pub fn question_body_with_figures(pages: &[LayoutPage], q: &LayoutQuestion, figu
         if EXTRA_SPACE_RE.is_match(&plain_line(t)) {
             continue;
         }
-        if let Some(c) = QUESTION_FOOTER_RE.captures(plain_line(t).as_str()) {
-            if c.get(1).map_or(true, |n| n.as_str().parse::<u32>().ok() == Some(q.number)) {
-                footer_marks = c[2].parse().ok();
-                footer_line = Some(k);
-                continue;
-            }
+        if let Some((true, marks)) = printed_total(t, q.number) {
+            footer_marks = marks;
+            footer_line = Some(k);
+            continue;
         }
         // Older Edexcel papers close a question with "(Total 7 marks)" set
         // after its text or its last part's allocation ("(7)(Total 7 marks)").
@@ -7901,7 +8030,7 @@ pub fn question_body_with_figures(pages: &[LayoutPage], q: &LayoutQuestion, figu
     }
     flush_code(&mut kept, &mut code_run);
     for &(fp, r) in &figures[next_figure.min(figures.len())..] {
-        if !inline(fp, &r) {
+        if !inline(fp, &r) && !after_total(fp, &r) {
             kept.push(FIGURE_PLACEHOLDER.to_string());
         }
     }
@@ -9328,5 +9457,105 @@ mod tests {
             let q12 = body(&pages, &map, 12);
             assert!(!q12.contains("only") && !q12.contains("Examiner"), "{q12}");
         }
+    }
+
+    /// A small stacked fraction set in a line of text stands on that line:
+    /// it spans the text's baseline, its bar on the text's maths axis, so it
+    /// is no exponent of the word before it (Edexcel M2 Jan 2009 Q2 "is
+    /// 11/25", WJEC Physics Jun 2022 Q2 "is 3/2 kT"). A fraction set as an
+    /// exponent stands clear above the baseline, and stays one.
+    #[test]
+    fn a_small_fraction_on_a_line_of_text_is_no_exponent() {
+        let _guard = crate::pdf_render::pdfium_test_lock();
+        let on_the_line: &[(&str, u32, &str)] = &[
+            ("papers/used/Maths_A-level_M2_Papers-Edexcel__January_2009_QP.pdf", 1, r"where $\sin \theta = \frac{1}{14}$."),
+            ("papers/used/Maths_A-level_M2_Papers-Edexcel__January_2009_QP.pdf", 2, r"the ground is $\frac{11}{25}$."),
+            ("papers/used/Maths_A-level_M2_Papers-Edexcel__January_2009_QP.pdf", 7, r"the wall is $\frac{1}{5}$,"),
+            ("papers/used/Physics_A-level_Past-Papers_WJEC-Wales__June_2022_QP_-_Unit_3_WJEC_Physics_A-Level.pdf", 2, r"is $\frac{3}{2}kT$ where"),
+        ];
+        let exponents: &[(&str, u32, &str)] = &[
+            ("papers/used/Maths_A-level_Papers_OCR-MEI__June_2025_QP.pdf", 9, r"3 +x^{\frac{5}{2}}"),
+            ("papers/used/07_legacy_c3_or_c4_qp.pdf", 12, r"x^{\frac{1}{2}} - x^{-\frac{1}{2}}"),
+        ];
+        for &(rel, n, printed) in on_the_line.iter().chain(exponents) {
+            let Some(pages) = corpus_pages(rel) else { continue };
+            let map = build_layout_map(&pages);
+            let b = body(&pages, &map, n);
+            assert!(b.contains(printed) && !b.contains(r"\text{is}^"), "{rel} Q{n}: {b}");
+        }
+    }
+
+    /// The bar of a mean square (pV = ⅓Nm c̄², WJEC Physics Jun 2022 Q2) is
+    /// drawn over the letter and its square: set high to clear the square, it
+    /// does not touch the letter, which is still under it.
+    #[test]
+    fn a_bar_over_a_letter_and_its_square_covers_both() {
+        let _guard = crate::pdf_render::pdfium_test_lock();
+        let Some(pages) = corpus_pages("papers/used/Physics_A-level_Past-Papers_WJEC-Wales__June_2022_QP_-_Unit_3_WJEC_Physics_A-Level.pdf") else { return };
+        let map = build_layout_map(&pages);
+        let q2 = body(&pages, &map, 2);
+        assert!(q2.contains(r"pV = \frac{1}{3}Nm\overline{c^{2}}"), "{q2}");
+    }
+
+    /// A relation's key stays underlined when the next line of text is set
+    /// close under its rule (Eduqas Computer Science Jun 2023 Q7): that line
+    /// runs on past the rule, so it is text below, not a part under a bar.
+    #[test]
+    fn a_key_underlined_above_a_close_line_of_text_stays_underlined() {
+        let _guard = crate::pdf_render::pdfium_test_lock();
+        let Some(pages) = corpus_pages("papers/used/Computer-Science_A-level_Past-Papers_Eduqas__June_2023_QP_-_Component_2_Eduqas_Computer_Science_A-level.pdf") else { return };
+        let map = build_layout_map(&pages);
+        let q7 = body(&pages, &map, 7);
+        assert!(q7.contains(r"\underline{\text{destinationCode}}"), "{q7}");
+        assert!(q7.contains("costPerNight)"), "{q7}");
+    }
+
+    /// A question ends at its own printed total: the answer booklet's
+    /// instructions printed after it are no part of it (Edexcel A Economics
+    /// Jun 2021 Q8, "Indicate which question you are answering…", "Write
+    /// your answer here:").
+    #[test]
+    fn a_question_ends_at_its_own_printed_total() {
+        let _guard = crate::pdf_render::pdfium_test_lock();
+        let Some(pages) = corpus_pages("papers/used/Economics_A-level_Past-Papers_Edexcel-A__June_2021_QP_-_Paper_2_Edexcel_(A)_Economics_A-level.pdf") else { return };
+        let map = build_layout_map(&pages);
+        let q8 = question_body(&pages, map.questions.iter().find(|q| q.number == 8).expect("Q8 mapped"));
+        assert!(q8.text.trim_end().ends_with("macroeconomic objectives."), "{}", q8.text);
+        assert!(!q8.text.contains("Indicate which question") && !q8.text.contains("Write your answer here"), "{}", q8.text);
+        assert_eq!(q8.footer_marks, Some(25));
+        assert!(q8.ends_at_footer);
+        let q7 = question_body(&pages, map.questions.iter().find(|q| q.number == 7).expect("Q7 mapped"));
+        assert!(q7.text.trim_end().ends_with("during ‘a significant recession’."), "{}", q7.text);
+    }
+
+    /// When another question's total follows a question's own, a heading was
+    /// missed: the merged text stays in the body for the gates to see.
+    #[test]
+    fn a_body_merged_past_its_own_total_keeps_the_merged_text() {
+        let ln = |y0: f32, text: &str| LayoutLine { x0: 72.0, x1: 400.0, y0, y1: y0 + 8.0, baseline: y0 + 8.0, size: 11.0, text: text.to_string(), glyphs: Vec::new(), furniture: None, bold_lead: false, unplaced: 0, code: false, char_width: 0.0 };
+        let body_of = |texts: &[&str]| {
+            let lines: Vec<LayoutLine> = texts.iter().enumerate().map(|(i, t)| ln(100.0 + 30.0 * i as f32, t)).collect();
+            let q = LayoutQuestion { number: 13, lines: (0..lines.len()).map(|l| (0, l)).collect(), start_page: 0, end_page: 0, start_y: 100.0, end_y: None, reference_from: None };
+            let pages = vec![LayoutPage { width: 595.0, height: 842.0, lines, ..Default::default() }];
+            question_body(&pages, &q)
+        };
+        let ended = body_of(&["13 Calculate the speed.", "(Total for Question 13 = 4 marks)", "Write your answer here:"]);
+        assert_eq!(ended.text, "13 Calculate the speed.");
+        assert!(ended.ends_at_footer);
+        let merged = body_of(&["13 Calculate the speed.", "(Total for Question 13 = 4 marks)", "A student throws a ball upwards.", "(Total for Question 14 = 3 marks)"]);
+        assert!(merged.text.contains("A student throws a ball upwards.") && merged.text.contains("Total for Question 14"), "{}", merged.text);
+        assert!(!merged.ends_at_footer);
+    }
+
+    /// A table drawn as one rectangle per cell (Edexcel C4 Jan 2006 Q2's
+    /// table of x and y to complete) is a table: its blank cells stay blank.
+    #[test]
+    fn a_table_drawn_as_cell_rectangles_keeps_its_blank_cells() {
+        let _guard = crate::pdf_render::pdfium_test_lock();
+        let Some(pages) = corpus_pages("papers/used/Maths_A-level_C4_Papers-Edexcel__January_2006_QP.pdf") else { return };
+        let map = build_layout_map(&pages);
+        let q2 = body(&pages, &map, 2);
+        assert!(q2.contains(r"| $x$ | 0 | $\frac{\pi}{16}$ | $\frac{\pi}{8}$ | $\frac{3\pi}{16}$ | $\frac{\pi}{4}$ |"), "{q2}");
+        assert!(q2.contains("| $y$ | 1 |  |  | 1.20269 |  |"), "{q2}");
     }
 }

@@ -3085,6 +3085,148 @@
         "5"
       ],
       "note": "Q1-Q5 from the paper; 60 marks; back-page OCR logo after the last question (round 3, cluster 13)"
+    },
+    "edx_m2_jan09": {
+      "file": "papers/used/Maths_A-level_M2_Papers-Edexcel__January_2009_QP.pdf",
+      "fileHash": "DDA3A5D6214128818F478322CF2C9526971F1D4760507B548100EAEA7CCA60E1",
+      "cohort": "triage_fixtures",
+      "style": "numbered",
+      "confidence": "MEDIUM",
+      "expectedIds": [
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7
+      ],
+      "candidateIds": [
+        "1",
+        "2",
+        "3",
+        "4",
+        "5",
+        "6",
+        "7"
+      ],
+      "note": "Questions 1-7, read from the PDF (1.0 W1: Q2 hung 11/25 on 'is' as an exponent)"
+    },
+    "wjec_phys_u3_jun22": {
+      "file": "papers/used/Physics_A-level_Past-Papers_WJEC-Wales__June_2022_QP_-_Unit_3_WJEC_Physics_A-Level.pdf",
+      "fileHash": "1991BA40A171184A356CA910CEFDF69B23E7CE3684E8F1675441FA26B5DC402C",
+      "cohort": "triage_fixtures",
+      "style": "numbered",
+      "confidence": "MEDIUM",
+      "expectedIds": [
+        1,
+        2,
+        3,
+        4,
+        5,
+        6
+      ],
+      "candidateIds": [
+        "1",
+        "2",
+        "3",
+        "4",
+        "5",
+        "6"
+      ],
+      "note": "Questions 1-6, read from the PDF (1.0 W1: Q2's bar of c-bar squared set on the square)"
+    },
+    "eduqas_cs_c2_jun23": {
+      "file": "papers/used/Computer-Science_A-level_Past-Papers_Eduqas__June_2023_QP_-_Component_2_Eduqas_Computer_Science_A-level.pdf",
+      "fileHash": "E9EB35CC93450EDC8E2D24F75B6E375D1AA50B3FF6C353167FE0A0BD173ABA7B",
+      "cohort": "triage_fixtures",
+      "style": "numbered",
+      "confidence": "MEDIUM",
+      "expectedIds": [
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8,
+        9,
+        10,
+        11,
+        12
+      ],
+      "candidateIds": [
+        "1",
+        "2",
+        "3",
+        "4",
+        "5",
+        "6",
+        "7",
+        "8",
+        "9",
+        "10",
+        "11",
+        "12"
+      ],
+      "note": "Questions 1-12, read from the PDF (1.0 W1: Q7's primary-key underline lost)"
+    },
+    "edxa_econ_p2_jun21": {
+      "file": "papers/used/Economics_A-level_Past-Papers_Edexcel-A__June_2021_QP_-_Paper_2_Edexcel_(A)_Economics_A-level.pdf",
+      "fileHash": "C64BD0D97E6305A3724D286140349794B71C4E169D587756B87AC6371B2C088D",
+      "cohort": "triage_fixtures",
+      "style": "numbered",
+      "confidence": "MEDIUM",
+      "expectedIds": [
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8
+      ],
+      "candidateIds": [
+        "1",
+        "2",
+        "3",
+        "4",
+        "5",
+        "6",
+        "7",
+        "8"
+      ],
+      "note": "Questions 1-8, read from the PDF; Section C answers one of Q7, Q8 (1.0 W1: Q8 carries answer-booklet furniture)"
+    },
+    "cie_s1_jun19": {
+      "file": "papers/used/Maths_A-level_Papers_CIE__June_2019_(v1)_QP_-_S1.pdf",
+      "fileHash": "8BFDFC8C3CBA78070DEBCCAB43781110BE122C6CB0950E6D6E0D68249DB051F5",
+      "cohort": "triage_fixtures",
+      "style": "numbered",
+      "confidence": "MEDIUM",
+      "expectedIds": [
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8
+      ],
+      "candidateIds": [
+        "1",
+        "2",
+        "3",
+        "4",
+        "5",
+        "6",
+        "7",
+        "8"
+      ],
+      "note": "Questions 1-8, read from the PDF (1.0 W1: Q2 loses 'box')"
     }
   }
 }

@@ -94,6 +94,17 @@ static INLINE_BOX_RE: LazyLock<regex::Regex> =
 /// box.", "from the box."): the margin's "box" never follows one.
 const BOX_NOUN_LEADS: &[&str] = &["a", "an", "the", "one", "two", "each", "every", "any", "this", "that", "correct", "appropriate", "empty", "blank", "shaded"];
 
+/// A possessive, which takes "box" as its noun as a determiner does ("from
+/// Rosa’s box.", CIE S1 Jun 2019; "the students' box."). A contraction
+/// ("it’s") is none, nor a word closing a quotation ("‘isotopes’").
+fn is_possessive(word: &str) -> bool {
+    const CONTRACTED: &[&str] = &["it", "that", "there", "here", "what", "who", "where", "he", "she", "let"];
+    let quoted = word.starts_with(|c: char| matches!(c, '‘' | '\'' | '"' | '“'));
+    let lower = word.to_lowercase();
+    let contraction = CONTRACTED.iter().any(|w| lower == format!("{w}'s") || lower == format!("{w}’s"));
+    !quoted && !contraction && ["'s", "’s", "s'", "s’"].iter().any(|end| word.ends_with(end))
+}
+
 static INLINE_IB_RE: LazyLock<regex::Regex> =
     LazyLock::new(|| regex::Regex::new(r"IB\$?/M/\$?[A-Za-z0-9$/]*").unwrap());
 
@@ -117,7 +128,7 @@ pub fn strip_ocr_boilerplate(content: &str) -> String {
     let out = INLINE_BOX_RE
         .replace_all(&out, |c: &regex::Captures| {
             let lead = c[1].trim_matches(|ch: char| !ch.is_alphanumeric()).to_ascii_lowercase();
-            if BOX_NOUN_LEADS.contains(&lead.as_str()) { c[0].to_string() } else { format!("{} .", &c[1]) }
+            if BOX_NOUN_LEADS.contains(&lead.as_str()) || is_possessive(&c[1]) { c[0].to_string() } else { format!("{} .", &c[1]) }
         })
         .to_string();
     // margin debris "box" glued after a part label or at line start:
@@ -1008,6 +1019,20 @@ mod tests {
         assert_eq!(strip_ocr_boilerplate("selects 2 pieces of fruit at random from the box."), "selects 2 pieces of fruit at random from the box.");
         // Margin debris glued to a sentence still goes.
         assert_eq!(strip_ocr_boilerplate("Which change increases the efficiency box."), "Which change increases the efficiency .");
+    }
+
+    #[test]
+    fn box_after_a_possessive_is_question_text() {
+        // CIE S1 Jun 2019 Q2: "… one fruit is chosen at random from Rosa’s
+        // box." A possessive, like a determiner, takes "box" as its noun.
+        let line = "is chosen at random from Jameel’s box and one fruit is chosen at random from Rosa’s box. The";
+        assert_eq!(strip_ocr_boilerplate(line), line);
+        assert_eq!(strip_ocr_boilerplate("a counter from the students' box."), "a counter from the students' box.");
+        assert_eq!(strip_ocr_boilerplate("a counter from Ben's box."), "a counter from Ben's box.");
+        // A contraction or a closing quotation is no possessive: margin
+        // debris after one still goes.
+        assert_eq!(strip_ocr_boilerplate("State what it’s box."), "State what it’s .");
+        assert_eq!(strip_ocr_boilerplate("Define the term ‘isotopes’ box."), "Define the term ‘isotopes’ .");
     }
 
     #[test]

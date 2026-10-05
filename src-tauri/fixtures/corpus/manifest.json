@@ -136,6 +136,11 @@
       "bytes": 957302
     },
     {
+      "path": "papers/used/Computer-Science_A-level_Past-Papers_Eduqas__June_2023_QP_-_Component_2_Eduqas_Computer_Science_A-level.pdf",
+      "sha256": "e9eb35cc93450edc8e2d24f75b6e375d1aa50b3ff6c353167fe0a0bd173aba7b",
+      "bytes": 256774
+    },
+    {
       "path": "papers/used/core pure 1 '21.pdf",
       "sha256": "5181985f57b07fc73c7365ca1ab9de9c32fec802cf99b4573991d5cdc6c402f4",
       "bytes": 896400
@@ -154,6 +159,11 @@
       "path": "papers/used/Economics_A-level_Past-Papers_Edexcel-A__June_2018_QP_-_Paper_2_Edexcel_(A)_Economics_AS-level.pdf",
       "sha256": "d4e4e8c501f260d3b001ef2725f23500ca909fb10a04e5a1ae699d59758b7221",
       "bytes": 770239
+    },
+    {
+      "path": "papers/used/Economics_A-level_Past-Papers_Edexcel-A__June_2021_QP_-_Paper_2_Edexcel_(A)_Economics_A-level.pdf",
+      "sha256": "c64bd0d97e6305a3724d286140349794b71c4e169d587756b87ac6371b2c088d",
+      "bytes": 876518
     },
     {
       "path": "papers/used/Economics_A-level_Past-Papers_OCR__June_2024_QP_-_Paper_1_OCR_Economics_A-level.pdf",
@@ -211,6 +221,11 @@
       "bytes": 196842
     },
     {
+      "path": "papers/used/Maths_A-level_M2_Papers-Edexcel__January_2009_QP.pdf",
+      "sha256": "dda3a5d6214128818f478322cf2c9526971f1d4760507b548100eaea7cca60e1",
+      "bytes": 141221
+    },
+    {
       "path": "papers/used/Maths_A-level_M3_Papers-Edexcel__June_2004_QP.pdf",
       "sha256": "d5e091472ef21fa7f1498138b1fc8c9217b02dcf74ed8fe91eb57fbaf4079ce4",
       "bytes": 115010
@@ -229,6 +244,11 @@
       "path": "papers/used/Maths_A-level_Papers_CIE__June_2017_(v1)_QP_-_P2.pdf",
       "sha256": "6416d5e825f5849e573375f0924623cb5b9c2d13ff63f6c6223f15d9295cf077",
       "bytes": 98451
+    },
+    {
+      "path": "papers/used/Maths_A-level_Papers_CIE__June_2019_(v1)_QP_-_S1.pdf",
+      "sha256": "8bfdfc8c3cba78070debccab43781110be122c6cb0950e6d6e0d68249db051f5",
+      "bytes": 118638
     },
     {
       "path": "papers/used/Maths_A-level_Papers_Edexcel-Further__June_2025_QP.pdf",
@@ -349,6 +369,11 @@
       "path": "papers/used/Physics_A-level_Past-Papers_OCR-A__June_2019_QP.pdf",
       "sha256": "a629d3e91a4b0c0ddbb3158eb3676a468e5eaa75b99a3bdb293da061bff789fb",
       "bytes": 4241063
+    },
+    {
+      "path": "papers/used/Physics_A-level_Past-Papers_WJEC-Wales__June_2022_QP_-_Unit_3_WJEC_Physics_A-Level.pdf",
+      "sha256": "1991ba40a171184a356ca910cefdf69b23e7ce3684e8f1675441fa26b5dc402c",
+      "bytes": 469719
     },
     {
       "path": "papers/used/Physics_GCSE_Past-Papers_OCR-A__November_2020_QP_-_Paper_1_OCR_(A)_Physics_GCSE.pdf",
