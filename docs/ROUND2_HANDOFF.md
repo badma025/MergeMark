@@ -53,9 +53,9 @@ updater, mark schemes, the six wrong strict cards from round 3.
 - **Numbers:** cargo test 378 passed, 0 failed. Calibration c13: 67/67 OK, the 22 originals unchanged (243/244, 69/69, zero attempts). Triage unused-c13 on the 123 papers left: PASS 31, FAIL 42, FLAGGED 43, REVIEW 7, unchanged from c11b on the same papers; 17 cards changed, with no regression in the targeted audits.
 - **Workflow notes from round 3:**
   - Code review ran before each cluster's verify chain (on the dev copy's diff), so its corrections were verified once.
-  - A verify chain is `bash output/fix-log/verify.sh <stamp>`; `verify.sh` has no `set -e`, so killing its cargo test moves it on to calibration. To stop one, stop the background task, then end the `bash verify.sh`, `node` calibration/triage and `cargo`/`e2e_import` processes.
+  - A verify chain is `bash scripts/verify.sh <stamp>`; `verify.sh` has no `set -e`, so killing its cargo test moves it on to calibration. To stop one, stop the background task, then end the `bash verify.sh`, `node` calibration/triage and `cargo`/`e2e_import` processes.
   - The seeded blinded sample is the same for the same paper set, and moves only when a card changes stratum.
-- **Baseline for a round 4:** run `unused-c13` and calibration run `c13`. Still open: "What is left" in the report (new strict cards found wrong in round 3 come first), Tesseract in WSL, macOS Vision run on a Mac, and nine tests that read the deleted root PDFs and so check nothing.
+- **Baseline for a round 4:** run `unused-c13` and calibration run `c13`. Still open: "What is left" in the report (new strict cards found wrong in round 3 come first), Tesseract in WSL, macOS Vision run on a Mac, and nine tests that read the deleted root PDFs and so check nothing (*stale: round 3 repointed them; see `docs/RELEASE_1_0_PLAN.md` W0*).
 
 ## Where things stood (3 Oct 2026, end of round 2)
 - **Committed on branch `import-fixes-rounds-1-2`** (3 Oct 2026, at the user's request), not pushed. See "Windows beta" below for what followed.
@@ -97,7 +97,7 @@ The user chose: commit, then the Windows beta, then round 3. The first release i
   - Worksheet PDFs printed `[MCQ:A]` markers; options now print their letter.
   - A worksheet compile that pdflatex did not finish (MiKTeX installing packages mid-run) was reported as compiled. It is now an error that keeps the log.
   - Hidden: the free-parses counter, the Settings "API & Spend" tab (credentials, OpenRouter dashboard), the "Auto-Topics" button. The REVIEW badge no longer mentions a vision fallback. Mark-scheme mode says import is limited.
-- **Known, not fixed:** the installer also ships the developer CLI `e2e_import.exe` (Tauri bundles every `src/bin` target); the flashcard CSV export carries pdflatex layout commands (`\needspace`, `\hfill`); the installer is unsigned (SmartScreen warning); a compile leaves `mergemark_logo.png` in Downloads.
+- **Known, not fixed:** the installer also ships the developer CLI `e2e_import.exe` (Tauri bundles every `src/bin` target; *stale: fixed in `68b77db`, which moved it to `examples/`*); the flashcard CSV export carries pdflatex layout commands (`\needspace`, `\hfill`); the installer is unsigned (SmartScreen warning); a compile leaves `mergemark_logo.png` in Downloads.
 - Tester notes: `docs/BETA_TESTERS.md`.
 
 ## Rules (from the user's original brief; still in force)
@@ -136,7 +136,7 @@ The user chose: commit, then the Windows beta, then round 3. The first release i
   - A parallel session refactored the Tier-0 build seam in the main tree ("Simplify the Tier-0 build seam"). The user chose to let it finish first. Its change is in main, and it changes no card: 855 calibration and 1771 triage cards are identical (`output/fix-log/seam/`, run `unused-seam`).
 
 ## Evidence behind the plan (from the unused-c5 logs)
-`node output/fix-log/flag-reasons.mjs unused-c5` counts the `[TIER0_FALLBACK] reason=…` lines in `output/triage/run-unused-c5/logs/`:
+`node scripts/flag-reasons.mjs unused-c5` counts the `[TIER0_FALLBACK] reason=…` lines in `output/triage/run-unused-c5/logs/`:
 
 | gate reason | cards flagged |
 |---|---|
@@ -334,20 +334,20 @@ Don't use `astra-flash-orchestrator`, and don't delegate to Flash.
    - `README.md`
 
    The first one is `snap-c5`, which is the round-1 end state.
-1. **Pick the fixtures.** Move the PDF from `papers/unused/` to `papers/used/` with an ordinary move, since `papers/` isn't tracked by git. Then add it to `PAPERS` in `scripts/lib/zero-cost-accounting.mjs` (cohort `triage_fixtures`), and add its expected IDs with `node output/fix-log/add-fixture.mjs <name> <lo> <hi> "<note>"`. Read the IDs from the PDF itself.
+1. **Pick the fixtures.** Move the PDF from `papers/unused/` to `papers/used/` with an ordinary move, since `papers/` isn't tracked by git. Then add it to `PAPERS` in `scripts/lib/zero-cost-accounting.mjs` (cohort `triage_fixtures`), and add its expected IDs with `node scripts/add-fixture.mjs <name> <lo> <hi> "<note>"`. Read the IDs from the PDF itself.
 2. **Diagnose** from its `--dump-layout` output (`diagnosing-bugs`). Write a failing test on the real paper (`tdd`), fix, and run `cargo test`.
-3. **Verify** with `bash output/fix-log/verify.sh c<N>`. It runs cargo test, calibration and triage in sequence, writes logs to `output/fix-log/c<N>-*.log`, and records status in `c<N>-status.txt`. It takes about 1.5–2 hours, so run it in the background and don't edit Rust in the main tree meanwhile.
+3. **Verify** with `bash scripts/verify.sh c<N>`. It runs cargo test, calibration and triage in sequence, writes logs to `output/fix-log/c<N>-*.log`, and records status in `c<N>-status.txt`. It takes about 1.5–2 hours, so run it in the background and don't edit Rust in the main tree meanwhile.
 4. **Compare:**
-   - `node output/fix-log/compare.mjs output/triage/run-unused-c5 output/triage/run-unused-c<N>`
-   - `node output/fix-log/trajectory.mjs unused-001 unused-c1 … unused-c<N>`, which reports on papers common to every run, so moved fixtures drop out
-   - `node output/fix-log/remaining.mjs unused-c<N>`
-   - `node output/fix-log/flag-reasons.mjs unused-c<N>`
+   - `node scripts/compare.mjs output/triage/run-unused-c5 output/triage/run-unused-c<N>`
+   - `node scripts/trajectory.mjs unused-001 unused-c1 … unused-c<N>`, which reports on papers common to every run, so moved fixtures drop out
+   - `node scripts/remaining.mjs unused-c<N>`
+   - `node scripts/flag-reasons.mjs unused-c<N>`
    - Calibration summary: `output/zero-cost-orchestration/c-calibration/run-c<N>/summary-c<N>.txt`
 5. **Blinded audit:**
    - `node scripts/build-audit-pack.mjs --run output/triage/run-unused-c<N>`
-   - `node output/fix-log/blind.mjs split output/triage/run-unused-c<N>/audit-pack 4`
-   - Four independent general-purpose agents, each given `output/fix-log/audit-rubric.md` and one slice. They don't see the automatic verdicts.
-   - `node output/fix-log/blind.mjs merge output/triage/run-unused-c<N>/audit-pack`
+   - `node scripts/blind.mjs split output/triage/run-unused-c<N>/audit-pack 4`
+   - Four independent general-purpose agents, each given `docs/audit-rubric.md` and one slice. They don't see the automatic verdicts.
+   - `node scripts/blind.mjs merge output/triage/run-unused-c<N>/audit-pack`
    - Round 1 reported MAJOR among the audited cards from PASS papers, and over all 48 sampled cards.
    - Don't regenerate an earlier run's audit pack.
 6. **Code-review** with the `code-review` skill.
@@ -375,8 +375,8 @@ Don't use `astra-flash-orchestrator`, and don't delegate to Flash.
 - **Project memory** (`MEMORY.md`) already holds: heredoc mangling, calibration recompiles from source, PDFium quirks, dev copy while verifying.
 - **Learned in round 2:**
   - *Every card a change makes strict must be checked against its source pages.* A resolved defect (an unidentified glyph, a deleted line) can have been hiding another, and no gate sees it (S1 Jun 2012's lost digits, the six cards in "Release readiness").
-    - Card-level tools: `output/fix-log/card-changes.mjs` (every changed card between two runs) and `bare-numbers.mjs` (number lines a card gains).
-    - Targeted packs: `scripts/build-audit-pack.mjs --ids <file>`, and `output/fix-log/cal-results.mjs` to make a calibration run usable by it.
+    - Card-level tools: `scripts/card-changes.mjs` (every changed card between two runs) and `bare-numbers.mjs` (number lines a card gains).
+    - Targeted packs: `scripts/build-audit-pack.mjs --ids <file>`, and `scripts/cal-results.mjs` to make a calibration run usable by it.
   - *Python on Windows writes CRLF in text mode.* `core.autocrlf` is true, so git normalises on commit, but snippets must be matched with line endings normalised. Patch scripts in round 2 read with `newline=''` and wrote back the file's own ending.
   - *Run the `e2e_import` binary from `src-tauri/`*: PDFium is found relative to the working directory, and elsewhere it reports "layout unavailable".
   - *`pdftotext`'s whole-file output splits at form feeds inside page text*, so its index is not a page number. Read a page with `-f N -l N`. The triage's `stats.pages` still uses the split (left for comparable runs).

@@ -6,7 +6,7 @@ Follow-up to [TRIAGE_AUDIT_UNUSED_001.md](TRIAGE_AUDIT_UNUSED_001.md). Every run
 
 - **Calibration** after each cluster: the 22 original papers stayed 22/22 fresh, 243/244 strict (historical) and 69/69 (test papers), zero attempts, in every run. The extra rows are papers moved from `papers/unused/` to `papers/used/` as fixtures (cohort `triage_fixtures`, registered in `scripts/lib/zero-cost-accounting.mjs` and `scripts/fixtures/source-expected-ids.json`).
 - **Triage** of what is left in `papers/unused/`, compared with run unused-001 **on the same papers** (fixtures excluded from both sides).
-- **Blinded visual audit** after each cluster: a fresh seeded sample (`build-audit-pack.mjs --seed 7`, 48 cards, same strata) judged by four agents that saw only the card, its pages and its figure crops, against a written rubric (`output/fix-log/audit-rubric.md`).
+- **Blinded visual audit** after each cluster: a fresh seeded sample (`build-audit-pack.mjs --seed 7`, 48 cards, same strata) judged by four agents that saw only the card, its pages and its figure crops, against a written rubric (`docs/audit-rubric.md`).
 
 Caveats that matter for reading the numbers:
 - Triage PASS needs every card of a paper to be clean, so a paper moves to PASS only when its last problem goes. Most fixes lift papers from FAIL to FLAGGED first.
@@ -687,7 +687,7 @@ Known gaps outside these numbers:
   - Edexcel-A Economics Jun 2021 Q8 (a PASS paper): the answer booklet's "Indicate which question you are answering…" and "Write your answer here:" follow its total.
   - CIE S1 Jun 2019 Q2: "from Rosa's box." loses "box" (MINOR; so in round 2 too).
   - Edexcel C4 Jan 2006 Q2 (fixture): the x/y table with blank cells to complete is flattened into lines, so the task can't be read.
-- Nine tests read papers from the repository root (`../physics '21.pdf`, `../physics '24.pdf`, in `deterministic.rs`, `doc_map.rs`, `pdf_render.rs` and `stroke_census.rs`). Those copies are among the old paper PDFs deleted from the working tree before round 1, so the tests return early and check nothing. The same papers are fixtures in `papers/used/`.
+- *(Corrected by the 1.0 plan, W0.)* The tests that read papers from the repository root were repointed at `papers/used/` in round 3; the one real orphan (`doc_map.rs`, `'23 edexcel.pdf`, a paper nowhere in the repo) is deleted. A test whose paper is missing now fails under `MERGEMARK_REQUIRE_FIXTURES=1`, which CI and `scripts/verify.sh` set; the papers the tests read are committed encrypted (`src-tauri/fixtures/corpus/`).
 - Monotype Symbol glyph ids are read in the installed font's order, checked by advance. A subset that renumbered its glyphs would not keep that order, and the advance cannot tell apart symbols of equal width. Of the 34 SymbolMT programs in the fixtures, only one did (2 glyphs), and its ids fall outside those read this way.
 
 ## Files
