@@ -132,11 +132,160 @@ fn cancelled(cancel: &AtomicBool) -> Result<(), String> {
     }
 }
 
+/// One reason the reader declines a document.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Refusal {
+    /// The 0-based page the reason was found on, when it is a page's.
+    pub page: Option<usize>,
+    pub reason: String,
+}
+
+/// Every reason the reader declines a document, not only the first: what
+/// `extract` refuses on each page, reading on past each refusal.
+#[derive(Debug, Clone)]
+pub struct Census {
+    pub pages: usize,
+    /// 0-based pages carrying `/Rotate`.
+    pub rotated_pages: Vec<usize>,
+    pub refusals: Vec<Refusal>,
+}
+
+/// How a refusal is handled. The reader refuses a document at its first
+/// reason; a census notes each reason and reads on. One code path serves
+/// both, so a census cannot drift from what the reader refuses.
+struct Judge {
+    census: Option<Vec<Refusal>>,
+}
+
+impl Judge {
+    fn strict() -> Self {
+        Judge { census: None }
+    }
+
+    /// Decline the document with "page N: reason" or, in a census, note the
+    /// reason and go on.
+    fn refuse_page(&mut self, page: usize, reason: impl Into<String>) -> Result<(), String> {
+        let reason = reason.into();
+        match &mut self.census {
+            None => Err(format!("page {}: {reason}", page + 1)),
+            Some(found) => {
+                Self::note(found, Some(page), reason);
+                Ok(())
+            }
+        }
+    }
+
+    /// Decline the document with the reason as it stands (the reason names
+    /// no page) or, in a census, note it against `page` and go on.
+    fn refuse_doc(&mut self, page: Option<usize>, reason: impl Into<String>) -> Result<(), String> {
+        let reason = reason.into();
+        match &mut self.census {
+            None => Err(reason),
+            Some(found) => {
+                Self::note(found, page, reason);
+                Ok(())
+            }
+        }
+    }
+
+    fn note(found: &mut Vec<Refusal>, page: Option<usize>, reason: String) {
+        let refusal = Refusal { page, reason };
+        if !found.contains(&refusal) {
+            found.push(refusal);
+        }
+    }
+}
+
+/// A page with `/Rotate` as it is displayed: raw user space (y up) mapped to
+/// the turned page, y down from its top edge. PDFium reports the clockwise
+/// quarter turns.
+#[derive(Debug, Clone, Copy)]
+struct Turn {
+    quarters: u8,
+    width: f32,
+    height: f32,
+}
+
+impl Turn {
+    fn new(page: &PdfPage) -> Result<Turn, String> {
+        let quarters = match page.rotation().map_err(|e| e.to_string())? {
+            PdfPageRenderRotation::None => 0,
+            PdfPageRenderRotation::Degrees90 => 1,
+            PdfPageRenderRotation::Degrees180 => 2,
+            PdfPageRenderRotation::Degrees270 => 3,
+        };
+        Ok(Turn { quarters, width: page.width().value, height: page.height().value })
+    }
+
+    /// The displayed page's width and height.
+    fn size(&self) -> (f32, f32) {
+        if self.quarters % 2 == 1 {
+            (self.height, self.width)
+        } else {
+            (self.width, self.height)
+        }
+    }
+
+    fn point(&self, x: f32, y: f32) -> (f32, f32) {
+        match self.quarters {
+            1 => (y, x),
+            2 => (self.width - x, y),
+            3 => (self.height - y, self.width - x),
+            _ => (x, self.height - y),
+        }
+    }
+
+    /// A raw user-space box (y up) on the displayed page (y down).
+    fn bounds(&self, left: f32, right: f32, top: f32, bottom: f32) -> Bounds {
+        if self.quarters == 0 {
+            // Unturned, exactly as the reader has always measured: a box
+            // PDFium reports inverted stays inverted, and is refused.
+            return Bounds { left, right, top: self.height - top, bottom: self.height - bottom };
+        }
+        let (a, b) = (self.point(left, top), self.point(right, bottom));
+        Bounds { left: a.0.min(b.0), right: a.0.max(b.0), top: a.1.min(b.1), bottom: a.1.max(b.1) }
+    }
+
+    /// A glyph's text matrix as the turned page shows it (y up), so that
+    /// text set upright on the displayed page reads as upright.
+    fn matrix(&self, m: [f32; 6]) -> [f32; 6] {
+        let [a, b, c, d, e, f] = m;
+        match self.quarters {
+            1 => [b, -a, d, -c, e, f],
+            2 => [-a, -b, -c, -d, e, f],
+            3 => [-b, a, -d, c, e, f],
+            _ => m,
+        }
+    }
+}
+
 /// Native PDFium handles never leave this collection pass.
 pub fn collect_page_evidence(
     path: &Path,
     cancel: &AtomicBool,
 ) -> Result<Vec<PageEvidence>, String> {
+    collect_with(path, cancel, &mut Judge::strict(), false).map(|(pages, _, _)| pages)
+}
+
+/// The census of one document: every refusal of every page (see `Census`).
+/// With `turn_rotated_pages` a rotated page is read as it is displayed, a
+/// probe of what lies behind the reader's refusal of rotated pages;
+/// otherwise such a page is noted and not read.
+pub fn census(path: &Path, turn_rotated_pages: bool) -> Result<Census, String> {
+    let cancel = AtomicBool::new(false);
+    let mut judge = Judge { census: Some(Vec::new()) };
+    let (pages, page_count, rotated_pages) = collect_with(path, &cancel, &mut judge, turn_rotated_pages)?;
+    extract_with(&pages, &cancel, &mut judge)?;
+    Ok(Census { pages: page_count, rotated_pages, refusals: judge.census.unwrap_or_default() })
+}
+
+/// The pages' evidence, the document's page count and its rotated pages.
+fn collect_with(
+    path: &Path,
+    cancel: &AtomicBool,
+    judge: &mut Judge,
+    turn_rotated_pages: bool,
+) -> Result<(Vec<PageEvidence>, usize, Vec<usize>), String> {
     cancelled(cancel)?;
     let pdfium = crate::pdf_render::get_pdfium()?;
     let document = pdfium
@@ -146,26 +295,24 @@ pub fn collect_page_evidence(
         return Err("Mark scheme exceeds the page limit".into());
     }
     let mut result = Vec::new();
+    let mut rotated = Vec::new();
     for (page_index, page) in document.pages().iter().enumerate() {
         cancelled(cancel)?;
+        let turn = Turn::new(&page)?;
         // The first profiles support unrotated pages. Decline rather than
         // silently mixing rotated text coordinates with path coordinates.
-        if page.rotation().map_err(|e| e.to_string())? != PdfPageRenderRotation::None {
-            return Err(format!(
-                "page {}: rotated layout unsupported",
-                page_index + 1
-            ));
+        if turn.quarters != 0 {
+            rotated.push(page_index);
+            if !turn_rotated_pages {
+                judge.refuse_page(page_index, "rotated layout unsupported")?;
+                continue;
+            }
         }
-        let height = page.height().value;
-        let bounds = |b: PdfRect| Bounds {
-            left: b.left().value,
-            right: b.right().value,
-            top: height - b.top().value,
-            bottom: height - b.bottom().value,
-        };
+        let (width, height) = turn.size();
+        let bounds = |b: PdfRect| turn.bounds(b.left().value, b.right().value, b.top().value, b.bottom().value);
         let mut evidence = PageEvidence {
             page_index,
-            width: page.width().value,
+            width,
             height,
             glyphs: Vec::new(),
             rules: Vec::new(),
@@ -179,28 +326,29 @@ pub fn collect_page_evidence(
             if ch.is_generated().unwrap_or(false) {
                 continue;
             }
-            let value = ch
-                .unicode_string()
-                .ok_or_else(|| format!("page {}: unmapped glyph {}", page_index + 1, ch.index()))?;
+            let Some(value) = ch.unicode_string() else {
+                judge.refuse_page(page_index, format!("unmapped glyph {}", ch.index()))?;
+                continue;
+            };
             if value.trim().is_empty() {
                 continue;
             }
             let matrix = ch.matrix().map_err(|e| e.to_string())?;
-            let (_, y) = ch.origin().map_err(|e| e.to_string())?;
+            let (x, y) = ch.origin().map_err(|e| e.to_string())?;
             evidence.glyphs.push(GlyphEvidence {
                 text: value,
                 character_index: ch.index() as usize,
                 bounds: bounds(ch.tight_bounds().map_err(|e| e.to_string())?),
                 font_size: ch.scaled_font_size().value,
-                baseline: height - y.value,
-                transformation: [
+                baseline: turn.point(x.value, y.value).1,
+                transformation: turn.matrix([
                     matrix.a(),
                     matrix.b(),
                     matrix.c(),
                     matrix.d(),
                     matrix.e(),
                     matrix.f(),
-                ],
+                ]),
             });
         }
         for object in page.objects().iter() {
@@ -208,12 +356,7 @@ pub fn collect_page_evidence(
                 PdfPageObject::Text(_) => (),
                 PdfPageObject::Path(path) => {
                     let quad = path.bounds().map_err(|e| e.to_string())?;
-                    let b = Bounds {
-                        left: quad.left().value,
-                        right: quad.right().value,
-                        top: height - quad.top().value,
-                        bottom: height - quad.bottom().value,
-                    };
+                    let b = turn.bounds(quad.left().value, quad.right().value, quad.top().value, quad.bottom().value);
                     let matrix = path.matrix().map_err(|e| e.to_string())?;
                     let mut start = None;
                     let mut previous = None;
@@ -222,7 +365,7 @@ pub fn collect_page_evidence(
                     for segment in path.segments().iter() {
                         let (x, y) = segment.point();
                         let (x, y) = matrix.apply_to_points(x, y);
-                        let point = (x.value, height - y.value);
+                        let point = turn.point(x.value, y.value);
                         match segment.segment_type() {
                             PdfPathSegmentType::MoveTo => {
                                 start = Some(point);
@@ -268,18 +411,18 @@ pub fn collect_page_evidence(
                 }
                 _ => {
                     let quad = object.bounds().map_err(|e| e.to_string())?;
-                    evidence.unresolved_graphics.push(Bounds {
-                        left: quad.left().value,
-                        right: quad.right().value,
-                        top: height - quad.top().value,
-                        bottom: height - quad.bottom().value,
-                    });
+                    evidence.unresolved_graphics.push(turn.bounds(
+                        quad.left().value,
+                        quad.right().value,
+                        quad.top().value,
+                        quad.bottom().value,
+                    ));
                 }
             }
         }
         result.push(evidence);
     }
-    Ok(result)
+    Ok((result, document.pages().len() as usize, rotated))
 }
 
 #[derive(Clone)]
@@ -543,7 +686,7 @@ fn question_key(text: &str, previous: Option<&QuestionKey>) -> Option<QuestionKe
     })
 }
 
-fn reconstruct(glyphs: &[&GlyphEvidence]) -> Result<String, String> {
+fn reconstruct(glyphs: &[&GlyphEvidence], page: usize, judge: &mut Judge) -> Result<String, String> {
     let ls = lines(glyphs.iter().copied());
     for line in &ls {
         for g in line {
@@ -557,16 +700,16 @@ fn reconstruct(glyphs: &[&GlyphEvidence]) -> Result<String, String> {
                 || g.text.contains('\u{fffd}')
                 || g.text.chars().any(|c| c == '\0')
             {
-                return Err("unreliable glyph geometry or encoding".into());
+                judge.refuse_page(page, "unreliable glyph geometry or encoding")?;
             }
             if g.text.chars().any(|c| "=^_∫√∑∏".contains(c)) {
-                return Err("formula transcription requires source review".into());
+                judge.refuse_page(page, "formula transcription requires source review")?;
             }
         }
     }
     for pair in ls.windows(2) {
         if pair[1][0].baseline - pair[0][0].baseline < pair[0][0].font_size * 0.8 {
-            return Err("spatial math or overlapping baselines requires source review".into());
+            judge.refuse_page(page, "spatial math or overlapping baselines requires source review")?;
         }
     }
     Ok(ls
@@ -576,13 +719,14 @@ fn reconstruct(glyphs: &[&GlyphEvidence]) -> Result<String, String> {
         .join("\n"))
 }
 
-fn extract_rows(page: &PageEvidence, region: &TableRegion) -> Result<Vec<PhysicalRow>, String> {
+fn extract_rows(page: &PageEvidence, region: &TableRegion, judge: &mut Judge) -> Result<Vec<PhysicalRow>, String> {
+    let p = page.page_index;
     if page
         .unresolved_graphics
         .iter()
         .any(|b| b.intersects(region.bounds))
     {
-        return Err("table contains unresolved graphical content".into());
+        judge.refuse_page(p, "table contains unresolved graphical content")?;
     }
     let mut columns: Vec<Vec<&GlyphEvidence>> = vec![Vec::new(); region.columns.len()];
     for rule in &page.rules {
@@ -601,7 +745,7 @@ fn extract_rows(page: &PageEvidence, region: &TableRegion) -> Result<Vec<Physica
                     .any(|c| (c.left - x).abs() < 4.0 || (c.right - x).abs() < 4.0)
             };
             if !at_edge(rule.left) || !at_edge(rule.right) {
-                return Err("unresolved in-cell rule (possible fraction bar)".into());
+                judge.refuse_page(p, "unresolved in-cell rule (possible fraction bar)")?;
             }
         }
     }
@@ -616,7 +760,13 @@ fn extract_rows(page: &PageEvidence, region: &TableRegion) -> Result<Vec<Physica
             .filter(|(_, col)| glyph.bounds.left >= col.left && glyph.bounds.right <= col.right)
             .collect();
         if owners.len() != 1 {
-            return Err("glyph crosses a column gutter".into());
+            judge.refuse_page(p, "glyph crosses a column gutter")?;
+            // A census reads on: the glyph goes to the column holding its centre.
+            let centre = (glyph.bounds.left + glyph.bounds.right) / 2.0;
+            if let Some(i) = region.columns.iter().position(|c| centre >= c.left && centre < c.right) {
+                columns[i].push(glyph);
+            }
+            continue;
         }
         columns[owners[0].0].push(glyph);
     }
@@ -678,7 +828,7 @@ fn extract_rows(page: &PageEvidence, region: &TableRegion) -> Result<Vec<Physica
                 .iter()
                 .any(|g| g.bounds.top < band[0] && g.bounds.bottom > band[0])
             {
-                return Err("glyph crosses a physical row separator".into());
+                judge.refuse_page(p, "glyph crosses a physical row separator")?;
             }
             let selected: Vec<_> = glyphs
                 .iter()
@@ -694,7 +844,7 @@ fn extract_rows(page: &PageEvidence, region: &TableRegion) -> Result<Vec<Physica
                     bottom: band[1],
                 },
                 character_indexes: selected.iter().map(|g| g.character_index).collect(),
-                text: reconstruct(&selected)?,
+                text: reconstruct(&selected, p, judge)?,
             });
         }
         if cells.iter().any(|c| !c.text.is_empty()) {
@@ -719,10 +869,18 @@ fn cell_text(row: &PhysicalRow, role: ColumnRole) -> &str {
 /// unknown pages may continue a known question, so partial output cannot
 /// safely suppress an overlapping LLM window yet.
 pub fn extract(pages: &[PageEvidence], cancel: &AtomicBool) -> Result<Extraction, String> {
+    extract_with(pages, cancel, &mut Judge::strict())
+}
+
+/// `extract`, with each refusal handled by `judge`. A census reads on past
+/// a refusal at the smallest unit it concerns (a page, a table, a row), so a
+/// page can carry several reasons.
+fn extract_with(pages: &[PageEvidence], cancel: &AtomicBool, judge: &mut Judge) -> Result<Extraction, String> {
     let mut entries: Vec<LogicalEntry> = Vec::new();
     let mut profile = None;
     for page in pages {
         cancelled(cancel)?;
+        let p = page.page_index;
         if page.glyphs.iter().any(|g| {
             [
                 g.bounds.left,
@@ -736,17 +894,24 @@ pub fn extract(pages: &[PageEvidence], cancel: &AtomicBool) -> Result<Extraction
                 || g.bounds.left > g.bounds.right
                 || g.bounds.top > g.bounds.bottom
         }) {
-            return Err("invalid glyph coordinates".into());
+            judge.refuse_doc(Some(p), "invalid glyph coordinates")?;
+            continue;
         }
         if !page.width.is_finite()
             || !page.height.is_finite()
             || page.width <= 0.0
             || page.height <= 0.0
         {
-            return Err("invalid page dimensions".into());
+            judge.refuse_doc(Some(p), "invalid page dimensions")?;
+            continue;
         }
-        let regions =
-            detect_table_regions(page).map_err(|e| format!("page {}: {e}", page.page_index + 1))?;
+        let regions = match detect_table_regions(page) {
+            Ok(regions) => regions,
+            Err(e) => {
+                judge.refuse_page(p, e)?;
+                continue;
+            }
+        };
         if regions.is_empty() {
             let prose = lines(&page.glyphs)
                 .iter()
@@ -776,10 +941,8 @@ pub fn extract(pages: &[PageEvidence], cancel: &AtomicBool) -> Result<Extraction
             if preamble || (page.glyphs.is_empty() && page.unresolved_graphics.is_empty()) {
                 continue;
             }
-            return Err(format!(
-                "page {}: unrecognized table or continuation",
-                page.page_index + 1
-            ));
+            judge.refuse_page(p, "unrecognized table or continuation")?;
+            continue;
         }
         for line in lines(&page.glyphs) {
             let b = line.iter().map(|g| g.bounds).reduce(Bounds::union).unwrap();
@@ -790,44 +953,41 @@ pub fn extract(pages: &[PageEvidence], cancel: &AtomicBool) -> Result<Extraction
                 .iter()
                 .any(|r| b.intersects(r.bounds) || b.intersects(r.header_bounds))
             {
-                return Err(format!(
-                    "page {}: text outside recognized tables",
-                    page.page_index + 1
-                ));
+                judge.refuse_page(p, "text outside recognized tables")?;
+                break;
             }
         }
         for region in regions {
-            if profile.is_some_and(|p| p != region.profile) {
-                return Err("mixed layout profiles".into());
+            if profile.is_some_and(|known| known != region.profile) {
+                judge.refuse_doc(Some(p), "mixed layout profiles")?;
             }
             profile = Some(region.profile);
-            for row in extract_rows(page, &region)
-                .map_err(|e| format!("page {}: {e}", page.page_index + 1))?
-            {
+            for row in extract_rows(page, &region, judge)? {
                 let id = cell_text(&row, ColumnRole::Question);
                 if id.eq_ignore_ascii_case("total") {
                     // Preserve totals as source rows; do not count them as
                     // another question or as extra marking points.
-                    entries
-                        .last_mut()
-                        .ok_or("total before first question")?
-                        .rows
-                        .push(row);
+                    match entries.last_mut() {
+                        Some(entry) => entry.rows.push(row),
+                        None => judge.refuse_doc(Some(p), "total before first question")?,
+                    }
                     continue;
                 }
                 if id.is_empty() {
-                    entries
-                        .last_mut()
-                        .ok_or("continuation without a question")?
-                        .rows
-                        .push(row);
+                    match entries.last_mut() {
+                        Some(entry) => entry.rows.push(row),
+                        None => judge.refuse_doc(Some(p), "continuation without a question")?,
+                    }
                     continue;
                 }
-                let key = question_key(id, entries.last().map(|e| &e.key))
-                    .ok_or_else(|| format!("invalid question key: {id}"))?;
+                let Some(key) = question_key(id, entries.last().map(|e| &e.key)) else {
+                    judge.refuse_doc(Some(p), format!("invalid question key: {id}"))?;
+                    continue;
+                };
                 if let Some(previous) = entries.last_mut() {
                     if key.whole < previous.key.whole {
-                        return Err("question sequence moves backwards".into());
+                        judge.refuse_doc(Some(p), "question sequence moves backwards")?;
+                        continue;
                     }
                     if key.whole == previous.key.whole && key.parts == previous.key.parts {
                         previous.rows.push(row);
@@ -842,7 +1002,7 @@ pub fn extract(pages: &[PageEvidence], cancel: &AtomicBool) -> Result<Extraction
         }
     }
     if entries.is_empty() {
-        return Err("no recognized marking entries".into());
+        judge.refuse_doc(None, "no recognized marking entries")?;
     }
     for entry in &entries {
         if !entry
@@ -855,7 +1015,7 @@ pub fn extract(pages: &[PageEvidence], cancel: &AtomicBool) -> Result<Extraction
                     .any(|c| c.is_ascii_digit())
             })
         {
-            return Err(format!("{}: missing answer or marks", entry.key.printed));
+            judge.refuse_doc(entry.rows.first().map(|r| r.page_index), format!("{}: missing answer or marks", entry.key.printed))?;
         }
     }
     Ok(Extraction {
@@ -1119,6 +1279,35 @@ pub(crate) mod tests {
             bottom: 180.0,
         });
         assert!(extract(&[p], &AtomicBool::new(false)).is_err());
+    }
+
+    /// A census finds every reason a document is refused, where the reader
+    /// stops at the first; the first reads as the reader words it.
+    #[test]
+    fn a_census_lists_every_refusal_the_reader_stops_at_the_first_of() {
+        let mut first = sample();
+        put(&mut first, 200.0, 80.0, "= F");
+        let mut second = page(1);
+        put(&mut second, 100.0, 100.0, "Unrecognized continuation");
+        let mut third = sample();
+        third.page_index = 2;
+        third.unresolved_graphics.push(Bounds { left: 100.0, right: 200.0, top: 120.0, bottom: 180.0 });
+        let pages = [first, second, third];
+        assert_eq!(
+            extract(&pages, &AtomicBool::new(false)).unwrap_err(),
+            "page 1: formula transcription requires source review"
+        );
+        let mut judge = Judge { census: Some(Vec::new()) };
+        extract_with(&pages, &AtomicBool::new(false), &mut judge).unwrap();
+        let found: Vec<_> = judge.census.unwrap().into_iter().map(|r| (r.page, r.reason)).collect();
+        assert_eq!(
+            found,
+            [
+                (Some(0), "formula transcription requires source review".to_string()),
+                (Some(1), "unrecognized table or continuation".to_string()),
+                (Some(2), "table contains unresolved graphical content".to_string()),
+            ]
+        );
     }
 
     #[test]

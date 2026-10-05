@@ -6,8 +6,9 @@
 //! no GUI, no Tauri state, no network.
 //!
 //! Usage:
-//!   cargo run --bin e2e_import -- "physics '24.pdf" "physics '24" --out dir
-//!   cargo run --bin e2e_import -- "<scheme>.pdf" "<name>" --mark-scheme --out dir
+//!   cargo run --example e2e_import -- "physics '24.pdf" "physics '24" --out dir
+//!   cargo run --example e2e_import -- "<scheme>.pdf" "<name>" --mark-scheme --out dir
+//!   cargo run --example e2e_import -- "<scheme>.pdf" "<name>" --mark-scheme --census --out dir
 //!
 //! `--offline` is accepted for older scripts: every run is offline. The
 //! certification it writes records zero model requests, because MergeMark
@@ -97,6 +98,29 @@ async fn main() -> Result<(), String> {
                 .resize(1000, 1500, image::imageops::FilterType::Lanczos3)
                 .save(out_dir.join(format!("source_page_{}.png", page + 1))).map_err(|e| e.to_string())?;
         }
+        return Ok(());
+    }
+    // Mark-scheme census: every reason the local reader refuses the scheme,
+    // not only the first, as read and with rotated pages turned upright.
+    if args.iter().any(|a| a == "--mark-scheme") && args.iter().any(|a| a == "--census") {
+        let path = PathBuf::from(&pdf_path);
+        let as_read = mergemark_lib::mark_scheme_deterministic::census(&path, false)?;
+        let turned = mergemark_lib::mark_scheme_deterministic::census(&path, true)?;
+        let refusals = |c: &mergemark_lib::mark_scheme_deterministic::Census| {
+            c.refusals.iter().map(|r| serde_json::json!({ "page": r.page.map(|p| p + 1), "reason": r.reason })).collect::<Vec<_>>()
+        };
+        let census = serde_json::json!({
+            "paper": paper_name,
+            "file": pdf_path,
+            "pages": as_read.pages,
+            "rotatedPages": as_read.rotated_pages.iter().map(|p| p + 1).collect::<Vec<_>>(),
+            "asRead": refusals(&as_read),
+            "rotatedPagesTurned": refusals(&turned),
+        });
+        std::fs::create_dir_all(&out_dir).map_err(|e| e.to_string())?;
+        let slug = paper_name.replace(' ', "_").replace('\'', "");
+        std::fs::write(out_dir.join(format!("{slug}_ms_census.json")), serde_json::to_string_pretty(&census).unwrap()).map_err(|e| e.to_string())?;
+        println!("[E2E][MS-CENSUS] pages={} refusals as read={} with rotated pages turned={}", as_read.pages, as_read.refusals.len(), turned.refusals.len());
         return Ok(());
     }
     // Mark-scheme import: what the app's local reader makes of the scheme.
