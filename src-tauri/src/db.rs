@@ -118,6 +118,12 @@ async fn open_library(db_path: &Path, existed: bool) -> Result<SqlitePool, sqlx:
     let _ = sqlx::query("ALTER TABLE questions ADD COLUMN answer_stale BOOLEAN NOT NULL DEFAULT 0")
         .execute(&pool)
         .await;
+    // The paper a card was imported from (path, SHA-256 of its bytes) and
+    // the pages its question is on, 1-based: what the card is checked
+    // against (source_pages.rs).
+    for column in ["source_path TEXT", "source_sha256 TEXT", "source_first_page INTEGER", "source_last_page INTEGER"] {
+        let _ = sqlx::query(&format!("ALTER TABLE questions ADD COLUMN {column}")).execute(&pool).await;
+    }
 
     // NULL sanitization
     let _ = sqlx::query("UPDATE questions SET subject = 'Mathematics' WHERE subject IS NULL")

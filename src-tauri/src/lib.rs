@@ -18,6 +18,7 @@ pub mod ocr;
 pub mod pdf_render;
 pub mod pipeline;
 pub mod sanitize;
+mod source_pages;
 pub(crate) mod stroke_census;
 mod taxonomy;
 #[cfg(test)]
@@ -108,6 +109,8 @@ pub fn run() {
             commands::update_question,
             commands::commit_mark_schemes,
             commands::mark_question_verified,
+            commands::show_source_pages,
+            commands::relocate_source,
             commands::get_paper_names,
             commands::cancel_import,
             commands::export_worksheet_markdown,

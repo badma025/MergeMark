@@ -392,108 +392,7 @@ pub async fn import_backup(
         .await
         .map_err(|e| format!("Failed to start import transaction: {}", e))?;
 
-    let result: Result<(i64, i64), String> = async {
-        if replace {
-            sqlx::query("DELETE FROM questions")
-                .execute(&mut *tx)
-                .await
-                .map_err(|e| format!("Failed to clear existing questions: {}", e))?;
-        }
-
-        let mut added = 0i64;
-        let mut updated = 0i64;
-
-        for q in &questions {
-            let has_composite = !q.paper_name.trim().is_empty() && q.question_number.is_some();
-
-            // Merge mode: if a row with the same (paper_name, question_number)
-            // exists, update it in place and keep its existing id.
-            if !replace && has_composite {
-                let existing_id: Option<String> = sqlx::query_scalar(
-                    "SELECT id FROM questions WHERE paper_name = ? AND question_number = ?",
-                )
-                .bind(&q.paper_name)
-                .bind(q.question_number)
-                .fetch_optional(&mut *tx)
-                .await
-                .map_err(|e| format!("Import failed while checking duplicates: {}", e))?;
-
-                if let Some(id) = existing_id {
-                    sqlx::query(
-                        r#"
-                        UPDATE questions
-                        SET subject = ?, subtopic = ?, marks = ?, content = ?,
-                            math_snippet = ?, is_code = ?, answer_content = ?,
-                            topics = ?, module = ?
-                        WHERE id = ?
-                        "#,
-                    )
-                    .bind(&q.subject)
-                    .bind(&q.subtopic)
-                    .bind(q.marks)
-                    .bind(&q.content)
-                    .bind(&q.math_snippet)
-                    .bind(q.is_code)
-                    .bind(&q.answer_content)
-                    .bind(&q.topics)
-                    .bind(&q.module)
-                    .bind(&id)
-                    .execute(&mut *tx)
-                    .await
-                    .map_err(|e| format!("Import failed while updating a question: {}", e))?;
-                    updated += 1;
-                    continue;
-                }
-            }
-
-            // Insert path: in merge mode, dodge id collisions with a fresh id.
-            let mut id = q.id.clone();
-            if !replace {
-                loop {
-                    let taken: Option<String> =
-                        sqlx::query_scalar("SELECT id FROM questions WHERE id = ?")
-                            .bind(&id)
-                            .fetch_optional(&mut *tx)
-                            .await
-                            .map_err(|e| {
-                                format!("Import failed while checking duplicates: {}", e)
-                            })?;
-                    if taken.is_none() {
-                        break;
-                    }
-                    id = Uuid::new_v4().to_string();
-                }
-            }
-
-            sqlx::query(
-                r#"
-                INSERT INTO questions (id, subject, subtopic, marks, content, math_snippet,
-                                       is_code, answer_content, topics, paper_name,
-                                       question_number, module)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                "#,
-            )
-            .bind(&id)
-            .bind(&q.subject)
-            .bind(&q.subtopic)
-            .bind(q.marks)
-            .bind(&q.content)
-            .bind(&q.math_snippet)
-            .bind(q.is_code)
-            .bind(&q.answer_content)
-            .bind(&q.topics)
-            .bind(&q.paper_name)
-            .bind(q.question_number)
-            .bind(&q.module)
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| format!("Import failed while inserting a question: {}", e))?;
-            added += 1;
-        }
-
-        Ok((added, updated))
-    }
-    .await;
+    let result = restore_rows(&mut tx, &questions, replace).await;
 
     match result {
         Ok((added, updated)) => {
@@ -515,11 +414,172 @@ pub async fn import_backup(
     }
 }
 
+/// Writes a backup's rows into the library, in one transaction. In merge
+/// mode a row for the same paper and question is updated in place, keeping
+/// its id. Returns how many rows were added and updated.
+async fn restore_rows(conn: &mut sqlx::SqliteConnection, questions: &[Question], replace: bool) -> Result<(i64, i64), String> {
+    if replace {
+        sqlx::query("DELETE FROM questions")
+            .execute(&mut *conn)
+            .await
+            .map_err(|e| format!("Failed to clear existing questions: {}", e))?;
+    }
+
+    let mut added = 0i64;
+    let mut updated = 0i64;
+
+    for q in questions {
+        let has_composite = !q.paper_name.trim().is_empty() && q.question_number.is_some();
+
+        // Merge mode: if a row with the same (paper_name, question_number)
+        // exists, update it in place and keep its existing id.
+        if !replace && has_composite {
+            let existing_id: Option<String> = sqlx::query_scalar(
+                "SELECT id FROM questions WHERE paper_name = ? AND question_number = ?",
+            )
+            .bind(&q.paper_name)
+            .bind(q.question_number)
+            .fetch_optional(&mut *conn)
+            .await
+            .map_err(|e| format!("Import failed while checking duplicates: {}", e))?;
+
+            if let Some(id) = existing_id {
+                sqlx::query(
+                    r#"
+                    UPDATE questions
+                    SET subject = ?, subtopic = ?, marks = ?, content = ?,
+                        math_snippet = ?, is_code = ?, answer_content = ?,
+                        topics = ?, module = ?,
+                        -- (a card that records its paper keeps it when the backup has none)
+                        source_path = COALESCE(?, source_path), source_sha256 = COALESCE(?, source_sha256),
+                        source_first_page = COALESCE(?, source_first_page), source_last_page = COALESCE(?, source_last_page)
+                    WHERE id = ?
+                    "#,
+                )
+                .bind(&q.subject)
+                .bind(&q.subtopic)
+                .bind(q.marks)
+                .bind(&q.content)
+                .bind(&q.math_snippet)
+                .bind(q.is_code)
+                .bind(&q.answer_content)
+                .bind(&q.topics)
+                .bind(&q.module)
+                .bind(&q.source_path)
+                .bind(&q.source_sha256)
+                .bind(q.source_first_page)
+                .bind(q.source_last_page)
+                .bind(&id)
+                .execute(&mut *conn)
+                .await
+                .map_err(|e| format!("Import failed while updating a question: {}", e))?;
+                updated += 1;
+                continue;
+            }
+        }
+
+        // Insert path: in merge mode, dodge id collisions with a fresh id.
+        let mut id = q.id.clone();
+        if !replace {
+            loop {
+                let taken: Option<String> =
+                    sqlx::query_scalar("SELECT id FROM questions WHERE id = ?")
+                        .bind(&id)
+                        .fetch_optional(&mut *conn)
+                        .await
+                        .map_err(|e| {
+                            format!("Import failed while checking duplicates: {}", e)
+                        })?;
+                if taken.is_none() {
+                    break;
+                }
+                id = Uuid::new_v4().to_string();
+            }
+        }
+
+        sqlx::query(
+            r#"
+            INSERT INTO questions (id, subject, subtopic, marks, content, math_snippet,
+                                   is_code, answer_content, topics, paper_name,
+                                   question_number, module, source_path, source_sha256,
+                                   source_first_page, source_last_page)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind(&id)
+        .bind(&q.subject)
+        .bind(&q.subtopic)
+        .bind(q.marks)
+        .bind(&q.content)
+        .bind(&q.math_snippet)
+        .bind(q.is_code)
+        .bind(&q.answer_content)
+        .bind(&q.topics)
+        .bind(&q.paper_name)
+        .bind(q.question_number)
+        .bind(&q.module)
+        .bind(&q.source_path)
+        .bind(&q.source_sha256)
+        .bind(q.source_first_page)
+        .bind(q.source_last_page)
+        .execute(&mut *conn)
+        .await
+        .map_err(|e| format!("Import failed while inserting a question: {}", e))?;
+        added += 1;
+    }
+
+    Ok((added, updated))
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A restored card keeps the paper it was imported from, so it can still
+    /// be checked against it; merged into a card that records none, it
+    /// brings its own.
+    #[tokio::test]
+    async fn a_restored_card_keeps_its_paper() {
+        let pool = crate::db::init_db(std::env::temp_dir().join(format!("mm_restore_{}", Uuid::new_v4()))).await.unwrap();
+        let card = |id: &str, number: i64| Question {
+            id: id.into(),
+            subject: "Mathematics".into(),
+            subtopic: String::new(),
+            marks: 2,
+            content: "A question.".into(),
+            math_snippet: String::new(),
+            is_code: false,
+            answer_content: None,
+            topics: None,
+            paper_name: "CIE S1 June 2019".into(),
+            question_number: Some(number),
+            module: None,
+            needs_review: false,
+            answer_stale: false,
+            source_path: Some("C:/papers/s1.pdf".into()),
+            source_sha256: Some("ab".repeat(32)),
+            source_first_page: Some(number + 2),
+            source_last_page: Some(number + 3),
+        };
+        sqlx::query("INSERT INTO questions (id, subject, subtopic, marks, content, math_snippet, is_code, paper_name, question_number) VALUES ('kept', 'Mathematics', '', 2, 'A question.', '', 0, 'CIE S1 June 2019', 1)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let mut conn = pool.acquire().await.unwrap();
+        assert_eq!(restore_rows(&mut conn, &[card("a", 1), card("b", 2)], false).await.unwrap(), (1, 1));
+        let rows: Vec<(String, Option<String>, Option<String>, Option<i64>, Option<i64>)> =
+            sqlx::query_as("SELECT id, source_path, source_sha256, source_first_page, source_last_page FROM questions ORDER BY question_number")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        let paper = (Some("C:/papers/s1.pdf".to_string()), Some("ab".repeat(32)));
+        assert_eq!(rows, vec![
+            ("kept".to_string(), paper.0.clone(), paper.1.clone(), Some(3), Some(4)),
+            ("b".to_string(), paper.0, paper.1, Some(4), Some(5)),
+        ]);
+    }
 
     #[test]
     fn export_rewrite_swaps_abs_paths_and_dedupes() {

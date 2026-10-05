@@ -1895,6 +1895,23 @@ pub fn render_page_from_document(
         .map_err(|e| format!("Failed to convert bitmap to image: {:?}", e))
 }
 
+/// Renders pages (0-based) of a PDF held in memory at 300 DPI, the figure
+/// crops' resolution, handing each to `each` as it is drawn: the pages a
+/// card is checked against (source_pages.rs).
+pub fn render_pages_at_300dpi(
+    bytes: &[u8],
+    page_indexes: &[usize],
+    mut each: impl FnMut(usize, image::DynamicImage) -> Result<(), String>,
+) -> Result<(), String> {
+    let pdfium = get_pdfium()?;
+    let document = pdfium.load_pdf_from_byte_slice(bytes, None)
+        .map_err(|e| format!("Failed to load PDF: {:?}", e))?;
+    for &index in page_indexes {
+        each(index, render_page_from_document(&document, index, DEFAULT_FIGURE_RENDER_DPI)?)?;
+    }
+    Ok(())
+}
+
 #[allow(dead_code)]
 pub fn render_pdf_page_at_300dpi(path: &Path, page_idx: usize) -> Result<image::DynamicImage, String> {
     let pdfium = get_pdfium()?;

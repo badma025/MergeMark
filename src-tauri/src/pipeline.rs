@@ -336,6 +336,9 @@ pub struct BuiltQuestion {
     pub needs_review: bool,
     #[allow(dead_code)]
     pub notes: Vec<String>,
+    /// The pages the question was read from (0-based): its span in the
+    /// layout map, kept so the card can be checked against the paper.
+    pub pages: std::ops::RangeInclusive<usize>,
 }
 
 #[derive(Debug, Clone)]
@@ -828,6 +831,7 @@ pub async fn run_question_pipeline<P: Progress>(
                         is_code: false,
                         needs_review: true,
                         notes: vec!["Fallback card created due to incomplete extraction".to_string()],
+                        pages: span.start_page..=span.end_page,
                     });
                 }
             }
@@ -1913,6 +1917,7 @@ fn assemble_built_question(
         is_code: config.subject == "Computer Science" && is_code_acc,
         needs_review,
         notes,
+        pages: span.start_page..=span.end_page,
     })
 }
 
@@ -2225,6 +2230,7 @@ fn assemble_layout_question(
         is_code: false,
         needs_review,
         notes,
+        pages: span.start_page..=span.end_page,
     })
 }
 
@@ -3112,6 +3118,7 @@ mod tests {
             is_code: false,
             needs_review: false,
             notes: vec![],
+            pages: 0..=0,
         };
         let mut qs = vec![
             mk(5, vec![]),                        // untagged → classified
@@ -3135,7 +3142,7 @@ mod tests {
         let mut qs: Vec<_> = texts.iter().enumerate().map(|(i, text)| BuiltQuestion {
             question_number: i as u32 + 1, content: text.to_string(), marks: 1,
             topics: vec![], module: "Physics".into(), is_code: false,
-            needs_review: false, notes: vec![],
+            needs_review: false, notes: vec![], pages: 0..=0,
         }).collect();
         let assigned = classify_topics_deferred(&cfg, &mut qs, &cancel_flag());
         assert_eq!(assigned, 4);
@@ -3154,6 +3161,7 @@ mod tests {
             is_code: false,
             needs_review: false,
             notes: vec![],
+            pages: 0..=0,
         }];
         let mut cfg = config();
         cfg.allowed_topics = vec!["Thermal".into()];

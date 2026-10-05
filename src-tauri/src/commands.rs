@@ -58,6 +58,16 @@ pub struct Question {
     pub needs_review: bool,
     #[sqlx(default)]
     pub answer_stale: bool,
+    /// The PDF the card was imported from, the SHA-256 of its bytes, and the
+    /// pages its question is on (1-based): what it is checked against.
+    #[sqlx(default)]
+    pub source_path: Option<String>,
+    #[sqlx(default)]
+    pub source_sha256: Option<String>,
+    #[sqlx(default)]
+    pub source_first_page: Option<i64>,
+    #[sqlx(default)]
+    pub source_last_page: Option<i64>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -415,7 +425,11 @@ pub async fn get_all_questions(state: State<'_, AppState>) -> Result<Vec<Questio
             question_number,
             module,
             COALESCE(needs_review, 0) AS needs_review,
-            COALESCE(answer_stale, 0) AS answer_stale
+            COALESCE(answer_stale, 0) AS answer_stale,
+            source_path,
+            source_sha256,
+            source_first_page,
+            source_last_page
         FROM questions 
         ORDER BY rowid DESC
         "#
@@ -1410,6 +1424,9 @@ pub(crate) async fn import_question_paper<H: ImportHost>(
     // becomes instant.
     let file_bytes = std::fs::read(&file_path).unwrap_or_default();
     let cache_key = crate::db::extraction_cache_key(&file_bytes, paper_name.trim());
+    // The paper each card records, to be checked against (source_pages.rs).
+    let source_path = std::path::absolute(&file_path).map_or_else(|_| file_path.clone(), |p| p.to_string_lossy().into_owned());
+    let source_sha256 = (!file_bytes.is_empty()).then(|| crate::source_pages::sha256_hex(&file_bytes));
     let pool_check = state.db.lock().await;
     if let Ok(Some(cached_json)) = crate::db::get_cached_extraction(&pool_check, &cache_key).await {
         if let Ok(cached_questions) = serde_json::from_str::<Vec<Question>>(&cached_json) {
@@ -1423,8 +1440,8 @@ pub(crate) async fn import_question_paper<H: ImportHost>(
                     crate::sanitize::sanitize_question_content(&q.content, q.question_number.unwrap_or(0) as u32);
                 let _ = sqlx::query(
                     r#"
-                    INSERT INTO questions (id, subject, subtopic, topics, marks, content, math_snippet, is_code, paper_name, question_number, module, needs_review, answer_stale)
-                    VALUES (?, ?, ?, ?, ?, ?, '', ?, ?, ?, ?, ?, 0)
+                    INSERT INTO questions (id, subject, subtopic, topics, marks, content, math_snippet, is_code, paper_name, question_number, module, needs_review, answer_stale, source_path, source_sha256, source_first_page, source_last_page)
+                    VALUES (?, ?, ?, ?, ?, ?, '', ?, ?, ?, ?, ?, 0, ?, ?, ?, ?)
                     ON CONFLICT(paper_name, question_number) DO UPDATE SET
                         subject = excluded.subject,
                         subtopic = excluded.subtopic,
@@ -1433,7 +1450,11 @@ pub(crate) async fn import_question_paper<H: ImportHost>(
                         content = excluded.content,
                         is_code = excluded.is_code,
                         module = COALESCE(excluded.module, questions.module),
-                        needs_review = excluded.needs_review
+                        needs_review = excluded.needs_review,
+                        source_path = excluded.source_path,
+                        source_sha256 = excluded.source_sha256,
+                        source_first_page = excluded.source_first_page,
+                        source_last_page = excluded.source_last_page
                     "#,
                 )
                 .bind(&q.id)
@@ -1447,12 +1468,18 @@ pub(crate) async fn import_question_paper<H: ImportHost>(
                 .bind(q.question_number)
                 .bind(&q.module)
                 .bind(q.needs_review)
+                .bind(&source_path)
+                .bind(&source_sha256)
+                .bind(q.source_first_page)
+                .bind(q.source_last_page)
                 .execute(&*pool_check)
                 .await;
             }
             drop(pool_check);
             let mut sanitized = cached_questions;
             for q in &mut sanitized {
+                q.source_path = Some(source_path.clone());
+                q.source_sha256 = source_sha256.clone();
                 q.content = crate::sanitize::sanitize_question_content(
                     &q.content,
                     q.question_number.unwrap_or(0) as u32,
@@ -1560,11 +1587,12 @@ pub(crate) async fn import_question_paper<H: ImportHost>(
             .map(|(i,)| i)
             .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
 
+        let (first_page, last_page) = (*q.pages.start() as i64 + 1, *q.pages.end() as i64 + 1);
         let db_start = Instant::now();
         sqlx::query(
             r#"
-            INSERT INTO questions (id, subject, subtopic, topics, marks, content, math_snippet, is_code, paper_name, question_number, module, needs_review, answer_stale)
-            VALUES (?, ?, ?, ?, ?, ?, '', ?, ?, ?, ?, ?, 0)
+            INSERT INTO questions (id, subject, subtopic, topics, marks, content, math_snippet, is_code, paper_name, question_number, module, needs_review, answer_stale, source_path, source_sha256, source_first_page, source_last_page)
+            VALUES (?, ?, ?, ?, ?, ?, '', ?, ?, ?, ?, ?, 0, ?, ?, ?, ?)
             ON CONFLICT(paper_name, question_number) DO UPDATE SET
                 subject = excluded.subject,
                 subtopic = excluded.subtopic,
@@ -1573,7 +1601,11 @@ pub(crate) async fn import_question_paper<H: ImportHost>(
                 content = excluded.content,
                 is_code = excluded.is_code,
                 module = COALESCE(excluded.module, questions.module),
-                needs_review = excluded.needs_review
+                needs_review = excluded.needs_review,
+                source_path = excluded.source_path,
+                source_sha256 = excluded.source_sha256,
+                source_first_page = excluded.source_first_page,
+                source_last_page = excluded.source_last_page
             "#,
         )
         .bind(&id)
@@ -1587,6 +1619,10 @@ pub(crate) async fn import_question_paper<H: ImportHost>(
         .bind(q.question_number as i64)
         .bind(&q.module)
         .bind(q.needs_review)
+        .bind(&source_path)
+        .bind(&source_sha256)
+        .bind(first_page)
+        .bind(last_page)
         .execute(&mut *tx)
         .await
         .map_err(|e| format!("DB upsert failed for question {}: {}", q.question_number, e))?;
@@ -1613,6 +1649,10 @@ pub(crate) async fn import_question_paper<H: ImportHost>(
             module: Some(q.module),
             needs_review: q.needs_review,
             answer_stale: false,
+            source_path: Some(source_path.clone()),
+            source_sha256: source_sha256.clone(),
+            source_first_page: Some(first_page),
+            source_last_page: Some(last_page),
         });
     }
 
@@ -1996,6 +2036,38 @@ pub async fn mark_question_verified(
         .await
         .map_err(|e| format!("Failed to verify question: {}", e))?;
     Ok(())
+}
+
+/// The pages of the paper a card was imported from, rendered so the card
+/// can be checked against them; or why they cannot be shown (the paper
+/// moved, changed, or was never recorded).
+#[tauri::command]
+pub async fn show_source_pages(
+    id: String,
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+) -> Result<crate::source_pages::SourceView, String> {
+    let pages_dir = app.path().app_data_dir().map_err(|e| e.to_string())?.join("source-pages");
+    // Rendering takes a moment: the library stays free meanwhile.
+    let pool = state.db.lock().await.clone();
+    crate::source_pages::view(&pool, &pages_dir, &id).await
+}
+
+/// Points a card's paper at the PDF's new place, if the file chosen is the
+/// one the card was imported from (every card from it follows), and shows
+/// the card's pages from there.
+#[tauri::command]
+pub async fn relocate_source(
+    id: String,
+    path: String,
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+) -> Result<crate::source_pages::SourceView, String> {
+    {
+        let pool = state.db.lock().await;
+        crate::source_pages::relocate(&pool, &id, std::path::Path::new(&path)).await?;
+    }
+    show_source_pages(id, app, state).await
 }
 
 // ── Hybrid text-layer device (unchanged from the previous implementation) ────
@@ -2491,6 +2563,34 @@ mod tests {
         .expect("the paper is read locally");
         let q2 = questions.iter().find(|q| q.question_number == Some(2)).expect("Q2 imported");
         assert!(q2.content.contains("at random from Rosa’s box."), "{}", q2.content);
+    }
+
+    /// Each card records the paper it was read from, the SHA-256 of the file
+    /// and the pages its question is on, so it can be checked against them:
+    /// read fresh, and again from the cache.
+    #[tokio::test]
+    async fn an_imported_card_records_its_paper_and_its_pages() {
+        let _pdfium = crate::pdf_render::pdfium_test_lock();
+        let Some(file_path) = fixture("papers/used/Maths_A-level_Papers_CIE__June_2019_(v1)_QP_-_S1.pdf") else { return };
+        let path = std::path::absolute(&file_path).unwrap().to_string_lossy().into_owned();
+        let sha = crate::source_pages::sha256_hex(&std::fs::read(&file_path).unwrap());
+        let (state, host) = app_with_a_provider_key().await;
+        for read in ["fresh", "cached"] {
+            let questions = import_offline(&state, &host, file_path.clone(), "CIE S1 June 2019").await.expect("the paper is read locally");
+            assert_eq!(host.reports.lock().unwrap().len(), 1, "{read}: only a fresh read reports");
+            for (number, pages) in [(2, (4, 4)), (4, (6, 7))] {
+                let q = questions.iter().find(|q| q.question_number == Some(number)).expect("imported");
+                assert_eq!((q.source_path.as_deref(), q.source_sha256.as_deref()), (Some(path.as_str()), Some(sha.as_str())), "{read} Q{number}");
+                assert_eq!((q.source_first_page, q.source_last_page), (Some(pages.0), Some(pages.1)), "{read} Q{number}");
+                let pool = state.db.lock().await;
+                let saved: (Option<String>, Option<String>, Option<i64>, Option<i64>) = sqlx::query_as("SELECT source_path, source_sha256, source_first_page, source_last_page FROM questions WHERE id = ?")
+                    .bind(&q.id)
+                    .fetch_one(&*pool)
+                    .await
+                    .unwrap();
+                assert_eq!(saved, (Some(path.clone()), Some(sha.clone()), Some(pages.0), Some(pages.1)), "{read} Q{number}");
+            }
+        }
     }
 
     /// What the last page prints after "END OF QUESTION PAPER" (the board's

@@ -4,13 +4,15 @@ import { RichTextEditor } from "./RichTextEditor";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/ui/dialog";
-import { Plus, Trash2, Pencil, AlertTriangle, ShieldCheck, Maximize2, ZoomIn, ZoomOut, Download, Copy, Check, X, CheckCircle2, ChevronDown } from "lucide-react";
+import { Plus, Trash2, Pencil, AlertTriangle, ShieldCheck, Maximize2, ZoomIn, ZoomOut, Download, Copy, Check, X, CheckCircle2, ChevronDown, FileSearch } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 import { useTaxonomy } from "@/lib/TaxonomyContext";
 import { toast } from "sonner";
 import { ExamMarkdownRenderer } from "@/components/common/ExamMarkdownRenderer";
 import { preprocessExamMarkdown } from "@/lib/preprocess-math";
+import { pagesLabel } from "@/lib/source-pages";
+import { SourcePagesDialog } from "./SourcePagesDialog";
 
 /**
  * Interactive Diagram Lightbox Modal with zoom, copy, and download controls.
@@ -65,7 +67,7 @@ function DiagramLightboxModal({
 
   return (
     <Dialog open={isOpen} onOpenChange={(open) => !open && onClose()}>
-      <DialogContent className="max-w-5xl w-[95vw] max-h-[90vh] p-0 overflow-hidden bg-background/95 backdrop-blur-md border-border/80 shadow-2xl flex flex-col">
+      <DialogContent className="sm:max-w-5xl w-[95vw] max-h-[90vh] p-0 overflow-hidden bg-background/95 backdrop-blur-md border-border/80 shadow-2xl flex flex-col">
         <DialogHeader className="px-6 py-4 border-b border-border/60 flex flex-row items-center justify-between space-y-0">
           <div>
             <DialogTitle className="text-base font-semibold">{alt || "Diagram Inspection"}</DialogTitle>
@@ -193,6 +195,12 @@ export interface QuestionCardProps {
   needsReview?: boolean;
   /** Set when a mark scheme is re-imported over an existing answer — shows STALE ANSWER banner */
   answerStale?: boolean;
+  paperName?: string;
+  questionNumber?: number | null;
+  /** The PDF the card was imported from, and the pages its question is on (1-based), when recorded */
+  sourcePath?: string | null;
+  sourceFirstPage?: number | null;
+  sourceLastPage?: number | null;
   /** Whether this question is already selected in the active worksheet */
   isAdded?: boolean;
   onAddToWorksheet?: (id: string) => void;
@@ -212,6 +220,11 @@ export const QuestionCard = memo(function QuestionCard(props: QuestionCardProps)
     className,
     needsReview: initialNeedsReview,
     answerStale: initialAnswerStale,
+    paperName,
+    questionNumber,
+    sourcePath,
+    sourceFirstPage,
+    sourceLastPage,
     isAdded = false,
     onAddToWorksheet,
     onUpdate,
@@ -224,6 +237,8 @@ export const QuestionCard = memo(function QuestionCard(props: QuestionCardProps)
   const [needsReview, setNeedsReview] = useState(!!initialNeedsReview);
   const [answerStale, setAnswerStale] = useState(!!initialAnswerStale);
   const [isAddedBtnHovered, setIsAddedBtnHovered] = useState(false);
+  const [isShowingSource, setIsShowingSource] = useState(false);
+  const sourcePages = sourcePath && sourceFirstPage != null && sourceLastPage != null ? pagesLabel(sourceFirstPage, sourceLastPage) : null;
   let parsedTopics: string[] = [];
   try {
     if (topics) {
@@ -265,6 +280,7 @@ export const QuestionCard = memo(function QuestionCard(props: QuestionCardProps)
   }
 
   return (
+    <>
     <article
       onClick={() => {
         if (isEditing || Date.now() - lastCloseTime.current < 300) return;
@@ -336,6 +352,25 @@ export const QuestionCard = memo(function QuestionCard(props: QuestionCardProps)
 
         {/* Right: Action buttons (never squished, distinct hover styling) */}
         <div className="flex items-center gap-1 shrink-0 opacity-70 group-hover:opacity-100 focus-within:opacity-100 transition-opacity duration-150 -mr-1 -mt-1">
+          {!isEditing && sourcePages && (
+            <button
+              type="button"
+              onClick={(e) => {
+                e.stopPropagation();
+                setIsShowingSource(true);
+              }}
+              title={`Compare with the paper (${sourcePages})`}
+              aria-label={`Show question ${id} on the paper`}
+              className={cn(
+                "flex items-center justify-center rounded-md p-1.5",
+                "text-muted-foreground transition-all duration-150",
+                "hover:bg-primary/10 hover:text-primary",
+                "focus-visible:opacity-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/60"
+              )}
+            >
+              <FileSearch className="size-4" />
+            </button>
+          )}
           {!isEditing && (
             <button
               type="button"
@@ -630,5 +665,14 @@ export const QuestionCard = memo(function QuestionCard(props: QuestionCardProps)
         )}
       </div>
     </article>
+    {sourcePages && (
+      <SourcePagesDialog
+        id={id}
+        title={questionNumber != null ? `Question ${questionNumber}${paperName ? ` · ${paperName}` : ""}` : paperName || "The paper"}
+        isOpen={isShowingSource}
+        onClose={() => setIsShowingSource(false)}
+      />
+    )}
+    </>
   );
 });

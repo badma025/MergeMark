@@ -44,6 +44,10 @@ csv = "1.4.0"
 pdfium-render = "0.9.3"
 rayon = "1.10"
 
+# A card records the SHA-256 of the PDF it came from, to know the file again
+# if it moves. Already in Cargo.lock through Tauri.
+sha2 = "0.10"
+
 # Local OCR for scanned pages on macOS: Apple's Vision framework. Both
 # crates, and objc2-core-foundation behind NSRect, are already in Cargo.lock
 # through Tauri; only the Foundation classes the Vision calls use.
