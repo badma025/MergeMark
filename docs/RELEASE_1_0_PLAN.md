@@ -97,6 +97,8 @@ Flagged cards are honest, not wrong — this is usefulness, not correctness.
 - If the mass is the preamble and rotation gates → **tune**. Rotation is a drop-in: adopt the `Frame` type `layout.rs` already uses to normalise `/Rotate`. Loosen the preamble predicate. Port the glyph-identity recovery stack for the two unmapped-glyph schemes.
 - If the mass is the formula rule — **any cell containing `=` `^` `_` `∫` `√` `∑` `∏` refuses the whole document**, and maths schemes are wall-to-wall equals signs — this is a missing capability, not a loose gate. The honest options are rebuilding on `layout.rs`'s `TableGrid` and glyph stack, or cutting the feature from 1.0.
 
+**Decided 5 Oct 2026: cut from 1.0** (after step 1, [`MARK_SCHEME_CENSUS.md`](MARK_SCHEME_CENSUS.md): tuning alone would accept none of the 7 schemes). The import UI and its commands are removed; the reader stays outside the app for a rebuild.
+
 Two traps: the reader does **no CropBox normalisation**, which will bite on the Edexcel schemes the moment the cover gate opens; and the single real-PDF test **asserts the refusal**, pinning the bug in place.
 
 ## W5 — Ship-ability

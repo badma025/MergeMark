@@ -211,7 +211,7 @@ export function Settings() {
                   Repository Backup &amp; Migration
                 </h2>
                 <p className="text-xs text-muted-foreground mt-0.5">
-                  Export all extracted questions, mark schemes, and cropped diagrams to a compressed zip bundle.
+                  Export all questions, their answers, and cropped diagrams to a compressed zip bundle.
                 </p>
               </div>
 

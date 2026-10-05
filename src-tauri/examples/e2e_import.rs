@@ -123,7 +123,9 @@ async fn main() -> Result<(), String> {
         println!("[E2E][MS-CENSUS] pages={} refusals as read={} with rotated pages turned={}", as_read.pages, as_read.refusals.len(), turned.refusals.len());
         return Ok(());
     }
-    // Mark-scheme import: what the app's local reader makes of the scheme.
+    // Mark schemes: what the local reader makes of a scheme. The app does not
+    // import mark schemes in 1.0 (docs/MARK_SCHEME_CENSUS.md); the reader
+    // stays for measuring a rebuild.
     if args.iter().any(|a| a == "--mark-scheme") {
         let path = PathBuf::from(&pdf_path);
         let pages: Vec<PageInput> = mergemark_lib::pdf_render::render_pdf_pages(&path)?;

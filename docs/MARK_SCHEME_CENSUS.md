@@ -6,6 +6,13 @@ census of round 2 (cluster 5c) was therefore one reason per scheme, mostly from
 page 1. This census reads on past every refusal and records them all, page by
 page.
 
+**Decision (5 Oct 2026):** mark schemes are cut from 1.0. The app no longer
+offers mark-scheme import (the Import screen's mode, its review dialog and the
+`import_scheme` and `commit_mark_schemes` commands are gone). The reader, its
+pipeline glue and this census stay outside the app, as the measured baseline
+for a rebuild on `layout.rs`'s tables and glyph reading after 1.0. Answers can
+still be typed into a card.
+
 ## Method
 
 - `mark_scheme_deterministic::census` runs the reader's own code with a judge

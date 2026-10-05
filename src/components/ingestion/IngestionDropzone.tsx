@@ -1,7 +1,6 @@
 import { useState, useCallback, useRef, useEffect } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import { ReviewSyncModal, type ProposedMapping } from "./ReviewSyncModal";
 import { open } from "@tauri-apps/plugin-dialog";
 import { toast } from "sonner";
 import { UploadCloud, FileText, Loader2, AlertTriangle, CheckCircle2 } from "lucide-react";
@@ -52,7 +51,6 @@ interface IngestionDropzoneProps {
 
 export function IngestionDropzone({ isActive = false, onSuccess }: IngestionDropzoneProps) {
   const { subjects } = useTaxonomy();
-  const [importMode, setImportMode] = useState<"questions" | "mark_scheme">("questions");
   const [subject, setSubject] = useState("");
   const [moduleOverride, setModuleOverride] = useState("");
 
@@ -61,11 +59,6 @@ export function IngestionDropzone({ isActive = false, onSuccess }: IngestionDrop
       setSubject(subjects[0].id);
     }
   }, [subjects, subject]);
-  // Paper names already in the DB — populated when the user switches to mark_scheme mode.
-  const [availablePaperNames, setAvailablePaperNames] = useState<string[]>([]);
-  // The paper name the user has selected to match the mark scheme against.
-  const [msPaperName, setMsPaperName] = useState("");
-  const [pendingMappings, setPendingMappings] = useState<ProposedMapping[] | null>(null);
   const [isDraggingOver, setIsDraggingOver] = useState(false);
   const [isProcessing, setIsProcessing] = useState(false);
   const [progressMsg, setProgressMsg] = useState("");
@@ -98,15 +91,6 @@ export function IngestionDropzone({ isActive = false, onSuccess }: IngestionDrop
   }, []);
 
   // Structured completion report from the ingestion pipeline.
-  useEffect(() => {
-    // Load paper names on mount or when mode changes.
-    if (importMode === "mark_scheme") {
-      invoke<string[]>("get_paper_names")
-        .then(names => setAvailablePaperNames(names))
-        .catch(err => console.error("Failed to load paper names:", err));
-    }
-  }, [importMode]);
-
   useEffect(() => {
     const unlisten = listen('import-report', (event: any) => {
       const r = event.payload as ImportReport;
@@ -150,20 +134,6 @@ export function IngestionDropzone({ isActive = false, onSuccess }: IngestionDrop
     return () => { unlisten.then(f => f()); };
   }, []);
 
-  // Fetch distinct paper names from the DB whenever the user enters mark_scheme mode.
-  useEffect(() => {
-    if (importMode !== "mark_scheme") return;
-    invoke<string[]>("get_paper_names")
-      .then((names) => {
-        setAvailablePaperNames(names);
-        // Auto-select the first one if nothing is selected yet.
-        if (msPaperName === "" && names.length > 0) {
-          setMsPaperName(names[0]);
-        }
-      })
-      .catch(() => setAvailablePaperNames([]));
-  }, [importMode]);
-
   // ── Core processing logic ──────────────────────────────────────────────────
 
   async function processFile(filePath: string) {
@@ -179,38 +149,22 @@ export function IngestionDropzone({ isActive = false, onSuccess }: IngestionDrop
     setIsProcessing(true);
     setProgressMsg("");
     try {
-
-
-      if (importMode === "mark_scheme") {
-        // Use the DB-selected paper name so MS questions match the QP that was already imported.
-        const effectivePaperName = msPaperName;
-        if (!effectivePaperName) {
-          throw new Error("Please select which question paper this mark scheme belongs to before importing.");
-        }
-        const mappings = await invoke<ProposedMapping[]>("import_scheme", {
-          filePath,
-          paperName: effectivePaperName,
-        });
-        if (cancelledRef.current) return;
-        setPendingMappings(mappings);
-      } else {
-        if (moduleOverride.trim() === "") {
-          throw new Error(NO_MODULE_MESSAGE);
-        }
-        const questions = await invoke<any[]>("import_paper", {
-          filePath,
-          subject,
-          moduleOverride: moduleOverride.trim() !== "" ? moduleOverride.trim() : null,
-          paperName,
-        });
-        if (cancelledRef.current) return;
-        const count = questions.length;
-        toast.success(
-          count === 1 ? "1 question extracted!" : `${count} questions extracted!`,
-          { description: `Paper: ${paperName}`, duration: 6000 }
-        );
-        if (onSuccess) onSuccess();
+      if (moduleOverride.trim() === "") {
+        throw new Error(NO_MODULE_MESSAGE);
       }
+      const questions = await invoke<any[]>("import_paper", {
+        filePath,
+        subject,
+        moduleOverride: moduleOverride.trim() !== "" ? moduleOverride.trim() : null,
+        paperName,
+      });
+      if (cancelledRef.current) return;
+      const count = questions.length;
+      toast.success(
+        count === 1 ? "1 question extracted!" : `${count} questions extracted!`,
+        { description: `Paper: ${paperName}`, duration: 6000 }
+      );
+      if (onSuccess) onSuccess();
     } catch (err) {
       if (cancelledRef.current) return;
       const errMsg = err instanceof Error ? err.message : String(err);
@@ -365,33 +319,8 @@ export function IngestionDropzone({ isActive = false, onSuccess }: IngestionDrop
         </p>
       </div>
 
-      {/* ── Controls (Mode & Subject) ── */}
+      {/* ── Controls (Subject & Module) ── */}
       <div className="flex flex-col items-center gap-4 mb-6 w-full max-w-md">
-        <div className="flex flex-wrap items-center justify-center bg-muted/30 p-1 rounded-lg border border-border/50">
-          <button
-            onClick={() => setImportMode("questions")}
-            className={cn(
-              "px-4 py-2 text-sm font-medium rounded-md transition-all duration-200",
-              importMode === "questions" 
-                ? "bg-background text-foreground shadow-sm ring-1 ring-border/50" 
-                : "text-muted-foreground hover:text-foreground hover:bg-muted/50"
-            )}
-          >
-            Import Question Paper
-          </button>
-          <button
-            onClick={() => setImportMode("mark_scheme")}
-            className={cn(
-              "px-4 py-2 text-sm font-medium rounded-md transition-all duration-200",
-              importMode === "mark_scheme" 
-                ? "bg-background text-foreground shadow-sm ring-1 ring-border/50" 
-                : "text-muted-foreground hover:text-foreground hover:bg-muted/50"
-            )}
-          >
-            Import Mark Scheme
-          </button>
-        </div>
-
         <div className="flex flex-col gap-3 w-full">
           <div className="flex flex-wrap sm:flex-nowrap items-center gap-2 sm:gap-3">
             <label htmlFor="subject-select" className="text-sm font-medium text-foreground min-w-[100px]">
@@ -410,13 +339,13 @@ export function IngestionDropzone({ isActive = false, onSuccess }: IngestionDrop
             </select>
           </div>
 
-          {importMode === "questions" && availableModules.length === 0 && (
+          {availableModules.length === 0 && (
             <p className="text-sm text-muted-foreground italic">
               {NO_MODULE_MESSAGE}
             </p>
           )}
 
-          {importMode === "questions" && availableModules.length > 0 && (
+          {availableModules.length > 0 && (
             <div className="flex flex-wrap sm:flex-nowrap items-center gap-2 sm:gap-3">
               <label htmlFor="module-override" className="text-sm font-medium text-foreground min-w-[100px]">
                 Paper Module:
@@ -436,39 +365,10 @@ export function IngestionDropzone({ isActive = false, onSuccess }: IngestionDrop
           )}
         </div>
 
-        {/* Match-to-paper selector — only shown when importing a mark scheme */}
-        {importMode === "mark_scheme" && (
-          <div className="flex items-center gap-3">
-            <label htmlFor="ms-paper-select" className="text-sm font-medium text-foreground">
-              Match to Paper:
-            </label>
-            {availablePaperNames.length === 0 ? (
-              <p className="text-sm text-muted-foreground italic">
-                No question papers imported yet.
-              </p>
-            ) : (
-              <select
-                id="ms-paper-select"
-                value={msPaperName}
-                onChange={(e) => setMsPaperName(e.target.value)}
-                disabled={isProcessing}
-                className="h-9 w-64 rounded-md border border-input bg-background px-3 py-1 text-sm shadow-sm transition-colors focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring disabled:cursor-not-allowed disabled:opacity-50"
-              >
-                {availablePaperNames.map((name) => (
-                  <option key={name} value={name}>{name}</option>
-                ))}
-              </select>
-            )}
-          </div>
-        )}
-
-        {importMode === "mark_scheme" && (
-          <p className="text-xs text-muted-foreground max-w-md text-center">
-            Mark-scheme import is limited in this beta: MergeMark reads schemes on this
-            computer only, and most can't be read yet.
-          </p>
-        )}
-
+        <p className="text-xs text-muted-foreground max-w-md text-center">
+          MergeMark imports question papers. Mark schemes are not imported: to keep a
+          question's answer, open its card and type it in.
+        </p>
       </div>
 
       {/* ── Dropzone card ── */}
@@ -571,7 +471,7 @@ export function IngestionDropzone({ isActive = false, onSuccess }: IngestionDrop
               <p className="text-base font-semibold text-foreground">
                 {isDraggingOver
                   ? "Release to import"
-                  : `Drag & Drop a ${importMode === "questions" ? "Past Paper" : "Mark Scheme"} here`}
+                  : "Drag & Drop a Past Paper here"}
               </p>
               <p className="text-xs text-muted-foreground">
                 or{" "}
@@ -598,15 +498,6 @@ export function IngestionDropzone({ isActive = false, onSuccess }: IngestionDrop
         <FileText className="size-3.5 opacity-60" aria-hidden />
         <span>Accepted: .pdf, .png, .jpg, .txt (up to 100 pages per file)</span>
       </div>
-
-      <ReviewSyncModal
-        mappings={pendingMappings}
-        onClose={() => setPendingMappings(null)}
-        onSuccess={() => {
-          setPendingMappings(null);
-          if (onSuccess) onSuccess();
-        }}
-      />
 
       {/* ── Import Logs Modal ── */}
       {reports.length > 0 && (
