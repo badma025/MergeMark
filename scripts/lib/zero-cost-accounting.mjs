@@ -115,6 +115,17 @@ export const PAPERS = [
   { name: "eduqas_cs_c2_jun23", file: "papers/used/Computer-Science_A-level_Past-Papers_Eduqas__June_2023_QP_-_Component_2_Eduqas_Computer_Science_A-level.pdf", subject: "Computer Science", module: "Computer Science", cohort: "triage_fixtures" },
   { name: "edxa_econ_p2_jun21", file: "papers/used/Economics_A-level_Past-Papers_Edexcel-A__June_2021_QP_-_Paper_2_Edexcel_(A)_Economics_A-level.pdf", subject: "Economics", module: "A-Level Economics", cohort: "triage_fixtures" },
   { name: "cie_s1_jun19", file: "papers/used/Maths_A-level_Papers_CIE__June_2019_(v1)_QP_-_S1.pdf", subject: "Mathematics", module: "Statistics 1", cohort: "triage_fixtures" },
+  // 1.0 W1 round 2: shared stems ("Questions 3 and 4 refer to the following information").
+  { name: "edexcel21", file: "papers/used/edexcel '21 edexcel.pdf", subject: "Physics", module: "A-Level Physics", cohort: "triage_fixtures" },
+  { name: "ocrb_phys_p1_jun18", file: "papers/used/Physics_A-level_Past-Papers_OCR-B__June_2018_QP_-_Paper_1_OCR_(B)_Physics_AS-level.pdf", subject: "Physics", module: "A-Level Physics", cohort: "triage_fixtures" },
+  // 1.0 W3: cards that do not render, missed headings, a bracketed number read as marks.
+  { name: "edx_oct21", file: "papers/used/Maths_A-level_Papers_Edexcel__October_2021_QP.pdf", subject: "Mathematics", module: "A-Level Mathematics", cohort: "triage_fixtures" },
+  { name: "aqa_phys_jun22", file: "papers/used/Physics_A-level_Past-Papers_AQA__June_2022_QP.pdf", subject: "Physics", module: "A-Level Physics", cohort: "triage_fixtures" },
+  { name: "wjec_u1_jun23", file: "papers/used/Maths_A-level_Papers_WJEC__June_2023_QP_-_Unit_1_WJEC_Maths_AS-level.pdf", subject: "Mathematics", module: "AS Mathematics", cohort: "triage_fixtures" },
+  { name: "edx_gcse_jun18", file: "papers/used/Maths_GCSE_Past-Papers_Edexcel__June_2018_QP.pdf", subject: "Mathematics", module: "GCSE Mathematics", cohort: "triage_fixtures" },
+  { name: "aqa_gcse_jun24", file: "papers/used/Maths_GCSE_Past-Papers_AQA__June_2024_QP.pdf", subject: "Mathematics", module: "GCSE Mathematics", cohort: "triage_fixtures" },
+  { name: "edx_jun24", file: "papers/used/Maths_A-level_Papers_Edexcel__June_2024_QP.pdf", subject: "Mathematics", module: "A-Level Mathematics", cohort: "triage_fixtures" },
+  { name: "wjecf_u2_jun19", file: "papers/used/Maths_A-level_Papers_WJEC-Further__June_2019_QP_-_Unit_2_WJEC_Further_Maths_AS-level.pdf", subject: "Mathematics", module: "Further Mathematics", cohort: "triage_fixtures" },
 ];
 
 export function slugFor(paperName) {

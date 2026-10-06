@@ -314,7 +314,14 @@ async fn repair_old_library(pool: &SqlitePool) -> Result<(), sqlx::Error> {
 /// letter and its square, a key underlined above close text, a question
 /// ending at its own total, "box" after a possessive, tables drawn cell by
 /// cell): a cached v6 card can hold one of those defects.
-pub const EXTRACTION_CACHE_VERSION: u32 = 7;
+/// v8: 1.0 W1 round 2 (stems shared by several questions, a first line set
+/// beside a bare question number, an operator before a radical read as its
+/// index) and W3's first fixes (WJEC's "a)" part labels and raised decimal
+/// points, a question opening with a figure, a bracket against the word
+/// before it read as marks, MathTechnical's and MT Extra's symbols, units
+/// repaired inside maths): a cached v7 card can lack its stem, hold the next
+/// question's, or hold one of those defects.
+pub const EXTRACTION_CACHE_VERSION: u32 = 8;
 
 /// Compute a deterministic cache key from file content + parameters.
 /// Uses a fast FNV-1a hash of the file bytes (not cryptographic, just

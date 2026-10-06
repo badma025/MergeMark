@@ -700,6 +700,58 @@ The six strict cards round 3's audits found wrong ("What is left", below), fixed
   - The same line reads `y \sqrt[=]{…}`: the "=" left of the radical is taken as its index.
 - **Blinded audit w1r1:** pack built (`output/triage/run-unused-w1r1/audit-pack/`), judged in a separate session.
 
+## 1.0, W1 round 2 and the first W3 batch
+
+Round 2 takes the defects w1r1's targeted audit uncovered; the first W3 batch takes cards that did not render, missed headings and numbers read as marks. Run w1r2 compares with w1r1. Specs: `output/fix-log/spec-w1r2.md` and `spec-w1r2b.md`; review findings with their resolution: `review-w1r2-findings.md` and `review-w1r2b-findings.md`.
+
+**Causes and fixes** (`layout.rs` unless stated):
+- **Shared stems** (edexcel '21 Q3 and Q4, OCR B Physics AS Jun 2018 Q19 and Q20; holdout Edexcel Physics AS Jun 2025 Q7 and Q8). A stem printed for two questions ("Questions 3 and 4 refer to the following information.", "The following information is for use in questions 19 and 20.") went to the question before, and since w1r1 cut at that question's total, to no card. The lead-in now ends the question before (its text and its figure window), opens the first question it names, and opens the other too. That question's figure window takes in the stem's area (`AheadWindow`), and its recorded source pages take in the stem's page.
+- **A first line beside a bare number** (Edexcel Further Jun 2025 Q4, "y = √(15 + e²ˣ)", set 2.9 pt above the label's baseline): it sorted before "4." and went to Q3. A bare label now takes the lines on its row that sort before it.
+- **An operator read as a radical's index** (the same line, `y \sqrt[=]{…}`): the radicand's size was its largest item's, the stretched brackets'. It is now the radicand's text size.
+- **WJEC part labels on the heading line** ("0 1 a) Using the binomial theorem …", WJEC Maths Unit 1 Jun 2023: Q1, Q4, Q9, Q13 and Q14 unmapped, marks 114 of 120): "a)" was read as prose after a quantity. The heading pattern now takes a part label closed by a bracket.
+- **A question opening with a figure** (Edexcel GCSE Jun 2018 Q8, "8 3 kg of meat costs £54", merged into Q7). A pair of figures followed by a sentence (three words or more) is the number and the question's first figure. A pair before a short label ("1 5 cm") is still a quantity.
+- **A bracketed number read as marks** (`deterministic.rs`). The case: AQA GCSE Maths Jun 2024 Q4, a strict card, where "Work out P(5)" became "Work out P **[5 marks]**" (marks 9 of 4). The same defect: "Find fg(2)", "Find f(10)", "Po(18)", and calibration's AQA Jun 2019 Q8 "Find P(3) and P(10)" (strict, 14 marks of 4). A bracket set against the letter before it is text. After punctuation it is still an allocation: naiker M16 Q1's "… at this time.(2)".
+- **Raised decimal points** (WJEC Maths Unit 1 Jun 2023 Q14, newly mapped, "1 25 units"). A point's neighbouring digits were looked for on any line, and a digit of another line at the same x was taken. They are now the digits of its own row.
+- **Cards that did not render** (`sanitize.rs`, `layout.rs`):
+  - Edexcel Oct 2021 Q12, `\frac{2($$\text{u}$$^{-1}$)^{3}}{u}`: the unit-exponent repair took "u -1" inside maths for a unit. It now leaves maths alone. An escaped `\$` opens no maths there, nor in the repair of orphan units.
+  - AQA Physics Jun 2022 Q5, a fraction of two phrases unwrapped as prose: words inside `\text{…}` no longer count as prose.
+  - WJEC Maths Unit 1 Jun 2023 Q6, `\cos A^{\$}BC`. MathTechnical P01 is a pi font whose glyph names give the slot, not the symbol. From the glyph outlines in the font programs: "$" is a caret (the hat of "AB̂C"), "X" is ⩽ and "~" is <. That gives WJEC Further Unit 2 Jun 2019 Q4's "0 ⩽ x < 1" and WJEC Maths Unit 1 Jun 2019 Q5's "1 ⩽ n ⩽ 4", both strict and wrong before. Its other codes stay unknown.
+- **MT Extra's code 0x1F** read as ℂ: a subset gives that code to the first glyph it uses. It is ℝ in Edexcel Jun 2024 (Q5 and Q8 showed ℂ) and ℂ in FP2 Jun 2024. The glyph's name now says which.
+- **Reference material printed ahead of its question** ("This table is included so that you can answer …"). A figure in it fell to no card. The referenced question's window now takes in the material, and the figure is placed among its lines. No corpus paper prints one: the test is synthetic.
+- Withdrawn: reading a glyph-id glyph's advance from the pen position, for Times New Roman's "f" on Edexcel GCSE Jun 2018. Kerning shortens the pen advance, and the change lost the W of "Work". The f is also genuinely ambiguous (two subsets on the page, its code the other's "I" at the same advance), so it stays unknown.
+- `EXTRACTION_CACHE_VERSION` 7 → 8 (`db.rs`).
+
+**Code review**, two passes; every finding was taken:
+- Pass 1: the question stopped by a run now ends at the run (its figure window too); "N and M" names two questions, not a range; only the attested stem wordings are matched; a prepend helper; the window's own containment test.
+- Pass 2: the allocation rule above (the first, space-only version broke naiker Q1); the decimal-point row; MathTechnical's ⩽ and <, with no space entry; the spaced-pair rule above; the ahead window for reference material; `LayoutQuestion::first_page()` replacing two copies; one heading pattern for "(a)" and "a)"; `shared_stem` returning `[u32; 2]`.
+
+**Tests**, each red without its fix:
+- Shared stems: `a_shared_stem_opens_every_question_it_names`, `a_shared_stem_serves_the_questions_it_names`, `a_shared_stem_beside_the_question_before_it_is_none_of_its`, `a_lead_in_keeps_its_questions_reference_material_in_place`, `a_question_takes_the_figure_of_its_stem_on_an_earlier_page`, and through the import `a_shared_stem_and_its_drawing_reach_each_question_it_names`.
+- First lines and headings: `a_line_beside_a_bare_label_opens_its_question`, `an_operator_before_a_radical_is_no_index`, `a_heading_with_a_part_label_closed_by_a_bracket_opens_its_question`, `a_question_opening_with_a_quantity_is_still_a_question`, `a_pair_of_figures_opens_a_question_only_before_a_sentence`.
+- Allocations: `a_bracket_against_a_letter_is_no_allocation`, and through the import `a_bracketed_number_against_its_word_is_no_allocation` (AQA GCSE Jun 2024 Q4, AQA Jun 2019 Q8) and `an_allocation_against_the_full_stop_before_it_is_still_one` (naiker M16 Q1).
+- Symbols and decimals: `a_pi_fonts_caret_is_the_hat_over_its_letter`, `a_pi_fonts_relations_are_those_its_outlines_draw`, `a_double_struck_letter_is_the_one_its_glyph_name_says`, and `a_decimal_point_printed_raised_stays_in_its_number` (now with WJEC 2023 Q14).
+- Maths reaching the card: `maths_the_layout_reads_reaches_the_card_whole` (Edexcel Oct 2021 Q12, AQA Physics Jun 2022 Q5) and `an_escaped_dollar_opens_no_maths`.
+- Windows and pages: `reference_material_for_a_later_question_takes_its_figure_along`, `a_lead_in_takes_its_figure_from_the_question_before`, `a_card_records_the_pages_its_body_was_read_from`.
+- Review pass 2's tests were also checked by undoing each fix in a copy: all nine failed.
+
+**Fixtures:** nine holdouts fixed against moved to `papers/used/` (82 in all), registered and sealed (84 papers in the encrypted set): edexcel '21, OCR B Physics AS Jun 2018 P1, Edexcel Oct 2021, AQA Physics Jun 2022, WJEC Maths Unit 1 Jun 2023, Edexcel GCSE Jun 2018, AQA GCSE Maths Jun 2024, Edexcel Jun 2024 and WJEC Further Unit 2 Jun 2019. fp2 '24 joins the sealed set (fix h's test reads it). The mark-scheme cut leaves 07_legacy_c3_or_c4_ms unread, and its sealed copy is removed. 109 question papers are left in the holdout.
+
+**Numbers** (run w1r2):
+- **cargo test:** 415 passed, 0 failed, 4 ignored (with `MERGEMARK_REQUIRE_FIXTURES=1`), plus 43 script tests.
+- **Calibration w1r2:** 81/81 OK. Historical 243/244 strict, test papers 69/69, zero attempts and tokens. The 50 earlier fixtures hold 541 of 650 strict as in w1r1; the nine new ones bring the fixtures to 697 of 835.
+- **Calibration cards changed:** five, each as intended:
+  - AQA Jun 2019 Q8 "Find P(3) and P(10)", 4 marks;
+  - Edexcel Further Jun 2025 Q4 gains its first line;
+  - two flagged `\text` fractions repaired (AQA Chemistry GCSE Jun 2022 Q8, OCR A Physics Jun 2017 Q16);
+  - WJEC Further Jun 2024 Q2's ⩽, still flagged (its F(x) brackets are unknown).
+- **Triage unused-w1r2** (109 papers in both runs): PASS 26 → 27 (WJEC Maths Unit 1 Jun 2019, REVIEW → PASS), REVIEW 6 → 5, FLAGGED 42 and FAIL 35 unchanged. Printed totals matched 94 → 95. Marks tags over a card's marks 2 → 1 papers, totals over 3 → 2, id gaps 6 → 5. Eleven cards changed, all from the fixes above, and no line that is only a number was gained.
+- **Targeted audit:** every card that changed or turned strict was checked against its pages. No regression. It found four defects on strict cards that round 2 neither caused nor fixed. All are wrong since before w1r1, and they go to round 3:
+  - OCR B Physics AS Jun 2018 Q19 and Q20 (fixtures): the drawing of blocks X and Y is no figure (labelled boxes, arrows, a track). Its arrows decide the momentum answer.
+  - Edexcel Jun 2024 Q5 (fixture): "f(x) =" is read twice, `\text{ff}\left((xx\right)) ==`. The text layer holds two copies 4.3 pt apart, and the page shows one.
+  - WJEC Maths Unit 1 Jun 2019 Q7 (holdout): part b)'s fraction sorts after its own allocation.
+  - The 27 AES-encrypted papers (AQA's): the font catalog cannot read them (lopdf decrypts RC4 only), so their control-range glyphs go unnamed. An unnamed thin one becomes a rule: AQA Jun 2021 Q10's "π − 2" reads `\pi\quad 2` on a strict card.
+- **Blinded audit w1r2:** pack built from the triage run, judged in a separate session.
+
 ## What is left
 
 On the 123 holdout papers after round 3 (run unused-c13). Round 3 changed none of these findings; the unidentified-glyph counts are lower than after round 2 (37 papers, 106 cards on 126 papers) only because three papers became fixtures.

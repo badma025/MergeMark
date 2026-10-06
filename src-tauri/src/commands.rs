@@ -2284,6 +2284,86 @@ mod tests {
         assert!(q2.content.contains("at random from Rosa’s box."), "{}", q2.content);
     }
 
+    /// A stem printed for two questions ("Questions 3 and 4 refer to the
+    /// following information.") reaches both cards with its drawing, and the
+    /// card before ends at its own total, without either (edexcel '21).
+    #[tokio::test]
+    async fn a_shared_stem_and_its_drawing_reach_each_question_it_names() {
+        let _pdfium = crate::pdf_render::pdfium_test_lock();
+        let Some(file_path) = fixture("papers/used/edexcel '21 edexcel.pdf") else { return };
+        let (state, host) = app_with_a_provider_key().await;
+        let questions = import_offline(&state, &host, file_path, "edexcel 21").await.expect("the paper is read locally");
+        let card = |n: i64| questions.iter().find(|q| q.question_number == Some(n)).unwrap_or_else(|| panic!("Q{n} imported"));
+        for n in [3, 4] {
+            let q = card(n);
+            assert!(q.content.starts_with("Questions 3 and 4 refer to the following information."), "Q{n}: {}", q.content);
+            assert!(q.content.contains("horizontal spring") && q.content.contains("![Diagram]("), "Q{n}: {}", q.content);
+        }
+        let q2 = card(2);
+        assert!(!q2.content.contains("refer to") && !q2.content.contains("![Diagram]("), "{}", q2.content);
+    }
+
+    /// What the layout reads as maths reaches the card as maths:
+    /// - Edexcel Oct 2021 Q12's "2(u − 1)³/u": a letter, a minus and a digit
+    ///   inside maths are a subtraction, not a unit with an exponent;
+    /// - AQA Physics Jun 2022 Q5's fraction of two phrases: words inside
+    ///   \text{…} are maths' own text, not a sentence wrapped in maths.
+    #[tokio::test]
+    async fn maths_the_layout_reads_reaches_the_card_whole() {
+        let _pdfium = crate::pdf_render::pdfium_test_lock();
+        let (Some(edexcel), Some(aqa)) = (
+            fixture("papers/used/Maths_A-level_Papers_Edexcel__October_2021_QP.pdf"),
+            fixture("papers/used/Physics_A-level_Past-Papers_AQA__June_2022_QP.pdf"),
+        ) else { return };
+        let (state, host) = app_with_a_provider_key().await;
+        let questions = import_offline(&state, &host, edexcel, "Edexcel Oct 2021").await.expect("the paper is read locally");
+        let q12 = questions.iter().find(|q| q.question_number == Some(12)).expect("Q12 imported");
+        assert!(q12.content.contains(r"\frac{2(u -1)^{3}}{u}") && !q12.content.contains("$$"), "{}", q12.content);
+        let questions = import_offline(&state, &host, aqa, "AQA Physics Jun 2022").await.expect("the paper is read locally");
+        let q5 = questions.iter().find(|q| q.question_number == Some(5)).expect("Q5 imported");
+        assert!(
+            q5.content.contains(r"$\frac{\text{specific charge of the particle in column } \mathbf{X}}{\text{specific charge of the particle in column } \mathbf{Y}}$"),
+            "{}",
+            q5.content
+        );
+    }
+
+    /// A bracketed number set against the word before it ("Work out P(5)",
+    /// AQA GCSE Maths Jun 2024 Q4; "Find P(3) and P(10)", AQA A-level Maths
+    /// Jun 2019 Q8) is the question's text, not a mark allocation: the card
+    /// keeps it, and its marks are those printed.
+    #[tokio::test]
+    async fn a_bracketed_number_against_its_word_is_no_allocation() {
+        let _pdfium = crate::pdf_render::pdfium_test_lock();
+        let (Some(gcse), Some(alevel)) = (
+            fixture("papers/used/Maths_GCSE_Past-Papers_AQA__June_2024_QP.pdf"),
+            fixture("papers/used/Maths_A-level_Papers_AQA__June_2019_QP.pdf"),
+        ) else { return };
+        let (state, host) = app_with_a_provider_key().await;
+        let questions = import_offline(&state, &host, gcse, "AQA GCSE Maths Jun 2024").await.expect("the paper is read locally");
+        let q4 = questions.iter().find(|q| q.question_number == Some(4)).expect("Q4 imported");
+        assert!(q4.content.contains("Work out P(5)"), "{}", q4.content);
+        assert_eq!(q4.marks, 4, "{}", q4.content);
+        let questions = import_offline(&state, &host, alevel, "AQA A-level Maths Jun 2019").await.expect("the paper is read locally");
+        let q8 = questions.iter().find(|q| q.question_number == Some(8)).expect("Q8 imported");
+        assert!(q8.content.contains("Find P(3) and P(10)"), "{}", q8.content);
+        assert_eq!(q8.marks, 4, "{}", q8.content);
+    }
+
+    /// An allocation set against the full stop before it ("… John's age at
+    /// this time.(2)", naiker M16 Q1) is still one: the card carries the
+    /// paper's 11 marks.
+    #[tokio::test]
+    async fn an_allocation_against_the_full_stop_before_it_is_still_one() {
+        let _pdfium = crate::pdf_render::pdfium_test_lock();
+        let Some(file_path) = fixture("papers/used/naikermaths_paper_m16_pure.pdf") else { return };
+        let (state, host) = app_with_a_provider_key().await;
+        let questions = import_offline(&state, &host, file_path, "naiker M16").await.expect("the paper is read locally");
+        let q1 = questions.iter().find(|q| q.question_number == Some(1)).expect("Q1 imported");
+        assert!(q1.content.contains("John's age at this time.") && !q1.content.contains("time.(2)"), "{}", q1.content);
+        assert_eq!(q1.marks, 11, "{}", q1.content);
+    }
+
     /// Each card records the paper it was read from, the SHA-256 of the file
     /// and the pages its question is on, so it can be checked against them:
     /// read fresh, and again from the cache.

@@ -2066,12 +2066,34 @@ fn mathtype_private(raw: u32, lower: &str) -> Option<char> {
         };
     }
     if lower.contains("mt-extra") || lower.contains("mtextra") {
+        // (Not code 0x1F: a subset gives it to the first glyph it uses, ℝ in
+        // Edexcel Jun 2024, ℂ in FP2 Jun 2024; the glyph's name says which.)
         return match raw {
-            0xF0A3 | 0x1F => Some('ℂ'),
+            0xF0A3 => Some('ℂ'),
             _ => None,
         };
     }
     None
+}
+
+/// Monotype's MathTechnical P01 is a pi font: its symbols sit at letter and
+/// punctuation codes, and a subset's glyph names and ToUnicode map name the
+/// slot ("dollar", "X"), not the symbol. Established from the glyphs'
+/// outlines in the font programs: at "$" a caret 556 units wide, the font's
+/// advance, set over the B of "cos AB̂C" (WJEC Maths Unit 1 Jun 2023); at
+/// "X" a less-than over a slanted bar, ⩽, and at "~" a less-than ("0 ⩽ x <
+/// 1", "1 ⩽ x ⩽ 2": WJEC Further Unit 2 Jun 2019 and Jun 2024). Its other
+/// codes stay unknown.
+fn math_technical(raw: u32, lower: &str) -> Option<char> {
+    if !lower.contains("mathtechnicalp01") {
+        return None;
+    }
+    Some(match raw {
+        0x24 => 'ˆ',
+        0x58 => '⩽',
+        0x7E => '<',
+        _ => UNKNOWN_GLYPH,
+    })
 }
 
 /// MathMagic's equation fonts (OCR and CIE papers) draw maths symbols at
@@ -2151,7 +2173,7 @@ pub fn resolve_identity(raw: u32, font: &str) -> char {
     if let Some(c) = cie_newmath(raw, &lower) {
         return c;
     }
-    if let Some(c) = mathtype_private(raw, &lower) {
+    if let Some(c) = mathtype_private(raw, &lower).or_else(|| math_technical(raw, &lower)) {
         return c;
     }
     if let Some(c) = mathmagic(raw, &lower).or_else(|| advent(raw, &lower)) {
@@ -4204,7 +4226,12 @@ fn build_vector_radicals(pg: &PageGlyphs, mut items: Vec<Item>, rule_used: &mut 
         if radicand_idx.is_empty() {
             continue;
         }
-        let s_rad = radicand_idx.iter().map(|&i| items[i].size).fold(0.0, f32::max).max(1.0);
+        // The radicand's text size: brackets stretched under the sign are
+        // larger and say nothing of what a script there would be (Edexcel
+        // Further Jun 2025 Q4: 20.7 pt brackets, and the "=" before the sign
+        // at the text's 12 pt is no index).
+        let radicand_items: Vec<Item> = radicand_idx.iter().map(|&i| items[i].clone()).collect();
+        let s_rad = main_baseline(&radicand_items).1.max(1.0);
         let index_idx: Vec<usize> = items_in(&items, |o| {
             // The index sits in the crook of the sign: its foot between the
             // overbar and mid-height, never a line above the radical.
@@ -5335,11 +5362,13 @@ fn seat_raised_decimal_points(pg: &PageGlyphs, items: &mut [Item]) {
         }
         let dot = &items[d];
         let s = dot.size.max(4.0);
-        let left = items.iter().find(|o| digit(o) && o.x1 >= dot.x0 - 0.3 * s && o.x1 <= dot.x0 + 0.1 * s);
-        let right = items.iter().find(|o| digit(o) && o.x0 >= dot.x1 - 0.1 * s && o.x0 <= dot.x1 + 0.4 * s);
+        // (Digits of the point's own row: a digit of another line can stand
+        // at the same x, as in WJEC Maths Unit 1 Jun 2023 Q14's "1·25".)
+        let below = |o: &Item| digit(o) && o.base - dot.base > 0.18 * s && o.base - dot.base < 0.45 * s;
+        let left = items.iter().find(|o| below(o) && o.x1 >= dot.x0 - 0.3 * s && o.x1 <= dot.x0 + 0.1 * s);
+        let right = items.iter().find(|o| below(o) && o.x0 >= dot.x1 - 0.1 * s && o.x0 <= dot.x1 + 0.4 * s);
         let (Some(l), Some(r)) = (left, right) else { continue };
-        let lift = l.base - dot.base;
-        if (l.base - r.base).abs() <= 0.18 * s && lift > 0.18 * s && lift < 0.45 * s {
+        if (l.base - r.base).abs() <= 0.18 * s {
             let base = l.base;
             items[d].base = base;
         }
@@ -7214,6 +7243,41 @@ pub struct LayoutQuestion {
     /// this question (a data table "included so that you can answer …")
     /// was appended: the body ends with that material, complete as printed.
     pub reference_from: Option<usize>,
+    /// Material printed for this question before an earlier heading, and
+    /// where it lies, so that its figures are this question's as well: a
+    /// stem it shares with the questions before it ("Questions 3 and 4
+    /// refer to the following information.", opening its lines; the first
+    /// question the stem names starts there instead), or reference material
+    /// ("This table is included so that you can answer …", ending them).
+    pub ahead: Option<AheadWindow>,
+}
+
+impl LayoutQuestion {
+    /// The first page the question is read from: its heading's, or that of
+    /// material printed ahead of it for it.
+    pub fn first_page(&self) -> usize {
+        self.ahead.map_or(self.start_page, |w| w.start_page.min(self.start_page))
+    }
+}
+
+/// Where material printed ahead of a question for it lies: from its first
+/// line to the next question's heading.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct AheadWindow {
+    pub start_page: usize,
+    pub start_y: f32,
+    pub end_page: usize,
+    pub end_y: f32,
+    /// The material ends the question's lines (reference material, from
+    /// [`LayoutQuestion::reference_from`]) rather than opening them.
+    pub appended: bool,
+}
+
+impl AheadWindow {
+    /// The point (page, y) lies in the material's area.
+    fn contains(&self, page: usize, cy: f32) -> bool {
+        (page > self.start_page || page == self.start_page && cy >= self.start_y - 2.0) && (page < self.end_page || page == self.end_page && cy <= self.end_y)
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -7254,7 +7318,8 @@ static HEAD_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| 
         r"(?P<dot>\.)?",
         // OCR marks a question assessing extended response "2*".
         r"(?P<star>\*)?",
-        r"(?P<part>[ \t]*\.[ \t]*\d{1,2}|[ \t]+\((?:[a-h]|i{1,3}|iv|vi{0,3})\)\*?)?",
+        // (WJEC closes a part label with a bracket only: "0 1 a) Using …".)
+        r"(?P<part>[ \t]*\.[ \t]*\d{1,2}|[ \t]+\(?(?:[a-h]|i{1,3}|iv|vi{0,3})\)\*?)?",
         r"(?P<rest>[ \t].*|\(.*)?$"
     ))
     .unwrap()
@@ -7276,6 +7341,39 @@ static SECTION_BREAK_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock
 /// "Question parts 06.1 and 06.2 use …", "Questions 05.3, 05.4 and 05.5 use …".
 static LEAD_IN_RE: std::sync::LazyLock<regex::Regex> =
     std::sync::LazyLock::new(|| regex::Regex::new(r"(?i)^(?:for\s+)?questions?(?:\s+parts?)?\s+0?(\d{1,2})\s*\.\s*\d").unwrap());
+
+/// A stem shared by several questions, printed before the first of them:
+/// "Questions 3 and 4 refer to the following information." (edexcel '21),
+/// "The following information is for use in questions 19 and 20." (OCR B
+/// Physics AS Jun 2018).
+static SHARED_STEM_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+    regex::Regex::new(r"(?i)^(?:questions\s+(?P<a>\d{1,2})\s+and\s+(?P<b>\d{1,2})\s+refer\s+to\b|the\s+following\s+information\s+is\s+for\s+use\s+in\s+questions\s+(?P<c>\d{1,2})\s+and\s+(?P<d>\d{1,2})\b)").unwrap()
+});
+
+/// The questions a shared stem's lead-in names, in order: the two of "N and
+/// M" (not those between).
+fn shared_stem(text: &str) -> Option<[u32; 2]> {
+    let c = SHARED_STEM_RE.captures(text)?;
+    let named = |a: &str, b: &str| c.name(a).or(c.name(b)).and_then(|m| m.as_str().parse::<u32>().ok());
+    let (first, second) = (named("a", "c")?, named("b", "d")?);
+    (second > first).then_some([first, second])
+}
+
+/// The first of the lines set beside a bare question number ("4.") but
+/// sorted before it: on its row, right of it; `li` when there are none.
+fn beside_bare_label(page: &LayoutPage, li: usize, number: u32) -> usize {
+    let label = &page.lines[li];
+    let bare = plain_line(&label.text).trim().trim_end_matches('.') == number.to_string();
+    let mut open = li;
+    while bare && open > 0 {
+        let o = &page.lines[open - 1];
+        if o.furniture.is_some() || o.text.trim().is_empty() || o.x0 <= label.x1 || (o.baseline - label.baseline).abs() > 0.5 * label.size {
+            break;
+        }
+        open -= 1;
+    }
+    open
+}
 
 static REFERENCE_FOR_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
     regex::Regex::new(r"(?i)\bthis (?:table|figure|page|insert|information|data)\b.{0,40}?\bincluded\b.{0,40}?\banswer\b.{0,20}?\bquestions?(?:\s+parts?)?\s+0?(\d{1,2})").unwrap()
@@ -7313,7 +7411,11 @@ fn head_token(line: &LayoutLine) -> Option<HeadToken> {
     // no quantity.)
     let lead = line.text.trim_start();
     let maths_lead = lead.starts_with(|c: char| c.is_ascii_digit()) && lead.trim_start_matches(|c: char| c.is_ascii_digit() || c == ' ' || c == '\t').starts_with('$');
-    if caps.name("qword").is_none() && caps.name("dot").is_none() && caps.name("part").is_none() && !maths_lead {
+    // (A pair of figures before a sentence is the number and the question's
+    // first figure, Edexcel GCSE Jun 2018's "8 3 kg of meat costs £54"; a
+    // pair before a short label, "1 5 cm", is still a quantity.)
+    let pair_opens_sentence = spaced_pair && !zero_padded && rest.split_whitespace().count() >= 3;
+    if caps.name("qword").is_none() && caps.name("dot").is_none() && caps.name("part").is_none() && !maths_lead && !pair_opens_sentence {
         if let Some(c) = rest.chars().next() {
             if c.is_ascii_lowercase() && !rest.starts_with("(") && rest.split_whitespace().next().map(|w| w.len() > 1).unwrap_or(false) {
                 return None;
@@ -7527,18 +7629,56 @@ pub fn build_layout_map(pages: &[LayoutPage]) -> LayoutMap {
     // Reference material printed ahead of the question it serves ("This table
     // is included so that you can answer Questions 09.1 and 09.2"): it ends
     // the question before it and is appended to the referenced question.
-    let mut reference_runs: Vec<(u32, Vec<(usize, usize)>)> = Vec::new();
+    let mut reference_runs: Vec<(u32, Vec<(usize, usize)>, AheadWindow)> = Vec::new();
     let mut lead_in_runs: Vec<(u32, Vec<(usize, usize)>)> = Vec::new();
+    // A stem shared by the questions it names (the first opens with it).
+    let mut stem_runs: Vec<([u32; 2], Vec<(usize, usize)>, AheadWindow)> = Vec::new();
+    // A bare number ("4.") whose first line is set beside it but a little
+    // higher, so that the line sorts first (an equation object 2.9 pt above
+    // the label's baseline, Edexcel Further Jun 2025 Q4): the question opens
+    // at that line, and the question before ends above it.
+    let opens: Vec<usize> = heads.iter().map(|&(pi, li, number)| beside_bare_label(&pages[pi], li, number)).collect();
+    // The top of question k's first row: its number and the lines set beside
+    // it.
+    let top = |k: usize| {
+        let (pi, li, _) = heads[k];
+        pages[pi].lines[opens[k]..=li].iter().map(|x| x.y0).fold(f32::MAX, f32::min)
+    };
     for (k, &(pi, li, number)) in heads.iter().enumerate() {
-        let next = heads.get(k + 1).copied();
+        let next = heads.get(k + 1).map(|&(np, _, nn)| (np, opens[k + 1], nn));
+        // The lines from (rp, rl) to the next heading: material printed for
+        // a question further on.
+        let run_to_next = |mut rp: usize, mut rl: usize| {
+            let mut run = Vec::new();
+            'run: while rp < pages.len() {
+                while rl < pages[rp].lines.len() {
+                    if next.is_some_and(|(np, nl, _)| rp == np && rl == nl) || stop_at(rp, rl) {
+                        break 'run;
+                    }
+                    if !running.contains(&plain_line(&pages[rp].lines[rl].text)) {
+                        run.push((rp, rl));
+                    }
+                    rl += 1;
+                }
+                rp += 1;
+                rl = 0;
+            }
+            run
+        };
+        // Where material printed from (p, l) for a question further on lies
+        // (one follows: the next heading ends it).
+        let ahead = |p: usize, l: usize, appended: bool| AheadWindow { start_page: p, start_y: pages[p].lines[l].y0, end_page: heads[k + 1].0, end_y: top(k + 1), appended };
         let mut lines = Vec::new();
         // Reference material for this question's own parts printed at its
         // end ("This table is included so that you can answer question parts
         // 07.1, 07.2 and 07.3"), after its last mark allocation.
         let mut own_reference: Option<usize> = None;
         let mut end_page = pi;
+        // Where a run printed for a question further on stopped this one:
+        // the question, and its figures, end there.
+        let mut stopped_at: Option<(usize, usize)> = None;
         let mut p = pi;
-        let mut l = li;
+        let mut l = opens[k];
         'collect: loop {
             if p >= pages.len() {
                 break;
@@ -7569,22 +7709,8 @@ pub fn build_layout_map(pages: &[LayoutPage]) -> LayoutMap {
                 {
                     // Everything from here to the next heading belongs to
                     // the referenced question.
-                    let mut run = Vec::new();
-                    let (mut rp, mut rl) = (p, l);
-                    'reference: while rp < pages.len() {
-                        while rl < pages[rp].lines.len() {
-                            if next.is_some_and(|(np, nl, _)| rp == np && rl == nl) || stop_at(rp, rl) {
-                                break 'reference;
-                            }
-                            if !running.contains(&plain_line(&pages[rp].lines[rl].text)) {
-                                run.push((rp, rl));
-                            }
-                            rl += 1;
-                        }
-                        rp += 1;
-                        rl = 0;
-                    }
-                    reference_runs.push((target, run));
+                    reference_runs.push((target, run_to_next(p, l), ahead(p, l, true)));
+                    stopped_at = Some((p, l));
                     break 'collect;
                 }
                 // A lead-in for the next question's parts ("Question parts
@@ -7595,22 +7721,18 @@ pub fn build_layout_map(pages: &[LayoutPage]) -> LayoutMap {
                     .and_then(|c| c[1].parse::<u32>().ok())
                     .filter(|&t| t > number && next.is_some_and(|(_, _, nn)| nn == t))
                 {
-                    let mut run = Vec::new();
-                    let (mut rp, mut rl) = (p, l);
-                    'lead: while rp < pages.len() {
-                        while rl < pages[rp].lines.len() {
-                            if next.is_some_and(|(np, nl, _)| rp == np && rl == nl) || stop_at(rp, rl) {
-                                break 'lead;
-                            }
-                            if !running.contains(&plain_line(&pages[rp].lines[rl].text)) {
-                                run.push((rp, rl));
-                            }
-                            rl += 1;
-                        }
-                        rp += 1;
-                        rl = 0;
-                    }
-                    lead_in_runs.push((target, run));
+                    lead_in_runs.push((target, run_to_next(p, l)));
+                    stopped_at = Some((p, l));
+                    break 'collect;
+                }
+                // A stem shared by the next question and others after it
+                // ("Questions 3 and 4 refer to the following information.")
+                // opens each of them.
+                if let Some(targets) = shared_stem(&plain_line(&pages[p].lines[l].text))
+                    .filter(|t| t[0] > number && next.is_some_and(|(_, _, nn)| nn == t[0]))
+                {
+                    stem_runs.push((targets, run_to_next(p, l), ahead(p, l, false)));
+                    stopped_at = Some((p, l));
                     break 'collect;
                 }
                 if own_reference.is_none()
@@ -7635,26 +7757,32 @@ pub fn build_layout_map(pages: &[LayoutPage]) -> LayoutMap {
         // in an answer booklet). Below it the page prints no question: OCR
         // MEI Further Jun 2019 sets its logo and copyright notice under Q5's
         // "END OF QUESTION PAPER".
-        let end_y = next
-            .map(|(np, nl, _)| (np, nl))
+        let end_y = stopped_at
+            .or(next.map(|(np, nl, _)| (np, nl)))
             .or(end_marker)
             .and_then(|(bp, bl)| if bp == end_page { pages[bp].lines.get(bl).map(|x| x.y0) } else { None });
         let marked = |&(p, l): &(usize, usize)| plain_line(&pages[p].lines[l].text).split_whitespace().any(|w| MARK_TOKEN_RE.is_match(w));
         let reference_from = own_reference.filter(|&i| i > 0 && lines[..i].iter().any(marked) && !lines[i..].iter().any(marked));
+        // (The number first, then the lines set beside it.)
+        if let Some(at) = lines.iter().position(|&x| x == (pi, li)) {
+            lines[..=at].rotate_right(1);
+        }
         map.questions.push(LayoutQuestion {
             number,
-            start_y: pages[pi].lines[li].y0,
+            start_y: top(k),
             lines,
             start_page: pi,
             end_page,
             end_y,
             reference_from,
+            ahead: None,
         });
     }
-    for (target, run) in reference_runs {
+    for (target, run, window) in reference_runs {
         if let Some(q) = map.questions.iter_mut().find(|q| q.number == target) {
             if !run.is_empty() {
                 q.reference_from = Some(q.lines.len());
+                q.ahead = Some(window);
             }
             q.lines.extend(run);
         }
@@ -7665,12 +7793,34 @@ pub fn build_layout_map(pages: &[LayoutPage]) -> LayoutMap {
                 q.start_page = fp;
                 q.start_y = pages[fp].lines[fl].y0;
             }
-            let mut lines = run;
-            lines.extend(std::mem::take(&mut q.lines));
-            q.lines = lines;
+            prepend_run(q, &run);
+        }
+    }
+    for (targets, run, window) in stem_runs {
+        if run.is_empty() {
+            continue;
+        }
+        for q in map.questions.iter_mut().filter(|q| targets.contains(&q.number)) {
+            if q.number == targets[0] {
+                // The first question it names starts there, as with a lead-in.
+                q.start_page = window.start_page;
+                q.start_y = window.start_y;
+            } else {
+                q.ahead = Some(window);
+            }
+            prepend_run(q, &run);
         }
     }
     map
+}
+
+/// Opens a question with lines printed before its heading for it (a lead-in,
+/// a shared stem); an index into its lines moves with them.
+fn prepend_run(q: &mut LayoutQuestion, run: &[(usize, usize)]) {
+    q.reference_from = q.reference_from.map(|r| r + run.len());
+    let mut lines = run.to_vec();
+    lines.extend(std::mem::take(&mut q.lines));
+    q.lines = lines;
 }
 
 /// The body text of one mapped question (lines joined with newlines; a page
@@ -7901,6 +8051,12 @@ pub fn question_body(pages: &[LayoutPage], q: &LayoutQuestion) -> QuestionBody {
 /// drawn: before the first line below the figure's top. A short line lying
 /// wholly inside a figure is one of its labels and stays in the figure.
 pub fn question_body_with_figures(pages: &[LayoutPage], q: &LayoutQuestion, figures: &[(usize, [f32; 4])]) -> QuestionBody {
+    // Figures of reference material printed ahead of the question and
+    // appended to its lines go among those lines, after its own figures.
+    let appended = |&(fp, r): &(usize, [f32; 4])| q.ahead.is_some_and(|w| w.appended && w.contains(fp, (r[1] + r[3]) * 0.5));
+    let ordered: Vec<(usize, [f32; 4])> = figures.iter().filter(|f| !appended(f)).chain(figures.iter().filter(|f| appended(f))).copied().collect();
+    let own_figures = ordered.iter().filter(|f| !appended(f)).count();
+    let figures = &ordered[..];
     let mut kept: Vec<String> = Vec::new();
     let mut footer_marks = None;
     let continuations = option_continuations(pages, &q.lines);
@@ -7962,10 +8118,23 @@ pub fn question_body_with_figures(pages: &[LayoutPage], q: &LayoutQuestion, figu
             break;
         }
         let line = &pages[p].lines[l];
+        // The question's own figures come before the material appended to
+        // it, whose own figures follow among its lines.
+        let appended_from = q.reference_from.filter(|_| own_figures < figures.len());
+        if appended_from == Some(k) {
+            for &(fp, r) in &figures[next_figure.min(own_figures)..own_figures] {
+                if !inline(fp, &r) {
+                    flush_code(&mut kept, &mut code_run);
+                    kept.push(FIGURE_PLACEHOLDER.to_string());
+                }
+            }
+            next_figure = next_figure.max(own_figures);
+        }
+        let placed = if appended_from.is_some_and(|r| k < r) { own_figures } else { figures.len() };
         // Figures drawn above this line come first (never ahead of the
         // heading: a figure beside "5." follows it).
         let cy = (line.y0 + line.y1) * 0.5;
-        while let Some(&(fp, r)) = figures.get(next_figure).filter(|_| k > 0) {
+        while let Some(&(fp, r)) = figures[..placed].get(next_figure).filter(|_| k > 0) {
             if fp > p || fp == p && r[1] >= cy {
                 break;
             }
@@ -8061,7 +8230,7 @@ pub fn question_body_with_figures(pages: &[LayoutPage], q: &LayoutQuestion, figu
     let ocr = q.lines.iter().any(|&(p, _)| pages[p].ocr);
     let ends_at_footer = footer_line.is_some_and(|f| last_text_line.is_some_and(|l| l <= f));
     let ends_on_tick_options = last_text_line.is_some_and(|l| tick_options.contains(&l));
-    QuestionBody { text: kept.join("\n"), footer_marks, pages: (q.start_page, q.end_page), undetected_figures, ends_with_reference: q.reference_from.is_some(), ends_at_footer, ends_on_tick_options, ocr }
+    QuestionBody { text: kept.join("\n"), footer_marks, pages: (q.first_page(), q.end_page), undetected_figures, ends_with_reference: q.reference_from.is_some(), ends_at_footer, ends_on_tick_options, ocr }
 }
 
 static FIGURE_CAPTION_RE: std::sync::LazyLock<regex::Regex> =
@@ -8098,6 +8267,10 @@ fn undetected_figure_captions(pages: &[LayoutPage], q: &LayoutQuestion, figures:
 /// The figures a layout question owns: on its pages, with their centre
 /// between its heading and the next question's heading.
 pub fn question_figure_window(pages: &[LayoutPage], q: &LayoutQuestion, page: usize, cy: f32) -> bool {
+    // (Material printed ahead of it for it is its own too.)
+    if q.ahead.is_some_and(|w| w.contains(page, cy)) {
+        return true;
+    }
     if page < q.start_page || page > q.end_page {
         return false;
     }
@@ -9021,6 +9194,12 @@ mod tests {
         assert!(q1.contains("Dave catches 4.3 fish per") && q1.contains("Llinos catches 3.8 fish per day"), "{q1}");
         let q3 = body(&pages, &map, 3);
         assert!(q3.contains("Poisson distribution with mean 2.5 is"), "{q3}");
+        // The point's digits are those of its row, not a digit of another
+        // line at the same x (WJEC Maths Unit 1 Jun 2023 Q14).
+        let Some(pages) = corpus_pages("papers/used/Maths_A-level_Papers_WJEC__June_2023_QP_-_Unit_1_WJEC_Maths_AS-level.pdf") else { return };
+        let map = build_layout_map(&pages);
+        let q14 = body(&pages, &map, 14);
+        assert!(q14.contains("dropped to 1.25 units") && q14.contains("drug is 0.6 units"), "{q14}");
     }
 
     #[test]
@@ -9298,7 +9477,7 @@ mod tests {
         let ln = |y0: f32, text: &str| LayoutLine { x0: 72.0, x1: 400.0, y0, y1: y0 + 8.0, baseline: y0 + 8.0, size: 11.0, text: text.to_string(), glyphs: Vec::new(), furniture: None, bold_lead: false, unplaced: 0, code: false, char_width: 0.0 };
         let body_of = |texts: &[&str]| {
             let lines: Vec<LayoutLine> = texts.iter().enumerate().map(|(i, t)| ln(100.0 + 30.0 * i as f32, t)).collect();
-            let q = LayoutQuestion { number: 6, lines: (0..lines.len()).map(|l| (0, l)).collect(), start_page: 0, end_page: 0, start_y: 100.0, end_y: None, reference_from: None };
+            let q = LayoutQuestion { number: 6, lines: (0..lines.len()).map(|l| (0, l)).collect(), start_page: 0, end_page: 0, start_y: 100.0, end_y: None, reference_from: None, ahead: None };
             let pages = vec![LayoutPage { width: 595.0, height: 842.0, lines, ..Default::default() }];
             question_body(&pages, &q).text
         };
@@ -9535,7 +9714,7 @@ mod tests {
         let ln = |y0: f32, text: &str| LayoutLine { x0: 72.0, x1: 400.0, y0, y1: y0 + 8.0, baseline: y0 + 8.0, size: 11.0, text: text.to_string(), glyphs: Vec::new(), furniture: None, bold_lead: false, unplaced: 0, code: false, char_width: 0.0 };
         let body_of = |texts: &[&str]| {
             let lines: Vec<LayoutLine> = texts.iter().enumerate().map(|(i, t)| ln(100.0 + 30.0 * i as f32, t)).collect();
-            let q = LayoutQuestion { number: 13, lines: (0..lines.len()).map(|l| (0, l)).collect(), start_page: 0, end_page: 0, start_y: 100.0, end_y: None, reference_from: None };
+            let q = LayoutQuestion { number: 13, lines: (0..lines.len()).map(|l| (0, l)).collect(), start_page: 0, end_page: 0, start_y: 100.0, end_y: None, reference_from: None, ahead: None };
             let pages = vec![LayoutPage { width: 595.0, height: 842.0, lines, ..Default::default() }];
             question_body(&pages, &q)
         };
@@ -9557,5 +9736,297 @@ mod tests {
         let q2 = body(&pages, &map, 2);
         assert!(q2.contains(r"| $x$ | 0 | $\frac{\pi}{16}$ | $\frac{\pi}{8}$ | $\frac{3\pi}{16}$ | $\frac{\pi}{4}$ |"), "{q2}");
         assert!(q2.contains("| $y$ | 1 |  |  | 1.20269 |  |"), "{q2}");
+    }
+
+    /// Material printed for several questions ("Questions 3 and 4 refer to
+    /// the following information.") opens each question it names, its figure
+    /// included, and is no part of the question before it: edexcel '21 Q3
+    /// and Q4 (their springs), OCR B Physics AS Jun 2018 Q19 and Q20.
+    #[test]
+    fn a_shared_stem_opens_every_question_it_names() {
+        let _guard = crate::pdf_render::pdfium_test_lock();
+        let Some(pages) = corpus_pages("papers/used/edexcel '21 edexcel.pdf") else { return };
+        let map = build_layout_map(&pages);
+        let q = |n: u32| map.questions.iter().find(|q| q.number == n).unwrap_or_else(|| panic!("Q{n} mapped"));
+        // The springs drawn under the stem, on page 3.
+        let springs = pages[2].figures[0];
+        let cy = (springs[1] + springs[3]) * 0.5;
+        for (n, own) in [(3, "3 What is the stiffness of the combination of springs?"), (4, "4 What is the elastic strain energy stored")] {
+            let b = question_body_with_figures(&pages, q(n), &[(2, springs)]).text;
+            assert!(b.starts_with("Questions 3 and 4 refer to the following information."), "Q{n}: {b}");
+            let stem = b.find("A horizontal force $F$ is applied to a horizontal spring").unwrap_or_else(|| panic!("Q{n} has its stem: {b}"));
+            let figure = b.find(FIGURE_PLACEHOLDER).unwrap_or_else(|| panic!("Q{n} has the springs: {b}"));
+            let question = b.find(own).unwrap_or_else(|| panic!("Q{n}: {b}"));
+            assert!(stem < figure && figure < question, "Q{n}: {b}");
+            assert!(question_figure_window(&pages, q(n), 2, cy), "the springs are Q{n}'s");
+        }
+        let q2 = body(&pages, &map, 2);
+        assert!(!q2.contains("refer to") && !q2.contains("horizontal spring"), "{q2}");
+        assert!(!question_figure_window(&pages, q(2), 2, cy), "the springs are not Q2's");
+
+        let Some(pages) = corpus_pages("papers/used/Physics_A-level_Past-Papers_OCR-B__June_2018_QP_-_Paper_1_OCR_(B)_Physics_AS-level.pdf") else { return };
+        let map = build_layout_map(&pages);
+        for n in [19, 20] {
+            let b = body(&pages, &map, n);
+            assert!(b.starts_with("The following information is for use in questions 19 and 20."), "Q{n}: {b}");
+            assert!(b.contains("Two moving objects, X and Y collide and then move off together."), "Q{n}: {b}");
+        }
+        let q18 = body(&pages, &map, 18);
+        assert!(!q18.contains("for use in") && !q18.contains("Two moving objects"), "{q18}");
+    }
+
+    /// A question's first line set beside its bare number, a little higher
+    /// (an equation 2.9 pt above the label's baseline), is the question's own
+    /// and not the end of the one before: Edexcel Further Jun 2025 Q4's
+    /// "y = √(15 + e^{2x})".
+    #[test]
+    fn a_line_beside_a_bare_label_opens_its_question() {
+        let _guard = crate::pdf_render::pdfium_test_lock();
+        let Some(pages) = corpus_pages("papers/used/Maths_A-level_Papers_Edexcel-Further__June_2025_QP.pdf") else { return };
+        let map = build_layout_map(&pages);
+        let q4 = body(&pages, &map, 4);
+        let mut lines = q4.lines();
+        assert_eq!(lines.next(), Some("4."), "{q4}");
+        assert!(lines.next().is_some_and(|l| l.contains(r"15 + \mathrm{e}^{2x}")), "{q4}");
+        let q3 = body(&pages, &map, 3);
+        assert!(!q3.contains(r"\mathrm{e}^{2x}"), "{q3}");
+    }
+
+    /// An operator before a radical is no index of it, though stretched
+    /// brackets under the sign are larger: Edexcel Further Jun 2025 Q4 reads
+    /// "y = √(15 + e^{2x})", not `y \sqrt[=]{…}`.
+    #[test]
+    fn an_operator_before_a_radical_is_no_index() {
+        let _guard = crate::pdf_render::pdfium_test_lock();
+        let Some(pages) = corpus_pages("papers/used/Maths_A-level_Papers_Edexcel-Further__June_2025_QP.pdf") else { return };
+        let stem = pages[11].lines.iter().find(|l| l.text.contains(r"\mathrm{e}^{2x}")).map(|l| l.text.clone());
+        assert_eq!(stem.as_deref(), Some(r"$y = \sqrt{\left(15 + \mathrm{e}^{2x}\right)}$"));
+    }
+
+    /// A shared stem serves the questions its lead-in names: "Questions 3
+    /// and 5" are two questions, not a range.
+    #[test]
+    fn a_shared_stem_serves_the_questions_it_names() {
+        assert_eq!(shared_stem("Questions 3 and 4 refer to the following information."), Some([3, 4]));
+        assert_eq!(shared_stem("Questions 3 and 5 refer to the following information."), Some([3, 5]));
+        assert_eq!(shared_stem("The following information is for use in questions 19 and 20."), Some([19, 20]));
+        assert_eq!(shared_stem("Each of Questions 5 to 34 is followed by four responses."), None);
+    }
+
+    /// A stem printed under the end of the question before it, on the same
+    /// page, is none of that question's, its figure included; a question it
+    /// serves on the next page takes the stem's figure and page too; and the
+    /// question it opens keeps its own reference material's place.
+    #[test]
+    fn a_shared_stem_beside_the_question_before_it_is_none_of_its() {
+        let ln = |x0: f32, y0: f32, text: &str| LayoutLine { x0, x1: 500.0, y0, y1: y0 + 8.0, baseline: y0 + 8.0, size: 11.0, text: text.to_string(), glyphs: Vec::new(), furniture: None, bold_lead: false, unplaced: 0, code: false, char_width: 0.0 };
+        let stem_figure = [100.0, 440.0, 300.0, 480.0];
+        let pages = vec![
+            LayoutPage {
+                width: 595.0,
+                height: 842.0,
+                lines: vec![
+                    ln(50.0, 100.0, "1 Calculate the speed of the car. [2]"),
+                    ln(50.0, 400.0, "Questions 2 and 3 refer to the following information."),
+                    ln(72.0, 420.0, "A ball is thrown upwards."),
+                    ln(50.0, 500.0, "2 Calculate the height it reaches. [1]"),
+                    ln(72.0, 520.0, "This table is included so that you can answer question 2."),
+                    ln(72.0, 540.0, "time 1 s"),
+                ],
+                figures: vec![stem_figure],
+                ..Default::default()
+            },
+            LayoutPage { width: 595.0, height: 842.0, lines: vec![ln(50.0, 100.0, "3 Calculate the time it takes. [1]")], ..Default::default() },
+        ];
+        let map = build_layout_map(&pages);
+        let q = |n: u32| map.questions.iter().find(|q| q.number == n).unwrap_or_else(|| panic!("Q{n} mapped"));
+        let cy = (stem_figure[1] + stem_figure[3]) * 0.5;
+        assert!(!question_figure_window(&pages, q(1), 0, cy), "the stem's figure is not Q1's");
+        assert!(question_figure_window(&pages, q(2), 0, cy) && question_figure_window(&pages, q(3), 0, cy));
+        assert_eq!(body(&pages, &map, 1), "1 Calculate the speed of the car. [2]");
+        for n in [2, 3] {
+            assert!(body(&pages, &map, n).starts_with("Questions 2 and 3 refer to the following information.\nA ball is thrown upwards."), "Q{n}");
+        }
+        assert_eq!(question_body(&pages, q(3)).pages, (0, 1), "Q3 is read from its stem's page too");
+        let at = |k: usize| pages[q(2).lines[k].0].lines[q(2).lines[k].1].text.as_str();
+        assert_eq!(q(2).reference_from.map(at), Some("This table is included so that you can answer question 2."));
+    }
+
+    /// Reference material printed under a question for one further on ("This
+    /// figure is included so that you can answer question 2.") ends the
+    /// question above it, figure included; the question it serves ends with
+    /// it, the figure in place among its lines, after the question's own.
+    #[test]
+    fn reference_material_for_a_later_question_takes_its_figure_along() {
+        let ln = |x0: f32, y0: f32, text: &str| LayoutLine { x0, x1: 500.0, y0, y1: y0 + 8.0, baseline: y0 + 8.0, size: 11.0, text: text.to_string(), glyphs: Vec::new(), furniture: None, bold_lead: false, unplaced: 0, code: false, char_width: 0.0 };
+        let figure = [100.0, 440.0, 300.0, 480.0];
+        let own_figure = [100.0, 300.0, 300.0, 340.0];
+        let pages = vec![
+            LayoutPage {
+                width: 595.0,
+                height: 842.0,
+                lines: vec![
+                    ln(50.0, 100.0, "1 Calculate the speed of the car. [2]"),
+                    ln(72.0, 400.0, "This figure is included so that you can answer question 2."),
+                    ln(72.0, 500.0, "Figure 1"),
+                ],
+                figures: vec![figure],
+                ..Default::default()
+            },
+            LayoutPage {
+                width: 595.0,
+                height: 842.0,
+                lines: vec![ln(50.0, 100.0, "2 Use Figure 1 to find the height."), ln(72.0, 200.0, "(a) Show the forces. [1]"), ln(72.0, 400.0, "(b) Find the height. [1]")],
+                figures: vec![own_figure],
+                ..Default::default()
+            },
+        ];
+        let map = build_layout_map(&pages);
+        let q = |n: u32| map.questions.iter().find(|q| q.number == n).unwrap_or_else(|| panic!("Q{n} mapped"));
+        let cy = (figure[1] + figure[3]) * 0.5;
+        assert!(!question_figure_window(&pages, q(1), 0, cy), "the figure is not Q1's");
+        assert!(question_figure_window(&pages, q(2), 0, cy), "the figure is Q2's");
+        assert_eq!(body(&pages, &map, 1), "1 Calculate the speed of the car. [2]");
+        let b = question_body_with_figures(&pages, q(2), &[(0, figure), (1, own_figure)]);
+        assert_eq!(
+            b.text,
+            format!("2 Use Figure 1 to find the height.\n(a) Show the forces. [1]\n{FIGURE_PLACEHOLDER}\n(b) Find the height. [1]\nThis figure is included so that you can answer question 2.\n{FIGURE_PLACEHOLDER}\nFigure 1")
+        );
+        assert_eq!(b.pages, (0, 1), "Q2 is read from the figure's page too");
+    }
+
+    /// A lead-in printed under the question before ends that question
+    /// there, its figure included: the figure is the question's it opens.
+    #[test]
+    fn a_lead_in_takes_its_figure_from_the_question_before() {
+        let ln = |x0: f32, y0: f32, text: &str| LayoutLine { x0, x1: 500.0, y0, y1: y0 + 8.0, baseline: y0 + 8.0, size: 11.0, text: text.to_string(), glyphs: Vec::new(), furniture: None, bold_lead: false, unplaced: 0, code: false, char_width: 0.0 };
+        let figure = [100.0, 330.0, 300.0, 380.0];
+        let pages = vec![LayoutPage {
+            width: 595.0,
+            height: 842.0,
+            lines: vec![
+                ln(50.0, 100.0, "1 Calculate the speed of the car. [2]"),
+                ln(50.0, 300.0, "Question parts 02.1 and 02.2 use the following information."),
+                ln(50.0, 400.0, "2 Calculate the height it reaches. [1]"),
+            ],
+            figures: vec![figure],
+            ..Default::default()
+        }];
+        let map = build_layout_map(&pages);
+        let q = |n: u32| map.questions.iter().find(|q| q.number == n).unwrap_or_else(|| panic!("Q{n} mapped"));
+        let cy = (figure[1] + figure[3]) * 0.5;
+        assert!(!question_figure_window(&pages, q(1), 0, cy), "the lead-in's figure is not Q1's");
+        assert!(question_figure_window(&pages, q(2), 0, cy), "the lead-in's figure is Q2's");
+        assert_eq!(body(&pages, &map, 1), "1 Calculate the speed of the car. [2]");
+    }
+
+    /// A pair of figures before a sentence opens a question ("8 3 kg of
+    /// meat costs £54"); before a short label it is a quantity ("1 5 cm").
+    #[test]
+    fn a_pair_of_figures_opens_a_question_only_before_a_sentence() {
+        let ln = |text: &str| LayoutLine { x0: 50.0, x1: 500.0, y0: 100.0, y1: 108.0, baseline: 108.0, size: 11.0, text: text.to_string(), glyphs: Vec::new(), furniture: None, bold_lead: false, unplaced: 0, code: false, char_width: 0.0 };
+        assert!(head_token(&ln("8 3 kg of meat costs £54")).is_some());
+        assert_eq!(head_token(&ln("1 5 cm")), None);
+        assert_eq!(head_token(&ln("2 4 cm")), None);
+    }
+
+    /// MathTechnical P01's "X" draws ⩽ and its "~" <: WJEC Further Unit 2's
+    /// distributions read "0 ⩽ x < 1", "1 ⩽ x ⩽ 2" (Jun 2019 Q4, with no
+    /// glyph unknown) and "−2 ⩽ x < 1", "1 ⩽ x ⩽ 2" (Jun 2024 Q2).
+    #[test]
+    fn a_pi_fonts_relations_are_those_its_outlines_draw() {
+        let _guard = crate::pdf_render::pdfium_test_lock();
+        let Some(pages) = corpus_pages("papers/used/Maths_A-level_Papers_WJEC-Further__June_2019_QP_-_Unit_2_WJEC_Further_Maths_AS-level.pdf") else { return };
+        let map = build_layout_map(&pages);
+        let q4 = body(&pages, &map, 4);
+        assert!(q4.contains(r"\text{for } 0 \leqslant x<1, \\ kx^{3} & \text{for } 1 \leqslant x\leqslant 2,") && !q4.contains(UNKNOWN_GLYPH), "{q4}");
+        let Some(pages) = corpus_pages("papers/used/Maths_A-level_Papers_WJEC-Further__June_2024_QP_-_Unit_2_WJEC_Further_Maths_AS-level.pdf") else { return };
+        let page = pages[5].lines.iter().map(|l| l.text.as_str()).collect::<Vec<_>>().join("\n");
+        assert!(page.contains(r"-2\leqslant\mathrm{x} < 1") && page.contains(r"1\leqslant\mathrm{x}\leqslant2"), "{page}");
+    }
+
+    /// A lead-in for a question's parts ("Question parts 02.1 and 02.2 use
+    /// the following information.") opens that question, and the reference
+    /// material printed at its end keeps its place.
+    #[test]
+    fn a_lead_in_keeps_its_questions_reference_material_in_place() {
+        let ln = |x0: f32, y0: f32, text: &str| LayoutLine { x0, x1: 500.0, y0, y1: y0 + 8.0, baseline: y0 + 8.0, size: 11.0, text: text.to_string(), glyphs: Vec::new(), furniture: None, bold_lead: false, unplaced: 0, code: false, char_width: 0.0 };
+        let pages = vec![LayoutPage {
+            width: 595.0,
+            height: 842.0,
+            lines: vec![
+                ln(50.0, 100.0, "1 Calculate the speed of the car. [2]"),
+                ln(50.0, 300.0, "Question parts 02.1 and 02.2 use the following information."),
+                ln(72.0, 320.0, "A ball is thrown upwards."),
+                ln(50.0, 400.0, "2 Calculate the height it reaches. [1]"),
+                ln(72.0, 420.0, "This table is included so that you can answer question 2."),
+                ln(72.0, 440.0, "time 1 s"),
+            ],
+            ..Default::default()
+        }];
+        let map = build_layout_map(&pages);
+        let q2 = map.questions.iter().find(|q| q.number == 2).expect("Q2 mapped");
+        assert!(body(&pages, &map, 2).starts_with("Question parts 02.1 and 02.2 use the following information."), "{}", body(&pages, &map, 2));
+        let at = |k: usize| pages[q2.lines[k].0].lines[q2.lines[k].1].text.as_str();
+        assert_eq!(q2.reference_from.map(at), Some("This table is included so that you can answer question 2."));
+    }
+
+    /// MathTechnical P01's glyph at the "$" code is a caret (its outline: an
+    /// inverted V 556 units wide, the font's advance there), set over B: the
+    /// hat of "cos AB̂C", WJEC Maths Unit 1 Jun 2023 Q6.
+    #[test]
+    fn a_pi_fonts_caret_is_the_hat_over_its_letter() {
+        let _guard = crate::pdf_render::pdfium_test_lock();
+        let Some(pages) = corpus_pages("papers/used/Maths_A-level_Papers_WJEC__June_2023_QP_-_Unit_1_WJEC_Maths_AS-level.pdf") else { return };
+        let line = pages[3].lines.iter().find(|l| l.text.contains("find the value of")).map(|l| l.text.clone()).unwrap_or_default();
+        assert!(line.contains(r"$\cos A\hat{B}C$"), "{line}");
+    }
+
+    /// WJEC prints a part label as "a)" on the heading line ("0 1 a) Using
+    /// the binomial theorem …"): the line is a heading, and every question
+    /// of WJEC Maths Unit 1 Jun 2023 is mapped (Q1, Q4, Q9, Q13 and Q14 were
+    /// not).
+    #[test]
+    fn a_heading_with_a_part_label_closed_by_a_bracket_opens_its_question() {
+        let _guard = crate::pdf_render::pdfium_test_lock();
+        let Some(pages) = corpus_pages("papers/used/Maths_A-level_Papers_WJEC__June_2023_QP_-_Unit_1_WJEC_Maths_AS-level.pdf") else { return };
+        let map = build_layout_map(&pages);
+        let numbers: Vec<u32> = map.questions.iter().map(|q| q.number).collect();
+        assert_eq!(numbers, (1..=14).collect::<Vec<_>>(), "{:?}", map.anomalies);
+        assert!(body(&pages, &map, 1).starts_with("0 1 a) Using the binomial theorem"), "{}", body(&pages, &map, 1));
+        assert!(body(&pages, &map, 4).starts_with("0 4 a) Find the remainder"), "{}", body(&pages, &map, 4));
+    }
+
+    /// A number with a question that opens with a figure ("8 3 kg of meat
+    /// costs £54", Edexcel GCSE Jun 2018 Q8) is a heading, not a quantity.
+    /// (The "f" of "of" stays unknown: two subsets of Times New Roman share
+    /// the page, and its code is the other's "I", of the same advance.)
+    #[test]
+    fn a_question_opening_with_a_quantity_is_still_a_question() {
+        let _guard = crate::pdf_render::pdfium_test_lock();
+        let Some(pages) = corpus_pages("papers/used/Maths_GCSE_Past-Papers_Edexcel__June_2018_QP.pdf") else { return };
+        let map = build_layout_map(&pages);
+        let q8 = body(&pages, &map, 8);
+        assert!(q8.starts_with("8 3 kg ") && q8.contains("meat costs £54
+Nina buys 2 kg of the meat.
+Work out how much Nina pays."), "{q8}");
+        assert!(!body(&pages, &map, 7).contains("meat costs"), "{}", body(&pages, &map, 7));
+    }
+
+    /// An MT Extra subset numbers its glyphs in its own order (the first it
+    /// uses is code 0x1F): the code says nothing of the glyph, its name does.
+    /// Edexcel A-level Maths Jun 2024's 0x1F is "Rbb", ℝ ("x ∈ ℝ", Q5 and
+    /// Q8); FP2 Jun 2024's is "Cbb", ℂ.
+    #[test]
+    fn a_double_struck_letter_is_the_one_its_glyph_name_says() {
+        let _guard = crate::pdf_render::pdfium_test_lock();
+        let text = |pages: &[LayoutPage]| pages.iter().flat_map(|p| p.lines.iter().map(|l| l.text.clone())).collect::<Vec<_>>().join("\n");
+        let Some(pages) = corpus_pages("papers/used/Maths_A-level_Papers_Edexcel__June_2024_QP.pdf") else { return };
+        let edexcel = text(&pages);
+        assert!(!edexcel.contains('ℂ') && !edexcel.contains(r"\mathbb{C}"), "the paper prints no ℂ");
+        assert_eq!(edexcel.matches('ℝ').count() + edexcel.matches(r"\mathbb{R}").count(), 4, "x ∈ ℝ four times");
+        let Some(pages) = corpus_pages("papers/used/fp2 '24.pdf") else { return };
+        let fp2 = text(&pages);
+        assert!(fp2.contains('ℂ') || fp2.contains(r"\mathbb{C}"), "FP2's Cbb is still ℂ");
     }
 }

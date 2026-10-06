@@ -1048,10 +1048,21 @@ static MARK_TAG_RE: LazyLock<regex::Regex> =
     LazyLock::new(|| regex::Regex::new(r"(?i)[\(\[]\s*(\d{1,2})\s*marks?\s*[\)\]]").unwrap());
 
 /// Bare line-end allocations — Edexcel/CIE style "(3)", "[2]" at the end of
-/// a line. The marks-checksum gate validates the sum against the printed
-/// footer whenever one exists, so a stray bracket cannot slip through.
+/// a line, read through [`bare_mark_tag`]. The marks-checksum gate validates
+/// the sum against the printed footer whenever one exists.
 static BARE_MARK_TAG_RE: LazyLock<regex::Regex> =
     LazyLock::new(|| regex::Regex::new(r"[\(\[]\s*(\d{1,2})\s*[\)\]][.:]?[ \t]*$").unwrap());
+
+/// A bare allocation ending the line. A bracket set against the letter
+/// before it is text, the argument of a function or a probability: AQA GCSE
+/// Jun 2024 Q4's "Work out P(5)", on a paper with no footer to check it, and
+/// Edexcel Jun 2024 Q8's "Find fg(2)". After punctuation it is an allocation
+/// still ("… John's age at this time.(2)", naiker M16 Q1).
+fn bare_mark_tag(line: &str) -> Option<regex::Captures<'_>> {
+    let caps = BARE_MARK_TAG_RE.captures(line)?;
+    let before = line[..caps.get(0)?.start()].chars().next_back();
+    (!before.is_some_and(char::is_alphabetic)).then_some(caps)
+}
 
 static TABLE_GAP_RE: LazyLock<regex::Regex> =
     LazyLock::new(|| regex::Regex::new(r"\S\s{2,}\S").unwrap());
@@ -1117,7 +1128,7 @@ fn strip_answer_lines(lines: Vec<String>) -> (Vec<String>, usize) {
                     && !prev.ends_with('?')
                     && !prev.ends_with(':')
                     && !MARK_TAG_RE.is_match(prev)
-                    && !BARE_MARK_TAG_RE.is_match(prev)
+                    && bare_mark_tag(prev).is_none()
                 {
                     is_ans[idx - 1] = true;
                 }
@@ -1134,7 +1145,7 @@ fn strip_answer_lines(lines: Vec<String>) -> (Vec<String>, usize) {
                     && !next.ends_with(':')
                     && !starts_subpart_label(next)
                     && !MARK_TAG_RE.is_match(next)
-                    && !BARE_MARK_TAG_RE.is_match(next)
+                    && bare_mark_tag(next).is_none()
                 {
                     is_ans[next_i] = true;
                 }
@@ -1239,9 +1250,9 @@ fn conservative_rejoin(lines: &[String]) -> Vec<String> {
                     && !t.contains("![")
                     && !t.contains("[DIAGRAM_PLACEHOLDER]")
                     && !MARK_TAG_RE.is_match(prev)
-                    && !BARE_MARK_TAG_RE.is_match(prev)
+                    && bare_mark_tag(prev).is_none()
                     && !MARK_TAG_RE.is_match(t)
-                    && !BARE_MARK_TAG_RE.is_match(t)
+                    && bare_mark_tag(t).is_none()
                     && !prev_ends_terminal(prev)
                     && cont
                     && !starts_subpart_label(t)
@@ -1305,7 +1316,7 @@ fn format_marks(blocks: &[String]) -> (Vec<String>, u32) {
     let mut out = Vec::with_capacity(blocks.len());
     let mut total = 0u32;
     for block in blocks {
-        if !MARK_TAG_RE.is_match(block) && !block.lines().any(|l| BARE_MARK_TAG_RE.is_match(l.trim()))
+        if !MARK_TAG_RE.is_match(block) && !block.lines().any(|l| bare_mark_tag(l.trim()).is_some())
         {
             out.push(block.clone());
             continue;
@@ -1322,13 +1333,13 @@ fn format_marks(blocks: &[String]) -> (Vec<String>, u32) {
                     block_total += tags.iter().sum::<u32>();
                     return MARK_TAG_RE.replace_all(line, "").into_owned();
                 }
-                if let Some(caps) = BARE_MARK_TAG_RE.captures(line.trim()) {
+                if let Some(caps) = bare_mark_tag(line.trim()) {
                     let trimmed = line.trim();
                     if caps.get(0).unwrap().end() == trimmed.len() {
                         if let Ok(v) = caps[1].parse::<u32>() {
                             block_total += v;
                             let indent = line.len() - line.trim_start().len();
-                            let stripped = BARE_MARK_TAG_RE.replace(trimmed, "");
+                            let stripped = &trimmed[..caps.get(0).unwrap().start()];
                             return format!("{}{}", &line[..indent], stripped.trim_end());
                         }
                     }
@@ -3028,6 +3039,20 @@ pub(crate) fn tier0_diagnose_span(
 
 #[cfg(test)]
 mod tests {
+    /// A bracket set against the letter before it is text; after a space or
+    /// punctuation it is an allocation.
+    #[test]
+    fn a_bracket_against_a_letter_is_no_allocation() {
+        let tag = |l: &str| super::bare_mark_tag(l).map(|c| c[1].to_string());
+        assert_eq!(tag("Work out P(5)"), None);
+        assert_eq!(tag("Find fg(2)"), None);
+        assert_eq!(tag("(a) Find P(3) and P(10)"), None);
+        assert_eq!(tag("and so determine John's age at this time.(2)"), Some("2".into()));
+        assert_eq!(tag("Calculate the speed. (3)"), Some("3".into()));
+        assert_eq!(tag("(4)"), Some("4".into()));
+        assert_eq!(tag("Show that x = 2 [2]"), Some("2".into()));
+    }
+
 
     #[test]
     #[ignore = "manual corpus diagnostic (presence-dependent PDFs); phase 4 runs the explicit corpus gate"]

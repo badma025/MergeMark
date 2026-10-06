@@ -831,7 +831,7 @@ pub async fn run_question_pipeline<P: Progress>(
                         is_code: false,
                         needs_review: true,
                         notes: vec!["Fallback card created due to incomplete extraction".to_string()],
-                        pages: span.start_page..=span.end_page,
+                        pages: source_pages(config, &span),
                     });
                 }
             }
@@ -1917,7 +1917,7 @@ fn assemble_built_question(
         is_code: config.subject == "Computer Science" && is_code_acc,
         needs_review,
         notes,
-        pages: span.start_page..=span.end_page,
+        pages: source_pages(config, span),
     })
 }
 
@@ -1933,6 +1933,13 @@ fn figure_is_layout_table(fig: &crate::pdf_render::DetectedFigure, lp: &crate::l
         let iy = (fy1.min(t[3]) - fy0.max(t[1])).max(0.0);
         ix * iy >= 0.6 * area
     })
+}
+
+/// The pages a card records as its source: the layout body's, which take in
+/// a stem printed on an earlier page, or else the span's.
+fn source_pages(config: &PipelineConfig, span: &QuestionSpan) -> std::ops::RangeInclusive<usize> {
+    let first = config.layout_questions.as_ref().and_then(|m| m.get(&span.number)).map_or(span.start_page, |b| b.pages.0.min(span.start_page));
+    first..=span.end_page
 }
 
 /// The kind recorded for a picture set inside a line of text.
@@ -1956,7 +1963,8 @@ fn layout_question_figures(
         (a[2].min(b[2]) - a[0].max(b[0])).max(0.0) * (a[3].min(b[3]) - a[1].max(b[1])).max(0.0)
     }
     let mut out: Vec<(LayoutFigure, [f32; 4])> = Vec::new();
-    for p in q.start_page..=q.end_page {
+    // (From the page of material printed ahead of it for it.)
+    for p in q.first_page()..=q.end_page {
         let Some(lp) = layout.get(p) else { continue };
         let (w, h) = (lp.width.max(1.0), lp.height.max(1.0));
         let mine = |r: &[f32; 4]| crate::layout::question_figure_window(layout, q, p, (r[1] + r[3]) * 0.5);
@@ -2230,7 +2238,7 @@ fn assemble_layout_question(
         is_code: false,
         needs_review,
         notes,
-        pages: span.start_page..=span.end_page,
+        pages: source_pages(config, span),
     })
 }
 
@@ -2619,6 +2627,30 @@ mod tests {
 
     fn cancel_flag() -> AtomicBool {
         AtomicBool::new(false)
+    }
+
+    /// A question's figures include those of a stem it shares with the
+    /// questions before it, printed on an earlier page than its heading.
+    #[test]
+    fn a_question_takes_the_figure_of_its_stem_on_an_earlier_page() {
+        let page = |figures: Vec<[f32; 4]>| crate::layout::LayoutPage { width: 595.0, height: 842.0, figures, ..Default::default() };
+        let layout = vec![page(vec![[100.0, 440.0, 300.0, 480.0]]), page(vec![])];
+        let stem = crate::layout::AheadWindow { start_page: 0, start_y: 400.0, end_page: 0, end_y: 500.0, appended: false };
+        let q = crate::layout::LayoutQuestion { number: 3, lines: vec![], start_page: 1, end_page: 1, start_y: 100.0, end_y: None, reference_from: None, ahead: Some(stem) };
+        let figures = layout_question_figures(&layout, &q, &[vec![], vec![]]);
+        assert_eq!(figures.iter().map(|(f, _)| f.page).collect::<Vec<_>>(), vec![0]);
+    }
+
+    /// A card records the pages its layout body was read from, an earlier
+    /// page of a stem included; without a layout body, its span's.
+    #[test]
+    fn a_card_records_the_pages_its_body_was_read_from() {
+        let span = QuestionSpan { number: 3, start_page: 1, end_page: 2, start_y_frac: None, end_y_frac: None, expected_marks: None, reliable_pages: vec![], ambiguous_pages: vec![] };
+        let mut c = config();
+        assert_eq!(source_pages(&c, &span), 1..=2);
+        let body = crate::layout::QuestionBody { pages: (0, 2), ..Default::default() };
+        c.layout_questions = Some(Arc::new([(3, body)].into_iter().collect()));
+        assert_eq!(source_pages(&c, &span), 0..=2);
     }
 
     #[tokio::test]

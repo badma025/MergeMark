@@ -197,6 +197,11 @@ pub fn normalize_unicode_math(content: &str) -> String {
     )) {
         let t = re
             .replace_all(&t, |caps: &regex::Captures| {
+                // Inside maths a letter, a minus and a digit are a
+                // subtraction: Edexcel Oct 2021 Q12's "2(u − 1)³/u".
+                if in_math_span(&t, caps.get(2).map_or(0, |m| m.start())) {
+                    return caps[0].to_string();
+                }
                 format!(
                     "{}$\\text{{{}}}^{{-{}}}${}",
                     &caps[1],
@@ -211,6 +216,15 @@ pub fn normalize_unicode_math(content: &str) -> String {
     normalize_unicode_math_rest(&t)
 }
 
+/// The byte offset `at` lies inside a maths span: an odd number of `$` before
+/// it on its line, or inside a `$$` display block. (An escaped `\$` is a
+/// dollar sign.)
+fn in_math_span(t: &str, at: usize) -> bool {
+    let delimiters = |s: &str, d: &str| s.match_indices(d).filter(|&(i, _)| !s[..i].ends_with('\\')).count();
+    let line_start = t[..at].rfind('\n').map_or(0, |i| i + 1);
+    delimiters(&t[line_start..at], "$") % 2 == 1 || delimiters(&t[..at], "$$") % 2 == 1
+}
+
 fn normalize_unicode_math_rest(t: &str) -> String {
     // "x × 10-15" / "x \times 10-15" -> "x \times 10^{-15}"
     let sci = regex::Regex::new(r"(?:×|\\times)[ \t]*10-(\d+)").unwrap();
@@ -221,10 +235,7 @@ fn normalize_unicode_math_rest(t: &str) -> String {
     // char is consumed and re-emitted because the regex crate has no lookahead)
     let bare = regex::Regex::new(r"(?m)(^|[^$\w^{])10-(\d+)([^\w}]|$)").unwrap();
     let t = bare.replace_all(&t, |caps: &regex::Captures| {
-        let start = caps.get(0).unwrap().start();
-        let line_start = t[..start].rfind('\n').map_or(0, |i| i+1);
-        if t[line_start..start].matches('$').count() % 2 == 1
-            || t[..start].matches("$$").count() % 2 == 1 {
+        if in_math_span(&t, caps.get(0).unwrap().start()) {
             format!("{}10^{{-{}}}{}", &caps[1], &caps[2], &caps[3])
         } else {
             format!("{}$10^{{-{}}}${}", &caps[1], &caps[2], &caps[3])
@@ -257,7 +268,7 @@ fn normalize_unicode_math_rest(t: &str) -> String {
                 match unit_run.find(rest) {
                     Some(m) => {
                         rebuilt.push_str(&rest[..m.start()]);
-                        if rebuilt.matches('$').count() % 2 == 0 {
+                        if !in_math_span(&rebuilt, rebuilt.len()) {
                             let s = m.as_str().trim();
                             let num_end = s
                                 .find(|c: char| !c.is_ascii_digit() && c != '.' && c != ',')
@@ -389,11 +400,17 @@ static MATH_SPAN_RE: LazyLock<regex::Regex> =
 static LONG_ENGLISH_WORD_RE: LazyLock<regex::Regex> =
     LazyLock::new(|| regex::Regex::new(r"^[A-Za-z]{3,}$").unwrap());
 
+/// A `\text{…}` group: words set inside maths on purpose (a fraction of
+/// two phrases, AQA Physics Jun 2022 Q5), no sign of a sentence wrapped in
+/// maths.
+static TEXT_GROUP_RE: LazyLock<regex::Regex> = LazyLock::new(|| regex::Regex::new(r"\\text\s*\{[^{}]*\}").unwrap());
+
 pub fn unwrap_sentence_math(content: &str) -> String {
     MATH_SPAN_RE
         .replace_all(content, |caps: &regex::Captures| {
             let inner = &caps[1];
-            let english_words = inner
+            let english_words = TEXT_GROUP_RE
+                .replace_all(inner, " ")
                 .split_whitespace()
                 .filter(|w| !w.contains('\\') && LONG_ENGLISH_WORD_RE.is_match(w))
                 .count();
@@ -879,6 +896,13 @@ fn collapse_blank_lines(t: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    /// An escaped dollar sign opens no maths: a unit after it is repaired,
+    /// and one inside maths after it is not wrapped again.
+    #[test]
+    fn an_escaped_dollar_opens_no_maths() {
+        assert_eq!(super::normalize_unicode_math(r"It costs \$3 to run at 5 m s-1."), r"It costs \$3 to run at 5 $\text{m s}^{-1}$.");
+        assert_eq!(super::normalize_unicode_math(r"It costs \$3 to run at $5\ \text{m}$."), r"It costs \$3 to run at $5\ \text{m}$.");
+    }
     #[test]
     fn bare_negative_power_does_not_nest_math_delimiters() {
         assert_eq!(normalize_unicode_math(r"$r \approx 10-15 \text{m}$"), r"$r \approx 10^{-15} \text{m}$");
