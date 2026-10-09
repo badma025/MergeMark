@@ -461,7 +461,12 @@ pub async fn run_question_pipeline<P: Progress>(
     let mut layout_spans: Option<Vec<QuestionSpan>> = None;
     let layout_pages_input: Option<Vec<PageInput>> = match config.layout_evidence.as_ref() {
         Some(ev) if !ev.layout.is_empty() && ev.layout.len() == pages.len() => {
-            let lmap = crate::layout::build_layout_map(&ev.layout);
+            let mut lmap = crate::layout::build_layout_map(&ev.layout);
+            // A paper that prints no question number is one task, when its
+            // text layer finds no question either (`unnumbered_task`).
+            if lmap.questions.is_empty() && doc_map::build_text_only_map(&page_texts, pages.len(), &doc_map::scan_text_layer(&page_texts)).spans.is_empty() {
+                lmap.questions.extend(crate::layout::unnumbered_task(&ev.layout));
+            }
             report.anomalies.extend(lmap.anomalies.iter().cloned());
             report.choice_groups = lmap.choice_groups.clone();
             let scanned = |f: fn(&crate::layout::LayoutPage) -> bool| ev.layout.iter().filter(|lp| f(lp)).map(|lp| lp.page + 1).collect::<Vec<_>>();

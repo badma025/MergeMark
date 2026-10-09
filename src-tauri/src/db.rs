@@ -321,7 +321,14 @@ async fn repair_old_library(pool: &SqlitePool) -> Result<(), sqlx::Error> {
 /// before it read as marks, MathTechnical's and MT Extra's symbols, units
 /// repaired inside maths): a cached v7 card can lack its stem, hold the next
 /// question's, or hold one of those defects.
-pub const EXTRACTION_CACHE_VERSION: u32 = 8;
+/// v9: 1.0 W1 round 3 (AES-encrypted papers' fonts read, Advent's and MT
+/// Extra's symbols, a superscript at the text's size, an integral's fraction
+/// limit, glyphs clipped out of sight or white on white, an expression set in
+/// its label row's gap, an enlarged sign on its own row, an allocation beside
+/// a drawing, a paper with no question numbers, array indices in code, a
+/// drawing of boxes and arrows): a cached v8 card can hold one of those
+/// defects.
+pub const EXTRACTION_CACHE_VERSION: u32 = 9;
 
 /// Compute a deterministic cache key from file content + parameters.
 /// Uses a fast FNV-1a hash of the file bytes (not cryptographic, just

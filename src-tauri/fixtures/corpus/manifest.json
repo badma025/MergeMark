@@ -41,9 +41,19 @@
       "bytes": 649987
     },
     {
+      "path": "papers/used/01_edexcel_maths_p1_ms.pdf",
+      "sha256": "d14546017b151f65b772a1e0249a5662cb6771101132a05c355951224d657690",
+      "bytes": 469244
+    },
+    {
       "path": "papers/used/01_edexcel_maths_p1_qp.pdf",
       "sha256": "34177bcc22ec70d2fd56138a072635bd2cb4cdc0ad713433672d7d6c00733a40",
       "bytes": 1117392
+    },
+    {
+      "path": "papers/used/02_edexcel_further_maths_cp1_ms.pdf",
+      "sha256": "eadbf0030a1ecbd1ff129552daa928613ffe4ea9c008f4bd9b108f5a3e5d609f",
+      "bytes": 350021
     },
     {
       "path": "papers/used/03_aqa_physics_p1_qp.pdf",
@@ -54,6 +64,11 @@
       "path": "papers/used/04_cie_maths_9709_p1_qp.pdf",
       "sha256": "147e68dd3edc9e2478250353ddb9c9e04b189916b2a765a71e9b8eb9e9992f89",
       "bytes": 711774
+    },
+    {
+      "path": "papers/used/05_cs_or_decision_qp.pdf",
+      "sha256": "c3b39d1093d5a04a9d00980ac980a36a31f37f4e02266794809b92ddd838148e",
+      "bytes": 481882
     },
     {
       "path": "papers/used/07_legacy_c3_or_c4_qp.pdf",
@@ -86,9 +101,24 @@
       "bytes": 351894
     },
     {
+      "path": "papers/used/Chemistry_A-level_Past-Papers_Edexcel__June_2020_QP_-_Paper_1_Edexcel_Chemistry_AS-level.pdf",
+      "sha256": "abead7fd1725cf11679be0d29ba25e935b198342cfaf672ef6fc7422f71e2bc1",
+      "bytes": 629830
+    },
+    {
       "path": "papers/used/Chemistry_A-level_Past-Papers_Edexcel__June_2022_QP_-_Paper_1_Edexcel_Chemistry_A-level.pdf",
       "sha256": "2a2b867dba3fed89cf49735d8104a9748ea6651e3e36106e8860460ed096ea94",
       "bytes": 911025
+    },
+    {
+      "path": "papers/used/Chemistry_A-level_Past-Papers_Edexcel__June_2024_QP_-_Paper_3_Edexcel_Chemistry_A-level.pdf",
+      "sha256": "bdd7cca3b0076d11990dbcb69afaac0699c80ee77b40007421b95edd3bfdf681",
+      "bytes": 731833
+    },
+    {
+      "path": "papers/used/Chemistry_A-level_Past-Papers_OCR-A__June_2017_QP.pdf",
+      "sha256": "85ed4b2a481450ca77f0da42f58f093d972b44c9f6f367d28d7902d17cdb773a",
+      "bytes": 10378499
     },
     {
       "path": "papers/used/Chemistry_A-level_Past-Papers_OCR-A__June_2022_QP.pdf",
@@ -196,6 +226,11 @@
       "bytes": 210949
     },
     {
+      "path": "papers/used/m3_centre_of_mass.pdf",
+      "sha256": "4dfd61540e9f811d2a3935291e8ac97334123adc9ea34b4befc1eb90aab93c17",
+      "bytes": 4925857
+    },
+    {
       "path": "papers/used/madas_paper_2_t.pdf",
       "sha256": "76fc6779a3ef13c60495dc50f72a7b90cb95a94ccfdb41b98cdf9205562dcd92",
       "bytes": 98535
@@ -234,6 +269,21 @@
       "path": "papers/used/Maths_A-level_Papers_AQA__June_2019_QP.pdf",
       "sha256": "c8759908c9bee9df4788d7ccb92717e14c3992923048f375fe65de96b5e5d7a7",
       "bytes": 328875
+    },
+    {
+      "path": "papers/used/Maths_A-level_Papers_AQA__June_2021_QP.pdf",
+      "sha256": "691e458d8e515f515ccd0df6ce93cf039efbc603e6dff3476915afdc5eecd357",
+      "bytes": 677420
+    },
+    {
+      "path": "papers/used/Maths_A-level_Papers_AQA-Further__June_2019_QP.pdf",
+      "sha256": "1eec24caf906d101432e8da1d7cfad1308f73c72b4ee5bcd5a7d58f700096aa7",
+      "bytes": 297390
+    },
+    {
+      "path": "papers/used/Maths_A-level_Papers_AQA-Further__June_2021_QP.pdf",
+      "sha256": "cec3a577b7d5ab38a0dc71d805a1c30a2cd40ae5f0f97f09f02bb970bbc963e3",
+      "bytes": 556569
     },
     {
       "path": "papers/used/Maths_A-level_Papers_AQA-Further__June_2025_QP.pdf",
@@ -284,6 +334,11 @@
       "path": "papers/used/Maths_A-level_Papers_OCR-MEI-Further__June_2019_QP.pdf",
       "sha256": "19beff8b2c75d2a098db9354b63370e5db272fb7bc7180b50bb2c0e37b41c85e",
       "bytes": 910125
+    },
+    {
+      "path": "papers/used/Maths_A-level_Papers_WJEC__June_2019_QP_-_Unit_1_WJEC_Maths_AS-level.pdf",
+      "sha256": "6fc887b787ed82b3d12ed06cc87790861955028e19530e106b48d2dc5f8efacd",
+      "bytes": 304186
     },
     {
       "path": "papers/used/Maths_A-level_Papers_WJEC__June_2023_QP_-_Unit_1_WJEC_Maths_AS-level.pdf",
@@ -351,9 +406,19 @@
       "bytes": 133528
     },
     {
+      "path": "papers/used/Maths_GCSE_Past-Papers_Edexcel-IGCSE-A__June_2022_QP.pdf",
+      "sha256": "1678e26ff6b7d8df0904e995c748becb61b1f36d94f3336b72ad761dd3a8e8b2",
+      "bytes": 1010909
+    },
+    {
       "path": "papers/used/Maths_GCSE_Past-Papers_OCR__June_2024_QP.pdf",
       "sha256": "895da2ae7b7e0246da3a87afb108825be41f1e0c945de936eb388ff61d29a138",
       "bytes": 3783570
+    },
+    {
+      "path": "papers/used/mp1_t.pdf",
+      "sha256": "0ff276b00e3550f42c44cf318d3b63e7aaf4b839c9e99933d2704cdd21898464",
+      "bytes": 61866
     },
     {
       "path": "papers/used/naikermaths_paper_m16_pure.pdf",
@@ -414,6 +479,11 @@
       "path": "papers/used/Physics_A-level_Past-Papers_WJEC-Wales__June_2022_QP_-_Unit_3_WJEC_Physics_A-Level.pdf",
       "sha256": "1991ba40a171184a356ca910cefdf69b23e7ce3684e8f1675441fa26b5dc402c",
       "bytes": 469719
+    },
+    {
+      "path": "papers/used/Physics_A-level_Past-Papers_WJEC-Wales__June_2024_QP_-_Unit_5_(Examination_1)_WJEC_Physics_A-level.pdf",
+      "sha256": "d0afa1897e4f342250c43068e8da36d4a864cbc950575a282fc71f9c2d0d1c6a",
+      "bytes": 227078
     },
     {
       "path": "papers/used/Physics_GCSE_Past-Papers_OCR-A__November_2020_QP_-_Paper_1_OCR_(A)_Physics_GCSE.pdf",

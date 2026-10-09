@@ -752,33 +752,137 @@ Round 2 takes the defects w1r1's targeted audit uncovered; the first W3 batch ta
   - The 27 AES-encrypted papers (AQA's): the font catalog cannot read them (lopdf decrypts RC4 only), so their control-range glyphs go unnamed. An unnamed thin one becomes a rule: AQA Jun 2021 Q10's "π − 2" reads `\pi\quad 2` on a strict card.
 - **Blinded audit w1r2:** pack built from the triage run, judged in a separate session.
 
+## 1.0, W1 round 3 and the second W3 batch
+
+Round 3 takes the four defects w1r2's targeted audit found, and what the round 3 investigations found among the holdout's remaining hard findings: symbol fonts, marks over or under the printed totals, the paper with no question numbers. Run w1r3c compares with w1r2. Spec: `output/fix-log/spec-w1r3.md`. Review findings with their resolution: `review-w1r3-findings.md`. Tools, scans and the fix scripts: `output/fix-log/round3/`.
+
+**Causes and fixes** (`layout.rs` unless stated):
+- **AES-encrypted papers** (`pdf_decrypt.rs`, new). The corpus's 26 encrypted papers (AQA's) are all AES-128 (V 4, R 4, the AESV2 crypt filter for streams and strings), with an empty user password. lopdf decrypts RC4 only and drops an object stream it cannot parse, so the font catalog read no fonts and control-range codes went unnamed. An unnamed thin bar (Advent's minus) became a rule, and the minus left strict cards: AQA Jun 2021 Q10 "π − 2", AQA Further Jun 2021 Q1 "Var(4X − 2)". The module hand-writes:
+  - the file key (Algorithm 2), checked against /U (Algorithms 5 and 6);
+  - the object keys (Algorithm 1 with "sAlT");
+  - AES-128-CBC and RC4, tested against FIPS 197, SP 800-38A and RC4's published vectors.
+
+  Decryption runs through lopdf's load filter; a drop guard clears the key. Any other encryption is read as before; no corpus paper has one.
+- **Advent 3B2 and MT Extra symbols** (AQA Further Jun 2019, AQA Jun 2021, IGCSE Jun 2022). Each identity entry comes from the glyph's outline in the embedded font program: bracket pieces, √ and its overbar, { } | ( < :, α β ε γ μ, ≈ and °. MT Extra's U+F061 is ↦.
+- **A superscript at the text's size** (AQA Further Jun 2019 Q9, "re^{iθ}", its i at 12 pt raised 3.9 pt). At most three characters, raised a quarter to half an em and tight after a letter of a row of their own size, are a superscript.
+- **An integral's fraction limit** (AQA Further Jun 2019 Q8(c), ∫₀^{π/3} with π at text size): a stacked fraction at an integral's corner is a limit whatever its parts' size.
+- **A fraction under a radical's bar** (AQA Jun 2021 Q7(c)): the inner-bar slack is 0.1 em, not 0.5 pt. A bar set in glyph pieces ends 0.64 pt short.
+- **Glyphs clipped out of sight** (Edexcel Jun 2024 Q1, Q3, Q5, "ff((xx)) =="). MathType repeats "f(x) =" as text, clipped out. A glyph wholly outside its text object's clip path is dropped, after control codes are named. Over the corpus, 358 glyphs on 17 papers are dropped so, all out of sight:
+  - Edexcel back-page furniture, and spaces;
+  - an unshown right brace (WJEC Further Jun 2024 U2);
+  - a table row clipped off (OCR MEI Further Nov 2020);
+  - a doubled page number (WJEC Jun 2023 U1).
+- **White text on white paper** (mp1_t's ratings "(***+)", which merged Q2 into Q1). A run of white glyphs is dropped when less than 70% of the quarter em round it is darker than paper. Over the 1,045 white runs of the 48 papers with white text, that ring scores:
+  - 0.98–0.99 behind fills (the CP1 mark scheme's header row);
+  - 0.79–0.89 round the covers' paper codes;
+  - at most 0.62 round the hidden codes over m3_centre_of_mass's watermark;
+  - 0 on white paper.
+
+  618 glyphs on 25 papers are dropped, all invisible.
+- **An expression in its label row's gap** (WJEC Maths Unit 1 Jun 2019 Q7 b), 3.2 pt below "b) … [3]"): a row lying in a gap of another, within 0.45 em of its baseline, is the same line when it fills the gap within 2 em (a symbol or a fraction in its place in a sentence: AQA Physics 2015 Q1's "Tick (✓)", physics '18 Q9's ratio) or the other row is a part's label row (a part label before the gap or an allocation after it).
+- **An enlarged sign on a row of its own** (WJEC Maths Unit 1 Jun 2023 Q13 a), a 25 pt integral lowered 7.4 pt). A big operator set without limits is placed like a fraction, after the glyph rows, and is no measure of its row's size.
+- **An allocation beside a drawing** (OCR A Chemistry Jun 2017 Q18, 11 marks of 14): a bracketed number alone in the allocation column is never a figure's label.
+- **A paper with no question numbers** (WJEC Physics Unit 5 Jun 2024, no cards). When neither the layout map nor the text-layer map finds a question, "Answer all questions." over lettered parts with allocations is one question.
+- **Array indices in code** (`deterministic.rs`; AQA CS 05 Q2, 36 marks of 11): nothing inside fenced code is an allocation.
+- **A drawing of boxes and arrows** (OCR B Physics AS Jun 2018 Q19 and Q20, blocks X and Y on a track):
+  - An arrow's shaft is no table border.
+  - Arrows seed figure regions, after the regions seeded by oblique strokes have grown and never inside one. They do not seed in tables (ruled or drawn cell by cell) or radicals.
+  - An arrow meeting another at right angles is an axis and seeds nothing; empty axes stay answer space.
+  - A small region holding an arrow, or at an arrow's end, joins the drawing within 12 pt.
+  - A drawing 120 pt wide and 20 pt tall is a figure only when it holds an arrow (a line of outlined letters is as wide), and an axis stays a border of its answer grid.
+- **Local OCR after its threads end** (`ocr.rs`; a crash, found by the verify chain's test run). The windows crate keeps each WinRT class's activation factory for the life of the process. The reading threads joined the multithreaded apartment, and about 30 s after the last of them ended, COM unloaded the engine's DLLs from under the cached factories. The next read crashed the process. The apartment is now kept for the life of the process (`CoIncrementMTAUsage`). In the app, a paper's pages are first read on tokio's blocking threads, which end after 10 s idle (the layout's reads find them cached), so a scanned import after an earlier one could have crashed the app the same way (not reproduced in the app).
+- `EXTRACTION_CACHE_VERSION` 8 → 9 (`db.rs`).
+
+**Measured before the chain** (dev copy, page scans of all 198 papers, each change toggled off and on):
+- **Enlarged signs:** 7 of the 101 pages that set a big operator change, all for the better against the page renders. As well as WJEC 2023 Q13:
+  - C4 Jun 2014's "∫ 8/(2x − 1)³ dx, x > ½" is one line;
+  - AQA Jun 2025 Q5's number is on its first line, and Q17's integral is whole;
+  - Edexcel Further Jun 2019's "I_n = ∫ cosecⁿx dx" is whole;
+  - madas paper 2's "(12)" is on its line.
+- **Arrows:** against the same code with arrows off, 54 pages change, 52 of them in their figures; no table is lost or gained (scanned before the chain's corrections below). Labels join their drawings ("Truck B Truck A Engine", "Ceiling/Floor", "18 Ω shunt", "20 N", "2.0 m s⁻¹"), and so do dimension arrows (12.0 cm, 18 cm, 1.4 m, 4.20 mm). Drawings that were no figure become one:
+  - OCR B 2018's blocks;
+  - OCR A Physics Jun 2017's force diagram;
+  - OCR A Physics Jun 2019's cable;
+  - OCR GCSE Jun 2024's probability scale, whose arrow is the answer;
+  - Edexcel GCSE Biology Jun 2024's Figure 19.
+
+  OCR A Chemistry Jun 2017's NMR spectrum, half outside its region before, is whole. The scans caught three wrong forms, each corrected and tested:
+  - seeding arrows first cut edexcel '18 p17's graph short;
+  - axes as arrows made blank answer axes figures on six pages;
+  - arrows that joined only each other lost phasor C, the number machine, cell X and cyclohexene.
+
+**Code review**, three passes and the final page scans. Every finding was taken or answered (`review-w1r3-findings.md`). Among them:
+- the one-task fallback moved after the text-layer map, which a numbered paper whose layout map fails still reaches;
+- the /U check;
+- the `\quad` heading fix withdrawn (redundant with the white drop);
+- the white rule judged by the ring round a run;
+- tests for every correction a scan prompted;
+- three judgement calls counted over every page of the 198 papers and not taken, because none would change a page: compound labels and "[3 marks]" in the gap rule, glyphs only before a label row's gap, a 60 pt minimum for an axis.
+
+**What the verify chains found.** Run w1r3's card changes showed three wrong forms, each corrected with a test red before (29 pages of the page scan change with them, `chain-fixes-scan.out`):
+- the gap rule merged a bar chart's data labels, set at different heights in each other's wide gaps (Edexcel-A Economics Jun 2021 Q5, "3.41 ${}^{3}.^{54}$ 3.38 3.50"). A row joins another's gap only when it fills the gap within 2 em, as a symbol or a fraction fills its place in a sentence, or when the other row is a part's label row;
+- the 120-by-20 rule made a line of outlined letters a drawing, and edexcel '19 Q17(b)(ii)'s table of grating spacings left the card. The rule now holds only for a region holding an arrow;
+- an answer grid's arrowed axis was no border, and Nov 2024 Q1's axis title "Time (t minutes)" became question text. An axis stays a border.
+
+Run w1r3b's test stage then crashed (the OCR entry above); w1r3c is the run reported below.
+
+**Tests**, each red without its fix (six of the reviews' also checked by undoing their fix in a copy, `mutate_r3.py`):
+- Encrypted papers (`pdf_decrypt.rs`): `aes_128_decrypts_the_standard_examples`, `rc4_encrypts_the_published_example`, `malformed_ciphertext_is_never_trusted`, `the_file_key_is_the_empty_passwords_only`, `an_aes_encrypted_papers_fonts_are_read`; in `layout.rs`, `an_encrypted_papers_minus_signs_are_read`.
+- Symbols and maths: `advent_fonts_read_as_their_outlines_draw`, `a_maps_to_arrow_is_read_as_one`, `a_superscript_at_the_texts_own_size_is_still_one`, `a_fraction_at_an_integrals_top_is_its_upper_limit`, `a_fraction_under_a_radicals_bar_is_built_first`.
+- Text that is not printed: `a_glyph_clipped_out_of_sight_is_not_read`, `white_text_on_a_white_page_is_not_read`, `a_white_code_over_a_watermark_is_not_read`, `white_text_on_a_tint_is_read`.
+- Lines: `an_expression_between_its_label_and_its_allocation_is_their_line`, `a_fraction_in_its_sentences_gap_is_in_its_line`, `a_charts_data_labels_are_no_label_row`, `an_enlarged_sign_does_not_part_a_line`, `an_enlarged_sign_takes_no_line_for_its_script`.
+- Allocations and questions: `an_allocation_beside_a_drawing_is_no_label` (and the import guard `an_allocation_beside_a_drawing_reaches_the_card`, which passed before), `a_task_with_no_question_number_is_one_question`, through the import `a_paper_with_no_question_number_imports_as_one_task`, and in `deterministic.rs` `an_index_in_code_is_no_allocation` (through the import `an_index_in_a_listing_is_no_allocation`).
+- Drawings: `a_drawing_of_boxes_and_arrows_is_a_figure`, `arrows_in_boxes_drawn_cell_by_cell_are_no_figure`, `an_axis_arrow_leaves_its_graph_whole`, `empty_axes_with_arrowheads_are_no_figure`, `an_arrow_beside_a_drawing_is_part_of_it`, `a_drawing_at_an_arrows_end_is_part_of_its_figure`, `a_table_among_outlined_letters_is_no_figure`, `an_answer_grids_arrowed_axes_are_its_borders`.
+- Local OCR (`ocr.rs`): `the_engine_reads_again_after_its_threads_have_ended`.
+
+**Fixtures:** the 14 papers fixed against moved to `papers/used/` (96 in all) and sealed (98 papers in the encrypted set). The 12 question papers are registered: Edexcel IGCSE Jun 2022, AQA Further Jun 2019 and Jun 2021, AQA Jun 2021, WJEC Maths Unit 1 Jun 2019, OCR A Chemistry Jun 2017, WJEC Physics Unit 5 Jun 2024, the CS/decision paper (05), mp1_t, m3_centre_of_mass (its expected ids are the two sections' union, 1–18), Edexcel Chemistry Jun 2020 P1 and Jun 2024 P3. The two mark schemes (01_edexcel_maths_p1_ms, 02_edexcel_further_maths_cp1_ms) are sealed, not registered: calibration imports question papers, as with 07_legacy_c3_or_c4_ms. 97 question papers are left in the holdout.
+
+**Numbers** (run w1r3c):
+- **cargo test:** 450 passed, 0 failed, 4 ignored (with `MERGEMARK_REQUIRE_FIXTURES=1`), plus 43 script tests; the fixture check holds all 98 sealed papers.
+- **Calibration w1r3c:** 93/93 OK. Historical 243/244 strict, test papers 69/69, zero attempts and tokens. The 59 earlier fixtures hold 698 of 835 strict (697 in w1r2: AQA Biology GCSE Jun 2022 Q10 is newly strict); the 12 new ones bring the fixtures to 822 of 996. m3_centre_of_mass, a worksheet whose two sections number 1–11 and 1–18, gives cards for ids 1–5 and 7–10 only (an ID mismatch since it was registered; not debugged).
+- **Calibration cards changed:** 20, each as intended:
+  - Edexcel Jun 2024 Q1, Q3 and Q5 lose the clipped copies ("g(x) =", "f(x) =");
+  - labels and dimension arrows join their drawings: edexcel '17 Q2's 20 N, OCR A Physics Jun 2017 Q8's forces, OCR A Physics Jun 2019 Q7's ground and Q16's 4.20 mm, OCR B Physics AS Jun 2018 Q16's 2L, Q19 and Q20's blocks, Q22's compass, OCR GCSE Jun 2024 Q5's probability scale;
+  - physics '18 Q9's fraction is in its sentence, WJEC Unit 1 Jun 2023 Q13's integral on its line, madas paper 2 Q8's integral before its allocation, where it is printed;
+  - AQA's part labels "0 8 1" read "(a)" (AQA Biology GCSE Jun 2022 Q8, and Q10, newly strict);
+  - Edexcel GCSE Jun 2022 Q28's crop holds the whole rectangle (it stopped halfway down and took in the sentence above), and "All measurements are in cm." is text;
+  - two flagged cards change and stay flagged: OCR GCSE Jun 2024 Q20 reads the answer line's empty brackets "(a) ( )" as printed, and WJEC Further Jun 2024 Q2 loses a right brace the page clips out of sight.
+- **Triage unused-w1r3c** (97 papers in both runs): PASS 26 → 27 (mp1_a, REVIEW → PASS: its white ratings no longer merge its questions, so its 2 cards become 13, 100 marks), REVIEW 5 → 5 (AQA Chemistry Jun 2022, FLAGGED → REVIEW), FLAGGED 40 → 39, FAIL 26 → 26. Printed totals matched 88 → 88. Unidentified-glyph findings 38 → 36, flagged cards 166 → 163, id gaps 3 → 2, papers mentioning a figure with no image 6 → 5. 36 cards changed (11 of them mp1_a's new ones), and no line that is only a number was gained. AQA Jun 2023 Q8's upper limit π/2, on a line of its own before (it was under What is left), is its integral's.
+- **Against w1r3b:** no card changed in either run (the crash fix, the third review's comments and tests).
+- **Targeted audit:** every card that changed or turned strict was checked against its pages, and the crop of every card whose labels moved into a drawing. The newly strict cards read whole (AQA Biology Jun 2024 Q7, AQA Chemistry Jun 2022 Q6, AQA Jun 2023 Q12; in calibration AQA Biology GCSE Jun 2022 Q10). Two cards changed for the worse, each where a round 3 rule meets an older fault, and two fixtures show older faults. All four go to the next round (What is left):
+  - Edexcel GCSE Physics Jun 2024 Q4 (holdout, flagged): Figure 9, a velocity–time graph printed on graph paper, is taken for graph paper to draw on, so it has no image and its labels are withheld as answer space. Its label "driver applies brakes" now reaches the text: the arrow that put it in the grid is no border now.
+  - OCR A Physics AS Jun 2023 Q24 (holdout, strict): the side view's "2.0 m", now read as the drawing's label, is cut by the crop. The detector's box over both views widens each view's crop to one picture, which stops above "Not to scale" (the value is also in the text and the plan view).
+  - OCR B Physics AS Jun 2018 Q16 (fixture, strict, as before round 3): wire X, smaller than a figure and too far from wire Y to join it, has no crop; its labels read as text.
+  - Edexcel GCSE Jun 2022 Q28 (fixture, strict): the left dimension arrow lies outside the crop; its label 4x reads as text.
+- **Blinded audit w1r3:** pack built from the triage run, judged in a separate session.
+
 ## What is left
 
-On the 123 holdout papers after round 3 (run unused-c13). Round 3 changed none of these findings; the unidentified-glyph counts are lower than after round 2 (37 papers, 106 cards on 126 papers) only because three papers became fixtures.
+On the 97 holdout papers after 1.0 W1 round 3 (run unused-w1r3c). No holdout paper's card marks differ from its printed total now (88 match; 9 print no total the triage reads). The papers this table named before for marks over or under their totals, for render errors and for no cards all became fixtures in rounds 2 and 3, so they are no longer counted here.
 
 | remaining hard finding | papers | cards | cause |
 |---|---|---|---|
-| unidentified glyph | 35 | 101 cards, all flagged (83 findings) | symbol-font glyphs no fixture established (each is `�`, never a guess): symbols drawn as curves (VectorOutline) and font families of one or two papers each (Advent variants, MathExtn, NewMathExtn, CIDFont) |
-| card marks below printed total | 3 | flagged | holdouts, not debugged: OCR A Chemistry Jun 2017 (97 of 100), WJEC Unit 1 Jun 2023 (114 of 120), Edexcel GCSE Jun 2018 (78 of 80) |
-| card marks above printed total | 4 | | choose-one papers whose instruction the question map does not recognise, so no alternatives are recorded: the CS/decision paper (125 vs 100), AQA Further Jun 2021 (58 vs 40), AQA GCSE Jun 2024 (85 vs 80), mp1_t (129 vs 125). Not debugged |
-| marks tags exceed the card's marks | 3 | 3 of 3 flagged | 06_community_pmt_pack Q9 (48 vs 7), Edexcel Jun 2024 (13 vs 11), Edexcel IGCSE Jun 2022 Q14 (14 vs 4). Holdouts, not investigated |
-| render error | 3 | 4, all flagged | unchanged since cluster 6: Edexcel Oct 2021 Q12, WJEC Unit 1 Jun 2023 Q6, AQA Physics Jun 2022 Q5 |
-| no cards | 1 | | WJEC Physics Unit 5 Jun 2024 prints no question numbers (see below) |
+| unidentified glyph | 25 | 36, all flagged | symbol-font glyphs no fixture established (each is `�`, never a guess): symbols drawn as curves (VectorOutline) and font families of one or two papers each (Advent variants, MathExtn, NewMathExtn, CIDFont) |
+| marks tags exceed the card's marks | 1 | 1, flagged | 06_community_pmt_pack Q9 (48 vs 7). Holdout, not investigated |
+| a question with no card | 2 | | Biology OCR-A Nov 2021 Q14; WJEC Physics Jun 2017 Unit 5 Q1, a practical task with a placeholder card, a quarantined card and 42% of its words in the cards. Not debugged |
 
 Known gaps outside these numbers:
 - Scanned papers are imported but their text needs a person (cluster 5's audit). The macOS (Vision) and Linux (Tesseract) backends exist but are untested at run time: the macOS one is compile-checked only, and Tesseract is not installed on this machine. With no engine, a scan is reported as not transcribed, never sent anywhere.
-- Mark schemes: the local reader accepts 0 of the 7 schemes available (cluster 5c); a refused scheme is reported as not transcribed.
+- Mark schemes are not imported in 1.0 (cut in W4 step 2).
 - The CIE M2 rotation arrow and its "5 rad s⁻¹" label lie 25pt beside the drawing and are not joined to its crop (the label's text is still on the card).
 - Single-part Edexcel questions now carry their footer allocation as a tag; cards imported before this run do not.
 - The audit-pack page picker sometimes attaches the wrong page. One cause, found and fixed in round 2: `pdftotext` splits its whole-file output at form feeds, and some pages carry a form feed in their text, so its index ran ahead of the PDF's pages. The picker now reads each page by itself.
   - The triage's page count (`stats.pages`, characters per page) still comes from that split, which also counts the empty text after the last form feed. It is left as it is so that runs stay comparable.
-- Maths no gate catches: AQA Jun 2023 Q8 is strict, but its integral's upper limit π/2 sits on a line of its own (holdout, not debugged).
-- A paper that prints no question numbers gives no cards (WJEC Physics Unit 5 Jun 2024, one practical task in parts (a)–(e)). The import says that no questions were found in the paper.
 - A superscript set over a subscript of several letters, or inside an exponent, lands on a line of its own:
   - physics '20 Q10 "c²ᵣₘₛ" (flagged);
-  - mp1_t Q10 "x² − 4x + 5" read as "x − 4x + 5" with a lone "2" (still strict).
+  - mp1_t Q10 "x² − 4x + 5" read as "x − 4x + 5" with a lone "2" (still strict; mp1_t is a fixture since 1.0 W1 round 3).
 
-  Holdouts, not debugged. Until cluster 9, the sanitizer deleted the lone "2" and the cards looked clean.
+  Not debugged. Until cluster 9, the sanitizer deleted the lone "2" and the cards looked clean.
+- Found by 1.0 W1 round 3's targeted audit, for the next round (see that round's numbers):
+  - a graph printed on graph paper is taken for graph paper to draw on (Edexcel GCSE Physics Jun 2024 Q4's Figure 9, flagged: no image, its labels withheld, one now in the text);
+  - a detector box over two drawings makes one picture of both, cut where a line of text runs under either (OCR A Physics AS Jun 2023 Q24, strict: the side view's "2.0 m" cut);
+  - a drawing smaller than a figure, too far from the next to join it, has no crop (OCR B Physics AS Jun 2018 Q16's wire X, strict);
+  - a dimension arrow beside a drawing can lie outside its crop (Edexcel GCSE Jun 2022 Q28's 4x, strict; the label reads as text).
 - The text-layer carve, used only when a question has no layout body, still drops every line that holds only a number (its page-number rule cannot tell a page number from an option without geometry).
 - Two flagged holdout cards end on what may be a page number (OCR B Physics Jun 2024 Q2 "6", WJEC Physics Jun 2017 Q2 "3"); OCR A's is handled (cluster 9).
 - Axis scales of drawn graphs and grids appear as lines of numbers in the card text, as their titles already did, except on graph paper drawn as one path (cluster 14).

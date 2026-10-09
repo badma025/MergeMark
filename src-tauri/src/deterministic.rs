@@ -1315,8 +1315,16 @@ fn subpart_paragraphs(lines: &[String], decimal_labels: bool) -> Vec<String> {
 fn format_marks(blocks: &[String]) -> (Vec<String>, u32) {
     let mut out = Vec::with_capacity(blocks.len());
     let mut total = 0u32;
+    // Code is verbatim: an index in a listing is no allocation (AQA's CS
+    // paper draws its stack S[7] … S[0] in code type).
+    let mut in_code = false;
     for block in blocks {
-        if !MARK_TAG_RE.is_match(block) && !block.lines().any(|l| bare_mark_tag(l.trim()).is_some())
+        let fences = block.lines().filter(|l| l.trim_start().starts_with("```")).count();
+        let code = in_code || fences > 0;
+        if fences % 2 == 1 {
+            in_code = !in_code;
+        }
+        if code || !MARK_TAG_RE.is_match(block) && !block.lines().any(|l| bare_mark_tag(l.trim()).is_some())
         {
             out.push(block.clone());
             continue;
@@ -3039,6 +3047,17 @@ pub(crate) fn tier0_diagnose_span(
 
 #[cfg(test)]
 mod tests {
+    /// An index in a listing ("[7]" inside a fenced block) is no allocation:
+    /// AQA's CS paper drew its stack S[7] … S[0] in code type, and Q2 counted
+    /// 36 marks for its 11.
+    #[test]
+    fn an_index_in_code_is_no_allocation() {
+        let blocks: Vec<String> = ["(c) What value will be returned? [1]", "```", "[7]", "[2]     Jib      Top = 2", "```", "(d) Explain. [2]"].iter().map(|s| s.to_string()).collect();
+        let (out, total) = super::format_marks(&blocks);
+        assert_eq!(total, 3, "{out:?}");
+        assert!(out.iter().any(|b| b == "[7]") && out.iter().any(|b| b.starts_with("[2]     Jib")), "{out:?}");
+    }
+
     /// A bracket set against the letter before it is text; after a space or
     /// punctuation it is an allocation.
     #[test]

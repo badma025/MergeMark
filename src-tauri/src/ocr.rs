@@ -75,6 +75,7 @@ pub fn recognize(img: &image::RgbaImage) -> Option<Vec<OcrLine>> {
 #[cfg(windows)]
 mod platform {
     use super::{OcrLine, OcrWord};
+    use std::sync::atomic::{AtomicBool, Ordering};
     use windows::Graphics::Imaging::{BitmapAlphaMode, BitmapPixelFormat, SoftwareBitmap};
     use windows::Media::Ocr::OcrEngine;
     use windows::Storage::Streams::DataWriter;
@@ -84,9 +85,20 @@ mod platform {
     }
 
     pub fn recognize(img: &image::RgbaImage) -> Option<Vec<OcrLine>> {
-        // WinRT on this thread (already initialised is fine).
-        unsafe {
-            let _ = windows::Win32::System::WinRT::RoInitialize(windows::Win32::System::WinRT::RO_INIT_MULTITHREADED);
+        // The windows crate keeps each agile activation factory it fetches
+        // for the life of the process, so this keeps the multithreaded
+        // apartment they come from as long. Joined only by the reading
+        // threads, the apartment was left with none when they ended; about
+        // 30 seconds later COM unloaded the engine's DLLs, and the next read
+        // faulted in them. A thread that has joined no apartment reads in
+        // this one.
+        static MTA_KEPT: AtomicBool = AtomicBool::new(false);
+        if !MTA_KEPT.load(Ordering::Acquire) {
+            // SAFETY: no arguments; the usage it takes is never released.
+            if unsafe { windows::Win32::System::Com::CoIncrementMTAUsage() }.is_err() {
+                return None;
+            }
+            MTA_KEPT.store(true, Ordering::Release);
         }
         // Exam papers here are English; the profile's languages otherwise.
         let english = ["en-GB", "en-US"].iter().find_map(|tag| {
@@ -341,5 +353,33 @@ mod tests {
         let lines = tesseract::recognize(&page.to_rgba8()).expect("tesseract ran");
         let words: Vec<&str> = lines.iter().flat_map(|l| l.words.iter().map(|w| w.text.as_str())).collect();
         assert!(words.iter().any(|w| w.contains("flywheel")), "{words:?}");
+    }
+
+    /// The engine still reads after the threads that ran it have ended. The
+    /// windows crate keeps each class's activation factory for the life of
+    /// the process; when only the reading threads had joined the
+    /// multithreaded apartment, COM unloaded the engine's DLLs about 30
+    /// seconds after the last of them ended, and the next read faulted in
+    /// the unloaded Windows.Globalization.dll (the crash in the verify
+    /// chain's test run). Waits 45 seconds. (Alone it fails without the fix;
+    /// in a parallel run other reads can keep the apartment for part of the
+    /// wait.)
+    #[cfg(windows)]
+    #[test]
+    fn the_engine_reads_again_after_its_threads_have_ended() {
+        #[link(name = "kernel32")]
+        unsafe extern "system" {
+            fn GetModuleHandleW(name: *const u16) -> *mut std::ffi::c_void;
+        }
+        let page = image::RgbaImage::from_pixel(200, 100, image::Rgba([255, 255, 255, 255]));
+        let read = |img: image::RgbaImage| std::thread::spawn(move || recognize(&img).is_some()).join().unwrap();
+        assert!(read(page.clone()));
+        let name: Vec<u16> = "Windows.Globalization.dll\0".encode_utf16().collect();
+        for _ in 0..90 {
+            std::thread::sleep(std::time::Duration::from_millis(500));
+            // SAFETY: a NUL-terminated module name; the handle is only tested.
+            assert!(!unsafe { GetModuleHandleW(name.as_ptr()) }.is_null(), "COM unloaded the engine's DLLs, whose factories the windows crate keeps");
+        }
+        assert!(read(page));
     }
 }

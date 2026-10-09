@@ -37,6 +37,8 @@ futures-util = "0.3"
 uuid = { version = "1.23.5", features = ["v4"] }
 regex = "1.13.0"
 pdf-extract = "0.7"
+# AES-encrypted papers read by the font catalog (pdf_decrypt); already built for lopdf.
+md-5 = "0.10"
 image = "0.25.10"
 base64 = "0.22.1"
 zip = { version = "2", default-features = false, features = ["deflate"] }
@@ -58,7 +60,7 @@ objc2-foundation = { version = "0.3.2", default-features = false, features = ["s
 # Local OCR for scanned pages on Windows: the operating system's own engine
 # (Windows.Media.Ocr). Already in the dependency graph through Tauri.
 [target.'cfg(windows)'.dependencies]
-windows = { version = "0.61", features = ["Media_Ocr", "Graphics_Imaging", "Storage_Streams", "Foundation", "Foundation_Collections", "Globalization", "Win32_System_WinRT"] }
+windows = { version = "0.61", features = ["Media_Ocr", "Graphics_Imaging", "Storage_Streams", "Foundation", "Foundation_Collections", "Globalization", "Win32_System_Com"] }
 
 # Updates: the app checks the project's GitHub releases for a newer signed
 # build (the only request it makes; imports never leave the machine), and

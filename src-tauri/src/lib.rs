@@ -18,6 +18,7 @@ pub mod ocr;
 pub mod pdf_render;
 pub mod pipeline;
 pub mod sanitize;
+mod pdf_decrypt;
 mod source_pages;
 pub(crate) mod stroke_census;
 mod taxonomy;

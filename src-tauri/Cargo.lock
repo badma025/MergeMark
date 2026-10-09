@@ -2653,6 +2653,7 @@ dependencies = [
  "csv",
  "futures-util",
  "image",
+ "md-5",
  "objc2",
  "objc2-foundation",
  "pdf-extract",

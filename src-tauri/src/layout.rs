@@ -304,6 +304,35 @@ fn walk_objects(objects: &[PdfPageObject], parent: PdfMatrix, frame: &Frame, out
     }
 }
 
+/// A glyph its text object's clip path leaves wholly out of sight: it is not
+/// printed (Edexcel Jun 2024's MathType equations repeat the "f(x) =" set
+/// beside them as text, clipped out, and were read twice: "ff((xx)) ==").
+/// Tested only where the glyph lies within its object's bounds: an object
+/// drawn inside a form gives its bounds and clip in the form's own space,
+/// not the page's.
+fn clipped_out(c: &PdfPageTextChar, tb: &PdfRect) -> bool {
+    let Ok(text) = c.text_object() else { return false };
+    let object = PdfPageObject::from(text);
+    let Ok(ob) = object.bounds() else { return false };
+    let (l, r, b, t) = (tb.left().value, tb.right().value, tb.bottom().value, tb.top().value);
+    let slack = 1.0;
+    if l < ob.left().value - slack || r > ob.right().value + slack || b < ob.bottom().value - slack || t > ob.top().value + slack {
+        return false;
+    }
+    let Some(clip) = object.get_clip_path() else { return false };
+    // (Every path of a clip clips: outside the box of any one is out.)
+    clip.iter().any(|path| {
+        let (mut x0, mut y0, mut x1, mut y1) = (f32::MAX, f32::MAX, f32::MIN, f32::MIN);
+        for s in path.iter() {
+            x0 = x0.min(s.x().value);
+            x1 = x1.max(s.x().value);
+            y0 = y0.min(s.y().value);
+            y1 = y1.max(s.y().value);
+        }
+        x0 <= x1 && (r <= x0 || l >= x1 || t <= y0 || b >= y1)
+    })
+}
+
 /// Extract glyph + vector evidence for one page. Never fails: a page whose
 /// text cannot be read yields an empty glyph list.
 pub fn extract_page(page: &PdfPage, page_index: usize) -> PageGlyphs {
@@ -316,6 +345,10 @@ pub fn extract_page_with(page: &PdfPage, page_index: usize, fonts: Option<&PageF
     let frame = Frame::new(page);
     let (width, height) = frame.size();
     let mut out = PageGlyphs { page: page_index, width, height, ..Default::default() };
+    // (Indices in `out.glyphs`, in order: glyphs clipped out of sight, see
+    // `clipped_out`, and glyphs filled white.)
+    let mut clipped_at: Vec<usize> = Vec::new();
+    let mut white_at: Vec<usize> = Vec::new();
     if let Ok(text) = page.text() {
         let text_chars = text.chars();
         let chars: Vec<PdfPageTextChar> = text_chars.iter().collect();
@@ -342,6 +375,7 @@ pub fn extract_page_with(page: &PdfPage, page_index: usize, fonts: Option<&PageF
             if (raw == 0x0D || raw == 0x0A) && !has_extent {
                 continue;
             }
+            let clipped = clipped_out(c, &tb);
             // UTF-16 surrogate halves arrive as separate chars (Cambria Math
             // alphanumerics such as U+1D400): recombine them.
             if (0xD800..=0xDBFF).contains(&raw) && k < chars.len() {
@@ -386,12 +420,20 @@ pub fn extract_page_with(page: &PdfPage, page_index: usize, fonts: Option<&PageF
                     ch = r;
                 }
             }
-            if std::mem::take(&mut generated_space) {
-                if let Some(prev) = out.glyphs.last() {
+            if std::mem::take(&mut generated_space) && !clipped {
+                // (Never beside a glyph clipped out of sight.)
+                let prev_clipped = out.glyphs.len().checked_sub(1).is_some_and(|i| clipped_at.last() == Some(&i));
+                if let Some(prev) = out.glyphs.last().filter(|_| !prev_clipped) {
                     if (prev.oy - oy).abs() < 0.3 * size && bx[0] >= prev.x1 - 0.5 && bx[0] - prev.x1 < 1.5 * size {
                         out.generated_spaces.push([oy, prev.x1, bx[0]]);
                     }
                 }
+            }
+            if clipped {
+                clipped_at.push(out.glyphs.len());
+            }
+            if c.fill_color().is_ok_and(|f| f.red() >= 245 && f.green() >= 245 && f.blue() >= 245) {
+                white_at.push(out.glyphs.len());
             }
             out.glyphs.push(Glyph {
                 idx: c.index() as usize,
@@ -418,11 +460,27 @@ pub fn extract_page_with(page: &PdfPage, page_index: usize, fonts: Option<&PageF
         resolve_control_codes(&mut out.glyphs, cat);
         resolve_glyph_ids(&mut out.glyphs, cat);
     }
+    // Glyphs not printed are dropped only now (the content stream counts
+    // them, and control codes are named by occurrence in its order): those
+    // clipped out of sight, and white ones on white paper (Madas's difficulty
+    // ratings, "(***+)", set white on the page). White on a fill or a tint
+    // behind most of its box is printed; a light watermark crossing it is no
+    // tint (m3_centre_of_mass's hidden "FM2-Q").
+    let unknown = out.glyphs.iter().any(|g| g.ch == UNKNOWN_GLYPH);
+    let ink = if unknown || !white_at.is_empty() { render_ink(page) } else { None };
+    let unseen_white = ink.as_ref().map(|m| white_on_paper(&out.glyphs, &white_at, m)).unwrap_or_default();
+    if !clipped_at.is_empty() || !white_at.is_empty() {
+        let mut i = 0;
+        out.glyphs.retain(|_| {
+            i += 1;
+            clipped_at.binary_search(&(i - 1)).is_err() && unseen_white.binary_search(&(i - 1)).is_err()
+        });
+    }
     // Glyphs whose identity is still unknown: when they leave no ink at all
     // they are invisible placeholders (MathType spacing glyphs) and carry no
     // source content; visible unknowns stay as UNKNOWN_GLYPH for the gates.
-    if out.glyphs.iter().any(|g| g.ch == UNKNOWN_GLYPH) {
-        if let Some(ink) = render_ink(page) {
+    if unknown {
+        if let Some(ink) = &ink {
             let before = out.glyphs.len();
             out.glyphs.retain(|g| g.ch != UNKNOWN_GLYPH || ink.has_ink(g.x0, g.y0, g.x1, g.y1));
             out.invisible_dropped = before - out.glyphs.len();
@@ -918,8 +976,8 @@ fn normalize_math_alnum(g: &mut Glyph) {
     }
 }
 
-/// Grey-level page raster used only to decide whether an unidentified glyph
-/// draws anything.
+/// Grey-level page raster: whether a glyph draws anything (an unidentified
+/// one), and whether a white one stands on anything but white paper.
 struct InkMap {
     gray: Vec<u8>,
     w: usize,
@@ -928,18 +986,24 @@ struct InkMap {
 }
 
 impl InkMap {
-    fn has_ink(&self, x0: f32, y0: f32, x1: f32, y1: f32) -> bool {
+    /// The box's pixels, as column and row ranges within the raster.
+    fn pixels(&self, x0: f32, y0: f32, x1: f32, y1: f32) -> (std::ops::Range<usize>, std::ops::Range<usize>) {
         let px0 = ((x0 * self.scale).floor().max(0.0) as usize).min(self.w);
         let px1 = ((x1 * self.scale).ceil().max(0.0) as usize).min(self.w);
         let py0 = ((y0 * self.scale).floor().max(0.0) as usize).min(self.h);
         let py1 = ((y1 * self.scale).ceil().max(0.0) as usize).min(self.h);
-        if px1 <= px0 || py1 <= py0 {
+        (px0..px1, py0..py1)
+    }
+
+    fn has_ink(&self, x0: f32, y0: f32, x1: f32, y1: f32) -> bool {
+        let (xs, ys) = self.pixels(x0, y0, x1, y1);
+        if xs.is_empty() || ys.is_empty() {
             // A zero-area box cannot be judged invisible from pixels.
             return true;
         }
         let mut dark = 0;
-        for y in py0..py1 {
-            for x in px0..px1 {
+        for y in ys {
+            for x in xs.clone() {
                 if self.gray[y * self.w + x] < 170 {
                     dark += 1;
                     if dark >= 2 {
@@ -950,6 +1014,51 @@ impl InkMap {
         }
         false
     }
+
+    /// The box's pixels darker than white paper, and all its pixels.
+    fn tinted(&self, x0: f32, y0: f32, x1: f32, y1: f32) -> (usize, usize) {
+        let (xs, ys) = self.pixels(x0, y0, x1, y1);
+        let total = xs.len() * ys.len();
+        let tinted = ys.flat_map(|y| xs.clone().map(move |x| (x, y))).filter(|&(x, y)| self.gray[y * self.w + x] < 240).count();
+        (tinted, total)
+    }
+}
+
+/// The white glyphs (of `white`, indices into `glyphs` in order) set on white
+/// paper. Each run of them, a word or a code set in one line, is judged by
+/// the quarter em round it, where the render holds none of its own strokes
+/// (it shows them as paper): a fill or a tint behind white text runs on past
+/// it, a light watermark crossing a hidden code does not, nor does white
+/// paper. Over the corpus's white runs that margin is 98% darker than paper
+/// behind the Edexcel Further CP1 mark scheme's header row and 79% or more
+/// round the covers' paper codes, at most 62% round m3_centre_of_mass's
+/// hidden codes ("FM2-Q"), and 0 round mp1_t's ratings. (Judged glyph by
+/// glyph, one letter of a code can lie on a stroke of the watermark.)
+fn white_on_paper(glyphs: &[Glyph], white: &[usize], ink: &InkMap) -> Vec<usize> {
+    let mut out = Vec::new();
+    let mut k = 0;
+    while k < white.len() {
+        let mut j = k + 1;
+        while j < white.len() && white[j] == white[j - 1] + 1 && {
+            let (a, b) = (&glyphs[white[j - 1]], &glyphs[white[j]]);
+            let s = a.size.max(b.size).max(1.0);
+            (a.oy - b.oy).abs() < 0.3 * s && b.x0 >= a.x0 - 0.5 * s && b.x0 - a.x1 < s
+        } {
+            j += 1;
+        }
+        let run = &white[k..j];
+        let (x0, y0, x1, y1) = run.iter().map(|&i| &glyphs[i]).fold((f32::MAX, f32::MAX, f32::MIN, f32::MIN), |b, g| (b.0.min(g.x0), b.1.min(g.y0), b.2.max(g.x1), b.3.max(g.y1)));
+        let pad = 0.25 * run.iter().map(|&i| glyphs[i].size).fold(1.0, f32::max);
+        let (inner, inner_total) = ink.tinted(x0, y0, x1, y1);
+        let (outer, outer_total) = ink.tinted(x0 - pad, y0 - pad, x1 + pad, y1 + pad);
+        // (A run whose margin no pixel can judge is kept.)
+        let ring = outer_total.saturating_sub(inner_total);
+        if ring > 0 && (outer.saturating_sub(inner) as f32) < 0.7 * ring as f32 {
+            out.extend_from_slice(run);
+        }
+        k = j;
+    }
+    out
 }
 
 fn render_ink(page: &PdfPage) -> Option<InkMap> {
@@ -1051,7 +1160,8 @@ pub struct PageFontCatalog {
 /// (and nested form XObjects). Returns an empty vector when the document
 /// cannot be parsed; resolution then simply does not apply.
 pub fn font_catalog(path: &std::path::Path) -> Vec<PageFontCatalog> {
-    let Ok(doc) = pdf_extract::Document::load(path) else { return Vec::new() };
+    // (An AES-encrypted paper is decrypted as it is read: see pdf_decrypt.)
+    let Some(doc) = crate::pdf_decrypt::load(path) else { return Vec::new() };
     let mut out = Vec::new();
     // (A font is read once per document, not once per page.)
     let mut cid_fonts = std::collections::HashMap::new();
@@ -1590,14 +1700,21 @@ fn glyph_name_to_char(name: &str, font: &str, width: f32) -> Option<char> {
     // identities were established from the rendered glyphs (see `advent`).
     let lower_font = font.to_ascii_lowercase();
     let advent_slot: &[(&str, char)] = if lower_font.starts_with("advp4c4e74") {
-        &[("C0", '−'), ("C2", '×'), ("C20", '≤'), ("C21", '≥')]
+        &[("C0", '−'), ("C2", '×'), ("C20", '≤'), ("C21", '≥'), ("C25", '≈')]
     } else if lower_font.starts_with("advp4c4e46") {
-        &[("C16", '('), ("C17", ')'), ("C18", '('), ("C19", ')')]
+        // (Tall brackets and braces: AQA Further Jun 2019, AQA Jun 2021; and
+        // the radical's overbar piece, at a control code in AQA Jun 2021.)
+        &[("C16", '('), ("C17", ')'), ("C18", '('), ("C19", ')'), ("C20", '['), ("C21", ']'), ("C26", '{'), ("C27", '}'), ("ffi", '\u{203E}')]
     } else {
         &[]
     };
     if lower_font.starts_with("advp4c4e") {
         return advent_slot.iter().find(|(n, _)| *n == name).map(|(_, c)| *c);
+    }
+    // (Advent's text-symbol font: a ring set high, "the nearest 0.1°", AQA
+    // Further Jun 2019 Q5.)
+    if lower_font.starts_with("advps0601") && name == "C176" {
+        return Some('°');
     }
     // Maths glyph names that say what they draw (CIE NewMathSymb sets θ and
     // ° under control codes this way).
@@ -2067,9 +2184,12 @@ fn mathtype_private(raw: u32, lower: &str) -> Option<char> {
     }
     if lower.contains("mt-extra") || lower.contains("mtextra") {
         // (Not code 0x1F: a subset gives it to the first glyph it uses, ℝ in
-        // Edexcel Jun 2024, ℂ in FP2 Jun 2024; the glyph's name says which.)
+        // Edexcel Jun 2024, ℂ in FP2 Jun 2024; the glyph's name says which.
+        // U+F061 is the font's own: an arrow from a bar, Edexcel IGCSE Jun
+        // 2022's "f : x ↦ …".)
         return match raw {
             0xF0A3 => Some('ℂ'),
+            0xF061 => Some('↦'),
             _ => None,
         };
     }
@@ -2138,15 +2258,37 @@ const MATHMAGIC_FAMILIES: &[(&str, &[(u32, char)])] = &[
 /// Advent 3B2's maths fonts (AQA papers) carry ToUnicode maps that name the
 /// glyph slot, not the symbol ("¼" for "=", "þ" for "+"). Each entry was
 /// established from the rendered glyph in the source paper (glyph inventory
-/// of AQA 7357/1 June 2019); other codes of these fonts stay unknown.
-/// Control-range codes are resolved by glyph name in [`glyph_name_to_char`].
+/// of AQA 7357/1 June 2019), or from the glyph's outline in the embedded
+/// font program (AQA Further Jun 2019 and AQA Jun 2021, whose subsets give
+/// the same glyph at the same code); other codes of these fonts stay
+/// unknown. Control-range codes are resolved by glyph name in
+/// [`glyph_name_to_char`].
 fn advent(raw: u32, lower: &str) -> Option<char> {
     let table: &[(u32, char)] = match lower {
-        "advp4c4e74" => &[(0x21, '→'), (0x31, '∞'), (0x70, '√'), (0xBC, '='), (0xFE, '+')],
-        "advp4c4e46" => &[(0x58, '∑'), (0xF0, '∫')],
-        "advp4c4e51" => &[(0x3A, '.'), (0x3E, '>')],
+        "advp4c4e74" => &[(0x21, '→'), (0x31, '∞'), (0x66, '{'), (0x67, '}'), (0x6A, '|'), (0x70, '√'), (0xBC, '='), (0xF0, '('), (0xFE, '+')],
+        // Bracket pieces at "2"–"7"; radical signs at "p" and "s" (1200 and
+        // 3000 units deep); at "ffi" a bar 233 units long, level with a
+        // sign's top and set in a run after it: the radical's overbar in
+        // pieces, read as the extender of Symbol's radicals.
+        "advp4c4e46" => &[
+            (0x32, '⎡'),
+            (0x33, '⎤'),
+            (0x34, '⎣'),
+            (0x35, '⎦'),
+            (0x36, '⎢'),
+            (0x37, '⎥'),
+            (0x58, '∑'),
+            (0x70, '√'),
+            (0x73, '√'),
+            (0xF0, '∫'),
+            (0xFB03, '\u{203E}'),
+        ],
+        "advp4c4e51" => &[(0x3A, '.'), (0x3C, '<'), (0x3E, '>')],
+        // (Its "colon" is two dots 431 units tall: the ratio colon of
+        // "{x : |x| < 1}", AQA Further Jun 2019 Q1.)
+        "advp4c4e59" => &[(0x3A, ':')],
         "advpi1" => &[(0x70, 'π')],
-        "advpi2" => &[(0x79, 'θ')],
+        "advpi2" => &[(0x61, 'α'), (0x62, 'β'), (0x65, 'ε'), (0x67, 'γ'), (0x6D, 'μ'), (0x79, 'θ')],
         "advps0601" => &[(0xAA, '©')],
         // The black pointer of "Turn over ►".
         "advps0501" => &[(0x73, '►')],
@@ -2844,10 +2986,10 @@ const ANSWER_UNITS: &str = concat!(
     r"(?:/(?:s|h|min|kg|m|l|mol)-?[123]?)?"
 );
 
-/// A part's answer label before its answer space ("(a)(ii) ………").
 /// A part label's letter or numeral: "(a)" … "(h)", "(i)" … "(x)".
 const PART_LABEL: &str = r"(?:[a-h]|i{1,3}|iv|vi{0,3}|ix|x)";
 
+/// A part's answer label before its answer space ("(a)(ii) ………").
 static PART_LABELS_RE: std::sync::LazyLock<regex::Regex> =
     std::sync::LazyLock::new(|| regex::Regex::new(&format!(r"^\s*(?:\({PART_LABEL}\)\s*)*")).unwrap());
 
@@ -3111,7 +3253,11 @@ pub fn layout_page(pg: &PageGlyphs) -> LayoutPage {
         }
     }
     let shapes = radical_shapes(pg);
-    let regions = figure_regions(pg, &shapes);
+    let grids = table_grids(pg);
+    // (Tables drawn cell by cell give no rules.)
+    let cell_grids = cell_rectangle_grids(pg);
+    let tables: Vec<[f32; 4]> = grids.iter().chain(&cell_grids).filter_map(|g| Some([*g.xs.first()?, *g.ys.first()?, *g.xs.last()?, *g.ys.last()?])).collect();
+    let regions = figure_regions(pg, &shapes, &tables);
     for (i, g) in pg.glyphs.iter().enumerate() {
         if furniture[i].is_none() && !is_space[i] && regions.iter().any(|r| g.cx() >= r[0] - 2.0 && g.cx() <= r[2] + 2.0 && g.cy() >= r[1] - 2.0 && g.cy() <= r[3] + 2.0) {
             furniture[i] = Some(FurnitureKind::Figure);
@@ -3127,14 +3273,11 @@ pub fn layout_page(pg: &PageGlyphs) -> LayoutPage {
     let mut rule_used = vec![false; pg.rules.len()];
     mark_box_edges(pg, &items, &mut rule_used);
     // Table borders are never fraction bars, overlines or radical bars.
-    let grids = table_grids(pg);
     for g in &grids {
         for &ri in &g.rules {
             rule_used[ri] = true;
         }
     }
-    // (Tables drawn cell by cell give no rules.)
-    let cell_grids = cell_rectangle_grids(pg);
     let mut shape_used = vec![false; shapes.len()];
     items = build_bracket_pieces(pg, items);
     loop {
@@ -3252,7 +3395,7 @@ pub fn layout_page(pg: &PageGlyphs) -> LayoutPage {
         for i in 0..built.len() {
             let l = &built[i];
             let printed = l.glyphs.iter().filter(|&&g| !is_space_char(pg.glyphs[g].ch)).count();
-            if kinds[i].is_some() || l.code || printed > 24 || l.bold_lead || FIGURE_LABEL_KEEP_RE.is_match(plain_line(&l.text).trim()) {
+            if kinds[i].is_some() || l.code || printed > 24 || l.bold_lead || kept_beside_figure(pg.width, l) {
                 continue;
             }
             let s = l.size.max(4.0);
@@ -3471,7 +3614,7 @@ fn classify_line_furniture(pg: &PageGlyphs, all: &[LayoutLine], idx: usize, rule
     // allocation, a part label or the question's total printed beside it
     // does not.
     let s = line.size.max(4.0);
-    let question_text = FIGURE_LABEL_KEEP_RE.is_match(plain_line(t).trim()) || QUESTION_FOOTER_RE.is_match(plain_line(t).trim());
+    let question_text = kept_beside_figure(pg.width, line) || QUESTION_FOOTER_RE.is_match(plain_line(t).trim());
     if line.glyphs.len() <= 30
         && !question_text
         && answer_grids.iter().any(|g| line.x0 <= g[2] + 2.0 * s && line.x1 >= g[0] - 6.0 * s && line.y0 <= g[3] + 2.5 * s && line.y1 >= g[1] - 0.5 * s)
@@ -3525,7 +3668,7 @@ fn classify_line_furniture(pg: &PageGlyphs, all: &[LayoutLine], idx: usize, rule
     let printed = line.glyphs.iter().filter(|&&g| !is_space_char(pg.glyphs[g].ch)).count();
     let plain_len = if printed > 0 { printed } else { t.replace('$', "").chars().count() };
     // (A caption, a mark allocation or a part label is never a label.)
-    let keep = FIGURE_LABEL_KEEP_RE.is_match(plain_line(t).trim());
+    let keep = kept_beside_figure(pg.width, line);
     if !heading && !keep && plain_len <= 24 {
         let (cx, cy) = ((line.x0 + line.x1) * 0.5, (line.y0 + line.y1) * 0.5);
         let _ = rule_used;
@@ -3782,11 +3925,51 @@ fn has_oblique(p: &VPath) -> bool {
     false
 }
 
+/// A stroke ending in an arrowhead, a small oblique path across one of its
+/// ends: an arrow, or an axis however far it runs (aea '24's x-axis spans the
+/// page under two small circles). `b` is the stroke's box.
+fn arrow_tipped(pg: &PageGlyphs, b: [f32; 4]) -> bool {
+    let horizontal = b[2] - b[0] >= b[3] - b[1];
+    pg.paths.iter().any(|a| {
+        let (aw, ah) = (a.x1 - a.x0, a.y1 - a.y0);
+        if aw > 12.0 || ah > 12.0 || aw < 1.5 && ah < 1.5 {
+            return false;
+        }
+        let at_end = if horizontal {
+            a.y0 <= b[3] + 1.0 && a.y1 >= b[1] - 1.0 && ((a.x0 - b[2]).abs() <= 4.0 || (a.x1 - b[2]).abs() <= 4.0 || (a.x1 - b[0]).abs() <= 4.0 || (a.x0 - b[0]).abs() <= 4.0)
+        } else {
+            a.x0 <= b[2] + 1.0 && a.x1 >= b[0] - 1.0 && ((a.y0 - b[3]).abs() <= 4.0 || (a.y1 - b[3]).abs() <= 4.0 || (a.y1 - b[1]).abs() <= 4.0 || (a.y0 - b[1]).abs() <= 4.0)
+        };
+        at_end && has_oblique(a)
+    })
+}
+
+/// Whether the stroke with box `b` meets, at right angles and within 2 pt, a
+/// stroke 10 pt or longer that ends in an arrowhead: with an arrowhead of its
+/// own (the callers ask), the two are a pair of axes.
+fn is_axis(pg: &PageGlyphs, b: [f32; 4]) -> bool {
+    let horizontal = b[2] - b[0] >= b[3] - b[1];
+    pg.paths.iter().any(|q| {
+        let (qw, qh) = (q.x1 - q.x0, q.y1 - q.y0);
+        q.stroked
+            && (qw >= 10.0 && qh <= 2.0 || qh >= 10.0 && qw <= 2.0)
+            && (qw >= qh) != horizontal
+            && q.x0 <= b[2] + 2.0
+            && q.x1 >= b[0] - 2.0
+            && q.y0 <= b[3] + 2.0
+            && q.y1 >= b[1] - 2.0
+            && arrow_tipped(pg, [q.x0, q.y0, q.x1, q.y1])
+    })
+}
+
 /// Diagram regions: clusters of oblique/curved vector strokes (plus the
-/// axis-aligned strokes that touch them: axes, grid lines, polygon edges) and
-/// raster images. Text inside a region is a figure label.
-fn figure_regions(pg: &PageGlyphs, shapes: &[RadicalShape]) -> Vec<[f32; 4]> {
+/// axis-aligned strokes that touch them: axes, grid lines, polygon edges),
+/// drawings of arrows, and raster images. Text inside a region is a figure
+/// label.
+fn figure_regions(pg: &PageGlyphs, shapes: &[RadicalShape], tables: &[[f32; 4]]) -> Vec<[f32; 4]> {
     let (w, h) = (pg.width, pg.height);
+    // (A radical drawn in strokes is no drawing.)
+    let in_radical = |p: &VPath| shapes.iter().any(|sh| p.x0 >= sh.x0 - 1.0 && p.x1 <= sh.x1 + 1.0 && p.y0 >= sh.y0 - 1.5 && p.y1 <= sh.y1 + 1.5);
     let mut boxes: Vec<[f32; 4]> = Vec::new();
     for p in &pg.paths {
         let (pw, ph) = (p.x1 - p.x0, p.y1 - p.y0);
@@ -3799,7 +3982,7 @@ fn figure_regions(pg: &PageGlyphs, shapes: &[RadicalShape]) -> Vec<[f32; 4]> {
         if pw <= 8.0 && ph >= 2.5 * pw.max(0.5) {
             continue; // bracket-like tall thin stroke
         }
-        if shapes.iter().any(|sh| p.x0 >= sh.x0 - 1.0 && p.x1 <= sh.x1 + 1.0 && p.y0 >= sh.y0 - 1.5 && p.y1 <= sh.y1 + 1.5) {
+        if in_radical(p) {
             continue;
         }
         if has_oblique(p) {
@@ -3844,27 +4027,16 @@ fn figure_regions(pg: &PageGlyphs, shapes: &[RadicalShape]) -> Vec<[f32; 4]> {
         }
     }
     merge(&mut boxes, 12.0);
-    // A long stroke ending in an arrowhead is an axis, however far it runs
-    // (aea '24's x-axis spans the page under two small circles).
-    let arrow_tipped = |p: &VPath| {
-        let horizontal = p.x1 - p.x0 >= p.y1 - p.y0;
-        pg.paths.iter().any(|a| {
-            let (aw, ah) = (a.x1 - a.x0, a.y1 - a.y0);
-            if aw > 12.0 || ah > 12.0 || aw < 1.5 && ah < 1.5 || !has_oblique(a) {
-                return false;
-            }
-            if horizontal {
-                a.y0 <= p.y1 + 1.0 && a.y1 >= p.y0 - 1.0 && ((a.x0 - p.x1).abs() <= 4.0 || (a.x1 - p.x1).abs() <= 4.0 || (a.x1 - p.x0).abs() <= 4.0 || (a.x0 - p.x0).abs() <= 4.0)
-            } else {
-                a.x0 <= p.x1 + 1.0 && a.x1 >= p.x0 - 1.0 && ((a.y0 - p.y1).abs() <= 4.0 || (a.y1 - p.y1).abs() <= 4.0 || (a.y1 - p.y0).abs() <= 4.0 || (a.y0 - p.y0).abs() <= 4.0)
-            }
-        })
-    };
-    // Grow with axis-aligned strokes that touch a drawing (axes, grids).
-    loop {
+    let within = |p: &VPath, r: &[f32; 4]| p.x0 >= r[0] - 1.0 && p.x1 <= r[2] + 1.0 && p.y0 >= r[1] - 1.0 && p.y1 <= r[3] + 1.0;
+    // Grow with axis-aligned strokes that touch a drawing (axes, grids), and
+    // none inside the boxes `fence`.
+    let grow = |boxes: &mut Vec<[f32; 4]>, fence: &[[f32; 4]]| loop {
         let mut grew = false;
         for r in boxes.iter_mut() {
             for p in &pg.paths {
+                if fence.iter().any(|t| within(p, t)) {
+                    continue;
+                }
                 let (pw, ph) = (p.x1 - p.x0, p.y1 - p.y0);
                 // A long line through the middle of the drawing (a dashed
                 // line of centres across two circles) belongs to it too.
@@ -3873,7 +4045,7 @@ fn figure_regions(pg: &PageGlyphs, shapes: &[RadicalShape]) -> Vec<[f32; 4]> {
                     && ph <= 0.95 * h
                     && (ph <= 3.0 && pcy > r[1] + 0.15 * (r[3] - r[1]) && pcy < r[3] - 0.15 * (r[3] - r[1]) && p.x0 < r[0] + 2.0 && p.x1 > r[2] - 2.0
                         || pw <= 3.0 && pcx > r[0] + 0.15 * (r[2] - r[0]) && pcx < r[2] - 0.15 * (r[2] - r[0]) && p.y0 < r[1] + 2.0 && p.y1 > r[3] - 2.0);
-                if (pw > 0.6 * w || ph > 0.6 * h) && !(pw <= 0.95 * w && ph <= 0.95 * h && arrow_tipped(p)) && !through {
+                if (pw > 0.6 * w || ph > 0.6 * h) && !(pw <= 0.95 * w && ph <= 0.95 * h && arrow_tipped(pg, [p.x0, p.y0, p.x1, p.y1])) && !through {
                     continue;
                 }
                 let b = [p.x0, p.y0, p.x1, p.y1];
@@ -3881,7 +4053,10 @@ fn figure_regions(pg: &PageGlyphs, shapes: &[RadicalShape]) -> Vec<[f32; 4]> {
                     // Only strokes that reach into the drawing, not a long
                     // answer line merely touching its corner.
                     let inside = (b[0].max(r[0]) <= b[2].min(r[2])) && (b[1].max(r[1]) <= b[3].min(r[3]));
-                    if inside {
+                    // (Or one running along its edge over half its width:
+                    // the track the blocks of a drawing stand on.)
+                    let along = ph <= 2.0 && b[2].min(r[2]) - b[0].max(r[0]) >= 0.5 * (r[2] - r[0]) || pw <= 2.0 && b[3].min(r[3]) - b[1].max(r[1]) >= 0.5 * (r[3] - r[1]);
+                    if inside || along {
                         r[0] = r[0].min(b[0]);
                         r[1] = r[1].min(b[1]);
                         r[2] = r[2].max(b[2]);
@@ -3894,10 +4069,65 @@ fn figure_regions(pg: &PageGlyphs, shapes: &[RadicalShape]) -> Vec<[f32; 4]> {
         if !grew {
             break;
         }
+    };
+    grow(&mut boxes, &[]);
+    // An arrow is drawn content (a force, a direction of motion): a drawing
+    // of boxes and arrows has no oblique stroke to seed it (OCR B Physics AS
+    // Jun 2018's blocks X and Y on their track). Not in a table, ruled or
+    // drawn cell by cell, where it is an entry (Edexcel Chemistry Jun 2020
+    // P1's orbital boxes), nor in a radical; and an arrow meeting another at
+    // right angles is an axis: empty axes to sketch on are answer space (AQA
+    // Jun 2019 Q7). Arrows seed after the drawings seeded by oblique strokes
+    // have grown (seeded with them, an axis's arrowhead kept edexcel '18
+    // p17's grid lines out of its graph) and grow, never into a table. A
+    // small drawing of an arrow, however seeded, then joins a drawing within
+    // 12 pt: OCR B Physics AS Jun 2018 Q5's phasor C, whose arrowheads seed
+    // small drawings beside the diagram. A small drawing an arrow points
+    // from or to, within 12 pt of it, joins the drawing that holds the arrow
+    // (Biology OCR-A Nov 2021 P1's cell X, Chemistry Edexcel Jun 2024 P3's
+    // cyclohexene before "Step 1").
+    let shaft = |p: &VPath| {
+        let (pw, ph) = (p.x1 - p.x0, p.y1 - p.y0);
+        p.stroked && (pw >= 10.0 && ph <= 2.0 || ph >= 10.0 && pw <= 2.0)
+    };
+    let tipped = |p: &VPath| arrow_tipped(pg, [p.x0, p.y0, p.x1, p.y1]);
+    let axis = |p: &VPath| is_axis(pg, [p.x0, p.y0, p.x1, p.y1]);
+    let arrows: Vec<&VPath> = pg
+        .paths
+        .iter()
+        .filter(|p| shaft(p) && p.x1 - p.x0 <= 0.6 * w && p.y1 - p.y0 <= 0.6 * h && !in_radical(p) && !tables.iter().any(|r| within(p, r)) && tipped(p) && !axis(p))
+        .collect();
+    // A drawing is big at 40 by 30 pt, or, for a drawing of arrows, 120 pt
+    // wide (a fifth of the page) at 20 pt tall: OCR B Physics AS Jun 2018's
+    // blocks on a track. (A line of outlined letters is as wide and as tall,
+    // and is no drawing: edexcel '19 Q17(b)(ii).)
+    let big = |r: &[f32; 4]| r[2] - r[0] >= 40.0 && r[3] - r[1] >= 30.0 || r[2] - r[0] >= 120.0 && r[3] - r[1] >= 20.0 && arrows.iter().any(|p| within(p, r));
+    let mut seeds: Vec<[f32; 4]> = arrows.iter().filter(|p| !boxes.iter().any(|r| within(p, r))).map(|p| [p.x0, p.y0, p.x1, p.y1]).collect();
+    merge(&mut seeds, 12.0);
+    grow(&mut seeds, tables);
+    boxes.extend(seeds);
+    loop {
+        let holds = |r: &[f32; 4]| arrows.iter().any(|p| within(p, r));
+        let pair = (0..boxes.len()).filter(|&i| !big(&boxes[i])).find_map(|i| {
+            let a = &boxes[i];
+            let j = if holds(a) {
+                (0..boxes.len()).find(|&j| j != i && near(a, &boxes[j], 12.0))
+            } else {
+                arrows.iter().filter(|p| near(a, &[p.x0, p.y0, p.x1, p.y1], 12.0)).find_map(|p| (0..boxes.len()).find(|&j| j != i && within(p, &boxes[j])))
+            };
+            j.map(|j| (i, j))
+        });
+        let Some((i, j)) = pair else { break };
+        let a = boxes.remove(i);
+        let r = &mut boxes[if j > i { j - 1 } else { j }];
+        r[0] = r[0].min(a[0]);
+        r[1] = r[1].min(a[1]);
+        r[2] = r[2].max(a[2]);
+        r[3] = r[3].max(a[3]);
     }
-    // A small drawing just off a figure (a dimension line "<- 4 cm ->"
-    // under it) is part of that figure.
-    let big = |r: &[f32; 4]| r[2] - r[0] >= 40.0 && r[3] - r[1] >= 30.0;
+    grow(&mut boxes, tables);
+    // A small drawing just off a big one (a dimension line "<- 4 cm ->"
+    // under it) is part of it.
     let (mut large, small): (Vec<[f32; 4]>, Vec<[f32; 4]>) = boxes.into_iter().partition(|r| big(r));
     for s in small {
         if let Some(l) = large.iter_mut().find(|l| near(l, &s, 24.0) && s[0] < l[2] && s[2] > l[0]) {
@@ -4284,9 +4514,12 @@ fn build_radicals(pg: &PageGlyphs, mut items: Vec<Item>, rule_used: &mut [bool])
                 !rule_used[*ri] && r.x0 >= it.x0 + 0.2 * (it.x1 - it.x0) - 1.0 && r.x0 <= it.x1 + 1.5 && (r.cy() - top).abs() <= 2.0 && r.w() >= 2.0
             });
             if let Some((ri, r)) = rule {
-                // Innermost: no unused bar under this one.
+                // Innermost: no unused bar under this one. (A bar set in glyph
+                // pieces can end short of a fraction's under it by more than
+                // half a point: 0.64 pt in AQA Jun 2021 Q7.)
+                let slack = (0.1 * it.size).max(0.5);
                 let inner_bar = pg.rules.iter().enumerate().any(|(rj, q)| {
-                    rj != ri && !rule_used[rj] && q.x0 >= r.x0 - 0.5 && q.x1 <= r.x1 + 0.5 && q.y0 > r.y1 && q.y1 < it.y1
+                    rj != ri && !rule_used[rj] && q.x0 >= r.x0 - slack && q.x1 <= r.x1 + slack && q.y0 > r.y1 && q.y1 < it.y1
                 });
                 if inner_bar {
                     continue;
@@ -4926,6 +5159,11 @@ fn split_matrix(pg: &PageGlyphs, rows: Vec<Vec<Item>>) -> Vec<Vec<Vec<Node>>> {
         .collect()
 }
 
+/// A sign that takes limits: a sum, a product, an integral or its pieces.
+fn is_big_operator(ch: char) -> bool {
+    matches!(ch, '∑' | '∏' | '∫' | '∮' | '⌠' | '⌡' | '⎮')
+}
+
 /// Limits stacked directly above/below ∑ ∏ ∫.
 fn build_big_op_limits(pg: &PageGlyphs, mut items: Vec<Item>) -> Vec<Item> {
     let mut done: std::collections::HashSet<usize> = std::collections::HashSet::new();
@@ -4933,7 +5171,7 @@ fn build_big_op_limits(pg: &PageGlyphs, mut items: Vec<Item>) -> Vec<Item> {
     let font_text = font_text_sizes(pg);
     loop {
         let pos = items.iter().position(|it| {
-            matches!(it.node, Node::G(g) if matches!(pg.glyphs[g].ch, '∑' | '∏' | '∫' | '∮' | '⌠' | '⌡' | '⎮') && !done.contains(&g))
+            matches!(it.node, Node::G(g) if is_big_operator(pg.glyphs[g].ch) && !done.contains(&g))
         });
         let Some(i) = pos else { return items };
         let Node::G(g) = items[i].node else { return items };
@@ -4959,19 +5197,33 @@ fn build_big_op_limits(pg: &PageGlyphs, mut items: Vec<Item>) -> Vec<Item> {
             let text = o.glyphs.iter().filter_map(|&k| font_text.get(pg.glyphs[k].font.as_str())).fold(body, |a, &b| a.max(b));
             o.size <= 0.85 * text
         };
+        // (A stacked fraction at an integral's corner is a limit whatever
+        // its parts' size: Advent sets π at the text's size there, no
+        // taller than the script-size 3 under it, AQA Further Jun 2019 Q8.)
+        let corner_fraction = |o: &Item| integral && matches!(o.node, Node::Frac(..));
         let above = items_in(&items, |o| {
             o.glyphs != op.glyphs
-                && small(o)
-                && ((o.cx() >= op.x0 - 0.4 * w && o.cx() <= op.x1 + 0.4 * w && o.y1 <= op.y0 + 1.0 && o.y1 >= op.y0 - 0.9 * body)
-                    || integral && o.x0 >= op.x0 + 0.3 * w && o.x0 <= op.x1 + 0.6 * body && o.cy() >= op.y0 - 0.5 * body && o.cy() <= op.y0 + 0.35 * h)
+                && (small(o)
+                    && (o.cx() >= op.x0 - 0.4 * w && o.cx() <= op.x1 + 0.4 * w && o.y1 <= op.y0 + 1.0 && o.y1 >= op.y0 - 0.9 * body)
+                    || (small(o) || corner_fraction(o))
+                        && integral
+                        && o.x0 >= op.x0 + 0.3 * w
+                        && o.x0 <= op.x1 + 0.6 * body
+                        && o.cy() >= op.y0 - 0.5 * body
+                        && o.cy() <= op.y0 + 0.35 * h)
         });
         let above = extend_limit(&items, above, &[i], &small);
         let below = items_in(&items, |o| {
             o.glyphs != op.glyphs
-                && small(o)
                 && !above.iter().any(|&a| items[a].glyphs == o.glyphs)
-                && ((o.cx() >= op.x0 - 0.4 * w && o.cx() <= op.x1 + 0.4 * w && o.y0 >= op.y1 - 1.0 && o.y0 <= op.y1 + 0.9 * body)
-                    || integral && o.x0 >= op.x0 && o.x0 <= op.x1 + 0.6 * body && o.cy() >= op.y1 - 0.35 * h && o.cy() <= op.y1 + 0.5 * body)
+                && (small(o)
+                    && (o.cx() >= op.x0 - 0.4 * w && o.cx() <= op.x1 + 0.4 * w && o.y0 >= op.y1 - 1.0 && o.y0 <= op.y1 + 0.9 * body)
+                    || (small(o) || corner_fraction(o))
+                        && integral
+                        && o.x0 >= op.x0
+                        && o.x0 <= op.x1 + 0.6 * body
+                        && o.cy() >= op.y1 - 0.35 * h
+                        && o.cy() <= op.y1 + 0.5 * body)
         });
         let mut beside = vec![i];
         beside.extend(&above);
@@ -5375,6 +5627,14 @@ fn seat_raised_decimal_points(pg: &PageGlyphs, items: &mut [Item]) {
     }
 }
 
+/// A part's label, as the glyphs before a gap read without spaces ("b)",
+/// "(ii)", "07b)"): a row it stands in holds its part's expression in its
+/// gap (see `group_lines`).
+static GAP_ROW_PART_RE: std::sync::LazyLock<regex::Regex> =
+    std::sync::LazyLock::new(|| regex::Regex::new(&format!(r"^\d{{0,2}}\(?{PART_LABEL}\)$")).unwrap());
+/// An allocation after a gap ("[3]", "(3)"), which does the same.
+static GAP_ROW_MARK_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| regex::Regex::new(r"^[\[(]\d{1,2}[\])]$").unwrap());
+
 /// Group page items into visual lines: baseline rows, with small raised /
 /// lowered items attached to the adjacent larger row as scripts.
 fn group_lines(pg: &PageGlyphs, mut items: Vec<Item>) -> Vec<Vec<Item>> {
@@ -5389,8 +5649,12 @@ fn group_lines(pg: &PageGlyphs, mut items: Vec<Item>) -> Vec<Vec<Item>> {
     // A stacked fraction hangs from the math axis, and how far its bar sits
     // above the text baseline depends on its parts (a radical denominator
     // lifts it): its estimated baseline is not exact, so fractions are placed
-    // after the glyph rows exist.
-    let on_axis = |it: &Item| axis_hung(&it.node);
+    // after the glyph rows exist. So is an enlarged sign set without limits,
+    // centred on the axis of its line: WJEC lowers a 25 pt integral 7.4 pt.
+    let big_sign = |it: &Item| it.force_base && matches!(it.node, Node::G(g) if is_big_operator(pg.glyphs[g].ch));
+    let on_axis = |it: &Item| axis_hung(&it.node) || big_sign(it);
+    // (A big operator, with limits or without, is enlarged.)
+    let enlarged = |it: &Item| matches!(it.node, Node::BigOp { .. }) || big_sign(it);
     for &i in &order {
         let it = &items[i];
         if on_axis(it) {
@@ -5423,7 +5687,7 @@ fn group_lines(pg: &PageGlyphs, mut items: Vec<Item>) -> Vec<Vec<Item>> {
             continue;
         }
         let s = it.size.max(4.0);
-        let big_op = matches!(it.node, Node::BigOp { .. });
+        let big_op = enlarged(it);
         let text_beside = big_op
             && (0..glyph_rows).any(|ri| {
                 let b = row_base[ri];
@@ -5477,7 +5741,7 @@ fn group_lines(pg: &PageGlyphs, mut items: Vec<Item>) -> Vec<Vec<Item>> {
             for &k in r {
                 e.0 = e.0.min(items[k].x0);
                 e.1 = e.1.max(items[k].x1);
-                if !matches!(items[k].node, Node::BigOp { .. }) {
+                if !enlarged(&items[k]) {
                     e.2 = e.2.max(items[k].size);
                 }
             }
@@ -5493,6 +5757,29 @@ fn group_lines(pg: &PageGlyphs, mut items: Vec<Item>) -> Vec<Vec<Item>> {
                     })
             })
         };
+        // Row x has items both sides of the span (x0, x1) and none across
+        // it, and is the span's line: the span fills the gap, within 2 em, as
+        // a symbol or a fraction set off the baseline fills its place in a
+        // sentence (AQA Physics 2015 Q1's "Tick (✓)", the fraction in physics
+        // '18 Q9's "What is the ratio … ?"), or row x is a part's label row,
+        // a part label before the gap or an allocation after it (WJEC's "b)
+        // … [3]"). A chart's data labels at different heights stand in wide
+        // gaps of each other's rows (Edexcel-A Economics Jun 2021 Q5).
+        let in_gap = |x: usize, (x0, x1): (f32, f32), s: f32| {
+            let r = &rows[x];
+            if r.iter().any(|&k| items[k].x1 > x0 && items[k].x0 < x1) {
+                return false;
+            }
+            let side = |before: bool| -> Vec<usize> {
+                let mut ks: Vec<usize> = r.iter().copied().filter(|&k| if before { items[k].x1 <= x0 } else { items[k].x0 >= x1 }).collect();
+                ks.sort_by(|&a, &b| items[a].x0.total_cmp(&items[b].x0));
+                ks
+            };
+            let (before, after) = (side(true), side(false));
+            let (Some(&last), Some(&next)) = (before.last(), after.first()) else { return false };
+            let text = |ks: &[usize]| -> String { ks.iter().filter_map(|&k| if let Node::G(g) = items[k].node { Some(pg.glyphs[g].ch) } else { None }).filter(|c| !c.is_whitespace()).collect() };
+            items[next].x0 - items[last].x1 - (x1 - x0) <= 2.0 * s || GAP_ROW_PART_RE.is_match(&text(&before)) || GAP_ROW_MARK_RE.is_match(&text(&after))
+        };
         let mut pair: Option<(usize, usize)> = None;
         'find: for a in 0..rows.len() {
             for b in (a + 1)..rows.len() {
@@ -5506,6 +5793,13 @@ fn group_lines(pg: &PageGlyphs, mut items: Vec<Item>) -> Vec<Vec<Item>> {
                 } else if eb.1 <= ea.0 {
                     ea.0 - eb.1
                 } else {
+                    // A row set in a gap of the other, a little off its
+                    // baseline, is the same line: WJEC sets a part's
+                    // expression 3.2 pt below its label and allocation.
+                    if (row_base[a] - row_base[b]).abs() <= 0.45 * s && (in_gap(a, (eb.0, eb.1), s) || in_gap(b, (ea.0, ea.1), s)) {
+                        pair = Some((a, b));
+                        break 'find;
+                    }
                     continue;
                 };
                 let near = (row_base[a] - row_base[b]).abs() <= 0.25 * s && gap <= 3.0 * s;
@@ -5525,7 +5819,9 @@ fn group_lines(pg: &PageGlyphs, mut items: Vec<Item>) -> Vec<Vec<Item>> {
             row_base[a] = full.iter().sum::<f32>() / full.len() as f32;
         }
     }
-    let row_size: Vec<f32> = rows.iter().map(|r| r.iter().map(|&k| items[k].size).fold(0.0, f32::max)).collect();
+    // (An enlarged sign is no measure of its line's text size: a line of
+    // text beside it is no script of the sign's size.)
+    let row_size: Vec<f32> = rows.iter().map(|r| r.iter().filter(|&&k| !big_sign(&items[k])).map(|&k| items[k].size).fold(0.0, f32::max)).collect();
     let mut target = vec![0usize; items.len()];
     for (ri, r) in rows.iter().enumerate() {
         for &k in r {
@@ -5575,7 +5871,21 @@ fn group_lines(pg: &PageGlyphs, mut items: Vec<Item>) -> Vec<Vec<Item>> {
                     }
                     continue;
                 }
-                if csize > 0.88 * hs {
+                // A superscript set at the text's own size (AQA Further Jun
+                // 2019 Q9's "re^{iθ}", its i at 12 pt raised 3.9 pt) is told
+                // by its place: a few characters raised a quarter to half an
+                // em, set tight after a letter of a row of its own size (never
+                // a subscript's). Two lines of text never stand that close
+                // beside each other.
+                let raised_tight = c.len() <= 3
+                    && csize <= 1.15 * hs
+                    && d <= -0.25 * hs
+                    && d >= -0.45 * hs
+                    && hr.iter().any(|&k| {
+                        let h = &items[k];
+                        is_letter_item(pg, h) && h.size >= 0.88 * hs && hgap(&items[first], h) <= 0.15 * hs && h.x1 <= items[first].x0 + 0.1 * hs
+                    });
+                if csize > 0.88 * hs && !raised_tight {
                     continue;
                 }
                 if d.abs() < 0.1 * hs {
@@ -5594,7 +5904,7 @@ fn group_lines(pg: &PageGlyphs, mut items: Vec<Item>) -> Vec<Vec<Item>> {
                         && d <= down
                         && (hgap(&items[first], h) <= 0.9 * hs && h.x1 <= items[first].x0 + 0.5 * hs || hgap(&items[last], h) <= 0.5 * hs && h.x0 >= items[last].x1 - 0.5 * hs)
                 });
-                if !adjacent {
+                if !adjacent && !raised_tight {
                     continue;
                 }
                 if best.map(|(_, bd)| d.abs() < bd).unwrap_or(true) {
@@ -5636,6 +5946,13 @@ fn group_lines(pg: &PageGlyphs, mut items: Vec<Item>) -> Vec<Vec<Item>> {
 /// Parse a box of items into nodes: the base sequence plus attached scripts.
 /// Returns (nodes, baseline, size, unplaced count).
 fn parse_box(pg: &PageGlyphs, items: Vec<Item>) -> (Vec<Node>, f32, f32, usize) {
+    parse_box_in(pg, items, false)
+}
+
+/// [`parse_box`] of a box that is itself a script (`in_script`): there a
+/// smaller character on its neighbour's baseline is no subscript of it (the
+/// θ of "e^{iθ}" beside its full-size i, AQA Further Jun 2019 Q9).
+fn parse_box_in(pg: &PageGlyphs, items: Vec<Item>, in_script: bool) -> (Vec<Node>, f32, f32, usize) {
     if items.is_empty() {
         return (Vec::new(), 0.0, 0.0, 0);
     }
@@ -5683,7 +6000,8 @@ fn parse_box(pg: &PageGlyphs, items: Vec<Item>) -> (Vec<Node>, f32, f32, usize) 
             // A reduced-size character set tight against the letter before
             // it, (almost) on that letter's baseline, is its subscript: Word
             // drops E_k's k by under half a point.
-            let tight_sub = it.size < 0.8 * s
+            let tight_sub = !in_script
+                && it.size < 0.8 * s
                 && d > -0.05 * s
                 && !stop(it)
                 && items.iter().any(|o| {
@@ -5692,7 +6010,18 @@ fn parse_box(pg: &PageGlyphs, items: Vec<Item>) -> (Vec<Node>, f32, f32, usize) 
                         && abuts(it, o)
                         && matches!(o.node, Node::G(g) if pg.glyphs[g].ch.is_alphabetic())
                 });
-            if small && d < -0.14 * s || stacked && d < 0.0 {
+            // (A superscript at the text's own size, see group_lines: the
+            // character raised a quarter to half an em and set tight after a
+            // letter on the line, where at most three stand at that height.
+            // Smaller characters after it are scripts by their size, the θ
+            // of "e^{iθ}".)
+            let raised_tight = !small
+                && (-0.45 * s..=-0.25 * s).contains(&d)
+                && items.iter().filter(|q| (q.base - it.base).abs() < 0.05 * s && q.x0 >= it.x0 - 0.05 * s && q.x0 <= it.x1 + 3.0 * s).count() <= 3
+                && items.iter().any(|o| {
+                    o.size >= 0.9 * s && (o.base - b).abs() < 0.1 * s && abuts(it, o) && matches!(o.node, Node::G(g) if pg.glyphs[g].ch.is_alphabetic())
+                });
+            if small && d < -0.14 * s || stacked && d < 0.0 || raised_tight {
                 Role::Sup
             } else if small && d > 0.07 * s || stacked && d > 0.0 || tight_sub {
                 Role::Sub
@@ -5788,7 +6117,7 @@ fn parse_box(pg: &PageGlyphs, items: Vec<Item>) -> (Vec<Node>, f32, f32, usize) 
     let mut seq = base_idx.clone();
     seq.extend(unplaced.iter().copied());
     seq.sort_by(|&x, &y| items[x].x0.partial_cmp(&items[y].x0).unwrap_or(std::cmp::Ordering::Equal));
-    let sub_nodes = |v: &Vec<usize>| -> Vec<Node> { parse_box(pg, v.iter().map(|&k| items[k].clone()).collect()).0 };
+    let sub_nodes = |v: &Vec<usize>| -> Vec<Node> { parse_box_in(pg, v.iter().map(|&k| items[k].clone()).collect(), true).0 };
     let mut nodes = Vec::new();
     let mut prev_right: Option<(f32, f32, f32)> = None; // (tight right, loose right, centre)
     // An upright letter whose following letters spell a function name
@@ -5948,11 +6277,15 @@ impl TableGrid {
 }
 
 fn border_segments(pg: &PageGlyphs) -> Vec<BorderSeg> {
+    // (An arrow's shaft is no border: OCR B Physics AS Jun 2018's blocks X
+    // and Y on their track, joined by arrows, made a grid. An axis is: Nov
+    // 2024 Q1's answer grid reaches as far as its axes.)
+    let shaft = |b: [f32; 4]| arrow_tipped(pg, b) && !is_axis(pg, b);
     let mut out: Vec<BorderSeg> = pg
         .rules
         .iter()
         .enumerate()
-        .filter(|(_, r)| r.w() >= 3.0)
+        .filter(|(_, r)| r.w() >= 3.0 && !shaft([r.x0, r.y0, r.x1, r.y1]))
         .map(|(ri, r)| BorderSeg { horizontal: true, at: r.cy(), from: r.x0, to: r.x1, rule: Some(ri) })
         .collect();
     for p in &pg.paths {
@@ -5961,7 +6294,7 @@ fn border_segments(pg: &PageGlyphs) -> Vec<BorderSeg> {
             out.push(BorderSeg { horizontal: false, at: 0.5 * (p.x0 + p.x1), from: p.y0, to: p.y1, rule: None });
             continue;
         }
-        if !p.stroked {
+        if !p.stroked || p.pts.len() == 2 && shaft([p.x0, p.y0, p.x1, p.y1]) {
             continue;
         }
         let mut prev: Option<[f32; 2]> = None;
@@ -6312,7 +6645,7 @@ enum WordClass {
 }
 
 static PART_LABEL_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
-    regex::Regex::new(r"^\((?:[a-h]|i{1,3}|iv|vi{0,3}|ix|x)\)[.,:]?$").unwrap()
+    regex::Regex::new(&format!(r"^\({PART_LABEL}\)[.,:]?$")).unwrap()
 });
 static MARK_TOKEN_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
     // Includes AEA style-and-clarity allocations "(+S1)".
@@ -7498,6 +7831,44 @@ fn choice_groups(pages: &[LayoutPage], heads: &[(usize, usize, u32)]) -> Vec<Cho
     groups
 }
 
+/// The instruction over a paper's questions.
+static ANSWER_ALL_RE: std::sync::LazyLock<regex::Regex> =
+    std::sync::LazyLock::new(|| regex::Regex::new(r"(?i)^answer\s+all\s+(?:the\s+)?questions\.?$").unwrap());
+
+/// "Answer all questions." over a task in lettered parts with allocations,
+/// and no question number anywhere: WJEC's practical examination (Physics
+/// Unit 5 Jun 2024, parts (a)-(d), 25 marks) is one question. A paper
+/// without the instruction, or without two parts and two allocations after
+/// it, is none (an insert, a formula sheet). The pipeline asks only when
+/// neither the layout map nor the text layer finds a question: a numbered
+/// paper whose map fails prints the same instruction.
+pub fn unnumbered_task(pages: &[LayoutPage]) -> Option<LayoutQuestion> {
+    let (sp, sl) = pages.iter().enumerate().find_map(|(p, page)| {
+        page.lines.iter().position(|l| l.furniture.is_none() && ANSWER_ALL_RE.is_match(plain_line(&l.text).trim())).map(|l| (p, l + 1))
+    })?;
+    let mut lines = Vec::new();
+    'pages: for (p, page) in pages.iter().enumerate().skip(sp) {
+        for (l, line) in page.lines.iter().enumerate() {
+            if p == sp && l < sl || line.furniture.is_some() || line.text.trim().is_empty() {
+                continue;
+            }
+            let plain = plain_line(&line.text);
+            if END_MARKER_RE.is_match(&plain) || TRAILING_PAGE_RE.is_match(&plain) {
+                break 'pages;
+            }
+            lines.push((p, l));
+        }
+    }
+    let text = |&(p, l): &(usize, usize)| plain_line(&pages[p].lines[l].text);
+    let parts = lines.iter().filter(|x| text(x).starts_with("(a)") || text(x).starts_with("(b)")).count();
+    let allocations = lines.iter().filter(|x| text(x).split_whitespace().any(|w| MARK_TOKEN_RE.is_match(w))).count();
+    if parts < 2 || allocations < 2 {
+        return None;
+    }
+    let (&(fp, fl), &(ep, _)) = (lines.first()?, lines.last()?);
+    Some(LayoutQuestion { number: 1, start_page: fp, start_y: pages[fp].lines[fl].y0, end_page: ep, end_y: None, lines, reference_from: None, ahead: None })
+}
+
 /// Build the question map from laid-out pages.
 pub fn build_layout_map(pages: &[LayoutPage]) -> LayoutMap {
     let mut map = LayoutMap::default();
@@ -8042,6 +8413,19 @@ static FIGURE_LABEL_KEEP_RE: std::sync::LazyLock<regex::Regex> = std::sync::Lazy
     regex::Regex::new(r"(?i)^(?:fig(?:ure|\.)?\s*\d+|table\s+\d+|\[?\(?\d{1,2}\s*marks?\)?\]?|\(\d{1,2}\)|\(?[a-h]\)|\(?(?:i|ii|iii|iv|v|vi)\))").unwrap()
 });
 
+static BRACKETED_MARK_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| regex::Regex::new(r"^\[\d{1,2}\]$").unwrap());
+
+/// A line kept as question text beside a figure, never one of its labels: a
+/// caption, a part label or an allocation. A bracketed number alone is an
+/// allocation in the allocation column at the page's right ("[3]" under OCR
+/// A Chemistry Jun 2017 Q18's flowchart); elsewhere it may be a drawing's
+/// own label, an array's index ("[7]").
+fn kept_beside_figure(page_width: f32, line: &LayoutLine) -> bool {
+    let plain = plain_line(&line.text);
+    let t = plain.trim();
+    FIGURE_LABEL_KEEP_RE.is_match(t) || line.x0 >= 0.8 * page_width && BRACKETED_MARK_RE.is_match(t)
+}
+
 pub fn question_body(pages: &[LayoutPage], q: &LayoutQuestion) -> QuestionBody {
     question_body_with_figures(pages, q, &[])
 }
@@ -8066,7 +8450,7 @@ pub fn question_body_with_figures(pages: &[LayoutPage], q: &LayoutQuestion, figu
         let plain = plain_line(&line.text);
         !line.code
             && plain.chars().count() <= 40
-            && !FIGURE_LABEL_KEEP_RE.is_match(plain.trim())
+            && !kept_beside_figure(pages[p].width, line)
             && figures.iter().any(|&(fp, r)| fp == p && line.x0 >= r[0] - 1.0 && line.x1 <= r[2] + 1.0 && line.y0 >= r[1] - 1.0 && line.y1 <= r[3] + 1.0)
     };
     let tick_options = tick_box_options(pages, &q.lines);
@@ -8497,7 +8881,7 @@ mod tests {
         let shape_pts = vec![(true, [300.0, 300.0]), (false, [360.0, 330.0]), (false, [360.0, 400.0]), (false, [300.0, 370.0]), (false, [300.0, 300.0])];
         let shape = VPath { x0: 300.0, x1: 360.0, y0: 300.0, y1: 400.0, pts: shape_pts, filled: true, stroked: true };
         let pg = PageGlyphs { page: 0, width: 595.0, height: 842.0, paths: vec![sheet, shape], ..Default::default() };
-        let regions = figure_regions(&pg, &[]);
+        let regions = figure_regions(&pg, &[], &[]);
         assert!(regions.iter().any(|r| r[0] <= 50.5 && r[2] >= 529.5 && r[1] <= 60.5 && r[3] >= 719.5), "{regions:?}");
     }
 
@@ -10028,5 +10412,335 @@ Work out how much Nina pays."), "{q8}");
         let Some(pages) = corpus_pages("papers/used/fp2 '24.pdf") else { return };
         let fp2 = text(&pages);
         assert!(fp2.contains('ℂ') || fp2.contains(r"\mathbb{C}"), "FP2's Cbb is still ℂ");
+    }
+
+    /// A drawing of axis-aligned boxes and arrows is a figure: OCR B Physics
+    /// AS Jun 2018's blocks X and Y on their track, whose arrows say they
+    /// move towards each other (Q19 and Q20's momentum turns on it). No
+    /// stroke of it is oblique, it is 26 pt tall, and its boxes, arrows and
+    /// track made a grid.
+    #[test]
+    fn a_drawing_of_boxes_and_arrows_is_a_figure() {
+        let _guard = crate::pdf_render::pdfium_test_lock();
+        let Some(pages) = corpus_pages("papers/used/Physics_A-level_Past-Papers_OCR-B__June_2018_QP_-_Paper_1_OCR_(B)_Physics_AS-level.pdf") else { return };
+        let drawing = pages[9].figures.iter().any(|r| r[0] <= 60.0 && r[2] >= 320.0 && r[1] <= 125.0 && r[3] >= 145.0);
+        assert!(drawing, "{:?}", pages[9].figures);
+    }
+
+    /// An enlarged sign is no measure of its line's size: set in its own
+    /// line, the 23 pt integral on page 33 of 01_edexcel_maths_p1_ms took
+    /// the line of text above it for its superscript. On the same page "Answer is ∫ 8 − 8 cos 4t + …" is one
+    /// line (before, its sign made a row of its own).
+    #[test]
+    fn an_enlarged_sign_takes_no_line_for_its_script() {
+        let _guard = crate::pdf_render::pdfium_test_lock();
+        let Some(pages) = corpus_pages("papers/used/01_edexcel_maths_p1_ms.pdf") else { return };
+        let lines: Vec<&str> = pages[32].lines.iter().map(|l| l.text.as_str()).collect();
+        assert!(lines.contains(&"There are other more complicated methods so look carefully at what they are doing."), "{lines:#?}");
+        assert!(lines.iter().any(|l| l.starts_with("$\\int 8 - 8 \\cos 4t + 48\\sin^{2} t \\cos t \\, \\mathrm{d}t =")), "{lines:#?}");
+        assert!(lines.iter().any(|l| l.starts_with("Answer is") && l.contains("\\int 8 - 8 \\cos 4t")), "{lines:#?}");
+    }
+
+    /// An enlarged sign joins the line it is centred on: WJEC Maths Unit 1
+    /// Jun 2023 Q13 a) "Find ∫(4x^{-2/3} + 5x³ + 7) dx. [3]" lowers its
+    /// 25 pt integral 7.4 pt. The sign made a row of its own, which took the
+    /// task beside it for its scripts, and the label and allocation were left
+    /// on a line before it.
+    #[test]
+    fn an_enlarged_sign_does_not_part_a_line() {
+        let _guard = crate::pdf_render::pdfium_test_lock();
+        let Some(pages) = corpus_pages("papers/used/Maths_A-level_Papers_WJEC__June_2023_QP_-_Unit_1_WJEC_Maths_AS-level.pdf") else { return };
+        let map = build_layout_map(&pages);
+        let q13 = body(&pages, &map, 13);
+        let line = q13.lines().find(|l| l.contains("Find")).unwrap_or_default();
+        assert!(line.contains("a)") && line.trim_end().ends_with("[3]"), "{q13}");
+    }
+
+    /// White text with no ink under it is not printed, so not read: mp1_t's
+    /// difficulty ratings ("(***+)", "(*****)") are set white beside each
+    /// heading, and Q2's made its heading a line of maths no rule knew (Q2
+    /// was merged into Q1).
+    #[test]
+    fn white_text_on_a_white_page_is_not_read() {
+        let _guard = crate::pdf_render::pdfium_test_lock();
+        let Some(pages) = corpus_pages("papers/used/mp1_t.pdf") else { return };
+        let map = build_layout_map(&pages);
+        assert_eq!(map.questions.iter().map(|q| q.number).collect::<Vec<_>>(), (1..=12).collect::<Vec<_>>(), "{:?}", map.anomalies);
+        for n in [1, 2, 5] {
+            let b = body(&pages, &map, n);
+            assert!(!b.contains("**") && b.starts_with(&format!("Question {n}")), "Q{n}: {b}");
+        }
+    }
+
+    /// A white code set over a light watermark is not printed, though one
+    /// letter of it lies on a stroke of the watermark: m3_centre_of_mass's
+    /// answers carry hidden codes ("FM2-Q"), and "FM2" or "F" was read
+    /// before ", k = 6"; "FM2-M", where the watermark is denser, before
+    /// ", tan θ = 5".
+    #[test]
+    fn a_white_code_over_a_watermark_is_not_read() {
+        let _guard = crate::pdf_render::pdfium_test_lock();
+        let Some(pages) = corpus_pages("papers/used/m3_centre_of_mass.pdf") else { return };
+        for (page, answer) in [(2, "k = 6"), (20, r"\tan\theta = 5")] {
+            let line = pages[page].lines.iter().find(|l| l.text.contains(answer)).map(|l| l.text.as_str()).unwrap_or_default();
+            assert!(line.starts_with(','), "p{}: {line}", page + 1);
+        }
+    }
+
+    /// White text on a tint is printed: the header row of the Edexcel
+    /// Further CP1 mark scheme's tables, white on grey, is read.
+    #[test]
+    fn white_text_on_a_tint_is_read() {
+        let _guard = crate::pdf_render::pdfium_test_lock();
+        let Some(pages) = corpus_pages("papers/used/02_edexcel_further_maths_cp1_ms.pdf") else { return };
+        let lines: Vec<&str> = pages[5].lines.iter().map(|l| l.text.as_str()).collect();
+        assert!(lines.iter().any(|t| t.contains("| Question | Scheme | Marks | AOs |")), "{lines:#?}");
+    }
+
+    /// Arrows in boxes drawn cell by cell are the boxes' entries, no
+    /// drawing: Edexcel Chemistry Jun 2020 P1's orbital boxes, of which two
+    /// of five became figures and took the labels under all five ("1s² 2s²
+    /// 2p⁶ 3s² 3p³") out of the text.
+    #[test]
+    fn arrows_in_boxes_drawn_cell_by_cell_are_no_figure() {
+        let _guard = crate::pdf_render::pdfium_test_lock();
+        let Some(pages) = corpus_pages("papers/used/Chemistry_A-level_Past-Papers_Edexcel__June_2020_QP_-_Paper_1_Edexcel_Chemistry_AS-level.pdf") else { return };
+        let lp = &pages[1];
+        assert!(!lp.figures.iter().any(|r| r[1] < 436.0 && r[3] > 403.0), "{:?}", lp.figures);
+        assert!(lp.lines.iter().any(|l| l.text.contains(r"2\mathrm{p}^{6}")), "the labels are text");
+    }
+
+    /// Arrows seed figures only after the drawings seeded by oblique strokes
+    /// have grown: seeded with them, the y-axis of edexcel '18 p17's graph
+    /// joined its arrowhead first, the graph's grid lines no longer spanned
+    /// it, and its region ended at 455 pt, not at the grid's 483.
+    #[test]
+    fn an_axis_arrow_leaves_its_graph_whole() {
+        let _guard = crate::pdf_render::pdfium_test_lock();
+        let Some(pages) = corpus_pages("papers/used/edexcel '18 edexcel.pdf") else { return };
+        assert!(pages[16].figures.iter().any(|r| r[0] <= 111.0 && r[2] >= 482.0), "{:?}", pages[16].figures);
+    }
+
+    /// Empty axes to sketch on are answer space, not a figure, though their
+    /// ends are arrows: AQA Jun 2019 Q7(a), "By sketching the graphs … on
+    /// the axes below".
+    #[test]
+    fn empty_axes_with_arrowheads_are_no_figure() {
+        let _guard = crate::pdf_render::pdfium_test_lock();
+        let Some(pages) = corpus_pages("papers/used/Maths_A-level_Papers_AQA__June_2019_QP.pdf") else { return };
+        let lp = &pages[7];
+        assert!(!lp.figures.iter().any(|r| r[0] < 405.0 && r[2] > 182.0 && r[1] < 393.0 && r[3] > 198.0), "{:?}", lp.figures);
+    }
+
+    /// An arrow beside a drawing is part of it: OCR B Physics AS Jun 2018
+    /// Q5's phasor diagrams, whose arrows were left out of their region.
+    #[test]
+    fn an_arrow_beside_a_drawing_is_part_of_it() {
+        let _guard = crate::pdf_render::pdfium_test_lock();
+        let Some(pages) = corpus_pages("papers/used/Physics_A-level_Past-Papers_OCR-B__June_2018_QP_-_Paper_1_OCR_(B)_Physics_AS-level.pdf") else { return };
+        assert!(pages[2].figures.iter().any(|r| r[0] <= 108.0 && r[2] >= 287.0 && r[1] <= 484.0 && r[3] >= 610.0), "{:?}", pages[2].figures);
+    }
+
+    /// A drawing an arrow points from is part of the arrow's figure:
+    /// Chemistry Edexcel Jun 2024 P3's cyclohexene, before "Step 1, HBr" and
+    /// the arrow to bromocyclohexane, was left out of its region.
+    #[test]
+    fn a_drawing_at_an_arrows_end_is_part_of_its_figure() {
+        let _guard = crate::pdf_render::pdfium_test_lock();
+        let Some(pages) = corpus_pages("papers/used/Chemistry_A-level_Past-Papers_Edexcel__June_2024_QP_-_Paper_3_Edexcel_Chemistry_A-level.pdf") else { return };
+        assert!(pages[13].figures.iter().any(|r| r[0] <= 72.0 && r[2] >= 300.0 && r[1] <= 117.0 && r[3] >= 160.0), "{:?}", pages[13].figures);
+    }
+
+    /// A chart's data labels at different heights are no label row and its
+    /// gap: Edexcel-A Economics Jun 2021 Q5's bar chart read "3.41
+    /// ${}^{3}.^{54}$ 3.38 3.50", its labels merged into one line.
+    #[test]
+    fn a_charts_data_labels_are_no_label_row() {
+        let _guard = crate::pdf_render::pdfium_test_lock();
+        let Some(pages) = corpus_pages("papers/used/Economics_A-level_Past-Papers_Edexcel-A__June_2021_QP_-_Paper_2_Edexcel_(A)_Economics_A-level.pdf") else { return };
+        let lines: Vec<&str> = pages[9].lines.iter().map(|l| l.text.as_str()).collect();
+        // Each label is a line at its own height: "3.54" and "3.38" alone,
+        // "3.41" with the "3.50" printed at its height.
+        assert!(!lines.iter().any(|t| t.contains("^{54}")), "{lines:#?}");
+        assert!(lines.contains(&"3.54") && lines.contains(&"3.38") && lines.contains(&"3.41\t3.50"), "{lines:#?}");
+        assert!(!lines.iter().any(|t| t.contains("3.41") && (t.contains("54") || t.contains("3.38"))), "{lines:#?}");
+    }
+
+    /// A fraction set in the gap of its sentence, off its baseline, is in
+    /// that line: physics '18 Q9, "What is the ratio (mass of gas in X)/(mass
+    /// of gas in Y) ?", whose fraction was a line of its own.
+    #[test]
+    fn a_fraction_in_its_sentences_gap_is_in_its_line() {
+        let _guard = crate::pdf_render::pdfium_test_lock();
+        let Some(pages) = corpus_pages("papers/used/physics '18.pdf") else { return };
+        let lines: Vec<&str> = pages[22].lines.iter().map(|l| l.text.as_str()).collect();
+        assert!(lines.iter().any(|t| t.starts_with("What is the ratio") && t.contains(r"\frac{") && t.trim_end().ends_with('?')), "{lines:#?}");
+    }
+
+    /// A table among outlined letters is no figure: edexcel '19 draws its
+    /// text as outlines, and Q17(b)(ii)'s table of grating spacings
+    /// ("d/10⁻⁶ m 1.0 1.7 2.0 3.3") became a figure, its values lost.
+    #[test]
+    fn a_table_among_outlined_letters_is_no_figure() {
+        let _guard = crate::pdf_render::pdfium_test_lock();
+        let Some(pages) = corpus_pages("papers/used/edexcel '19 edexcel.pdf") else { return };
+        assert!(!pages[20].figures.iter().any(|r| r[1] < 100.0 && r[3] > 80.0), "{:?}", pages[20].figures);
+    }
+
+    /// An answer grid's arrowed axes are its borders: Nov 2024 Q1's grid
+    /// reaches its y-axis, and the title under its x-axis ("Time (t
+    /// minutes)") is the grid's, not question text.
+    #[test]
+    fn an_answer_grids_arrowed_axes_are_its_borders() {
+        let _guard = crate::pdf_render::pdfium_test_lock();
+        let Some(pages) = corpus_pages("papers/used/Nov 2024 QP.pdf") else { return };
+        let lines: Vec<&str> = pages[1].lines.iter().map(|l| l.text.as_str()).collect();
+        assert!(!lines.iter().any(|t| t.starts_with("Time $(t$ minutes)")), "{lines:#?}");
+        let title = pages[1].furniture.iter().find(|l| l.text.starts_with("Time $(t$ minutes)"));
+        assert_eq!(title.map(|l| l.furniture), Some(Some(FurnitureKind::AnswerLine)), "{:#?}", pages[1].furniture);
+    }
+
+    /// A paper that prints no question number, over a task in lettered parts
+    /// with allocations after "Answer all questions.", is one question: WJEC
+    /// Physics Unit 5 Jun 2024's practical task, 25 marks (it gave no card).
+    #[test]
+    fn a_task_with_no_question_number_is_one_question() {
+        let _guard = crate::pdf_render::pdfium_test_lock();
+        let Some(pages) = corpus_pages("papers/used/Physics_A-level_Past-Papers_WJEC-Wales__June_2024_QP_-_Unit_5_(Examination_1)_WJEC_Physics_A-level.pdf") else { return };
+        assert!(build_layout_map(&pages).questions.is_empty());
+        let map = LayoutMap { questions: unnumbered_task(&pages).into_iter().collect(), ..Default::default() };
+        let b = body(&pages, &map, 1);
+        assert!(b.starts_with("You are asked to investigate how the resistance"), "{b}");
+        assert_eq!(printed_allocations(&b), 25, "{b}");
+    }
+
+    /// An allocation in brackets alone ("[3]") is never a figure's label,
+    /// however near the drawing: OCR A Chemistry Jun 2017 Q18 prints 14
+    /// marks, and the [3] under its flowchart was lost (11).
+    #[test]
+    fn an_allocation_beside_a_drawing_is_no_label() {
+        let _guard = crate::pdf_render::pdfium_test_lock();
+        let Some(pages) = corpus_pages("papers/used/Chemistry_A-level_Past-Papers_OCR-A__June_2017_QP.pdf") else { return };
+        let map = build_layout_map(&pages);
+        assert_eq!(printed_allocations(&body(&pages, &map, 18)), 14, "{}", body(&pages, &map, 18));
+    }
+
+    /// A part's expression set a little below its label and its allocation,
+    /// in the gap between them, is their line: WJEC Maths Unit 1 Jun 2019 Q7
+    /// b) "2√(6b²)/√2 − √27 + √192 [3]" (3.2 pt below; it followed the
+    /// allocation).
+    #[test]
+    fn an_expression_between_its_label_and_its_allocation_is_their_line() {
+        let _guard = crate::pdf_render::pdfium_test_lock();
+        let Some(pages) = corpus_pages("papers/used/Maths_A-level_Papers_WJEC__June_2019_QP_-_Unit_1_WJEC_Maths_AS-level.pdf") else { return };
+        let map = build_layout_map(&pages);
+        let q7 = body(&pages, &map, 7);
+        let line = q7.lines().find(|l| l.contains(r"\sqrt{192}")).unwrap_or_default();
+        assert!(line.starts_with(r"$\mathbf{b})") && line.trim_end().ends_with("[3]"), "{q7}");
+    }
+
+    /// A glyph its text object's clip path leaves out of sight is not
+    /// printed, so not read: Edexcel Jun 2024's MathType equations repeat
+    /// the "f(x) =" set beside them as text, clipped out (Q1, Q3 and Q5 read
+    /// "gg((xx)) ==", "ff((xx)) ==").
+    #[test]
+    fn a_glyph_clipped_out_of_sight_is_not_read() {
+        let _guard = crate::pdf_render::pdfium_test_lock();
+        let Some(pages) = corpus_pages("papers/used/Maths_A-level_Papers_Edexcel__June_2024_QP.pdf") else { return };
+        let map = build_layout_map(&pages);
+        for n in [1, 3, 5] {
+            let b = body(&pages, &map, n);
+            assert!(!b.contains("((xx") && !b.contains("==") && !b.contains("ff(") && !b.contains("gg("), "Q{n}: {b}");
+        }
+    }
+
+    /// An AES-encrypted paper's minus signs, named only in its encrypted
+    /// font dictionaries, are read: AQA Further Jun 2021 Q1's "Var(4X − 2)"
+    /// (before, its strict card read "Var(4X 2)": the unnamed bar became a
+    /// rule).
+    #[test]
+    fn an_encrypted_papers_minus_signs_are_read() {
+        let _guard = crate::pdf_render::pdfium_test_lock();
+        let Some(pages) = corpus_pages("papers/used/Maths_A-level_Papers_AQA-Further__June_2021_QP.pdf") else { return };
+        let map = build_layout_map(&pages);
+        let q1 = body(&pages, &map, 1);
+        assert!(q1.contains("Var(4X − 2)"), "{q1}");
+    }
+
+    /// A fraction under a radical's bar is built before the radical, though
+    /// the bar, set in glyph pieces, ends a little short of the fraction's:
+    /// AQA Jun 2021 Q7(c)'s "x_{n+1} = √(x_n − 1 + 3/x_n)", whose minus
+    /// signs its encrypted font dictionaries name.
+    #[test]
+    fn a_fraction_under_a_radicals_bar_is_built_first() {
+        let _guard = crate::pdf_render::pdfium_test_lock();
+        let Some(pages) = corpus_pages("papers/used/Maths_A-level_Papers_AQA__June_2021_QP.pdf") else { return };
+        let map = build_layout_map(&pages);
+        let q7 = body(&pages, &map, 7);
+        assert!(q7.contains(r"\sqrt{\mathrm{x}_n - 1 + \frac{3}{\mathrm{x}_n}}"), "{q7}");
+        assert!(q7.contains(r"\mathrm{x}^{3} + \mathrm{x} - 3"), "{q7}");
+    }
+
+    /// Advent 3B2's maths, Greek and symbol fonts read as their glyphs'
+    /// outlines draw them (AQA Further Jun 2019): bracket pieces and tall
+    /// brackets, braces and a bar, a radical's overbar in pieces, a ratio
+    /// colon, α β γ ε μ and the degree sign. No glyph of its questions is
+    /// unknown.
+    #[test]
+    fn advent_fonts_read_as_their_outlines_draw() {
+        let _guard = crate::pdf_render::pdfium_test_lock();
+        let Some(pages) = corpus_pages("papers/used/Maths_A-level_Papers_AQA-Further__June_2019_QP.pdf") else { return };
+        let map = build_layout_map(&pages);
+        for q in &map.questions {
+            let b = question_body(&pages, q).text;
+            assert!(!b.contains(UNKNOWN_GLYPH), "Q{}: {b}", q.number);
+        }
+        let q = |n: u32| body(&pages, &map, n);
+        assert!(q(1).contains(r"the set {x : $|\mathrm{x}| < 1\}$ as its"), "{}", q(1));
+        assert!(q(5).contains(r"\begin{bmatrix}1 \\ 1 \\ 1\end{bmatrix} = 7") && q(5).contains("0.1°"), "{}", q(5));
+        assert!(q(11).contains(r"\sqrt{4 - 2\mathrm{x} - \mathrm{x}^{2}}"), "{}", q(11));
+        assert!(q(13).contains(r"\alpha^{2} + \beta^{2} + \gamma^{2}"), "{}", q(13));
+        assert!(q(14).contains(r"9\mathrm{m}\varepsilon"), "{}", q(14));
+    }
+
+    /// A fraction set at an integral sign's top is its upper limit, though
+    /// its π is set at the text's size (Advent's π, x-height tall, is no
+    /// taller there than the 3 under it): AQA Further Jun 2019 Q8(c)'s
+    /// "∫₀^{π/3} sin⁵θ dθ", not a line of its own above the integral.
+    #[test]
+    fn a_fraction_at_an_integrals_top_is_its_upper_limit() {
+        let _guard = crate::pdf_render::pdfium_test_lock();
+        let Some(pages) = corpus_pages("papers/used/Maths_A-level_Papers_AQA-Further__June_2019_QP.pdf") else { return };
+        let map = build_layout_map(&pages);
+        let q8 = body(&pages, &map, 8);
+        assert!(q8.contains(r"\int_{0}^{\frac{\pi}{3}} \sin^{5} \theta"), "{q8}");
+    }
+
+    /// A superscript set at the text's own size, raised a third of an em and
+    /// tight after its base, is a superscript still: AQA Further Jun 2019 Q9's
+    /// "in the form re^{iθ}" (its i at 12 pt raised 3.9 pt, beside a 9.5 pt
+    /// θ), not a line of its own that sorts before Q9's heading into Q8.
+    #[test]
+    fn a_superscript_at_the_texts_own_size_is_still_one() {
+        let _guard = crate::pdf_render::pdfium_test_lock();
+        let Some(pages) = corpus_pages("papers/used/Maths_A-level_Papers_AQA-Further__June_2019_QP.pdf") else { return };
+        let map = build_layout_map(&pages);
+        let q9 = body(&pages, &map, 9);
+        assert!(q9.contains(r"in the form $\text{re}^{\mathrm{i}\theta}$ where"), "{q9}");
+        let q8 = body(&pages, &map, 8);
+        assert!(!q8.contains(r"\mathrm{i}_{\theta}"), "{q8}");
+    }
+
+    /// MT Extra's U+F061, a code of the font's own cmap (its glyph's outline
+    /// an arrow from a bar), is ↦: Edexcel IGCSE Jun 2022 Q14's "f : x ↦ …",
+    /// and "f⁻¹ : x ↦" twice more.
+    #[test]
+    fn a_maps_to_arrow_is_read_as_one() {
+        let _guard = crate::pdf_render::pdfium_test_lock();
+        let Some(pages) = corpus_pages("papers/used/Maths_GCSE_Past-Papers_Edexcel-IGCSE-A__June_2022_QP.pdf") else { return };
+        let map = build_layout_map(&pages);
+        let q14 = body(&pages, &map, 14);
+        assert_eq!(q14.matches(r"\mapsto").count(), 3, "{q14}");
+        assert!(!q14.contains(UNKNOWN_GLYPH), "{q14}");
     }
 }

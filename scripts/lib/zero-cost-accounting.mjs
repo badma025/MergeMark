@@ -126,6 +126,20 @@ export const PAPERS = [
   { name: "aqa_gcse_jun24", file: "papers/used/Maths_GCSE_Past-Papers_AQA__June_2024_QP.pdf", subject: "Mathematics", module: "GCSE Mathematics", cohort: "triage_fixtures" },
   { name: "edx_jun24", file: "papers/used/Maths_A-level_Papers_Edexcel__June_2024_QP.pdf", subject: "Mathematics", module: "A-Level Mathematics", cohort: "triage_fixtures" },
   { name: "wjecf_u2_jun19", file: "papers/used/Maths_A-level_Papers_WJEC-Further__June_2019_QP_-_Unit_2_WJEC_Further_Maths_AS-level.pdf", subject: "Mathematics", module: "Further Mathematics", cohort: "triage_fixtures" },
+  // 1.0 W1 round 3: symbol fonts read from their glyphs, scripts at text size, AES-encrypted papers.
+  { name: "edx_igcse_jun22", file: "papers/used/Maths_GCSE_Past-Papers_Edexcel-IGCSE-A__June_2022_QP.pdf", subject: "Mathematics", module: "GCSE Mathematics", cohort: "triage_fixtures" },
+  { name: "aqaf_jun19", file: "papers/used/Maths_A-level_Papers_AQA-Further__June_2019_QP.pdf", subject: "Mathematics", module: "Further Mathematics", cohort: "triage_fixtures" },
+  { name: "aqa_jun21", file: "papers/used/Maths_A-level_Papers_AQA__June_2021_QP.pdf", subject: "Mathematics", module: "A-Level Mathematics", cohort: "triage_fixtures" },
+  { name: "aqaf_jun21", file: "papers/used/Maths_A-level_Papers_AQA-Further__June_2021_QP.pdf", subject: "Mathematics", module: "Further Mathematics", cohort: "triage_fixtures" },
+  { name: "wjec_u1_jun19", file: "papers/used/Maths_A-level_Papers_WJEC__June_2019_QP_-_Unit_1_WJEC_Maths_AS-level.pdf", subject: "Mathematics", module: "AS Mathematics", cohort: "triage_fixtures" },
+  { name: "ocra_chem_jun17", file: "papers/used/Chemistry_A-level_Past-Papers_OCR-A__June_2017_QP.pdf", subject: "Chemistry", module: "A-Level Chemistry", cohort: "triage_fixtures" },
+  { name: "wjec_phys_u5_jun24", file: "papers/used/Physics_A-level_Past-Papers_WJEC-Wales__June_2024_QP_-_Unit_5_(Examination_1)_WJEC_Physics_A-level.pdf", subject: "Physics", module: "A-Level Physics", cohort: "triage_fixtures" },
+  { name: "cs05_qp", file: "papers/used/05_cs_or_decision_qp.pdf", subject: "Computer Science", module: "Computer Science", cohort: "triage_fixtures" },
+  { name: "mp1_t", file: "papers/used/mp1_t.pdf", subject: "Mathematics", module: "Pure Mathematics", cohort: "triage_fixtures" },
+  // (Round 3's review: white text over a watermark; arrows in boxes drawn cell by cell; a drawing at an arrow's end.)
+  { name: "m3_com", file: "papers/used/m3_centre_of_mass.pdf", subject: "Mathematics", module: "Mechanics", cohort: "triage_fixtures" },
+  { name: "edx_chem_p1_jun20", file: "papers/used/Chemistry_A-level_Past-Papers_Edexcel__June_2020_QP_-_Paper_1_Edexcel_Chemistry_AS-level.pdf", subject: "Chemistry", module: "AS Chemistry", cohort: "triage_fixtures" },
+  { name: "edx_chem_p3_jun24", file: "papers/used/Chemistry_A-level_Past-Papers_Edexcel__June_2024_QP_-_Paper_3_Edexcel_Chemistry_A-level.pdf", subject: "Chemistry", module: "A-Level Chemistry", cohort: "triage_fixtures" },
 ];
 
 export function slugFor(paperName) {

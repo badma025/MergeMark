@@ -2364,6 +2364,45 @@ mod tests {
         assert_eq!(q1.marks, 11, "{}", q1.content);
     }
 
+    /// An index in a listing is no allocation, through the import: AQA's CS
+    /// paper draws Q2's stack S[7] … S[0] in code type, and the card has the
+    /// paper's 11 marks, not 36.
+    #[tokio::test]
+    async fn an_index_in_a_listing_is_no_allocation() {
+        let _pdfium = crate::pdf_render::pdfium_test_lock();
+        let Some(file_path) = fixture("papers/used/05_cs_or_decision_qp.pdf") else { return };
+        let (state, host) = app_with_a_provider_key().await;
+        let questions = import_offline(&state, &host, file_path, "AQA CS").await.expect("the paper is read locally");
+        let q2 = questions.iter().find(|q| q.question_number == Some(2)).expect("Q2 imported");
+        assert_eq!(q2.marks, 11, "{}", q2.content);
+    }
+
+    /// An allocation beside a drawing is the question's, through the import,
+    /// where the drawing is cropped: OCR A Chemistry Jun 2017 Q18's "[3]"
+    /// under its flowchart, 14 marks.
+    #[tokio::test]
+    async fn an_allocation_beside_a_drawing_reaches_the_card() {
+        let _pdfium = crate::pdf_render::pdfium_test_lock();
+        let Some(file_path) = fixture("papers/used/Chemistry_A-level_Past-Papers_OCR-A__June_2017_QP.pdf") else { return };
+        let (state, host) = app_with_a_provider_key().await;
+        let questions = import_offline(&state, &host, file_path, "OCR A Chemistry").await.expect("the paper is read locally");
+        let q18 = questions.iter().find(|q| q.question_number == Some(18)).expect("Q18 imported");
+        assert_eq!(q18.marks, 14, "{}", q18.content);
+    }
+
+    /// A paper that prints no question number is one task, through the
+    /// import: WJEC Physics Unit 5 Jun 2024's practical examination is one
+    /// card of 25 marks (there was none).
+    #[tokio::test]
+    async fn a_paper_with_no_question_number_imports_as_one_task() {
+        let _pdfium = crate::pdf_render::pdfium_test_lock();
+        let Some(file_path) = fixture("papers/used/Physics_A-level_Past-Papers_WJEC-Wales__June_2024_QP_-_Unit_5_(Examination_1)_WJEC_Physics_A-level.pdf") else { return };
+        let (state, host) = app_with_a_provider_key().await;
+        let questions = import_offline(&state, &host, file_path, "WJEC Physics U5").await.expect("the paper is read locally");
+        assert_eq!(questions.iter().map(|q| q.question_number).collect::<Vec<_>>(), vec![Some(1)]);
+        assert_eq!(questions[0].marks, 25, "{}", questions[0].content);
+    }
+
     /// Each card records the paper it was read from, the SHA-256 of the file
     /// and the pages its question is on, so it can be checked against them:
     /// read fresh, and again from the cache.
