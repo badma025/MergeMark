@@ -168,6 +168,23 @@ mod platform {
     }
 
     pub fn recognize(img: &image::RgbaImage) -> Option<Vec<OcrLine>> {
+        let mut lines = read(img)?;
+        // Reading a whole page, Vision can drop a short label standing alone
+        // in the margin: on GitHub's macOS runner, a virtual Mac without the
+        // neural engine, the scanned M3 Jun 2004 paper lost "1." and "2.",
+        // which a Mac reads. Read by itself, the margin left of the text
+        // gives them back.
+        if let Some(edge) = super::text_left_edge(&lines, img.width() as f32) {
+            let margin = image::imageops::crop_imm(img, 0, 0, edge as u32, img.height()).to_image();
+            if let Some(found) = read(&margin) {
+                super::add_margin_labels(&mut lines, found, edge);
+            }
+        }
+        Some(lines)
+    }
+
+    /// One reading of an image by Vision.
+    fn read(img: &image::RgbaImage) -> Option<Vec<OcrLine>> {
         let (width, height) = (img.width() as f64, img.height() as f64);
         let mut png = Vec::new();
         img.write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png).ok()?;
@@ -249,6 +266,54 @@ mod platform {
 
     pub fn recognize(_img: &image::RgbaImage) -> Option<Vec<OcrLine>> {
         None
+    }
+}
+
+/// Where the text of a page read by OCR begins, in the image's pixels: a
+/// little left of where its lines a third of the page wide or longer start
+/// (their median, so a question number read into its line moves nothing).
+/// `None` with no such line, or no margin to read.
+#[cfg(any(target_os = "macos", test))]
+fn text_left_edge(lines: &[OcrLine], width: f32) -> Option<f32> {
+    let mut starts: Vec<f32> = lines
+        .iter()
+        .filter_map(|l| {
+            let x0 = l.words.iter().map(|w| w.bbox[0]).fold(f32::MAX, f32::min);
+            let x1 = l.words.iter().map(|w| w.bbox[2]).fold(f32::MIN, f32::max);
+            (x1 - x0 >= width / 3.0).then_some(x0)
+        })
+        .collect();
+    if starts.is_empty() {
+        return None;
+    }
+    starts.sort_by(f32::total_cmp);
+    let edge = starts[starts.len() / 2] - 0.005 * width;
+    (edge >= 0.04 * width).then_some(edge)
+}
+
+/// Adds to a page's lines the question labels that a reading of its margin
+/// alone (the image left of `edge`) found and the page's reading did not: a
+/// number of one or two digits, with a full stop or brackets, level with a
+/// line of the text, as a question's number is printed, and overlapping
+/// nothing already read.
+#[cfg(any(target_os = "macos", test))]
+fn add_margin_labels(lines: &mut Vec<OcrLine>, margin: Vec<OcrLine>, edge: f32) {
+    let label = |text: &str| {
+        let t = text.strip_prefix('(').unwrap_or(text);
+        let t = t.strip_suffix(['.', ')']).unwrap_or(t);
+        (1..=2).contains(&t.len()) && t.bytes().all(|b| b.is_ascii_digit())
+    };
+    let span = |l: &OcrLine, i: usize, start: f32, pick: fn(f32, f32) -> f32| l.words.iter().map(|w| w.bbox[i]).fold(start, pick);
+    for word in margin.into_iter().flat_map(|l| l.words) {
+        let b = word.bbox;
+        let level = lines.iter().any(|l| {
+            let (y0, y1) = (span(l, 1, f32::MAX, f32::min), span(l, 3, f32::MIN, f32::max));
+            span(l, 0, f32::MAX, f32::min) >= edge && b[3].min(y1) - b[1].max(y0) >= 0.5 * (b[3] - b[1])
+        });
+        let read = lines.iter().flat_map(|l| &l.words).any(|w| w.bbox[0] < b[2] && b[0] < w.bbox[2] && w.bbox[1] < b[3] && b[1] < w.bbox[3]);
+        if label(&word.text) && b[2] <= edge && level && !read {
+            lines.push(OcrLine { words: vec![word] });
+        }
     }
 }
 
@@ -337,6 +402,45 @@ mod tests {
         let text: Vec<Vec<&str>> = lines.iter().map(|l| l.words.iter().map(|w| w.text.as_str()).collect()).collect();
         assert_eq!(text, vec![vec!["1.", "A", "circular"], vec!["flywheel"]]);
         assert_eq!(lines[0].words[2].bbox, [380.0, 300.0, 680.0, 350.0]);
+    }
+
+    fn ocr_line(words: &[(&str, [f32; 4])]) -> OcrLine {
+        OcrLine { words: words.iter().map(|&(text, bbox)| OcrWord { text: text.to_string(), bbox }).collect() }
+    }
+
+    #[test]
+    fn a_margin_read_alone_gives_back_the_question_labels_a_page_read_dropped() {
+        // A page 2480 px wide (A4 at 300 dpi), its text from x = 320 and its
+        // question numbers at 230, as on the scanned M3 Jun 2004 paper.
+        let mut page = vec![
+            ocr_line(&[("A", [320.0, 250.0, 340.0, 290.0]), ("circular", [350.0, 250.0, 2000.0, 290.0])]),
+            ocr_line(&[("Two", [320.0, 1390.0, 380.0, 1430.0]), ("light", [390.0, 1390.0, 2100.0, 1430.0])]),
+            ocr_line(&[("3.", [229.0, 1980.0, 258.0, 2020.0])]),
+            ocr_line(&[("A", [320.0, 1980.0, 340.0, 2020.0]), ("particle", [350.0, 1980.0, 2050.0, 2020.0])]),
+        ];
+        let edge = text_left_edge(&page, 2480.0).expect("a margin");
+        assert!(edge > 260.0 && edge < 320.0, "{edge}");
+        let margin = vec![
+            ocr_line(&[("1.", [236.0, 262.0, 262.0, 300.0])]),
+            ocr_line(&[("2.", [233.0, 1400.0, 262.0, 1438.0])]),
+            // Read by the page already.
+            ocr_line(&[("3.", [229.0, 1985.0, 258.0, 2022.0])]),
+            // Level with no line of the text.
+            ocr_line(&[("7", [236.0, 3300.0, 262.0, 3340.0])]),
+            // No question number.
+            ocr_line(&[("N17132A", [212.0, 3417.0, 290.0, 3450.0])]),
+        ];
+        add_margin_labels(&mut page, margin, edge);
+        let alone: Vec<&str> = page.iter().filter(|l| l.words.len() == 1).map(|l| l.words[0].text.as_str()).collect();
+        assert_eq!(alone, ["3.", "1.", "2."]);
+    }
+
+    #[test]
+    fn a_page_without_a_line_of_text_or_a_margin_has_no_margin_to_read() {
+        let figure = vec![ocr_line(&[("Figure", [1100.0, 600.0, 1300.0, 640.0]), ("1", [1310.0, 600.0, 1340.0, 640.0])])];
+        assert_eq!(text_left_edge(&figure, 2480.0), None);
+        let edge_to_edge = vec![ocr_line(&[("Wide", [20.0, 100.0, 2400.0, 140.0])])];
+        assert_eq!(text_left_edge(&edge_to_edge, 2480.0), None);
     }
 
     #[test]
