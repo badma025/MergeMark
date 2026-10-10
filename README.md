@@ -84,7 +84,7 @@ MergeMark then opens normally from then on.
 Read [notes for users](docs/BETA_TESTERS.md) before your first import — in particular, what the **REVIEW** badge means and how to check a card against its paper.
 
 ### Updates
-MergeMark checks for a newer version when it starts, and from **Settings → Backup & Maintenance → Updates**, where the check at start-up can be turned off. To check, it asks this repository's GitHub releases for the newest version's details: an ordinary web request that carries nothing about your library or your papers. An update installs only if it is signed with MergeMark's key, and only when you choose **Install and restart**. Your library is backed up when a new version first opens it.
+MergeMark checks for a newer version when it starts, and from **Settings → Backup & Maintenance → Updates**, where the check at start-up can be turned off. To check, it asks this repository's GitHub releases for the newest version's details: an ordinary web request that carries nothing about your library or your papers. An update installs only if it is signed with MergeMark's key, and only when you choose **Install and restart**. Your library is backed up when a new version first opens it. A 0.9 beta cannot update itself to 1.0, which is signed with a new key: install 1.0 over it from the Releases tab, and your library is kept.
 
 ### How to Use
 1. **Import:** Drag and drop a PDF past paper into the ingestion dropzone.

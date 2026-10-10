@@ -8,9 +8,10 @@ name: Release
 #   git push origin v1.0.0
 #
 # Updates: the build signs its updater artifacts with the key whose public
-# half is in tauri.conf.json (secrets TAURI_SIGNING_PRIVATE_KEY and
-# TAURI_SIGNING_PRIVATE_KEY_PASSWORD; v0.9.1 and v0.9.2 shipped the same key)
-# and attaches latest.json. Installed copies read
+# half is in tauri.conf.json (key ID 51088306F548AC07, new in 1.0; secrets
+# TAURI_SIGNING_PRIVATE_KEY and TAURI_SIGNING_PRIVATE_KEY_PASSWORD) and
+# attaches latest.json. 0.9.1 and 0.9.2 trust an earlier key whose password
+# was lost, so they cannot install an update; the release text tells them so. Installed copies read
 # /releases/latest/download/latest.json, which is served only for the newest
 # PUBLISHED, non-prerelease release: the draft reaches them when you publish it.
 #
@@ -112,7 +113,12 @@ jobs:
         with:
           tagName: ${{ github.ref_name }}
           releaseName: "MergeMark ${{ github.ref_name }}"
-          releaseBody: "Download the installer below. Copies already installed update themselves once this release is published."
+          # Installed copies show this text in their update prompt, 0.9.1 and
+          # 0.9.2 included: they trust a key that can no longer sign.
+          releaseBody: |
+            Using a 0.9 beta? It cannot install this update by itself. Download MergeMark from https://github.com/badma025/MergeMark/releases and install it over the beta: your library is kept.
+
+            Download the installer for your computer below. From 1.0 on, MergeMark updates itself when a newer release is published.
           releaseDraft: true
           prerelease: false
           includeUpdaterJson: true

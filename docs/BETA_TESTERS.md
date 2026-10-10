@@ -19,6 +19,8 @@ Your library is stored in `%APPDATA%\com.mergemark.app` on Windows and `~/Librar
 ## Updates
 MergeMark checks for a newer version when it starts, and on request from **Settings → Backup & Maintenance → Updates**, where you can also turn off the check at start-up. The check asks the project's GitHub releases for the newest version's details; it carries nothing about your library or papers. An update installs only when you choose **Install and restart**, and only if it is signed with MergeMark's key.
 
+Coming from a 0.9 beta? It cannot update itself to 1.0, because 1.0 is signed with a new key. Download 1.0 from the Releases page and install it over the beta: your library is kept, and a backup of it is made when 1.0 first opens it.
+
 ## Before your first import
 Every card is filed under a subject and a module. The app starts with some maths subjects. For anything else, open **Settings → Curriculum Taxonomy**, add the subject, and add at least one module to it.
 

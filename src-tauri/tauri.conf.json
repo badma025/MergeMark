@@ -43,7 +43,7 @@
   },
   "plugins": {
     "updater": {
-      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEE1OUIyMzkyMjA1M0JDRTIKUldUaXZGTWdraU9icFlxRnkvWlJsUVhILzRob0FFYzlRR1phZHFBSWVmWmxIRVhUMmZWbm5ISmsK",
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDUxMDg4MzA2RjU0OEFDMDcKUldRSHJFajFCb01JVWJENTlvWFkxMkpZUEtCWHFGNnFxRWZpMEU4NHZIMVFPNi9JUGxFZzI3bkUK",
       "endpoints": ["https://github.com/badma025/MergeMark/releases/latest/download/latest.json"]
     }
   }
