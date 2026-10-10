@@ -16,7 +16,7 @@
 //   node scripts/check-signing.mjs    (with both variables set)
 //
 // CI runs it in .github/workflows/signing-check.yml and at the start of
-// release.yml.
+// release.yml; scripts/set-signing-secrets.mjs runs it before it sets the two.
 
 import { spawnSync } from "node:child_process";
 import { createHash, createPublicKey, verify } from "node:crypto";
