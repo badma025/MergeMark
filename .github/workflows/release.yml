@@ -104,15 +104,19 @@ jobs:
         run: node scripts/fixtures.mjs unpack
 
       # A test whose paper is missing fails rather than passing unchecked.
-      # bash runs with -eo pipefail, so either command failing fails the step
-      # (PowerShell, the Windows default, would report only the last one).
       - name: Test
         shell: bash
         env:
           MERGEMARK_REQUIRE_FIXTURES: "1"
-        run: |
-          cargo test --manifest-path src-tauri/Cargo.toml
-          node --test "scripts/tests/*.test.mjs" "scripts/*.test.mjs" "src/lib/*.test.mjs"
+        run: cargo test --manifest-path src-tauri/Cargo.toml
+
+      # The scripts' tests read papers with pdftotext, which Git for Windows
+      # ships (the one the triage was built with) and macOS lacks. They test
+      # Node code, the same on every platform, so Windows runs them.
+      - name: Test the scripts
+        if: runner.os == 'Windows'
+        shell: bash
+        run: node --test "scripts/tests/*.test.mjs" "scripts/*.test.mjs" "src/lib/*.test.mjs"
 
       - name: Build app and upload to draft release
         uses: tauri-apps/tauri-action@v0
