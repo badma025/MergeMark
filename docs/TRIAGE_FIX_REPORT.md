@@ -854,7 +854,7 @@ Run w1r3b's test stage then crashed (the OCR entry above); w1r3c is the run repo
   - OCR A Physics AS Jun 2023 Q24 (holdout, strict): the side view's "2.0 m", now read as the drawing's label, is cut by the crop. The detector's box over both views widens each view's crop to one picture, which stops above "Not to scale" (the value is also in the text and the plan view).
   - OCR B Physics AS Jun 2018 Q16 (fixture, strict, as before round 3): wire X, smaller than a figure and too far from wire Y to join it, has no crop; its labels read as text.
   - Edexcel GCSE Jun 2022 Q28 (fixture, strict): the left dimension arrow lies outside the crop; its label 4x reads as text.
-- **Blinded audit w1r3:** pack built from the triage run, judged in a separate session.
+- **Blinded audit w1r3:** 43 cards (`run-unused-w1r3c/audit-pack`), judged by the user: no MAJOR (no per-card verdicts saved).
 
 ## What is left
 
