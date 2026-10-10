@@ -3487,10 +3487,7 @@ pub fn set_ocr_lines(lp: &mut LayoutPage, lines: &[crate::ocr::OcrLine], px: f32
     let (w, h) = (lp.width, lp.height);
     let mut body = Vec::new();
     for l in lines {
-        let x0 = l.words.iter().map(|w| w.bbox[0]).fold(f32::MAX, f32::min) * px;
-        let y0 = l.words.iter().map(|w| w.bbox[1]).fold(f32::MAX, f32::min) * px;
-        let x1 = l.words.iter().map(|w| w.bbox[2]).fold(f32::MIN, f32::max) * px;
-        let y1 = l.words.iter().map(|w| w.bbox[3]).fold(f32::MIN, f32::max) * px;
+        let [x0, y0, x1, y1] = l.bbox().map(|v| v * px);
         let text = escape_prose(&l.words.iter().map(|w| w.text.as_str()).collect::<Vec<_>>().join(" "));
         let mut line = LayoutLine { x0, x1, y0, y1, baseline: y1, size: (y1 - y0).max(4.0), text, glyphs: Vec::new(), furniture: None, bold_lead: false, unplaced: 0, code: false, char_width: 0.0 };
         let t = line.text.trim().to_string();
@@ -9394,11 +9391,13 @@ mod tests {
         }
         assert!(pages.iter().all(|p| p.ocr));
         let map = build_layout_map(&pages);
-        // Engines differ by machine: on failure, what this one read.
-        let read = || pages.iter().flat_map(|p| p.lines.iter().chain(&p.furniture).map(move |l| {
+        // Engines differ by machine: on failure, the short lines this one
+        // read, question numbers among them (never the paper's text, which
+        // a public CI log would publish).
+        let short = || pages.iter().flat_map(|p| p.lines.iter().chain(&p.furniture).filter(|l| l.text.chars().count() <= 4).map(move |l| {
             format!("p{} {:.0},{:.0}{} {}", p.page, l.x0, l.y0, if l.furniture.is_some() { " furniture" } else { "" }, l.text)
         })).collect::<Vec<_>>().join("\n");
-        assert_eq!(map.questions.iter().map(|q| q.number).collect::<Vec<_>>(), (1..=7).collect::<Vec<_>>(), "read by OCR:\n{}", read());
+        assert_eq!(map.questions.iter().map(|q| q.number).collect::<Vec<_>>(), (1..=7).collect::<Vec<_>>(), "short lines read by OCR:\n{}", short());
         let q1 = question_body(&pages, &map.questions[0]);
         assert!(q1.ocr && q1.text.contains("circular flywheel"), "{}", q1.text);
         // The text layer the import is classified by comes from OCR too.

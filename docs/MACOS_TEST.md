@@ -6,30 +6,29 @@ Vision framework. Then the macOS job can go back into
 `.github/workflows/release.yml`.
 
 **Run on 10 Oct 2026, on the user's Mac: it passed.** The macOS job is back in
-`release.yml`. Two things are left for the first build downloaded from a
-release: the universal disk image (this test built for the Mac's own
-processor), and the README's "Open Anyway" steps.
+`release.yml`. Three things are left for the first build downloaded from a
+release candidate:
+- the universal disk image (this test built for the Mac's own processor);
+- the README's "Open Anyway" steps;
+- step 5.2 again. Since this test, the Vision backend also reads a page's
+  margin by itself, for question numbers its reading of the whole page
+  dropped (GitHub's macOS runner, a virtual Mac, dropped "1." and "2." of that
+  paper). On a Mac, which reads them, it should change nothing: the paper
+  still gives seven questions.
 
 ## 1. Get the code onto the Mac
-
-The branch is not pushed yet, so carry it over as a git bundle. On the Windows
-machine, in the repository:
-
-```bash
-git bundle create mergemark.bundle import-fixes-rounds-1-2
-```
-
-Copy `mergemark.bundle` to the Mac. To run the tests there too, also copy the
-fixtures key, `~/.mergemark/fixtures.key` (on Windows
-`C:\Users\<you>\.mergemark\fixtures.key`), to the same place on the Mac. It is
-a secret: copy it directly (USB stick or AirDrop), not through a chat or email.
 
 On the Mac:
 
 ```bash
-git clone -b import-fixes-rounds-1-2 mergemark.bundle MergeMark
+git clone https://github.com/badma025/MergeMark MergeMark
 cd MergeMark
 ```
+
+To run the tests there too, copy the fixtures key, `~/.mergemark/fixtures.key`
+(on Windows `C:\Users\<you>\.mergemark\fixtures.key`), to the same place on
+the Mac. It is a secret: copy it directly (USB stick or AirDrop), not through a
+chat or email.
 
 ## 2. Tools
 

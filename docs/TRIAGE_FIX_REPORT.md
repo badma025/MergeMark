@@ -894,7 +894,7 @@ On the 96 holdout papers after 1.0 W1 round 4 (run unused-w1r4); round 4 changed
 | a question with no card | 2 | | Biology OCR-A Nov 2021 Q14; WJEC Physics Jun 2017 Unit 5 Q1, a practical task with a placeholder card, a quarantined card and 42% of its words in the cards. Not debugged |
 
 Known gaps outside these numbers:
-- Scanned papers are imported but their text needs a person (cluster 5's audit). The macOS (Vision) backend first ran on 10 Oct 2026, on the user's Mac, and passed (`docs/MACOS_TEST.md`). The Linux (Tesseract) backend is untested at run time: Tesseract is not installed on this machine. With no engine, a scan is reported as not transcribed, never sent anywhere.
+- Scanned papers are imported but their text needs a person (cluster 5's audit). The macOS (Vision) backend first ran on 10 Oct 2026, on the user's Mac, and passed (`docs/MACOS_TEST.md`). On GitHub's macOS runner, a virtual Mac, Vision's reading of a whole page dropped question numbers standing alone in the margin. The margin is now read again by itself, and the numbers the page's reading lacks are added: only "3." or "(3)" forms, level with a line of the text (1.0 release dry run, `docs/RELEASE_1_0_PLAN.md`). The Linux (Tesseract) backend is untested at run time: Tesseract is not installed on this machine. With no engine, a scan is reported as not transcribed, never sent anywhere.
 - Mark schemes are not imported in 1.0 (cut in W4 step 2).
 - The CIE M2 rotation arrow and its "5 rad s⁻¹" label lie 25pt beside the drawing and are not joined to its crop (the label's text is still on the card).
 - Single-part Edexcel questions now carry their footer allocation as a tag; cards imported before this run do not.

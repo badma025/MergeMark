@@ -25,6 +25,15 @@ pub struct OcrLine {
     pub words: Vec<OcrWord>,
 }
 
+impl OcrLine {
+    /// The box of all its words `[x0, y0, x1, y1]`, in the image's pixels.
+    pub fn bbox(&self) -> [f32; 4] {
+        self.words.iter().fold([f32::MAX, f32::MAX, f32::MIN, f32::MIN], |b, w| {
+            [b[0].min(w.bbox[0]), b[1].min(w.bbox[1]), b[2].max(w.bbox[2]), b[3].max(w.bbox[3])]
+        })
+    }
+}
+
 /// Whether this machine has a local OCR engine.
 pub fn available() -> bool {
     #[cfg(test)]
@@ -275,14 +284,7 @@ mod platform {
 /// `None` with no such line, or no margin to read.
 #[cfg(any(target_os = "macos", test))]
 fn text_left_edge(lines: &[OcrLine], width: f32) -> Option<f32> {
-    let mut starts: Vec<f32> = lines
-        .iter()
-        .filter_map(|l| {
-            let x0 = l.words.iter().map(|w| w.bbox[0]).fold(f32::MAX, f32::min);
-            let x1 = l.words.iter().map(|w| w.bbox[2]).fold(f32::MIN, f32::max);
-            (x1 - x0 >= width / 3.0).then_some(x0)
-        })
-        .collect();
+    let mut starts: Vec<f32> = lines.iter().map(OcrLine::bbox).filter(|b| b[2] - b[0] >= width / 3.0).map(|b| b[0]).collect();
     if starts.is_empty() {
         return None;
     }
@@ -293,26 +295,26 @@ fn text_left_edge(lines: &[OcrLine], width: f32) -> Option<f32> {
 
 /// Adds to a page's lines the question labels that a reading of its margin
 /// alone (the image left of `edge`) found and the page's reading did not: a
-/// number of one or two digits, with a full stop or brackets, level with a
-/// line of the text, as a question's number is printed, and overlapping
-/// nothing already read.
+/// number of one or two digits with a full stop ("3.") or in brackets
+/// ("(3)"), level with a line of the text, as a question's number is printed,
+/// and overlapping nothing already read. Each goes before the line it is
+/// level with. A bare number (a page or a line number) is never taken: the
+/// question map can read one as a heading.
 #[cfg(any(target_os = "macos", test))]
 fn add_margin_labels(lines: &mut Vec<OcrLine>, margin: Vec<OcrLine>, edge: f32) {
     let label = |text: &str| {
-        let t = text.strip_prefix('(').unwrap_or(text);
-        let t = t.strip_suffix(['.', ')']).unwrap_or(t);
-        (1..=2).contains(&t.len()) && t.bytes().all(|b| b.is_ascii_digit())
+        let digits = text.strip_suffix('.').or_else(|| text.strip_prefix('(')?.strip_suffix(')'));
+        digits.is_some_and(|d| (1..=2).contains(&d.len()) && d.bytes().all(|b| b.is_ascii_digit()))
     };
-    let span = |l: &OcrLine, i: usize, start: f32, pick: fn(f32, f32) -> f32| l.words.iter().map(|w| w.bbox[i]).fold(start, pick);
     for word in margin.into_iter().flat_map(|l| l.words) {
         let b = word.bbox;
-        let level = lines.iter().any(|l| {
-            let (y0, y1) = (span(l, 1, f32::MAX, f32::min), span(l, 3, f32::MIN, f32::max));
-            span(l, 0, f32::MAX, f32::min) >= edge && b[3].min(y1) - b[1].max(y0) >= 0.5 * (b[3] - b[1])
+        let level_with = lines.iter().position(|l| {
+            let lb = l.bbox();
+            lb[0] >= edge && b[3].min(lb[3]) - b[1].max(lb[1]) >= 0.5 * (b[3] - b[1])
         });
-        let read = lines.iter().flat_map(|l| &l.words).any(|w| w.bbox[0] < b[2] && b[0] < w.bbox[2] && w.bbox[1] < b[3] && b[1] < w.bbox[3]);
-        if label(&word.text) && b[2] <= edge && level && !read {
-            lines.push(OcrLine { words: vec![word] });
+        let already_read = lines.iter().flat_map(|l| &l.words).any(|w| w.bbox[0] < b[2] && b[0] < w.bbox[2] && w.bbox[1] < b[3] && b[1] < w.bbox[3]);
+        if let Some(at) = level_with.filter(|_| label(&word.text) && b[2] <= edge && !already_read) {
+            lines.insert(at, OcrLine { words: vec![word] });
         }
     }
 }
@@ -417,22 +419,27 @@ mod tests {
             ocr_line(&[("Two", [320.0, 1390.0, 380.0, 1430.0]), ("light", [390.0, 1390.0, 2100.0, 1430.0])]),
             ocr_line(&[("3.", [229.0, 1980.0, 258.0, 2020.0])]),
             ocr_line(&[("A", [320.0, 1980.0, 340.0, 2020.0]), ("particle", [350.0, 1980.0, 2050.0, 2020.0])]),
+            ocr_line(&[("Find", [320.0, 2600.0, 400.0, 2640.0]), ("the", [410.0, 2600.0, 1900.0, 2640.0])]),
         ];
         let edge = text_left_edge(&page, 2480.0).expect("a margin");
         assert!(edge > 260.0 && edge < 320.0, "{edge}");
         let margin = vec![
             ocr_line(&[("1.", [236.0, 262.0, 262.0, 300.0])]),
             ocr_line(&[("2.", [233.0, 1400.0, 262.0, 1438.0])]),
+            ocr_line(&[("(4)", [222.0, 2605.0, 262.0, 2642.0])]),
             // Read by the page already.
             ocr_line(&[("3.", [229.0, 1985.0, 258.0, 2022.0])]),
+            // A bare number level with a line: a page or a line number.
+            ocr_line(&[("5", [150.0, 1985.0, 175.0, 2020.0])]),
             // Level with no line of the text.
-            ocr_line(&[("7", [236.0, 3300.0, 262.0, 3340.0])]),
+            ocr_line(&[("7.", [236.0, 3300.0, 262.0, 3340.0])]),
             // No question number.
             ocr_line(&[("N17132A", [212.0, 3417.0, 290.0, 3450.0])]),
         ];
         add_margin_labels(&mut page, margin, edge);
-        let alone: Vec<&str> = page.iter().filter(|l| l.words.len() == 1).map(|l| l.words[0].text.as_str()).collect();
-        assert_eq!(alone, ["3.", "1.", "2."]);
+        // Each before the line it is level with, in reading order.
+        let starts: Vec<&str> = page.iter().map(|l| l.words[0].text.as_str()).collect();
+        assert_eq!(starts, ["1.", "A", "2.", "Two", "3.", "A", "(4)", "Find"]);
     }
 
     #[test]
