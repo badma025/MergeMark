@@ -9394,7 +9394,11 @@ mod tests {
         }
         assert!(pages.iter().all(|p| p.ocr));
         let map = build_layout_map(&pages);
-        assert_eq!(map.questions.iter().map(|q| q.number).collect::<Vec<_>>(), (1..=7).collect::<Vec<_>>());
+        // Engines differ by machine: on failure, what this one read.
+        let read = || pages.iter().flat_map(|p| p.lines.iter().chain(&p.furniture).map(move |l| {
+            format!("p{} {:.0},{:.0}{} {}", p.page, l.x0, l.y0, if l.furniture.is_some() { " furniture" } else { "" }, l.text)
+        })).collect::<Vec<_>>().join("\n");
+        assert_eq!(map.questions.iter().map(|q| q.number).collect::<Vec<_>>(), (1..=7).collect::<Vec<_>>(), "read by OCR:\n{}", read());
         let q1 = question_body(&pages, &map.questions[0]);
         assert!(q1.ocr && q1.text.contains("circular flywheel"), "{}", q1.text);
         // The text layer the import is classified by comes from OCR too.
