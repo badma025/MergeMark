@@ -880,7 +880,7 @@ Round 4 takes the four strict cards known to be wrong after round 3, as the user
 - **Calibration cards changed:** five, each as intended: mp1_t Q10's "(e²)^{x² − 4x + 5}"; OCR B Physics AS Jun 2018 Q16's wire X with its labels, in one picture with wire Y; Edexcel GCSE Jun 2022 Q28's 4x in its picture; OCR B Physics AS Jun 2018 Q4's "top of bottle" and "bottom of bottle" arrows in theirs; Edexcel Chemistry Jun 2024 P3 Q7's "Step 2" in the scheme's first row. The new fixture's Q24 has its two views, the side view's "2.0 m" whole.
 - **Triage unused-w1r4** (96 papers in both runs): every count as in w1r3c (PASS 27, REVIEW 5, FLAGGED 39, FAIL 25, flagged cards 161, printed totals matched 87). One card changed: OCR B Physics Jun 2024 P2 Q5's Fig. 5.1 is one picture, sphere P and its arrow beside sphere Q. No line that is only a number was gained.
 - **Targeted audit:** every card that changed, and every crop the page scans changed without a change of text (Edexcel M3 Jan 2013 Q6's velocity u, OCR A Chemistry Jun 2017 Q17, OCR A Physics Jun 2019 Q5, Edexcel Chemistry Jun 2024 P3 Q7), checked against its pages. No text or drawing was lost. Two cosmetic effects: Q24's side view takes in the first letter of "Not to scale" at its edge, and Edexcel Chemistry Jun 2024 P3 Q7's second crop of its reaction scheme now starts through the "Step 2" label, which the first crop holds whole (a figure label now, it no longer trims that crop as a line of text did). Older faults the audit found, for the next round (What is left; fixtures, strict): OCR A Chemistry Jun 2017 Q17's benzoic acid cut at the crop's left edge; Edexcel Chemistry Jun 2024 P3 Q7's reaction scheme cut into two overlapping crops, and its mechanism structures cut at their bottom; OCR A Physics Jun 2019 Q5's road found only in part.
-- **Blinded audit w1r4:** pack built from the triage run, judged in a separate session.
+- **Blinded audit w1r4:** 43 cards (`run-unused-w1r4/audit-pack`), judged by the user: no MAJOR (no per-card verdicts saved). With w1r3's, the second blinded audit in a row to find no wrong strict card.
 
 ## What is left
 
@@ -893,7 +893,7 @@ On the 96 holdout papers after 1.0 W1 round 4 (run unused-w1r4); round 4 changed
 | a question with no card | 2 | | Biology OCR-A Nov 2021 Q14; WJEC Physics Jun 2017 Unit 5 Q1, a practical task with a placeholder card, a quarantined card and 42% of its words in the cards. Not debugged |
 
 Known gaps outside these numbers:
-- Scanned papers are imported but their text needs a person (cluster 5's audit). The macOS (Vision) and Linux (Tesseract) backends exist but are untested at run time: the macOS one is compile-checked only, and Tesseract is not installed on this machine. With no engine, a scan is reported as not transcribed, never sent anywhere.
+- Scanned papers are imported but their text needs a person (cluster 5's audit). The macOS (Vision) backend first ran on 10 Oct 2026, on the user's Mac, and passed (`docs/MACOS_TEST.md`). The Linux (Tesseract) backend is untested at run time: Tesseract is not installed on this machine. With no engine, a scan is reported as not transcribed, never sent anywhere.
 - Mark schemes are not imported in 1.0 (cut in W4 step 2).
 - The CIE M2 rotation arrow and its "5 rad s⁻¹" label lie 25pt beside the drawing and are not joined to its crop (the label's text is still on the card).
 - Single-part Edexcel questions now carry their footer allocation as a tag; cards imported before this run do not.
@@ -917,13 +917,7 @@ Known gaps outside these numbers:
 - The text-layer carve, used only when a question has no layout body, still drops every line that holds only a number (its page-number rule cannot tell a page number from an option without geometry).
 - Two flagged holdout cards end on what may be a page number (OCR B Physics Jun 2024 Q2 "6", WJEC Physics Jun 2017 Q2 "3"); OCR A's is handled (cluster 9).
 - Axis scales of drawn graphs and grids appear as lines of numbers in the card text, as their titles already did, except on graph paper drawn as one path (cluster 14).
-- The six wrong strict cards the cluster 10 audit found are fixed (round 3). **Strict cards still wrong for reasons no gate sees**, found by round 3's audits (holdouts unless marked; not debugged):
-  - Edexcel M2 Jan 2009 Q2: "is 11/25" reads `\text{is}^{\frac{11}{25}}`. The fraction is built (cluster 12) but hung on "is" as an exponent (before: `\text{is}_{25}^{11}`).
-  - WJEC Physics Jun 2022 U3 Q2: "⅓Nm c̄²" reads `\frac{1}{3}Nm^{\bar{2}}c`. The bar over c is set on the square (before: the bar was read as a fraction over "of").
-  - Eduqas CS Jun 2023 Q7: the underline that marks destinationCode as the relation's primary key is lost (before: it was read as a fraction bar over the next line).
-  - Edexcel-A Economics Jun 2021 Q8 (a PASS paper): the answer booklet's "Indicate which question you are answering…" and "Write your answer here:" follow its total.
-  - CIE S1 Jun 2019 Q2: "from Rosa's box." loses "box" (MINOR; so in round 2 too).
-  - Edexcel C4 Jan 2006 Q2 (fixture): the x/y table with blank cells to complete is flattened into lines, so the task can't be read.
+- The six wrong strict cards the cluster 10 audit found are fixed (round 3), and so are the six that round 3's audits found after them, in 1.0 W1 round 1 (its section above): Edexcel M2 Jan 2009 Q2, WJEC Physics Jun 2022 U3 Q2, Eduqas CS Jun 2023 Q7, Edexcel-A Economics Jun 2021 Q8, CIE S1 Jun 2019 Q2 and Edexcel C4 Jan 2006 Q2. *(This list still called them open until 1.0 W1 round 4.)*
 - *(Corrected by the 1.0 plan, W0.)* The tests that read papers from the repository root were repointed at `papers/used/` in round 3; the one real orphan (`doc_map.rs`, `'23 edexcel.pdf`, a paper nowhere in the repo) is deleted. A test whose paper is missing now fails under `MERGEMARK_REQUIRE_FIXTURES=1`, which CI and `scripts/verify.sh` set; the papers the tests read are committed encrypted (`src-tauri/fixtures/corpus/`).
 - Monotype Symbol glyph ids are read in the installed font's order, checked by advance. A subset that renumbered its glyphs would not keep that order, and the advance cannot tell apart symbols of equal width. Of the 34 SymbolMT programs in the fixtures, only one did (2 glyphs), and its ids fall outside those read this way.
 

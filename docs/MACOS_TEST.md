@@ -1,9 +1,14 @@
 # Testing MergeMark 1.0 on a Mac
 
-The macOS build has never been run. This checks the two things only a Mac can:
-that the app imports papers (PDFium bundled in `Contents/Frameworks`), and that
-scanned pages are read by Apple's Vision framework. Then the macOS job can go
-back into `.github/workflows/release.yml`.
+This checks the two things only a Mac can: that the app imports papers (PDFium
+bundled in `Contents/Frameworks`), and that scanned pages are read by Apple's
+Vision framework. Then the macOS job can go back into
+`.github/workflows/release.yml`.
+
+**Run on 10 Oct 2026, on the user's Mac: it passed.** The macOS job is back in
+`release.yml`. Two things are left for the first build downloaded from a
+release: the universal disk image (this test built for the Mac's own
+processor), and the README's "Open Anyway" steps.
 
 ## 1. Get the code onto the Mac
 

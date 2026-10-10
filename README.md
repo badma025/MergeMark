@@ -28,12 +28,12 @@ This application is engineered for maximum performance and a minimal memory foot
 * **Frontend:** React & TypeScript
 * **Database:** SQLite (Local)
 * **PDF engine:** PDFium (via `pdfium-render`) for glyphs, fonts, vector paths and page rendering
-* **Intelligence:** A local geometry-first layout engine for digital papers; the operating system's own OCR engine for scanned papers (Windows, verified; macOS and Linux backends exist but are not yet run-tested). No AI models.
+* **Intelligence:** A local geometry-first layout engine for digital papers; the operating system's own OCR engine for scanned papers (Windows and macOS, verified; the Linux backend exists but is not yet run-tested). No AI models.
 
 ## 🔍 How importing works
 Everything is imported **on this machine**. MergeMark has no AI service to send anything to: imports make no requests, need no API key and cost nothing.
 * **Question papers with a text layer** (almost every board PDF) are rebuilt from the PDF itself, in the four stages below.
-* **Scanned papers** (pages printed as pictures or outlines, with no text layer or only a watermark) are read on this computer: on Windows by the operating system's own OCR engine, on macOS by Apple's Vision framework, and elsewhere by Tesseract when it is installed (`tesseract` on the PATH, for example `sudo apt install tesseract-ocr`). Only the Windows path has been run against real papers: the macOS backend is compile-checked and Tesseract is untested. OCR reads words, not mathematics, so every question it produces is kept for review. Where no local OCR engine is available, a scanned paper is reported as not transcribed.
+* **Scanned papers** (pages printed as pictures or outlines, with no text layer or only a watermark) are read on this computer: on Windows by the operating system's own OCR engine, on macOS by Apple's Vision framework, and elsewhere by Tesseract when it is installed (`tesseract` on the PATH, for example `sudo apt install tesseract-ocr`). The Windows and macOS paths have been run against real papers; Tesseract is untested. OCR reads words, not mathematics, so every question it produces is kept for review. Where no local OCR engine is available, a scanned paper is reported as not transcribed.
 * **Mark schemes are not imported in 1.0.** The local reader could not read the schemes it was measured on ([`docs/MARK_SCHEME_CENSUS.md`](docs/MARK_SCHEME_CENSUS.md)), so the feature is left out rather than shipped half-working. A question's answer can be typed into its card.
 
 A local import runs in four stages:

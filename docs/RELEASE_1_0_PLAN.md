@@ -174,8 +174,11 @@ W0 → W4 step 1 (so the mark-scheme decision lands early, while it can still ch
 
 ## Where things stand right now
 
-- Branch `import-fixes-rounds-1-2` and `master` both at `68b77db`, pushed. Working tree clean apart from the 17 root PDF deletions (unstaged, deliberately) and an untracked `Cohort/`.
-- Round 3 is committed (`4414b74`). The v0.9.4 release-prep commit (`68b77db`) landed the licence, CI, versioning, `.env` removal and the move of the dev CLI from `src/bin/` to `examples/`.
-- `cargo test` 378 passing; the NSIS installer builds and no longer carries `e2e_import.exe` (the `ROUND2_HANDOFF.md` note about that is now stale).
-- The two leaked API keys have been revoked by the user. `.env` is untracked and gitignored.
-- Background reading on `layout.rs` and the six wrong strict cards did not finish in the originating session; W1 starts with its own diagnosis per cluster regardless.
+*Updated 10 Oct 2026.*
+
+- Every workstream is done: W0, W2, W4 (mark schemes cut from 1.0), W5, and W1 rounds 1–4 with W3 batches 1–2, each recorded in `TRIAGE_FIX_REPORT.md`. They are committed on `import-fixes-rounds-1-2`, not pushed: the remote's `master` and branch are at this plan's commit, `e775e52`.
+- The blinded audits w1r3 and w1r4 found no MAJOR card, so this file's definition of done is met. Declaring convergence, and so 1.0, is the user's call (Where to stop, 4).
+- The macOS test passed on the user's Mac on 10 Oct 2026 (`docs/MACOS_TEST.md`), and the macOS job is back in `release.yml`. Still to check, on the first build downloaded from a release: the universal disk image and the README's "Open Anyway" steps.
+- The updater's signing secrets were replaced on 10 Oct 2026 with the key installed copies trust (key ID A59B…, `~/.tauri/mergemark.key` on the user's PC; v0.9.3 had been signed with another). Before a release is published, check that its signatures carry that key ID.
+- `cargo test` 455 passing with `MERGEMARK_REQUIRE_FIXTURES=1`; 99 papers in the encrypted test set; 96 question papers left in the holdout. The faults still known are under "What is left" in `TRIAGE_FIX_REPORT.md`.
+- Local tags `v1.0.0-byok` and `v1.0.0-free` are old and not on the remote: push a release tag by name, never with `--tags`.
