@@ -1,0 +1,35 @@
+name: Signing check
+
+# Checks the updater signing secrets in about two minutes, without a release:
+# signs a scratch file with them and verifies it against the public key in
+# src-tauri/tauri.conf.json (scripts/check-signing.mjs). Run it after changing
+# either secret:
+#   gh workflow run signing-check.yml
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Check the signing secrets
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: node scripts/check-signing.mjs
