@@ -140,6 +140,8 @@ export const PAPERS = [
   { name: "m3_com", file: "papers/used/m3_centre_of_mass.pdf", subject: "Mathematics", module: "Mechanics", cohort: "triage_fixtures" },
   { name: "edx_chem_p1_jun20", file: "papers/used/Chemistry_A-level_Past-Papers_Edexcel__June_2020_QP_-_Paper_1_Edexcel_Chemistry_AS-level.pdf", subject: "Chemistry", module: "AS Chemistry", cohort: "triage_fixtures" },
   { name: "edx_chem_p3_jun24", file: "papers/used/Chemistry_A-level_Past-Papers_Edexcel__June_2024_QP_-_Paper_3_Edexcel_Chemistry_A-level.pdf", subject: "Chemistry", module: "A-Level Chemistry", cohort: "triage_fixtures" },
+  // (Round 4: OCR A Physics AS Jun 2023 P1, Q24's side and plan views.)
+  { name: "ocra_phys_as_jun23", file: "papers/used/Physics_A-level_Past-Papers_OCR-A__June_2023_QP_-_Paper_1_OCR_(A)_Physics_AS-level.pdf", subject: "Physics", module: "AS Physics", cohort: "triage_fixtures" },
 ];
 
 export function slugFor(paperName) {

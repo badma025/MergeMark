@@ -1983,6 +1983,26 @@ fn layout_question_figures(
             .filter(|(_, r)| mine(r))
             .collect();
         let mut keep = vec![true; detected.len()];
+        // A detector box is a piece of a layout region when they overlap by
+        // half the smaller.
+        let piece_of = |d: &[f32; 4], r: &[f32; 4]| overlap(d, r) >= 0.5 * area(d).min(area(r));
+        // A box over two drawings or more, the page's, with a line of
+        // question text between them, is a picture of no one drawing and
+        // lends no extent: OCR A Physics AS Jun 2023 Q24's box over its side
+        // and plan views, "side view plan view" above them and "Not to scale"
+        // below. (Over one drawing the layout split, with nothing but its
+        // labels between the pieces, it still joins them.)
+        let spans_text: Vec<bool> = detected
+            .iter()
+            .map(|(_, d)| {
+                let held: Vec<&[f32; 4]> = lp.figures.iter().filter(|r| piece_of(d, r)).collect();
+                held.len() >= 2
+                    && lp.lines.iter().any(|l| {
+                        let (cx, cy) = ((l.x0 + l.x1) * 0.5, (l.y0 + l.y1) * 0.5);
+                        cx > d[0] && cx < d[2] && cy > d[1] && cy < d[3] && !held.iter().any(|r| overlap(&[l.x0, l.y0, l.x1, l.y1], r) > 0.0)
+                    })
+            })
+            .collect();
         // A detector box over what the layout already transcribed as text
         // (a table, a row of bits, labelled boxes, the sentence above) is a
         // partial picture of that text, not a figure.
@@ -2001,9 +2021,7 @@ fn layout_question_figures(
         // inside one figure (its curve "C") is a label, not an option.
         let option_set = detected.iter().filter_map(|(f, _)| f.option_label.as_deref()).collect::<std::collections::BTreeSet<_>>().len();
         for region in lp.figures.iter().filter(|r| mine(r)) {
-            let pieces: Vec<usize> = (0..detected.len())
-                .filter(|&i| overlap(&detected[i].1, region) >= 0.5 * area(&detected[i].1).min(area(region)))
-                .collect();
+            let pieces: Vec<usize> = (0..detected.len()).filter(|&i| piece_of(&detected[i].1, region)).collect();
             if option_set >= 3 && pieces.iter().any(|&i| detected[i].0.option_label.is_some()) {
                 continue; // the detector's labelled option crops stand
             }
@@ -2021,7 +2039,7 @@ fn layout_question_figures(
             for &i in &pieces {
                 keep[i] = false;
                 let d = &detected[i].1;
-                if !agrees {
+                if !agrees && !spans_text[i] {
                     rect = [rect[0].min(d[0]), rect[1].min(d[1]), rect[2].max(d[2]), rect[3].max(d[3])];
                 }
                 caption = caption.or_else(|| detected[i].0.caption.clone());
@@ -2041,7 +2059,7 @@ fn layout_question_figures(
         // over one is the same picture.
         for im in lp.inline_images.iter().filter(|r| mine(r)) {
             for (i, (_, d)) in detected.iter().enumerate() {
-                if overlap(d, im) >= 0.5 * area(im).min(area(d)) {
+                if piece_of(d, im) {
                     keep[i] = false;
                 }
             }
@@ -2632,6 +2650,24 @@ mod tests {
 
     fn cancel_flag() -> AtomicBool {
         AtomicBool::new(false)
+    }
+
+    /// A detector box over two drawings widens neither: OCR A Physics AS Jun
+    /// 2023 Q24's box over its side and plan views (and the line of text
+    /// between them) made each view's crop the pair's, which stopped above
+    /// "Not to scale" and cut the side view's "2.0 m" in half.
+    #[test]
+    fn a_detector_box_over_two_drawings_widens_neither() {
+        let _guard = crate::pdf_render::pdfium_test_lock();
+        let Some(path) = crate::test_support::corpus_paper("papers/used/Physics_A-level_Past-Papers_OCR-A__June_2023_QP_-_Paper_1_OCR_(A)_Physics_AS-level.pdf") else { return };
+        let Some(layout) = crate::pdf_render::load_layout_pages(&path).or_else(|| crate::test_support::unavailable("PDFium could not lay out OCR A Physics AS Jun 2023")) else { return };
+        let Some(detected) = crate::test_support::pdfium(crate::pdf_render::detect_pdf_figures(&path), "OCR A Physics AS Jun 2023's figures") else { return };
+        let map = crate::layout::build_layout_map(&layout);
+        let q24 = map.questions.iter().find(|q| q.number == 24).expect("Q24 mapped");
+        let crops: Vec<[f32; 4]> = layout_question_figures(&layout, q24, &detected).into_iter().filter(|(f, _)| f.page == 19).map(|(_, r)| r).collect();
+        assert_eq!(crops.len(), 2, "{crops:?}");
+        // The side view's "2.0 m" stands on a baseline at 269.6 pt.
+        assert!(crops.iter().any(|r| r[0] < 100.0 && r[2] < 320.0 && r[3] >= 271.0), "{crops:?}");
     }
 
     /// A question's figures include those of a stem it shares with the

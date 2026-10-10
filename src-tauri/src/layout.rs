@@ -4097,17 +4097,17 @@ fn figure_regions(pg: &PageGlyphs, shapes: &[RadicalShape], tables: &[[f32; 4]])
         .iter()
         .filter(|p| shaft(p) && p.x1 - p.x0 <= 0.6 * w && p.y1 - p.y0 <= 0.6 * h && !in_radical(p) && !tables.iter().any(|r| within(p, r)) && tipped(p) && !axis(p))
         .collect();
+    let holds = |r: &[f32; 4]| arrows.iter().any(|p| within(p, r));
     // A drawing is big at 40 by 30 pt, or, for a drawing of arrows, 120 pt
     // wide (a fifth of the page) at 20 pt tall: OCR B Physics AS Jun 2018's
     // blocks on a track. (A line of outlined letters is as wide and as tall,
     // and is no drawing: edexcel '19 Q17(b)(ii).)
-    let big = |r: &[f32; 4]| r[2] - r[0] >= 40.0 && r[3] - r[1] >= 30.0 || r[2] - r[0] >= 120.0 && r[3] - r[1] >= 20.0 && arrows.iter().any(|p| within(p, r));
+    let big = |r: &[f32; 4]| r[2] - r[0] >= 40.0 && r[3] - r[1] >= 30.0 || r[2] - r[0] >= 120.0 && r[3] - r[1] >= 20.0 && holds(r);
     let mut seeds: Vec<[f32; 4]> = arrows.iter().filter(|p| !boxes.iter().any(|r| within(p, r))).map(|p| [p.x0, p.y0, p.x1, p.y1]).collect();
     merge(&mut seeds, 12.0);
     grow(&mut seeds, tables);
     boxes.extend(seeds);
     loop {
-        let holds = |r: &[f32; 4]| arrows.iter().any(|p| within(p, r));
         let pair = (0..boxes.len()).filter(|&i| !big(&boxes[i])).find_map(|i| {
             let a = &boxes[i];
             let j = if holds(a) {
@@ -4126,11 +4126,33 @@ fn figure_regions(pg: &PageGlyphs, shapes: &[RadicalShape], tables: &[[f32; 4]])
         r[3] = r[3].max(a[3]);
     }
     grow(&mut boxes, tables);
-    // A small drawing just off a big one (a dimension line "<- 4 cm ->"
-    // under it) is part of it.
+    // A small drawing just off a big one is part of it: under or over it
+    // within 24 pt (a dimension line "<- 4 cm ->" under it), or else, if it
+    // holds an arrow, beside the nearest one in its band (overlapping half
+    // its own height or more) within 100 pt, as far as the import lets
+    // pieces of one drawing stand apart, with nothing in the box the two make
+    // but their strokes and labels hugging either (within 1.5 em): a
+    // dimension line beside a drawing (Edexcel GCSE Jun 2022 Q28's 4x, 17 pt
+    // off), or another drawing of the same diagram with its own dimension
+    // lines (OCR B Physics AS Jun 2018 Q16's wire X, 59 pt from wire Y). (Its
+    // arrow tells it from a margin's hatching or a word drawn in outlines,
+    // which edexcel '19 sets beside its graphs.)
     let (mut large, small): (Vec<[f32; 4]>, Vec<[f32; 4]>) = boxes.into_iter().partition(|r| big(r));
+    let beside = |l: &[f32; 4], s: &[f32; 4]| -> Option<f32> {
+        let gap = if s[2] <= l[0] { l[0] - s[2] } else { s[0] - l[2] };
+        let band = l[3].min(s[3]) - l[1].max(s[1]);
+        let u = [l[0].min(s[0]), l[1].min(s[1]), l[2].max(s[2]), l[3].max(s[3])];
+        let clear = pg.glyphs.iter().all(|g| {
+            let b = [g.x0, g.y0, g.x1, g.y1];
+            is_space_char(g.ch) || g.cx() <= u[0] || g.cx() >= u[2] || g.cy() <= u[1] || g.cy() >= u[3] || box_gap(l, &b).min(box_gap(s, &b)) <= 1.5 * g.size.max(4.0)
+        });
+        (gap >= 0.0 && gap <= 100.0 && band >= 0.5 * (s[3] - s[1]) && clear).then_some(gap)
+    };
     for s in small {
-        if let Some(l) = large.iter_mut().find(|l| near(l, &s, 24.0) && s[0] < l[2] && s[2] > l[0]) {
+        let under = large.iter().position(|l| near(l, &s, 24.0) && s[0] < l[2] && s[2] > l[0]);
+        let nearest_beside = || (0..large.len()).filter_map(|i| beside(&large[i], &s).map(|gap| (i, gap))).min_by(|a, b| a.1.total_cmp(&b.1)).map(|(i, _)| i);
+        if let Some(i) = under.or_else(|| if holds(&s) { nearest_beside() } else { None }) {
+            let l = &mut large[i];
             l[0] = l[0].min(s[0]);
             l[1] = l[1].min(s[1]);
             l[2] = l[2].max(s[2]);
@@ -4158,6 +4180,11 @@ fn figure_regions(pg: &PageGlyphs, shapes: &[RadicalShape], tables: &[[f32; 4]])
         on_page >= 0.5 * area && !strip && !page_sized
     });
     out
+}
+
+/// The gap between two boxes `[x0, y0, x1, y1]`, 0 where they meet.
+fn box_gap(a: &[f32; 4], b: &[f32; 4]) -> f32 {
+    (a[0] - b[2]).max(b[0] - a[2]).max(a[1] - b[3]).max(b[1] - a[3]).max(0.0)
 }
 
 /// Graph paper: one stroked path drawn only in axis-aligned segments (the
@@ -5919,26 +5946,33 @@ fn group_lines(pg: &PageGlyphs, mut items: Vec<Item>) -> Vec<Vec<Item>> {
         }
     }
     // A script attached to a row that itself moved (the subscript n of an
-    // exponent f(x_n)) follows that row to its final line.
-    let row_dest: Vec<usize> = rows
-        .iter()
-        .enumerate()
-        .map(|(ri, r)| {
-            let first = r.first().map(|&k| target[k]).unwrap_or(ri);
-            if first != ri && r.iter().all(|&k| target[k] == first) { first } else { ri }
-        })
-        .collect();
-    for t in target.iter_mut() {
-        for _ in 0..4 {
-            if row_dest[*t] == *t {
-                break;
-            }
-            *t = row_dest[*t];
+    // exponent f(x_n)) follows that row to its final line. A row has moved
+    // when all its items end on one line, together or by way of other rows:
+    // the square of mp1_t Q10's (x − 2)² went to its own bracket's row and
+    // then on, and the square on the x of (e²)^{x² − 4x + 5}, set on the
+    // same exponent row, stayed behind as a line of its own. Rows set on each
+    // other (a "1ˢᵗ" standing alone: "st" on the 1, the 1 a prescript of the
+    // s) end together, on the row first reached.
+    fn row_lands(r: usize, rows: &[Vec<usize>], target: &[usize], memo: &mut [Option<usize>], open: &mut [bool]) -> usize {
+        if let Some(d) = memo[r] {
+            return d;
         }
+        if open[r] {
+            return r;
+        }
+        open[r] = true;
+        let mut ends = rows[r].iter().map(|&k| if target[k] == r { r } else { row_lands(target[k], rows, target, memo, open) });
+        let first = ends.next().unwrap_or(r);
+        let d = if first != r && ends.all(|e| e == first) { first } else { r };
+        memo[r] = Some(d);
+        d
     }
+    let mut memo = vec![None; rows.len()];
+    let mut open = vec![false; rows.len()];
+    let lands: Vec<usize> = target.iter().map(|&t| row_lands(t, &rows, &target, &mut memo, &mut open)).collect();
     let mut out: Vec<Vec<Item>> = vec![Vec::new(); rows.len()];
     for (i, it) in items.into_iter().enumerate() {
-        out[target[i]].push(it);
+        out[lands[i]].push(it);
     }
     out.into_iter().filter(|r| !r.is_empty()).collect()
 }
@@ -8667,7 +8701,7 @@ pub fn question_figure_window(pages: &[LayoutPage], q: &LayoutQuestion, page: us
 /// A layout figure region widened to take in the label lines set just
 /// outside its strokes (axis names, vertex letters), plus a small margin.
 pub fn figure_crop_rect(lp: &LayoutPage, r: [f32; 4]) -> [f32; 4] {
-    let dist = |f: &LayoutLine, b: &[f32; 4]| (b[0] - f.x1).max(f.x0 - b[2]).max(b[1] - f.y1).max(f.y0 - b[3]).max(0.0);
+    let dist = |f: &LayoutLine, b: &[f32; 4]| box_gap(&[f.x0, f.y0, f.x1, f.y1], b);
     let others: Vec<[f32; 4]> = lp.figures.iter().copied().filter(|o| *o != r).collect();
     // Labels reach out from the drawing in steps (an axis title beyond its
     // tick values); a label nearer another figure on the page is that one's.
@@ -10541,6 +10575,44 @@ Work out how much Nina pays."), "{q8}");
         assert!(pages[2].figures.iter().any(|r| r[0] <= 108.0 && r[2] >= 287.0 && r[1] <= 484.0 && r[3] >= 610.0), "{:?}", pages[2].figures);
     }
 
+    /// A drawing beside a figure, in its band, with nothing between them but
+    /// labels, is part of it: OCR B Physics AS Jun 2018 Q16's wire X (115 by
+    /// 26 pt with its dimension arrows, under a figure's 30 pt), 59 pt left of
+    /// wire Y, was no figure, and its labels "L" and "wire X" question text.
+    #[test]
+    fn a_drawing_beside_a_figure_in_its_band_is_part_of_it() {
+        let _guard = crate::pdf_render::pdfium_test_lock();
+        let Some(pages) = corpus_pages("papers/used/Physics_A-level_Past-Papers_OCR-B__June_2018_QP_-_Paper_1_OCR_(B)_Physics_AS-level.pdf") else { return };
+        let lp = &pages[7];
+        assert!(lp.figures.iter().any(|r| r[0] <= 100.0 && r[2] >= 470.0 && r[1] <= 494.0 && r[3] >= 519.0), "{:?}", lp.figures);
+        let lines: Vec<&str> = lp.lines.iter().map(|l| l.text.as_str()).collect();
+        assert!(!lines.iter().any(|t| t.contains("$L$") || t.contains("wire X")), "{lines:#?}");
+    }
+
+    /// A margin's hatching is no drawing beside a figure, nor is a word drawn
+    /// in outlines: edexcel '19 draws its text, and without the beside rule's
+    /// arrow its Q10 option graphs took the "DO NOT WRITE IN THIS AREA" strip
+    /// beside them, and graph A the question's text above it.
+    #[test]
+    fn a_margins_hatching_is_no_drawing_beside_a_figure() {
+        let _guard = crate::pdf_render::pdfium_test_lock();
+        let Some(pages) = corpus_pages("papers/used/edexcel '19 edexcel.pdf") else { return };
+        assert!(pages[6].figures.iter().all(|r| r[0] >= 90.0 && r[1] >= 120.0), "{:?}", pages[6].figures);
+    }
+
+    /// A dimension line beside a drawing is part of it, as one under it is:
+    /// Edexcel GCSE Jun 2022 Q28's "4x" arrow, 17 pt left of rectangle STUV,
+    /// was left out of its figure, and its label read as question text.
+    #[test]
+    fn a_dimension_line_beside_a_drawing_is_part_of_it() {
+        let _guard = crate::pdf_render::pdfium_test_lock();
+        let Some(pages) = corpus_pages("papers/used/Maths_GCSE_Past-Papers_Edexcel__June_2022_QP.pdf") else { return };
+        let lp = &pages[17];
+        assert!(lp.figures.iter().any(|r| r[0] <= 160.0 && r[2] >= 430.0 && r[1] <= 140.0 && r[3] >= 270.0), "{:?}", lp.figures);
+        let lines: Vec<&str> = lp.lines.iter().map(|l| l.text.as_str()).collect();
+        assert!(!lines.iter().any(|t| t.contains("4x")), "{lines:#?}");
+    }
+
     /// A drawing an arrow points from is part of the arrow's figure:
     /// Chemistry Edexcel Jun 2024 P3's cyclohexene, before "Step 1, HBr" and
     /// the arrow to bromocyclohexane, was left out of its region.
@@ -10729,6 +10801,21 @@ Work out how much Nina pays."), "{q8}");
         assert!(q9.contains(r"in the form $\text{re}^{\mathrm{i}\theta}$ where"), "{q9}");
         let q8 = body(&pages, &map, 8);
         assert!(!q8.contains(r"\mathrm{i}_{\theta}"), "{q8}");
+    }
+
+    /// A script follows its exponent to its line when the exponent's row
+    /// moved there piece by piece: mp1_t Q10's "(e²)^{x² − 4x + 5}", whose
+    /// square on x (7.2 pt, raised 5 pt over the 9 pt exponent) was a line of
+    /// its own above the equation, leaving "x − 4x + 5" in the exponent. The
+    /// exponent's row also held the square of "(x − 2)²", which went by way
+    /// of its bracket's row.
+    #[test]
+    fn a_script_follows_an_exponent_moved_piece_by_piece() {
+        let _guard = crate::pdf_render::pdfium_test_lock();
+        let Some(pages) = corpus_pages("papers/used/mp1_t.pdf") else { return };
+        let lines: Vec<&str> = pages[4].lines.iter().map(|l| l.text.as_str()).collect();
+        assert!(!lines.iter().any(|t| t.trim() == "2"), "{lines:#?}");
+        assert!(lines.iter().any(|t| t.contains(r"\right)^{x^{2}")), "{lines:#?}");
     }
 
     /// MT Extra's U+F061, a code of the font's own cmap (its glyph's outline

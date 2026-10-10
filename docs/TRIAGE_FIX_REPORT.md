@@ -856,13 +856,39 @@ Run w1r3b's test stage then crashed (the OCR entry above); w1r3c is the run repo
   - Edexcel GCSE Jun 2022 Q28 (fixture, strict): the left dimension arrow lies outside the crop; its label 4x reads as text.
 - **Blinded audit w1r3:** 43 cards (`run-unused-w1r3c/audit-pack`), judged by the user: no MAJOR (no per-card verdicts saved).
 
+## 1.0, W1 round 4: the four wrong strict cards
+
+Round 4 takes the four strict cards known to be wrong after round 3, as the user chose on 10 Oct 2026 after judging the w1r2 and w1r3 blinded audits. Run w1r4 compares with w1r3c. Spec: `output/fix-log/spec-w1r4.md`. Review findings with their resolution: `review-w1r4-findings.md`. Tools, scans and the fix scripts: `output/fix-log/round4/`.
+
+**Causes and fixes** (`layout.rs` unless stated):
+- **A script left behind when its row's items moved one by one** (mp1_t Q10, "(e²)^{x² − 4x + 5}" read "x − 4x + 5" with the square a line of its own). A script attached to a row followed it only when every item of the row went straight to one row. The exponent's row went to the main line item by item, its other square by way of its bracket's row, so it did not count as moved. A row has moved now when all its items end on one line, resolved once per row; rows set on each other end together. A first form, each script following the item it is set on, split Edexcel-A Economics Jun 2021's chart label "1ˢᵗ Jan 2018" ("st" on the 1, the 1 a prescript of the s) and was withdrawn.
+- **A drawing or a dimension line beside a figure** (OCR B Physics AS Jun 2018 Q16's wire X, 26.5 pt tall where a figure needs 30, and 59 pt from wire Y; Edexcel GCSE Jun 2022 Q28's dimension line 4x, 17 pt beside rectangle STUV). A small drawing joined a figure only above or below it. Failing that, one holding an arrow now joins the nearest figure beside it, in its band and within 100 pt, when every glyph in the box the two make is a label hugging one of them. The arrow tells it from a margin's hatching or a word drawn in outlines: a first form without it joined edexcel '19's "DO NOT WRITE IN THIS AREA" strips to its graphs, and graph A the question's text.
+- **A detector box over two drawings** (`pipeline.rs`; OCR A Physics AS Jun 2023 Q24, the side view's "2.0 m" cut in half and gone from the text). The figure detector's box spanned the side and plan views and the lines of text between them; each view's crop was widened to it, and the one picture they made was trimmed above "Not to scale", through the label. A box over two of the page's drawings with question text in it lends no extent now; over one drawing the layout split, with nothing but labels between the pieces, it still joins them.
+- `EXTRACTION_CACHE_VERSION` 9 → 10 (`db.rs`).
+
+**Measured before the chain** (dev copy): page scans of all 198 papers against round 3's final scan change 11 pages. Besides the three layout targets, eight: drawings hold the arrows and labels beside them (Edexcel Chemistry Jun 2024 P3's "Step 2" and step arrows, OCR A Chemistry Jun 2017's "H₂SO₄" arrow, Edexcel M3 Jan 2013 Figure 3's velocity u, OCR B Physics AS Jun 2018 Q4's bottle arrows, OCR B Physics Jun 2024 P2 Fig. 5.1's sphere P), OCR A Physics Jun 2019's partly found road, and OCR noise on a handwritten solutions sheet. The detector-box rule, counted over every question of the 198 papers, changes Q24 alone.
+
+**Code review**, both axes; every finding taken or answered (`review-w1r4-findings.md`). Among them: the row rule resolved once per row (no caps); the beside rule checking the whole box the join makes, tried after under/over and nearest first; the detector-box rule counting the page's drawings and asking for text between them; a test for the arrow condition.
+
+**Tests**, each red without its fix (the review's corrections also checked by undoing each in a copy, `mutate_r4.py`): `a_script_follows_an_exponent_moved_piece_by_piece`, `a_drawing_beside_a_figure_in_its_band_is_part_of_it`, `a_dimension_line_beside_a_drawing_is_part_of_it`, `a_margins_hatching_is_no_drawing_beside_a_figure`, and in `pipeline.rs` `a_detector_box_over_two_drawings_widens_neither`.
+
+**Fixtures:** OCR A Physics AS Jun 2023 P1 moved to `papers/used/` (97 in all), registered (`ocra_phys_as_jun23`, ids 1–25) and sealed (99 papers in the encrypted set). 96 question papers are left in the holdout.
+
+**Numbers** (run w1r4):
+- **cargo test:** 455 passed, 0 failed, 4 ignored (with `MERGEMARK_REQUIRE_FIXTURES=1`), plus 43 script tests; the fixture check holds all 99 sealed papers.
+- **Calibration w1r4:** 94/94 OK. Historical 243/244 strict, test papers 69/69, zero attempts and tokens. The 71 earlier fixtures hold 822 of 996 strict, as in w1r3c; the new one brings them to 845 of 1021 (23 of its 25). m3_centre_of_mass's ID mismatch is as before.
+- **Calibration cards changed:** five, each as intended: mp1_t Q10's "(e²)^{x² − 4x + 5}"; OCR B Physics AS Jun 2018 Q16's wire X with its labels, in one picture with wire Y; Edexcel GCSE Jun 2022 Q28's 4x in its picture; OCR B Physics AS Jun 2018 Q4's "top of bottle" and "bottom of bottle" arrows in theirs; Edexcel Chemistry Jun 2024 P3 Q7's "Step 2" in the scheme's first row. The new fixture's Q24 has its two views, the side view's "2.0 m" whole.
+- **Triage unused-w1r4** (96 papers in both runs): every count as in w1r3c (PASS 27, REVIEW 5, FLAGGED 39, FAIL 25, flagged cards 161, printed totals matched 87). One card changed: OCR B Physics Jun 2024 P2 Q5's Fig. 5.1 is one picture, sphere P and its arrow beside sphere Q. No line that is only a number was gained.
+- **Targeted audit:** every card that changed, and every crop the page scans changed without a change of text (Edexcel M3 Jan 2013 Q6's velocity u, OCR A Chemistry Jun 2017 Q17, OCR A Physics Jun 2019 Q5, Edexcel Chemistry Jun 2024 P3 Q7), checked against its pages. No text or drawing was lost. Two cosmetic effects: Q24's side view takes in the first letter of "Not to scale" at its edge, and Edexcel Chemistry Jun 2024 P3 Q7's second crop of its reaction scheme now starts through the "Step 2" label, which the first crop holds whole (a figure label now, it no longer trims that crop as a line of text did). Older faults the audit found, for the next round (What is left; fixtures, strict): OCR A Chemistry Jun 2017 Q17's benzoic acid cut at the crop's left edge; Edexcel Chemistry Jun 2024 P3 Q7's reaction scheme cut into two overlapping crops, and its mechanism structures cut at their bottom; OCR A Physics Jun 2019 Q5's road found only in part.
+- **Blinded audit w1r4:** pack built from the triage run, judged in a separate session.
+
 ## What is left
 
-On the 97 holdout papers after 1.0 W1 round 3 (run unused-w1r3c). No holdout paper's card marks differ from its printed total now (88 match; 9 print no total the triage reads). The papers this table named before for marks over or under their totals, for render errors and for no cards all became fixtures in rounds 2 and 3, so they are no longer counted here.
+On the 96 holdout papers after 1.0 W1 round 4 (run unused-w1r4); round 4 changed none of these findings. No holdout paper's card marks differ from its printed total now (87 match; 9 print no total the triage reads). The papers this table named before for marks over or under their totals, for render errors and for no cards all became fixtures in rounds 2 and 3, so they are no longer counted here.
 
 | remaining hard finding | papers | cards | cause |
 |---|---|---|---|
-| unidentified glyph | 25 | 36, all flagged | symbol-font glyphs no fixture established (each is `�`, never a guess): symbols drawn as curves (VectorOutline) and font families of one or two papers each (Advent variants, MathExtn, NewMathExtn, CIDFont) |
+| unidentified glyph | 24 | 35, all flagged | symbol-font glyphs no fixture established (each is `�`, never a guess): symbols drawn as curves (VectorOutline) and font families of one or two papers each (Advent variants, MathExtn, NewMathExtn, CIDFont) |
 | marks tags exceed the card's marks | 1 | 1, flagged | 06_community_pmt_pack Q9 (48 vs 7). Holdout, not investigated |
 | a question with no card | 2 | | Biology OCR-A Nov 2021 Q14; WJEC Physics Jun 2017 Unit 5 Q1, a practical task with a placeholder card, a quarantined card and 42% of its words in the cards. Not debugged |
 
@@ -875,14 +901,16 @@ Known gaps outside these numbers:
   - The triage's page count (`stats.pages`, characters per page) still comes from that split, which also counts the empty text after the last form feed. It is left as it is so that runs stay comparable.
 - A superscript set over a subscript of several letters, or inside an exponent, lands on a line of its own:
   - physics '20 Q10 "c²ᵣₘₛ" (flagged);
-  - mp1_t Q10 "x² − 4x + 5" read as "x − 4x + 5" with a lone "2" (still strict; mp1_t is a fixture since 1.0 W1 round 3).
+  - mp1_t Q10 "x² − 4x + 5" read as "x − 4x + 5" with a lone "2": fixed in 1.0 W1 round 4 (another cause than physics '20's).
 
-  Not debugged. Until cluster 9, the sanitizer deleted the lone "2" and the cards looked clean.
-- Found by 1.0 W1 round 3's targeted audit, for the next round (see that round's numbers):
-  - a graph printed on graph paper is taken for graph paper to draw on (Edexcel GCSE Physics Jun 2024 Q4's Figure 9, flagged: no image, its labels withheld, one now in the text);
-  - a detector box over two drawings makes one picture of both, cut where a line of text runs under either (OCR A Physics AS Jun 2023 Q24, strict: the side view's "2.0 m" cut);
-  - a drawing smaller than a figure, too far from the next to join it, has no crop (OCR B Physics AS Jun 2018 Q16's wire X, strict);
-  - a dimension arrow beside a drawing can lie outside its crop (Edexcel GCSE Jun 2022 Q28's 4x, strict; the label reads as text).
+  physics '20 is not debugged. Until cluster 9, the sanitizer deleted the lone "2" and the cards looked clean.
+- Found by 1.0 W1 round 3's targeted audit: a graph printed on graph paper is taken for graph paper to draw on (Edexcel GCSE Physics Jun 2024 Q4's Figure 9, flagged: no image, its labels withheld, one now in the text). Its three strict cards (OCR A Physics AS Jun 2023 Q24, OCR B Physics AS Jun 2018 Q16's wire X, Edexcel GCSE Jun 2022 Q28's 4x) are fixed in round 4.
+- Found by 1.0 W1 round 4's targeted audit, older than it (fixtures, strict; not debugged):
+  - OCR A Chemistry Jun 2017 Q17's benzoic acid is cut at its crop's left edge;
+  - Edexcel Chemistry Jun 2024 P3 Q7's reaction scheme is cut into two overlapping crops, the second through the word "bromocyclohexane", and its mechanism structures are cut at their bottom;
+  - OCR A Physics Jun 2019 Q5's road (sections A to D) is found only in part.
+
+  Cosmetic, from round 4: OCR A Physics AS Jun 2023 Q24's side view takes in the first letter of "Not to scale" at its edge; Q7's second crop starts through the "Step 2" label its first crop holds whole.
 - Found by the w1r2 blinded audit, on flagged cards, for the next round:
   - CIE Nov 2003 P2 Q1 (holdout): the modulus bars of |8 − 3x| < 2 are unidentified glyphs, set on a line of their own, so the inequality reads "8 − 3x < 2";
   - m3_centre_of_mass (fixture, all its cards flagged): the worksheet prints each answer in a box ("k = 6", "h = 5r") beside a handwritten worked solution, and the cards carry both, the solutions as crops.

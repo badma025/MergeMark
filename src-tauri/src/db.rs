@@ -328,7 +328,10 @@ async fn repair_old_library(pool: &SqlitePool) -> Result<(), sqlx::Error> {
 /// a drawing, a paper with no question numbers, array indices in code, a
 /// drawing of boxes and arrows): a cached v8 card can hold one of those
 /// defects.
-pub const EXTRACTION_CACHE_VERSION: u32 = 9;
+/// v10: 1.0 W1 round 4 (a script left behind when its row's items moved one
+/// by one, a drawing or a dimension line beside a figure, a detector box over
+/// two drawings): a cached v9 card can hold one of those defects.
+pub const EXTRACTION_CACHE_VERSION: u32 = 10;
 
 /// Compute a deterministic cache key from file content + parameters.
 /// Uses a fast FNV-1a hash of the file bytes (not cryptographic, just
