@@ -1,7 +1,7 @@
 name: Release
 
-# Builds the MergeMark Windows installer whenever a version tag is pushed,
-# then attaches it to a draft GitHub Release for review.
+# Builds the MergeMark installers for Windows and macOS whenever a version tag
+# is pushed, then attaches them to a draft GitHub Release for review.
 #
 # Usage:
 #   git tag v1.0.0 master
@@ -14,17 +14,20 @@ name: Release
 # /releases/latest/download/latest.json, which is served only for the newest
 # PUBLISHED, non-prerelease release: the draft reaches them when you publish it.
 #
-# Windows only, on purpose. MergeMark loads PDFium through
-# `Pdfium::bind_to_system_library()` and ships `pdfium.dll` beside the
-# executable via `src-tauri/tauri.windows.conf.json`. There is no equivalent
-# bundling for macOS or Linux yet, so those builds compile but fail at the
-# first import with "Failed to bind to pdfium". macOS also needs a Developer
-# ID signature and notarisation before Gatekeeper will open it at all.
-# Re-add those platforms once both are solved; see docs/ROUND2_HANDOFF.md.
+# PDFium: Windows ships the committed `src-tauri/pdfium.dll` beside the
+# executable (`tauri.windows.conf.json`). macOS fetches the same PDFium build,
+# as a universal library checked against its SHA-256
+# (`scripts/fetch-pdfium-macos.sh`), into the app's Contents/Frameworks
+# (`tauri.macos.conf.json`); the tests find it in src-tauri. macOS is one
+# universal build, Apple Silicon and Intel, first run on a Mac on 10 Oct 2026
+# (docs/MACOS_TEST.md). Linux is not built: nothing bundles PDFium for it.
 #
-# The installer is unsigned, so Windows SmartScreen warns on first run. To
-# sign it, add the signing secrets documented at
-# https://v2.tauri.app/distribute/ and pass them to the tauri-action step.
+# Neither installer carries a publisher's signature. Windows SmartScreen warns
+# on first run; the macOS app is signed ad hoc and not notarised, so
+# Gatekeeper blocks its first opening until the user allows it (Privacy &
+# Security -> Open Anyway, in the README). To sign them, add the signing
+# secrets documented at https://v2.tauri.app/distribute/ and pass them to the
+# tauri-action step.
 
 on:
   push:
@@ -43,6 +46,9 @@ jobs:
           - platform: windows-latest
             args: ""
             rustTargets: ""
+          - platform: macos-latest
+            args: "--target universal-apple-darwin"
+            rustTargets: "aarch64-apple-darwin,x86_64-apple-darwin"
 
     runs-on: ${{ matrix.platform }}
 
@@ -68,6 +74,11 @@ jobs:
 
       - name: Install frontend dependencies
         run: npm ci
+
+      # PDFium is committed for Windows only (see the top of this file).
+      - name: Fetch PDFium (macOS)
+        if: runner.os == 'macOS'
+        run: bash scripts/fetch-pdfium-macos.sh
 
       # The Rust crate embeds the built frontend, so it is built before the
       # tests compile.
