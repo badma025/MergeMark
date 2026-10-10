@@ -750,7 +750,7 @@ Round 2 takes the defects w1r1's targeted audit uncovered; the first W3 batch ta
   - Edexcel Jun 2024 Q5 (fixture): "f(x) =" is read twice, `\text{ff}\left((xx\right)) ==`. The text layer holds two copies 4.3 pt apart, and the page shows one.
   - WJEC Maths Unit 1 Jun 2019 Q7 (holdout): part b)'s fraction sorts after its own allocation.
   - The 27 AES-encrypted papers (AQA's): the font catalog cannot read them (lopdf decrypts RC4 only), so their control-range glyphs go unnamed. An unnamed thin one becomes a rule: AQA Jun 2021 Q10's "π − 2" reads `\pi\quad 2` on a strict card.
-- **Blinded audit w1r2:** pack built from the triage run, judged in a separate session.
+- **Blinded audit w1r2:** 45 cards judged in a separate session: 19 CLEAN, 13 MINOR, 13 MAJOR (`run-unused-w1r2/audit-pack/merged.json`). 11 of the MAJORs are on cards the app flags for review: unidentified glyphs (each `�`; AQA Further Jun 2019 Q7's matrix and Q13's α, β and γ read since round 3's Advent symbols), 06_community_pmt_pack Q9, WJEC Physics Unit 5 Jun 2017 Q2, CIE Nov 2003 P2 Q1, and m3_centre_of_mass, whose worksheet prints its answers. Two were on strict cards: mp1_a Q1, which took in Questions 2 and 3 (fixed by round 3's white-text rule), and mp1_t Q10 (open, under What is left).
 
 ## 1.0, W1 round 3 and the second W3 batch
 
@@ -883,6 +883,9 @@ Known gaps outside these numbers:
   - a detector box over two drawings makes one picture of both, cut where a line of text runs under either (OCR A Physics AS Jun 2023 Q24, strict: the side view's "2.0 m" cut);
   - a drawing smaller than a figure, too far from the next to join it, has no crop (OCR B Physics AS Jun 2018 Q16's wire X, strict);
   - a dimension arrow beside a drawing can lie outside its crop (Edexcel GCSE Jun 2022 Q28's 4x, strict; the label reads as text).
+- Found by the w1r2 blinded audit, on flagged cards, for the next round:
+  - CIE Nov 2003 P2 Q1 (holdout): the modulus bars of |8 − 3x| < 2 are unidentified glyphs, set on a line of their own, so the inequality reads "8 − 3x < 2";
+  - m3_centre_of_mass (fixture, all its cards flagged): the worksheet prints each answer in a box ("k = 6", "h = 5r") beside a handwritten worked solution, and the cards carry both, the solutions as crops.
 - The text-layer carve, used only when a question has no layout body, still drops every line that holds only a number (its page-number rule cannot tell a page number from an option without geometry).
 - Two flagged holdout cards end on what may be a page number (OCR B Physics Jun 2024 Q2 "6", WJEC Physics Jun 2017 Q2 "3"); OCR A's is handled (cluster 9).
 - Axis scales of drawn graphs and grids appear as lines of numbers in the card text, as their titles already did, except on graph paper drawn as one path (cluster 14).
