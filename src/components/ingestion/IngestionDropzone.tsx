@@ -8,6 +8,7 @@ import { cn } from "@/lib/utils";
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { Button } from "@/components/ui/button";
 import { useTaxonomy } from "@/lib/TaxonomyContext";
+import { batchSummary, importablePaths, paperNameOf, type PaperResult } from "@/lib/import-batch";
 
 export interface Quarantine { scope: string; page?: number; questionNumber?: number; reason: string }
 export interface TimingEntry {
@@ -65,7 +66,11 @@ export function IngestionDropzone({ isActive = false, onSuccess }: IngestionDrop
   const [lastFile, setLastFile] = useState<string | null>(null);
   const [reports, setReports] = useState<ImportReport[]>([]);
   const [showLogs, setShowLogs] = useState(false);
-  const cancelledRef = useRef(false);
+  // The running batch's id: Cancel moves it on, which stops that batch
+  const batchRef = useRef(0);
+  const isBatchRef = useRef(false);
+  const flaggedRef = useRef(0);
+  const [batchPosition, setBatchPosition] = useState<{ index: number; total: number } | null>(null);
   
   const activeSubject = subjects.find(s => s.id === subject);
   const availableModules = activeSubject ? activeSubject.modules : [];
@@ -95,8 +100,9 @@ export function IngestionDropzone({ isActive = false, onSuccess }: IngestionDrop
     const unlisten = listen('import-report', (event: any) => {
       const r = event.payload as ImportReport;
       setReports(prev => [r, ...prev]);
-      // An import that read nothing fails with its own message.
-      if (r.questionsExtracted === 0) return;
+      flaggedRef.current += r.quarantined.length;
+      // A batch reports once, at its end; an import that read nothing fails with its own message.
+      if (isBatchRef.current || r.questionsExtracted === 0) return;
       const warnings: number = r.quarantined.length;
       
       const elapsedSec = r?.totalElapsedMs 
@@ -136,64 +142,89 @@ export function IngestionDropzone({ isActive = false, onSuccess }: IngestionDrop
 
   // ── Core processing logic ──────────────────────────────────────────────────
 
-  async function processFile(filePath: string) {
+  /**
+   * Import the chosen files one after another, all under the subject and
+   * module on screen (the backend runs one extraction at a time). One file
+   * reports as it always has; a batch reports once, at its end, and each
+   * paper's own report goes to Import Logs.
+   */
+  async function processFiles(paths: string[]) {
     // Imports run entirely on this machine: no key, model or provider.
-    // Derive the paper name from the file's basename (minus extension).
-    // e.g. "C:\\exams\\2024_June_P1.pdf" → "2024_June_P1"
-    const paperName =
-      filePath.replace(/\\/g, "/").split("/").pop()?.replace(/\.[^.]+$/, "") ||
-      filePath;
-
-    cancelledRef.current = false;
-    setLastFile(filePath);
-    setIsProcessing(true);
-    setProgressMsg("");
-    try {
-      if (moduleOverride.trim() === "") {
-        throw new Error(NO_MODULE_MESSAGE);
-      }
-      const questions = await invoke<any[]>("import_paper", {
-        filePath,
-        subject,
-        moduleOverride: moduleOverride.trim() !== "" ? moduleOverride.trim() : null,
-        paperName,
+    const { accepted, refused } = importablePaths(paths);
+    if (refused.length > 0) {
+      toast.error(refused.length === 1 ? "File not imported" : `${refused.length} files not imported`, {
+        description: `Only PDF, PNG, JPG and TXT files can be imported: ${refused.map(paperNameOf).join(", ")}`,
+        duration: 8000,
       });
-      if (cancelledRef.current) return;
-      const count = questions.length;
-      toast.success(
-        count === 1 ? "1 question extracted!" : `${count} questions extracted!`,
-        { description: `Paper: ${paperName}`, duration: 6000 }
-      );
-      if (onSuccess) onSuccess();
-    } catch (err) {
-      if (cancelledRef.current) return;
-      const errMsg = err instanceof Error ? err.message : String(err);
-      if (errMsg.includes("Import cancelled by user")) {
-        toast.info("Import Cancelled", {
-          description: `Stopped processing ${paperName}`,
-          duration: 4000,
+    }
+    if (accepted.length === 0) return;
+    if (moduleOverride.trim() === "") {
+      toast.error("Ingestion failed", { description: NO_MODULE_MESSAGE, duration: 8000 });
+      return;
+    }
+
+    // A cancel retires this batch: it stops here even if another starts before its import unwinds
+    const batch = ++batchRef.current;
+    const isBatch = accepted.length > 1;
+    isBatchRef.current = isBatch;
+    flaggedRef.current = 0;
+    const results: PaperResult[] = [];
+    setIsProcessing(true);
+
+    for (const [i, filePath] of accepted.entries()) {
+      if (batchRef.current !== batch) break;
+      const paperName = paperNameOf(filePath);
+      setLastFile(filePath);
+      setBatchPosition(isBatch ? { index: i + 1, total: accepted.length } : null);
+      setProgressMsg("");
+      try {
+        const questions = await invoke<any[]>("import_paper", {
+          filePath,
+          subject,
+          moduleOverride: moduleOverride.trim(),
+          paperName,
         });
-      } else {
-        toast.error("Ingestion failed", {
-          description: errMsg,
-          duration: 8000,
-        });
+        if (batchRef.current !== batch) break;
+        results.push({ path: filePath, ok: true, questions: questions.length });
+        if (!isBatch) {
+          const count = questions.length;
+          toast.success(
+            count === 1 ? "1 question extracted!" : `${count} questions extracted!`,
+            { description: `Paper: ${paperName}`, duration: 6000 }
+          );
+        }
+      } catch (err) {
+        if (batchRef.current !== batch) break;
+        const errMsg = err instanceof Error ? err.message : String(err);
+        results.push({ path: filePath, ok: false, error: errMsg });
+        if (!isBatch) toast.error("Ingestion failed", { description: errMsg, duration: 8000 });
       }
-    } finally {
-      if (!cancelledRef.current) {
-        setLastFile(null);
-        setProgressMsg("");
-        setIsProcessing(false);
-      }
+    }
+
+    // Cancelled: the Cancel button has already reset the screen (and, for one file, said so)
+    const cancelled = batchRef.current !== batch;
+    if (isBatch && results.length > 0) {
+      const summary = batchSummary(results, cancelled, flaggedRef.current);
+      (summary.failed ? toast.warning : toast.success)(summary.title, { description: summary.description, duration: 15000 });
+    } else if (isBatch && cancelled) {
+      toast.info("Import Cancelled", { description: `Stopped processing ${paperNameOf(accepted[0])}`, duration: 3500 });
+    }
+    if (results.some((r) => r.ok) && onSuccess) onSuccess();
+    if (!cancelled) {
+      isBatchRef.current = false;
+      setLastFile(null);
+      setBatchPosition(null);
+      setProgressMsg("");
+      setIsProcessing(false);
     }
   }
 
   // ── Native Tauri Drag-and-Drop ─────────────────────────────────────────────
 
-  const processFileRef = useRef(processFile);
+  const processFilesRef = useRef(processFiles);
   useEffect(() => {
-    processFileRef.current = processFile;
-  }, [processFile]);
+    processFilesRef.current = processFiles;
+  }, [processFiles]);
 
   const isProcessingRef = useRef(isProcessing);
   useEffect(() => {
@@ -236,11 +267,11 @@ export function IngestionDropzone({ isActive = false, onSuccess }: IngestionDrop
                 px >= rect.left - 20 && px <= rect.right + 20 && py >= rect.top - 20 && py <= rect.bottom + 20;
 
               if (isWithinRect(rawX, rawY) || isWithinRect(logicalX, logicalY)) {
-                processFileRef.current(paths[0]);
+                processFilesRef.current(paths);
               }
             } else {
               // Fallback if position check fails
-              processFileRef.current(paths[0]);
+              processFilesRef.current(paths);
             }
           }
         }
@@ -262,13 +293,13 @@ export function IngestionDropzone({ isActive = false, onSuccess }: IngestionDrop
   async function handleBrowse() {
     if (isProcessing) return;
     const selected = await open({
-      multiple: false,
+      multiple: true,
       filters: [
         { name: "Documents & Images", extensions: ["pdf", "txt", "png", "jpg", "jpeg"] },
       ],
     });
-    if (selected && typeof selected === "string") {
-      await processFile(selected);
+    if (selected && selected.length > 0) {
+      await processFiles(Array.isArray(selected) ? selected : [selected]);
     }
   }
 
@@ -318,8 +349,8 @@ export function IngestionDropzone({ isActive = false, onSuccess }: IngestionDrop
           Import Document
         </h1>
         <p className="text-sm text-muted-foreground max-w-md">
-          Drop a PDF, image, or plain-text document below and MergeMark will
-          automatically process it into your repository.
+          Drop one paper or several below (PDF, image or plain text) and MergeMark
+          imports each into your repository, under the subject and module you choose.
         </p>
       </div>
 
@@ -386,7 +417,7 @@ export function IngestionDropzone({ isActive = false, onSuccess }: IngestionDrop
         onDragOver={handleDragOver}
         onDrop={handleDrop}
         aria-disabled={isProcessing}
-        aria-label="Drag and drop a file here, or click to browse"
+        aria-label="Drag and drop papers here, or click to browse"
         className={cn(
           // Layout
           "relative flex flex-col items-center justify-center gap-5",
@@ -446,23 +477,27 @@ export function IngestionDropzone({ isActive = false, onSuccess }: IngestionDrop
                 {progressMsg}
               </p>
               <p className="text-xs text-muted-foreground truncate max-w-xs pb-2">
-                {lastFile ?? ""}
+                {batchPosition && `File ${batchPosition.index} of ${batchPosition.total}: `}
+                {lastFile ? paperNameOf(lastFile) : ""}
               </p>
               <button
                 type="button"
                 onClick={(e) => {
                   e.stopPropagation();
-                  cancelledRef.current = true;
-                  const currentPaper = lastFile
-                    ? lastFile.replace(/\\/g, "/").split("/").pop()?.replace(/\.[^.]+$/, "") || lastFile
-                    : "import";
+                  batchRef.current += 1;
+                  const wasBatch = isBatchRef.current;
+                  isBatchRef.current = false;
                   setIsProcessing(false);
                   setProgressMsg("");
                   setLastFile(null);
-                  toast.info("Import Cancelled", {
-                    description: `Stopped processing ${currentPaper}`,
-                    duration: 3500,
-                  });
+                  setBatchPosition(null);
+                  // A batch says what it finished when its import unwinds
+                  if (!wasBatch) {
+                    toast.info("Import Cancelled", {
+                      description: `Stopped processing ${lastFile ? paperNameOf(lastFile) : "import"}`,
+                      duration: 3500,
+                    });
+                  }
                   invoke("cancel_import").catch(console.error);
                 }}
                 className="pointer-events-auto px-4 py-1.5 text-xs font-semibold text-destructive-foreground bg-destructive hover:bg-destructive/90 rounded-md transition-all shadow-sm active:scale-95"
@@ -475,7 +510,7 @@ export function IngestionDropzone({ isActive = false, onSuccess }: IngestionDrop
               <p className="text-base font-semibold text-foreground">
                 {isDraggingOver
                   ? "Release to import"
-                  : "Drag & Drop a Past Paper here"}
+                  : "Drag & Drop Past Papers here"}
               </p>
               <p className="text-xs text-muted-foreground">
                 or{" "}

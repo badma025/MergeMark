@@ -25,7 +25,7 @@ Coming from a 0.9 beta? It cannot update itself to 1.0, because 1.0 is signed wi
 Every card is filed under a subject and a module. The app starts with some maths subjects. For anything else, open **Settings → Curriculum Taxonomy**, add the subject, and add at least one module to it.
 
 ## Importing a question paper
-Open **Import PDF**, choose the subject and module, then drag a question-paper PDF onto the drop area (or click to browse).
+Open **Import PDF**, choose the subject and module, then drag one or more question-paper PDFs onto the drop area (or click to browse and select several). Every paper in a batch is filed under that subject and module; when the batch ends, one message says how many papers and questions were imported and names any paper that failed. Each paper's own report is under **View Import Logs**.
 
 - **Cards marked REVIEW need checking against the paper.** The import flags any card it can't fully verify: a symbol it couldn't identify, marks that don't add up, a question whose end it couldn't find, or text read by OCR.
 - **Cards without REVIEW passed every check, but can still be wrong.** If you find one, please report it: these are the most useful reports.

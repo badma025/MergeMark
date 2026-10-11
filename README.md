@@ -16,7 +16,7 @@ MergeMark is a local-first desktop application built to replace manual data entr
 Currently optimized for **GCSE and A-Level Mathematics & Further Mathematics**, and tested on A-Level Physics and Computer Science papers.
 
 ## ✨ Key Features
-* **Zero-Friction Parsing:** Drag and drop full exam papers or question booklets. The engine automatically isolates distinct questions from the layout.
+* **Zero-Friction Parsing:** Drag and drop full exam papers or question booklets, one or many at a time. The engine automatically isolates distinct questions from the layout.
 * **Fully Offline Import:** Every paper is read on your machine. MergeMark makes no AI requests of any kind, needs no API key and costs nothing. See [How importing works](#-how-importing-works).
 * **Check any card against its paper:** each card records the PDF and the pages it came from. **Compare with the paper**, in the card's ⋯ menu, shows those pages, so a card can always be compared with what the paper prints.
 * **100% Local & Private:** Built on a local SQLite database. Your files, extractions, and data live strictly on your machine and are never uploaded anywhere. The one request MergeMark makes is the [update check](#updates).
@@ -87,7 +87,7 @@ Read [notes for users](docs/BETA_TESTERS.md) before your first import — in par
 MergeMark checks for a newer version when it starts, and from **Settings → Backup & Maintenance → Updates**, where the check at start-up can be turned off. To check, it asks this repository's GitHub releases for the newest version's details: an ordinary web request that carries nothing about your library or your papers. An update installs only if it is signed with MergeMark's key, and only when you choose **Install and restart**. Your library is backed up when a new version first opens it. A 0.9 beta cannot update itself to 1.0, which is signed with a new key: install 1.0 over it from the Releases tab, and your library is kept.
 
 ### How to Use
-1. **Import:** Drag and drop a PDF past paper into the ingestion dropzone.
+1. **Import:** Drag and drop one or more PDF past papers into the ingestion dropzone. A batch imports one paper after another, under the subject and module you chose.
 2. **Review:** Check the extracted questions, against their pages with **Compare with the paper** in each card's ⋯ menu. You can edit any card to correct it.
 3. **Export:** Copy the isolated question blocks as clean markdown/LaTeX to use in your notes, active recall templates, or custom worksheets.
 
