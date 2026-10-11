@@ -6,7 +6,8 @@ import { cn } from "@/lib/utils";
 export interface WorksheetItemData {
   id: string;
   subject: string;
-  subtopic: string;
+  /** Where the question came from ("Q6 · paper"), or its module for one added by hand */
+  source: string;
   marks: number;
 }
 
@@ -41,7 +42,7 @@ export function WorksheetItem({ item, onRemove }: WorksheetItemProps) {
           ? "z-50 shadow-lg shadow-black/30 opacity-90 border-primary/50"
           : "hover:border-border/80"
       )}
-      aria-label={`${item.subject} – ${item.subtopic}, ${item.marks} marks`}
+      aria-label={`${item.subject} – ${item.source}, ${item.marks} marks`}
     >
       {/* Drag handle */}
       <button
@@ -60,11 +61,11 @@ export function WorksheetItem({ item, onRemove }: WorksheetItemProps) {
 
       {/* Topic info */}
       <div className="flex min-w-0 flex-1 flex-col gap-0.5">
-        <span className="truncate text-xs font-semibold text-foreground leading-tight">
+        <span className="truncate text-xs font-semibold text-foreground leading-tight" title={item.subject}>
           {item.subject}
         </span>
-        <span className="truncate text-[0.68rem] text-muted-foreground leading-tight">
-          {item.subtopic}
+        <span className="truncate text-[0.68rem] text-muted-foreground leading-tight" title={item.source}>
+          {item.source}
         </span>
       </div>
 

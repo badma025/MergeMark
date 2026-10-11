@@ -15,6 +15,13 @@ import { checkForUpdatesAtStart } from "@/lib/updates";
 
 export type SelectedQuestion = Omit<QuestionCardProps, "onAddToWorksheet">;
 
+/** A worksheet line: where the question came from ("Q6 · M2 Jan 2009"), or its module for one added by hand. */
+function toWorksheetItem(q: SelectedQuestion): WorksheetItemData {
+  const source = q.paperName && q.questionNumber != null ? `Q${q.questionNumber} · ${q.paperName}` : null;
+  const module = q.module && q.module !== "General" && q.module !== "Unknown" ? q.module : null;
+  return { id: q.id, subject: q.subject, source: source || module || q.subtopic, marks: q.marks };
+}
+
 type Tab = "repository" | "ingestion" | "settings" | "flashcards";
 
 const TABS: { id: Tab; label: string; icon: React.ElementType }[] = [
@@ -41,14 +48,7 @@ function App() {
         return prev.filter((q) => q.id !== question.id);
       }
 
-      const newWorksheetItem: WorksheetItemData = {
-        id: question.id,
-        subject: question.subject,
-        subtopic: question.subtopic,
-        marks: question.marks,
-      };
-
-      return [...prev, newWorksheetItem];
+      return [...prev, toWorksheetItem(question)];
     });
   }
 
@@ -66,12 +66,7 @@ function App() {
       const existingIds = new Set(prev.map((q) => q.id));
       const toAdd = questions
         .filter((q) => !existingIds.has(q.id))
-        .map((q) => ({
-          id: q.id,
-          subject: q.subject,
-          subtopic: q.subtopic,
-          marks: q.marks,
-        }));
+        .map(toWorksheetItem);
       return [...prev, ...toAdd];
     });
     toast.success(`Added ${questions.length} questions to worksheet`);
@@ -161,6 +156,7 @@ function App() {
                 onAddToWorksheet={handleAddQuestion}
                 onAddMultipleToWorksheet={handleAddMultipleQuestions}
                 selectedQuestionIds={selectedQuestions.map((q) => q.id)}
+                onQuestionsRemoved={(ids) => setSelectedQuestions((prev) => prev.filter((q) => !ids.includes(q.id)))}
               />
             </div>
             <div className={cn("absolute inset-0 flex flex-col min-h-0 min-w-0 overflow-hidden bg-background", activeTab === "ingestion" ? "z-10 opacity-100 pointer-events-auto" : "z-0 opacity-0 pointer-events-none")}>

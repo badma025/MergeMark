@@ -1197,6 +1197,10 @@ static RE_LATEX_LEADING_NUM_SAFE: LazyLock<regex::Regex> = LazyLock::new(|| {
 static RE_LATEX_INLINE_MARKS_SAFE: LazyLock<regex::Regex> = LazyLock::new(|| {
     regex::Regex::new(r"(?i)(?:\*{0,2}[\[\(]\s*(\d+)\s*m\s*a\s*r\s*k\s*s?\s*[\]\)]\*{0,2}|\b(\d+)\s*m\s*a\s*r\s*k\s*s?\s*(?:\]|\)|$))").unwrap()
 });
+/// A printed bullet that opens a line: one item of a list the paper prints a line each
+static RE_LATEX_BULLET_ITEM: LazyLock<regex::Regex> = LazyLock::new(|| {
+    regex::Regex::new(r"(?m)^[ \t]*•[ \t]*(.*)").unwrap()
+});
 static RE_MARK_TAG_GENERAL: LazyLock<regex::Regex> = LazyLock::new(|| {
     regex::Regex::new(r"(?i)(?:\*{0,2}[\[\(]\s*(\d+)\s*m\s*a\s*r\s*k\s*s?\s*[\]\)]\*{0,2})").unwrap()
 });
@@ -1353,6 +1357,8 @@ fn process_non_math_latex(content: &str) -> String {
 
     // Convert markdown bullet lists (* item or - item)
     t = RE_LATEX_LIST_ITEM.replace_all(&t, r"\par\textbullet\hspace{0.5em}${1}").to_string();
+    // and the paper's own bullets, one item to a line, which would otherwise reflow into one sentence
+    t = RE_LATEX_BULLET_ITEM.replace_all(&t, r"\par\textbullet\hspace{0.5em}${1}").to_string();
 
     // Markdown Bold (**text**)
     t = RE_SAFE_BOLD.replace_all(&t, r"\textbf{${1}}").to_string();
@@ -1428,6 +1434,8 @@ pub fn relocate_misplaced_marks(raw_content: &str) -> String {
         header: String,
         body: String,
         mark: Option<u32>,
+        /// Text after a mark on a line of its own: the lead-in to the next part
+        lead_in: Option<String>,
     }
 
     let mut chunks: Vec<SubpartChunk> = Vec::new();
@@ -1439,7 +1447,25 @@ pub fn relocate_misplaced_marks(raw_content: &str) -> String {
         } else {
             text.len()
         };
-        let raw_body = &text[body_start..body_end];
+        let mut raw_body = &text[body_start..body_end];
+
+        // A mark on a line of its own, after the part's finished sentence and
+        // with more text after it, ends the part there: what follows leads into
+        // the next part. A mark after unfinished text is out of place and moves
+        // to the end, as before.
+        let mut lead_in: Option<String> = None;
+        if let Some(last) = RE_MARK_TAG_GENERAL.find_iter(raw_body).last() {
+            let (before, after) = (&raw_body[..last.start()], &raw_body[last.end()..]);
+            let line_before = before.rsplit('\n').next().unwrap_or("");
+            let line_after = after.split('\n').next().unwrap_or("");
+            let own_line = line_before.trim().is_empty() && line_after.trim().is_empty() && after.contains('\n');
+            let finished = before.trim_end().trim_end_matches(['$', '*']).ends_with(['.', '?', '!']);
+            if own_line && finished && !after.trim().is_empty() {
+                let collapsed = RE_COLLAPSE_SPACES.replace_all(after, " ").to_string();
+                lead_in = Some(collapsed.trim().to_string());
+                raw_body = &raw_body[..last.end()];
+            }
+        }
 
         let mut subpart_mark: Option<u32> = None;
         for cap in RE_MARK_TAG_GENERAL.captures_iter(raw_body) {
@@ -1456,6 +1482,7 @@ pub fn relocate_misplaced_marks(raw_content: &str) -> String {
             header,
             body: collapsed_body.trim().to_string(),
             mark: subpart_mark,
+            lead_in,
         });
     }
 
@@ -1479,6 +1506,10 @@ pub fn relocate_misplaced_marks(raw_content: &str) -> String {
         if let Some(m) = chunk.mark {
             let mark_word = if m == 1 { "mark" } else { "marks" };
             result.push_str(&format!(" **[{} {}]**", m, mark_word));
+        }
+        if let Some(lead_in) = &chunk.lead_in {
+            result.push_str("\n\n");
+            result.push_str(lead_in);
         }
         if i + 1 < chunks.len() {
             result.push_str("\n\n");
@@ -1526,6 +1557,13 @@ pub fn format_markdown_for_latex(raw_content: &str) -> String {
 
     let mut result = RE_LATEX_MULTIPLE_NL_SAFE.replace_all(&processed, "\n\n").to_string();
     result = RE_LATEX_LEADING_NUM_SAFE.replace(&result, "").to_string();
+    // A question that opens with a list keeps its number on the first item's line
+    if let Some(rest) = result.trim_start().strip_prefix("\\par") {
+        // \par itself, not \parbox or \paragraph
+        if !rest.starts_with(|c: char| c.is_ascii_alphabetic()) {
+            result = rest.to_string();
+        }
+    }
     result
 }
 
@@ -3021,6 +3059,44 @@ mod tests {
         assert!(print.contains("\\includegraphics") && print.contains("\\ensuremath{\\theta}"), "{print}");
     }
 
+    /// A bulleted list the paper prints one item to a line (Edexcel Further
+    /// Jun 2025 Q8) keeps its lines on the worksheet: LaTeX would otherwise
+    /// reflow them into one sentence with bullets in it.
+    #[test]
+    fn printed_bullets_start_their_own_lines_on_the_worksheet() {
+        let raw = "Hence, given that the line $l$\n• is a tangent to $E$\n• passes through the point (10, 20)\n\n(b) determine the possible equations of $l$";
+        let print = format_markdown_for_latex(raw);
+        assert_eq!(print.matches("\\par\\textbullet\\hspace{0.5em}").count(), 2, "{print}");
+        assert!(!print.contains('•'), "{print}");
+        assert!(print.contains("is a tangent to") && print.contains("passes through the point (10, 20)"), "{print}");
+        // A bullet inside a line is text, not a list; one inside display maths stays maths
+        assert!(!format_markdown_for_latex("A • B").contains("\\textbullet"));
+        assert!(!format_markdown_for_latex("Given\n$$a = b\n• c$$").contains("\\par"));
+        // A question that opens with a bullet keeps its number on the bullet's line
+        assert!(!format_markdown_for_latex("• is a tangent to $E$\n• passes through (10, 20)").trim_start().starts_with("\\par"));
+    }
+
+    /// A mark on a line of its own ends its part: the text after it leads into
+    /// the next part (Edexcel Further Jun 2025 Q8, "Hence, given that…") and
+    /// keeps its place, rather than taking the mark to its own end.
+    #[test]
+    fn a_mark_on_its_own_line_stays_with_its_part_not_the_next_parts_lead_in() {
+        let raw = "The ellipse $E$ has equation\n\n(a) Show that the equation holds\nwhere $k$ is a constant to be determined.\n\n**[2 marks]**\nHence, given that the line $l$\n• is a tangent to $E$\n\n(b) determine the possible equations of $l$\n\n**[5 marks]**";
+        let relocated = relocate_misplaced_marks(raw);
+        let a_mark = relocated.find("**[2 marks]**").expect(&relocated);
+        let hence = relocated.find("Hence, given").expect(&relocated);
+        let b = relocated.find("(b)").expect(&relocated);
+        assert!(relocated.find("determined.").unwrap() < a_mark && a_mark < hence && hence < b, "{relocated}");
+        assert!(relocated.contains("• is a tangent to $E$"), "{relocated}");
+        assert!(relocated.trim_end().ends_with("**[5 marks]**"), "{relocated}");
+        // A mark printed before its part's text still moves to the end
+        let before = relocate_misplaced_marks("(a) **[2 marks]** Find $x$.\n\n(b) Find $y$. **[3 marks]**");
+        assert!(before.contains("(a) Find $x$. **[2 marks]**"), "{before}");
+        // So does one the text layer set mid-sentence: the part's text before it is not finished
+        let mid = relocate_misplaced_marks("(a) Show that\n\n**[2 marks]**\n\n$x = 3$ is a root.\n\n(b) Hence factorise. **[3 marks]**");
+        assert!(mid.contains("$x = 3$ is a root. **[2 marks]**"), "{mid}");
+    }
+
     #[test]
     fn mcq_options_print_their_letters_not_the_card_markers() {
         // physics '21 Q5: options are stored as `- [MCQ:X] …` list items.
@@ -3030,8 +3106,9 @@ mod tests {
         assert!(output.contains("\\par\\textbf{A}\\hspace{0.5em}500"), "{output}");
         assert!(output.contains("\\par\\textbf{B}\\hspace{0.5em}250"), "{output}");
         assert!(output.contains("\\par\\textbf{D}\\hspace{0.5em}$1.33 \\times 10^{-13}$ J"), "{output}");
-        // An ordinary bullet keeps its bullet.
-        assert!(format_markdown_for_latex("- the value of $a$").contains("\\par\\textbullet\\hspace{0.5em}the value of $a$"));
+        // An ordinary bullet keeps its bullet (opening the question, on its number's line).
+        assert!(format_markdown_for_latex("- the value of $a$").starts_with("\\textbullet\\hspace{0.5em}the value of $a$"));
+        assert!(format_markdown_for_latex("Find\n- the value of $a$").contains("\\par\\textbullet\\hspace{0.5em}the value of $a$"));
     }
 
     #[test]

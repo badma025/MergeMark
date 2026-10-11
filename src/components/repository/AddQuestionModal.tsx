@@ -16,7 +16,7 @@ export interface AddQuestionModalProps {
 }
 
 export function AddQuestionModal({ open, onOpenChange, onSuccess }: AddQuestionModalProps) {
-  const [subject, setSubject] = useState<string>("Mathematics");
+  const [subject, setSubject] = useState<string>("");
   const [module, setModule] = useState<string>("");
   const [marks, setMarks] = useState<number>(1);
   const [topics, setTopics] = useState<string[]>([]);
@@ -26,16 +26,21 @@ export function AddQuestionModal({ open, onOpenChange, onSuccess }: AddQuestionM
   const { subjects, topicsBySubject } = useTaxonomy();
   const subjectNames = subjects.map(s => s.name);
 
-  // Set default module when modal opens or subject changes
+  // On opening, start from a subject that exists: the select shows its first
+  // option when the state names no subject, so a question would otherwise save
+  // under a subject the library does not have, with no topics to choose
   useEffect(() => {
-    if (open) {
-      const subjectMods = topicsBySubject[subject] || {};
-      const firstMod = Object.keys(subjectMods)[0] || "";
-      if (!module) {
-        setModule(firstMod);
-      }
+    if (!open) return;
+    if (!subjectNames.includes(subject) && subjectNames.length > 0) {
+      handleSubjectChange(subjectNames[0]);
+      return;
     }
-  }, [open, subject]);
+    const subjectMods = topicsBySubject[subject] || {};
+    const firstMod = Object.keys(subjectMods)[0] || "";
+    if (!module) {
+      setModule(firstMod);
+    }
+  }, [open, subject, subjects, topicsBySubject]);
 
   // When subject changes, reset module and topics
   function handleSubjectChange(newSubject: string) {
@@ -84,9 +89,7 @@ export function AddQuestionModal({ open, onOpenChange, onSuccess }: AddQuestionM
       onSuccess();
       onOpenChange(false);
       
-      // Reset form
-      setSubject("Mathematics");
-      setModule("");
+      // Reset the form, keeping the subject and module for the next question
       setMarks(1);
       setTopics([]);
       setContent("");

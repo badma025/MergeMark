@@ -54,9 +54,12 @@ pub struct Question {
     pub question_number: Option<i64>,
     #[sqlx(default)]
     pub module: Option<String>,
+    // A card added by hand sends neither flag (AddQuestionModal)
     #[sqlx(default)]
+    #[serde(default)]
     pub needs_review: bool,
     #[sqlx(default)]
+    #[serde(default)]
     pub answer_stale: bool,
     /// The PDF the card was imported from, the SHA-256 of its bytes, and the
     /// pages its question is on (1-based): what it is checked against.
@@ -872,7 +875,7 @@ pub async fn compile_worksheet(
             if i > 0 {
                 latex.push_str("\\newpage\n");
             }
-            latex.push_str(&format!("  \\item\\relax {}\n", content));
+            latex.push_str(&format!("  {} {}\n", worksheet_item(&content), content));
             if !question.math_snippet.is_empty() {
                 if question.is_code {
                     latex.push_str(&format!(
@@ -920,7 +923,7 @@ pub async fn compile_worksheet(
             }
         } else {
             latex.push_str("  \\needspace{4.5cm}\n");
-            latex.push_str(&format!("  \\item\\relax {}\n", content));
+            latex.push_str(&format!("  {} {}\n", worksheet_item(&content), content));
             if !question.math_snippet.is_empty() {
                 if question.is_code {
                     latex.push_str(&format!(
@@ -938,7 +941,7 @@ pub async fn compile_worksheet(
         }
 
         answer_latex.push_str("  \\needspace{4.5cm}\n");
-        answer_latex.push_str(&format!("  \\item\\relax {}\n", content));
+        answer_latex.push_str(&format!("  {} {}\n", worksheet_item(&content), content));
         if !question.math_snippet.is_empty() {
             if question.is_code {
                 answer_latex.push_str(&format!(
@@ -1064,6 +1067,17 @@ pub async fn compile_worksheet(
 /// What compiling answers when no pdflatex can run: the worksheet screen
 /// then offers to install MiKTeX.
 const PDFLATEX_NOT_FOUND: &str = "PDFLATEX_NOT_FOUND";
+
+/// How a question's `\item` opens. One whose content starts with its figure
+/// sets the label on a line pulled back up beside the figure's top; without
+/// that, LaTeX holds the label to the first line of text, under the figure.
+fn worksheet_item(content: &str) -> &'static str {
+    if content.trim_start().starts_with("\\nopagebreak\\begin{center}\\includegraphics") {
+        "\\item\\relax\\leavevmode\\vspace{-\\baselineskip}"
+    } else {
+        "\\item\\relax"
+    }
+}
 
 /// pdflatex on the PATH, or where MiKTeX (for this user or all users) or
 /// MacTeX installs it, since an app started from the desktop may not have
@@ -2074,6 +2088,46 @@ pub async fn import_flashcards(app: tauri::AppHandle, file_path: String) -> Resu
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── Adding a question by hand ───────────────────────────────────────────
+
+    /// What AddQuestionModal sends to `add_question`: a card typed by hand has
+    /// no review flag, stale answer or source paper, and says nothing of them.
+    #[test]
+    fn a_question_added_by_hand_is_accepted_without_import_fields() {
+        let sent = serde_json::json!({
+            "id": "6f1c3a52-0000-4000-8000-000000000000",
+            "subject": "A Level Further Mathematics (Edexcel)",
+            "subtopic": "Core Pure",
+            "marks": 3,
+            "content": "Find $\\frac{dy}{dx}$ when $y = x^2$.",
+            "mathSnippet": "",
+            "isCode": false,
+            "topics": "[\"Argand diagrams\"]",
+            "paperName": "",
+            "questionNumber": null,
+            "module": "Core Pure"
+        });
+        let question: Question = serde_json::from_value(sent).expect("the dialog's payload deserializes");
+        assert!(!question.needs_review && !question.answer_stale);
+        assert_eq!(question.answer_content, None);
+        assert_eq!(question.source_path, None);
+    }
+
+    // ── Worksheet question numbers ──────────────────────────────────────────
+
+    /// A question that opens with its figure prints its number beside the
+    /// figure's top, as the paper does: LaTeX would otherwise hold the label
+    /// back to the first line of text, under the figure.
+    #[test]
+    fn a_question_opening_with_a_figure_numbers_the_figure_not_the_text_below() {
+        let figure_first = crate::validate::format_markdown_for_latex("![Diagram](C:/d/fig.png)\n\nFigure 3\nA cricket ball is hit.");
+        assert!(figure_first.trim_start().starts_with("\\nopagebreak\\begin{center}\\includegraphics"), "{figure_first}");
+        assert_eq!(worksheet_item(&figure_first), "\\item\\relax\\leavevmode\\vspace{-\\baselineskip}");
+
+        let text_first = crate::validate::format_markdown_for_latex("A cricket ball is hit.\n\n![Diagram](C:/d/fig.png)");
+        assert_eq!(worksheet_item(&text_first), "\\item\\relax");
+    }
 
     // ── Worksheet compile ───────────────────────────────────────────────────
 

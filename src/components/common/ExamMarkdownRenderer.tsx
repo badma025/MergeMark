@@ -1,4 +1,4 @@
-import React, { memo } from 'react';
+import React, { memo, useLayoutEffect, useRef } from 'react';
 import ReactMarkdown from 'react-markdown';
 import remarkMath from 'remark-math';
 import rehypeKatex from 'rehype-katex';
@@ -10,6 +10,9 @@ import { remarkMathFix } from '@/lib/remark-math-fix';
 import type { Root, Paragraph } from 'mdast';
 import { visit } from 'unist-util-visit';
 import { ErrorBoundary } from '@/components/common/ErrorBoundary';
+import { convertFileSrc } from '@tauri-apps/api/core';
+import { resolveImageSrc } from '@/lib/image-src';
+import { fitWideMath } from '@/lib/fit-math';
 
 export interface ExamMarkdownRendererProps {
   content: string;
@@ -73,6 +76,8 @@ function ParagraphWithFlushMarks({
 }: React.HTMLAttributes<HTMLParagraphElement> & { node?: unknown }) {
   const childrenArray = React.Children.toArray(children);
   if (childrenArray.length === 0) return <p {...props}>{children}</p>;
+  // A diagram renders as a block (DiagramImg is a <div>), which a <p> cannot hold
+  const P = containsImage(children) ? 'div' : 'p';
 
   const lastChild = childrenArray[childrenArray.length - 1];
 
@@ -85,7 +90,7 @@ function ParagraphWithFlushMarks({
       const leadingChildren = childrenArray.slice(0, -1);
 
       return (
-        <p className="my-1.5 leading-relaxed text-foreground relative clearfix after:content-[''] after:block after:clear-both" {...props}>
+        <P className="my-1.5 leading-relaxed text-foreground relative clearfix after:content-[''] after:block after:clear-both" {...props}>
           {leadingChildren}
           {cleanString}
           {/* Flush-right mark allocation badge */}
@@ -100,12 +105,12 @@ function ParagraphWithFlushMarks({
           >
             {markString.startsWith('[') || markString.startsWith('(') ? markString : `[${markString}]`}
           </span>
-        </p>
+        </P>
       );
     }
   }
 
-  return <p className="my-1.5 leading-relaxed text-foreground" {...props}>{children}</p>;
+  return <P className="my-1.5 leading-relaxed text-foreground" {...props}>{children}</P>;
 }
 
 /**
@@ -272,9 +277,38 @@ export const ExamMarkdownRenderer = memo(function ExamMarkdownRenderer({
     processedContent = content || "";
   }
 
+  // Long equations shrink to their line, again whenever the card changes width
+  const rootRef = useRef<HTMLDivElement>(null);
+  useLayoutEffect(() => {
+    const root = rootRef.current;
+    if (!root) return;
+    let frame = 0;
+    let disposed = false;
+    let width = root.clientWidth;
+    const fit = () => {
+      cancelAnimationFrame(frame);
+      if (!disposed) frame = requestAnimationFrame(() => fitWideMath(root));
+    };
+    fitWideMath(root);
+    // Only a change of width moves an equation's fit: not a diagram loading below it
+    const observer = new ResizeObserver(() => {
+      if (root.clientWidth === width) return;
+      width = root.clientWidth;
+      fit();
+    });
+    observer.observe(root);
+    document.fonts?.ready.then(fit);
+    return () => {
+      disposed = true;
+      observer.disconnect();
+      cancelAnimationFrame(frame);
+    };
+  }, [processedContent]);
+
   return (
     <ErrorBoundary fallbackTitle="Could not render formatting">
       <div
+        ref={rootRef}
         className={cn(
           "prose prose-sm dark:prose-invert max-w-none",
           "prose-p:my-1.5 prose-headings:font-bold prose-headings:tracking-tight",
@@ -308,7 +342,7 @@ export const ExamMarkdownRenderer = memo(function ExamMarkdownRenderer({
                 }
                 return (
                   <img
-                    src={href}
+                    src={resolveImageSrc(href, convertFileSrc)}
                     alt={altText}
                     className="max-w-full rounded-md my-2 border border-border"
                   />
@@ -379,7 +413,8 @@ export const ExamMarkdownRenderer = memo(function ExamMarkdownRenderer({
               if (imageRenderer && imgProps.src) {
                 return <>{imageRenderer(imgProps.src, imgProps.alt)}</>;
               }
-              return <img {...imgProps} alt={imgProps.alt || "Diagram"} className="max-w-full rounded-md my-3 border border-border" />;
+              const src = typeof imgProps.src === 'string' ? resolveImageSrc(imgProps.src, convertFileSrc) : imgProps.src;
+              return <img {...imgProps} src={src} alt={imgProps.alt || "Diagram"} className="max-w-full rounded-md my-3 border border-border" />;
             },
           }}
         >

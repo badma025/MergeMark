@@ -207,7 +207,8 @@ export function IngestionDropzone({ isActive = false, onSuccess }: IngestionDrop
 
   useEffect(() => {
     let unlisten: (() => void) | undefined;
-    
+    let disposed = false;
+
     import("@tauri-apps/api/webview").then(({ getCurrentWebview }) => {
       getCurrentWebview().onDragDropEvent((event) => {
         if (!isActiveRef.current) return;
@@ -244,11 +245,14 @@ export function IngestionDropzone({ isActive = false, onSuccess }: IngestionDrop
           }
         }
       }).then(fn => {
-        unlisten = fn;
+        // Unmounted before the listener was registered: drop it now, or a remount adds a second one
+        if (disposed) fn();
+        else unlisten = fn;
       }).catch(console.error);
     }).catch(console.error);
 
     return () => {
+      disposed = true;
       if (unlisten) unlisten();
     };
   }, []);

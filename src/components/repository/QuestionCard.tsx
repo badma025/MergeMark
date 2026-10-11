@@ -4,7 +4,8 @@ import { RichTextEditor } from "./RichTextEditor";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/ui/dialog";
-import { Plus, Trash2, Pencil, AlertTriangle, ShieldCheck, Maximize2, ZoomIn, ZoomOut, Download, Copy, Check, X, CheckCircle2, ChevronDown, FileSearch } from "lucide-react";
+import { Plus, Trash2, Pencil, AlertTriangle, ShieldCheck, Maximize2, ZoomIn, ZoomOut, Download, Copy, Check, X, CheckCircle2, ChevronDown, FileSearch, MoreHorizontal } from "lucide-react";
+import { DropdownMenu, DropdownMenuTrigger, DropdownMenuContent, DropdownMenuItem, DropdownMenuSeparator } from "@/components/ui/dropdown-menu";
 import { cn } from "@/lib/utils";
 import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 import { useTaxonomy } from "@/lib/TaxonomyContext";
@@ -12,6 +13,7 @@ import { toast } from "sonner";
 import { ExamMarkdownRenderer } from "@/components/common/ExamMarkdownRenderer";
 import { preprocessExamMarkdown } from "@/lib/preprocess-math";
 import { pagesLabel } from "@/lib/source-pages";
+import { resolveImageSrc } from "@/lib/image-src";
 import { SourcePagesDialog } from "./SourcePagesDialog";
 
 /**
@@ -29,8 +31,7 @@ function DiagramLightboxModal({
   alt: string;
 }) {
   const [scale, setScale] = useState(1);
-  const isLocal = /^[a-zA-Z]:[\\/]/.test(src) || src.startsWith("/");
-  const resolved = isLocal ? convertFileSrc(src) : src;
+  const resolved = resolveImageSrc(src, convertFileSrc);
 
   const handleZoomIn = () => setScale((s) => Math.min(s + 0.25, 3.5));
   const handleZoomOut = () => setScale((s) => Math.max(s - 0.25, 0.5));
@@ -118,8 +119,7 @@ function DiagramImg({
   alt: string;
 }) {
   const [isLightboxOpen, setIsLightboxOpen] = useState(false);
-  const isLocal = /^[a-zA-Z]:[\\/]/.test(src) || src.startsWith("/");
-  const resolved = isLocal ? convertFileSrc(src) : src;
+  const resolved = resolveImageSrc(src, convertFileSrc);
 
   return (
     <div className="relative group/diag my-4 inline-block max-w-full">
@@ -238,6 +238,8 @@ export const QuestionCard = memo(function QuestionCard(props: QuestionCardProps)
   const [answerStale, setAnswerStale] = useState(!!initialAnswerStale);
   const [isAddedBtnHovered, setIsAddedBtnHovered] = useState(false);
   const [isShowingSource, setIsShowingSource] = useState(false);
+  // Delete asks twice: the first click arms it, the menu closing disarms it
+  const [isConfirmingDelete, setIsConfirmingDelete] = useState(false);
   const sourcePages = sourcePath && sourceFirstPage != null && sourceLastPage != null ? pagesLabel(sourceFirstPage, sourceLastPage) : null;
   let parsedTopics: string[] = [];
   try {
@@ -308,24 +310,27 @@ export const QuestionCard = memo(function QuestionCard(props: QuestionCardProps)
             </Badge>
           )}
           <Badge
-            className="text-xs font-medium tracking-wide bg-zinc-800 text-zinc-50 hover:bg-zinc-800/90 dark:bg-zinc-200 dark:text-zinc-900 dark:hover:bg-zinc-200/90 shrink-0"
+            className="text-xs font-medium tracking-wide bg-zinc-800 text-zinc-50 hover:bg-zinc-800/90 dark:bg-zinc-200 dark:text-zinc-900 dark:hover:bg-zinc-200/90 max-w-full"
+            title={displaySubject}
           >
-            {displaySubject}
+            <span className="truncate">{displaySubject}</span>
           </Badge>
           {module && module !== "General" && module !== "Unknown" && (
             <Badge
-              className="text-xs font-medium tracking-wide bg-purple-900/50 text-purple-200 border-purple-800 hover:bg-purple-900/60 shrink-0"
+              className="text-xs font-medium tracking-wide bg-purple-900/50 text-purple-200 border-purple-800 hover:bg-purple-900/60 max-w-full"
+              title={module}
             >
-              {module}
+              <span className="truncate">{module}</span>
             </Badge>
           )}
           {parsedTopics.map((topic, i) => (
             <Badge
               key={i}
               variant="outline"
-              className="text-xs font-medium bg-blue-900/50 text-blue-200 border-blue-800 shrink-0"
+              className="text-xs font-medium bg-blue-900/50 text-blue-200 border-blue-800 max-w-full"
+              title={topic}
             >
-              {topic}
+              <span className="truncate">{topic}</span>
             </Badge>
           ))}
           {(() => {
@@ -350,115 +355,85 @@ export const QuestionCard = memo(function QuestionCard(props: QuestionCardProps)
           })()}
         </div>
 
-        {/* Right: Action buttons (never squished, distinct hover styling) */}
-        <div className="flex items-center gap-1 shrink-0 opacity-70 group-hover:opacity-100 focus-within:opacity-100 transition-opacity duration-150 -mr-1 -mt-1">
-          {!isEditing && sourcePages && (
-            <button
-              type="button"
-              onClick={(e) => {
-                e.stopPropagation();
-                setIsShowingSource(true);
-              }}
-              title={`Compare with the paper (${sourcePages})`}
-              aria-label={`Show question ${id} on the paper`}
+        {/* Right: one menu holds the card's actions, so a narrow card keeps its badges clear */}
+        {!isEditing && (
+          <DropdownMenu onOpenChange={(open) => { if (!open) setIsConfirmingDelete(false); }}>
+            <DropdownMenuTrigger
+              onClick={(e) => e.stopPropagation()}
+              title="More actions"
+              aria-label={`Actions for question ${id}`}
               className={cn(
-                "flex items-center justify-center rounded-md p-1.5",
-                "text-muted-foreground transition-all duration-150",
-                "hover:bg-primary/10 hover:text-primary",
+                "flex items-center justify-center rounded-md p-1.5 shrink-0 -mr-1 -mt-1",
+                "text-muted-foreground opacity-70 group-hover:opacity-100 transition-all duration-150",
+                "hover:bg-primary/10 hover:text-primary data-popup-open:opacity-100 data-popup-open:bg-primary/10 data-popup-open:text-primary",
                 "focus-visible:opacity-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/60"
               )}
             >
-              <FileSearch className="size-4" />
-            </button>
-          )}
-          {!isEditing && (
-            <button
-              type="button"
-              onClick={(e) => {
-                e.stopPropagation();
-                navigator.clipboard.writeText(displayContent);
-                toast.success("Question copied to clipboard");
-              }}
-              title="Copy Question Markdown"
-              aria-label={`Copy question ${id}`}
-              className={cn(
-                "flex items-center justify-center rounded-md p-1.5",
-                "text-muted-foreground transition-all duration-150",
-                "hover:bg-primary/10 hover:text-primary",
-                "focus-visible:opacity-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/60"
+              <MoreHorizontal className="size-4" />
+            </DropdownMenuTrigger>
+            {/* React events bubble through the portal: keep a menu click from opening the editor */}
+            <DropdownMenuContent onClick={(e) => e.stopPropagation()}>
+              {sourcePages && (
+                <DropdownMenuItem onClick={() => setIsShowingSource(true)}>
+                  <FileSearch />
+                  <span>Compare with the paper</span>
+                  <span className="ml-auto pl-3 text-xs text-muted-foreground">{sourcePages}</span>
+                </DropdownMenuItem>
               )}
-            >
-              <Copy className="size-4" />
-            </button>
-          )}
-          {!isEditing && (
-            <button
-              type="button"
-              onClick={(e) => {
-                e.stopPropagation();
-                setEditContent(displayContent);
-                setEditMarks(marks);
-                setEditAnswerContent(strippedAnswerContent);
-                setEditTopics(parsedTopics);
-                setIsEditing(true);
-              }}
-              title="Edit Question"
-              aria-label={`Edit question ${id}`}
-              className={cn(
-                "flex items-center justify-center rounded-md p-1.5",
-                "text-muted-foreground transition-all duration-150",
-                "hover:bg-primary/10 hover:text-primary",
-                "focus-visible:opacity-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/60"
+              <DropdownMenuItem
+                onClick={() => {
+                  setEditContent(displayContent);
+                  setEditMarks(marks);
+                  setEditAnswerContent(strippedAnswerContent);
+                  setEditTopics(parsedTopics);
+                  setIsEditing(true);
+                }}
+              >
+                <Pencil />
+                <span>Edit</span>
+              </DropdownMenuItem>
+              <DropdownMenuItem
+                onClick={() => {
+                  navigator.clipboard.writeText(displayContent);
+                  toast.success("Question copied to clipboard");
+                }}
+              >
+                <Copy />
+                <span>Copy as Markdown</span>
+              </DropdownMenuItem>
+              {needsReview && (
+                <DropdownMenuItem
+                  onClick={async () => {
+                    try {
+                      await invoke("mark_question_verified", { id });
+                      setNeedsReview(false);
+                      setAnswerStale(false);
+                      toast.success("Question marked as verified");
+                    } catch (e: any) {
+                      toast.error(e.toString());
+                    }
+                  }}
+                >
+                  <ShieldCheck className="text-emerald-500" />
+                  <span>Mark as verified</span>
+                </DropdownMenuItem>
               )}
-            >
-              <Pencil className="size-4" />
-            </button>
-          )}
-          {!isEditing && needsReview && (
-            <button
-              type="button"
-              onClick={async (e) => {
-                e.stopPropagation();
-                try {
-                  await invoke("mark_question_verified", { id });
-                  setNeedsReview(false);
-                  setAnswerStale(false);
-                  toast.success("Question marked as verified");
-                } catch (e: any) {
-                  toast.error(e.toString());
-                }
-              }}
-              aria-label={`Mark question ${id} as verified`}
-              className={cn(
-                "flex items-center justify-center rounded-md p-1.5",
-                "text-emerald-600 transition-all duration-150",
-                "hover:bg-emerald-500/10 hover:text-emerald-500",
-                "focus-visible:opacity-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-500/60"
-              )}
-              title="Mark as Verified"
-            >
-              <ShieldCheck className="size-4" />
-            </button>
-          )}
-          <button
-            id={`delete-question-${id}`}
-            type="button"
-            onClick={(e) => {
-              e.stopPropagation();
-              onDelete?.(id);
-            }}
-            title="Delete Question"
-            aria-label={`Delete question ${id}`}
-            className={cn(
-              "flex items-center justify-center rounded-md p-1.5",
-              "text-muted-foreground transition-all duration-150",
-              "hover:bg-destructive/10 hover:text-destructive",
-              "focus-visible:opacity-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-destructive/60"
-            )}
-          >
-            <Trash2 className="size-4" />
-          </button>
-        </div>
+              <DropdownMenuSeparator />
+              <DropdownMenuItem
+                id={`delete-question-${id}`}
+                variant="destructive"
+                closeOnClick={isConfirmingDelete}
+                onClick={() => {
+                  if (isConfirmingDelete) onDelete?.(id);
+                  else setIsConfirmingDelete(true);
+                }}
+              >
+                <Trash2 />
+                <span>{isConfirmingDelete ? "Click again to delete" : "Delete"}</span>
+              </DropdownMenuItem>
+            </DropdownMenuContent>
+          </DropdownMenu>
+        )}
       </div>
 
       {/* ── Stale Answer Warning Banner ── */}

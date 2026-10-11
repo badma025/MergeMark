@@ -23,6 +23,8 @@ export interface RepositoryFeedProps {
   onAddToWorksheet: (question: Omit<QuestionCardProps, "onAddToWorksheet" | "onDelete">) => void;
   onAddMultipleToWorksheet?: (questions: Omit<QuestionCardProps, "onAddToWorksheet" | "onDelete">[]) => void;
   selectedQuestionIds?: string[];
+  /** Questions deleted from the library: they leave the worksheet too */
+  onQuestionsRemoved?: (ids: string[]) => void;
 }
 
 function QuestionCardSkeleton() {
@@ -64,6 +66,7 @@ export function RepositoryFeed({
   onAddToWorksheet,
   onAddMultipleToWorksheet,
   selectedQuestionIds = [],
+  onQuestionsRemoved,
 }: RepositoryFeedProps) {
   const [search, setSearch] = useState("");
   const deferredSearch = useDeferredValue(search);
@@ -77,6 +80,8 @@ export function RepositoryFeed({
   const [reviewFilter, setReviewFilter] = useState<"All" | "Clean" | "Needs review">("All");
   const [questions, setQuestions] = useState<Omit<QuestionCardProps, "onAddToWorksheet" | "onDelete">[]>([]);
   const [loading, setLoading] = useState(true);
+  // Only a library that loaded can say a question is gone
+  const [hasLoaded, setHasLoaded] = useState(false);
   const splashDismissedRef = useRef(false);
   const paintConfirmedRef = useRef(false);
   const cardsMountedRef = useRef(false);
@@ -84,14 +89,6 @@ export function RepositoryFeed({
 
   const subjectNames = useMemo(() => (subjects || []).map(s => s?.name).filter(Boolean), [subjects]);
 
-  const ALL_TOPICS = useMemo(() => {
-    if (!topicsBySubject) return [];
-    return Array.from(new Set(
-      Object.values(topicsBySubject)
-        .filter(Boolean)
-        .flatMap(subjectMods => Object.values(subjectMods || {}).flat().filter(Boolean))
-    ));
-  }, [topicsBySubject]);
 
   const availablePapers = useMemo(() => {
     return Array.from(
@@ -161,6 +158,7 @@ export function RepositoryFeed({
     try {
       const data = await invoke<Omit<QuestionCardProps, "onAddToWorksheet" | "onDelete">[]>("get_all_questions");
       setQuestions(data || []);
+      setHasLoaded(true);
     } catch (error) {
       console.error("Failed to fetch questions:", error);
       toast.error("Failed to load questions", { description: String(error) });
@@ -170,17 +168,23 @@ export function RepositoryFeed({
   }
 
   const handleDelete = useCallback(async (id: string) => {
-    // Optimistically remove from local state immediately so the UI feels instant
-    setQuestions((prev) => prev.filter((q) => q.id !== id));
+    // Removed once the library has deleted it, since leaving the library also takes it off the worksheet
     try {
       await invoke("delete_question", { id });
+      setQuestions((prev) => prev.filter((q) => q.id !== id));
       toast.success("Question removed from repository");
     } catch (err) {
-      // Roll back if the backend call fails
       toast.error("Failed to delete question", { description: String(err) });
-      fetchQuestions(); // re-sync with DB
     }
   }, []);
+
+  // A question deleted here, or with its paper in Manage PDFs, leaves the worksheet
+  useEffect(() => {
+    if (!hasLoaded || loading || !onQuestionsRemoved) return;
+    const present = new Set(questions.map((q) => q.id));
+    const gone = selectedQuestionIds.filter((id) => !present.has(id));
+    if (gone.length > 0) onQuestionsRemoved(gone);
+  }, [questions, hasLoaded, loading, selectedQuestionIds, onQuestionsRemoved]);
 
   const handleUpdate = useCallback(async (id: string, newContent: string, newMarks: number, newAnswerContent?: string, newTopics?: string[], newModule?: string) => {
     try {
@@ -516,6 +520,7 @@ export function RepositoryFeed({
             return (
               <Badge
                 key={subject}
+                render={<button type="button" aria-pressed={isSelected} />}
                 variant={isSelected ? "default" : "secondary"}
                 className={cn(
                   "cursor-pointer transition-colors text-xs font-semibold py-1 px-3 rounded-md break-normal",
@@ -543,6 +548,7 @@ export function RepositoryFeed({
               return (
                 <Badge
                   key={mod}
+                  render={<button type="button" aria-pressed={isSelected} />}
                   variant={isSelected ? "default" : "secondary"}
                   className={cn(
                     "cursor-pointer transition-colors text-xs font-semibold py-1 px-3 rounded-md break-normal",
@@ -576,6 +582,7 @@ export function RepositoryFeed({
               return (
                 <Badge
                   key={id}
+                  render={<button type="button" aria-pressed={isSelected} />}
                   variant={isSelected ? "default" : "outline"}
                   className={cn(
                     "cursor-pointer text-xs font-medium py-0.5 px-2.5 rounded-md transition-all",
@@ -621,10 +628,12 @@ export function RepositoryFeed({
           </div>
         </div>
 
-        {/* Topics Filter */}
+        {/* Topics Filter: a subject's own topics, once one is chosen (every subject's at once fills the screen) */}
+        {selectedSubject === "All" ? (
+          <p className="mt-3 text-xs text-muted-foreground">Choose a subject to filter by topic.</p>
+        ) : (
         <div className="mt-3 flex flex-wrap items-center gap-2 max-h-36 overflow-y-auto pr-1">
           {(() => {
-            if (selectedSubject === "All") return ALL_TOPICS;
             const subjectMods = topicsBySubject[selectedSubject] || {};
             if (selectedModule === "All") {
               return Object.values(subjectMods).flat();
@@ -635,6 +644,7 @@ export function RepositoryFeed({
             return (
               <Badge
                 key={topic}
+                render={<button type="button" aria-pressed={isSelected} />}
                 variant={isSelected ? "default" : "outline"}
                 className={cn(
                   "cursor-pointer transition-colors text-xs font-medium py-0.5 break-normal",
@@ -653,6 +663,7 @@ export function RepositoryFeed({
             );
           })}
         </div>
+        )}
       </div>
 
       {/* ── Scrollable question grid ── */}
