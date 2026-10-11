@@ -33,7 +33,7 @@ Open **Import PDF**, choose the subject and module, then drag a question-paper P
 - A paper that prints no question numbers gives no cards.
 
 ## Checking a card against its paper
-Each imported card has a source button (the page with a magnifier, at the top right of the card). It shows the pages of the PDF the question was read from, so you can compare the two. Zoom in with the + and − buttons.
+Each imported card's ⋯ menu (top right of the card) has **Compare with the paper**. It shows the pages of the PDF the question was read from, so you can compare the two. Zoom in with the + and − buttons.
 
 - If you have moved or renamed the PDF since importing it, the card says so. Choose **Find the PDF...** and pick the file in its new place: every card from that paper follows it. MergeMark accepts the file only if it is the same PDF.
 - If the file at that place has changed (for example, a different download of the paper), the card says so rather than showing pages that may not match. Find the original, or import the paper again.

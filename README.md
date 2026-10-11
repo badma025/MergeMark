@@ -18,7 +18,7 @@ Currently optimized for **GCSE and A-Level Mathematics & Further Mathematics**, 
 ## ✨ Key Features
 * **Zero-Friction Parsing:** Drag and drop full exam papers or question booklets. The engine automatically isolates distinct questions from the layout.
 * **Fully Offline Import:** Every paper is read on your machine. MergeMark makes no AI requests of any kind, needs no API key and costs nothing. See [How importing works](#-how-importing-works).
-* **Check any card against its paper:** each card records the PDF and the pages it came from. Its source button shows those pages, so a card can always be compared with what the paper prints.
+* **Check any card against its paper:** each card records the PDF and the pages it came from. **Compare with the paper**, in the card's ⋯ menu, shows those pages, so a card can always be compared with what the paper prints.
 * **100% Local & Private:** Built on a local SQLite database. Your files, extractions, and data live strictly on your machine and are never uploaded anywhere. The one request MergeMark makes is the [update check](#updates).
 * **Markdown & LaTeX Ready:** Export extractions instantly into your preferred knowledge management workflows (like Obsidian) or use them to compile targeted topic tests.
 
@@ -88,7 +88,7 @@ MergeMark checks for a newer version when it starts, and from **Settings → Bac
 
 ### How to Use
 1. **Import:** Drag and drop a PDF past paper into the ingestion dropzone.
-2. **Review:** Check the extracted questions, against their pages with each card's source button. You can edit any card to correct it.
+2. **Review:** Check the extracted questions, against their pages with **Compare with the paper** in each card's ⋯ menu. You can edit any card to correct it.
 3. **Export:** Copy the isolated question blocks as clean markdown/LaTeX to use in your notes, active recall templates, or custom worksheets.
 
 ## 🗺️ Roadmap

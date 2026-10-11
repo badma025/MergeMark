@@ -915,6 +915,7 @@ Known gaps outside these numbers:
 - Found by the w1r2 blinded audit, on flagged cards, for the next round:
   - CIE Nov 2003 P2 Q1 (holdout): the modulus bars of |8 − 3x| < 2 are unidentified glyphs, set on a line of their own, so the inequality reads "8 − 3x < 2";
   - m3_centre_of_mass (fixture, all its cards flagged): the worksheet prints each answer in a box ("k = 6", "h = 5r") beside a handwritten worked solution, and the cards carry both, the solutions as crops.
+- Found by the end-to-end run of 11 Oct 2026, for 1.0.1 (fixture, strict, cosmetic): Edexcel Further Jun 2025 Q2 sets its given Taylor-series formula inside a large square bracket built from pieces. The pieces are dropped but one, which becomes a line of its own, `$\text{⎡}$`, between "is given by" and the formula. The formula itself reads whole.
 - The text-layer carve, used only when a question has no layout body, still drops every line that holds only a number (its page-number rule cannot tell a page number from an option without geometry).
 - Two flagged holdout cards end on what may be a page number (OCR B Physics Jun 2024 Q2 "6", WJEC Physics Jun 2017 Q2 "3"); OCR A's is handled (cluster 9).
 - Axis scales of drawn graphs and grids appear as lines of numbers in the card text, as their titles already did, except on graph paper drawn as one path (cluster 14).

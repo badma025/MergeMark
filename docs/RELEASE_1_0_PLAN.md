@@ -174,7 +174,7 @@ W0 → W4 step 1 (so the mark-scheme decision lands early, while it can still ch
 
 ## Where things stand right now
 
-*Updated 10 Oct 2026.*
+*Updated 11 Oct 2026.*
 
 - Every workstream is done: W0, W2, W4 (mark schemes cut from 1.0), W5, and W1 rounds 1–4 with W3 batches 1–2, each recorded in `TRIAGE_FIX_REPORT.md`. They are on `import-fixes-rounds-1-2` and `master`, pushed on 10 Oct 2026.
 - The blinded audits w1r3 and w1r4 found no MAJOR card, and the user declared convergence on 10 Oct 2026 (Where to stop, 4). The release starts with dry runs, tags `v1.0.0-rc.N`, each failed one's tag removed; then `v1.0.0`. **A candidate's draft is ready when:**
@@ -189,7 +189,17 @@ W0 → W4 step 1 (so the mark-scheme decision lands early, while it can still ch
     - On macOS, the margin is read again by itself, for question numbers the whole page's reading dropped. A census on the runner found no Vision setting that reads them. The test passes on the runner with the fix (temporary branch `ci/vision-census`).
     - Code review of all of it: `output/fix-log/review-release-dryrun-findings.md`.
   - **rc.3:** the secrets set by `scripts/set-signing-secrets.mjs` signed (the signing check passed on GitHub). Windows built and signed with key `51088306F548AC07`. On macOS every Rust test passed (456: the Windows-only one does not run there), but three of the scripts' tests failed: they need pdftotext, which Git for Windows ships. They now run in the Windows job only.
-  - **rc.4 (`5248cdc`):** both jobs succeeded. The draft holds the Windows installer, the universal disk image and the macOS update bundle. Its `latest.json` lists `windows-x86_64` and both `darwin-aarch64` and `darwin-x86_64`, and every signature carries key `51088306F548AC07`. Waiting on the user's installs (the checklist's last item). Then: remove rc.4's draft and tag, tag `v1.0.0` at the same commit (its `latest.json` names the tag in every URL, so a draft cannot be retagged), check its draft the same way, and the user publishes it.
+  - **rc.4 (`5248cdc`):** both jobs succeeded. The draft holds the Windows installer, the universal disk image and the macOS update bundle. Its `latest.json` lists `windows-x86_64` and both `darwin-aarch64` and `darwin-x86_64`, and every signature carries key `51088306F548AC07`. Superseded by rc.5 before the installs finished.
+  - **rc.5:** the user's testing of rc.4 and an end-to-end run of the app (11 Oct 2026, the real desktop build driven over WebView2's DevTools port, on its own app identifier) found faults outside the import engine. Fixed and committed:
+    - adding a question by hand always failed (`add_question` required `needsReview`), and the dialog started on a subject that does not exist;
+    - a deleted question stayed on the worksheet;
+    - the editor's preview showed no diagrams;
+    - the card's action icons did not fit, so they moved to a ⋯ menu, and Delete now takes a second click;
+    - on the worksheet PDF, a figure-first question's number printed under its figure, printed bullets ran into one line, and a part's mark followed the next part's lead-in;
+    - smaller things: the topic filter appears once a subject is chosen, long equations shrink to their card, and worksheet lines name their paper.
+
+    The stray "⎡" it found on a strict card is under "What is left" in `TRIAGE_FIX_REPORT.md`, for 1.0.1. The checklist above applies to rc.5 in full, including the user's installs. Then: remove the rc.4 and rc.5 drafts and tags, tag `v1.0.0` at rc.5's commit (its `latest.json` names the tag in every URL, so a draft cannot be retagged), check its draft the same way, and the user publishes it.
+- **1.0.1, proposed (11 Oct 2026, not yet designed):** topics for imported questions, and the "Auto-Topics" button back. The user is weighing a cloud model (an exception to the no-AI rule) against offline options: syllabus keyword signs, a model trained on papers labelled at development time (it cannot place a subject it was not trained on, so it does not cover user-made subjects), and a small embedding model on the computer that compares a question with any topic list, learning from the user's own tags. Measure on a labelled set before choosing.
 - The macOS test passed on the user's Mac on 10 Oct 2026 (`docs/MACOS_TEST.md`), and the macOS job is back in `release.yml`. The margin re-read came after it: on a real Mac it is checked with the release candidate, as above.
 - **Updater signing key: new in 1.0**, key ID `51088306F548AC07` (`~/.tauri/mergemark-1.key` on the user's PC, its password in their password manager). The key secret holds it (the signing check matched its fingerprint). The password secret, set twice by hand (`gh`'s hidden prompt, then GitHub's web page), did not open it; `scripts/set-signing-secrets.mjs` sets both from the key file and the password typed once, after checking locally that they sign with the app's key. The key 0.9.1 and 0.9.2 trust (A59B…) can no longer sign. Those betas show the release text in their update prompt, and it tells their users to answer No and install 1.0 by hand. 0.9.3 has no update address. Before a release is published, check that its signatures carry the new key ID.
 - `cargo test` with `MERGEMARK_REQUIRE_FIXTURES=1`: 455 passing at round 4; the dry run's fixes add two OCR unit tests. 99 papers are in the encrypted test set, and 96 question papers are left in the holdout. The faults still known are under "What is left" in `TRIAGE_FIX_REPORT.md`.
